@@ -1,0 +1,1602 @@
+---
+title: "Webhooks: how the server calls you"
+description: Why polling another backend fails, how webhooks flip the direction, and how to engineer both sides properly with HMAC signatures over raw bytes, replay and SSRF defences, idempotency, ordering, retries, the outbox pattern and event-log syncing.
+---
+
+<Callout type="info">
+  Notes for [Webhooks](https://youtu.be/eWM0CVReP04) by **Sriniously**, from the *Backend from First Principles* series. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+
+  The lesson's demo receiver is in **Go**. Code here is **TypeScript (Node/NestJS + Postgres)**.
+</Callout>
+
+Every lesson so far assumed **the client starts the conversation**. Even the real-time lesson kept that rule: the browser opens a connection first, then the server can push down it. This lesson breaks the premise for **service-to-service** communication: **another backend calls yours**, with no browser and no human involved.
+
+<Mermaid chart={`flowchart LR
+  A["Why: another backend has the news"] --> B["Polling the provider fails"]
+  B --> C["Flip it: webhook = POST to your URL"]
+  C --> D["Receiving: 2xx + deadlines, registration, handshakes"]
+  D --> E["Security: HMAC on raw bytes, replay, timing, SSRF"]
+  E --> F["At-least-once: idempotency"]
+  F --> G["Out of order: ordering strategies"]
+  G --> H["Retries + thin receiver + queue"]
+  H --> I["Sending: outbox + dispatcher"]
+  I --> J["When webhooks are the wrong tool"]`} />
+
+---
+
+## 1. The problem: the news lives in someone else's system 🎓
+
+### The example
+The task board sells a **paid plan**. Payments go through a provider such as **Stripe**. When a payment succeeds, **that success happens in Stripe's system, not yours.** You need a **signal** from Stripe, and only then can you unlock the plan.
+
+### Why the browser can't be the one who receives the signal
+1. **Reliability:** the user's network can drop, they can close the tab, their machine can crash. If the browser is the messenger, the signal can be lost at any of those moments. It's **their** network, not your server's.
+2. **Security:** anything on the client side can be modified. "Payment approved" is far too critical to accept from a browser.
+
+So **your server** must receive the signal, and your system must be the **source of truth**.
+
+---
+
+## 2. The first idea: poll the provider 🎓
+
+After sending the payment to Stripe, your server polls every second: "what's the status of payment X?". While it's pending, keep polling. When it's decided (succeeded or failed), update the DB and tell the browser.
+
+**Why it fails:**
+- **Delay:** the formula from the real-time lesson: average delay is **half the interval**, so 0.5 s at 1 s polling.
+- **Waste:** every "still pending" response is a wasted request.
+- **The serious one, load on the provider:** if the provider has **10,000 merchants** each polling every second, that's **10,000 req/s** hitting its API **for nothing**. To protect itself the provider **rate-limits merchants aggressively**, so you can't poll every second anyway. With, say, a **60 s** interval forced on you, the average delay falls back to **30 s**.
+
+<Mermaid chart={`sequenceDiagram
+  participant Y as Your backend
+  participant P as Payment provider
+  loop every second (until rate limited)
+    Y->>P: GET /payments/pi_123
+    P-->>Y: status pending
+  end
+  Note over P: payment succeeds
+  Y->>P: GET /payments/pi_123
+  P-->>Y: status succeeded
+  Note over Y,P: 10,000 merchants x 1 req/s = 10,000 req/s of mostly "pending"`} />
+
+---
+
+## 3. The fix: flip the direction 🎓
+
+Instead of asking repeatedly, **trust the provider to tell you** when the event happens. That mechanism is a **webhook**.
+
+**A webhook is nothing fancy: a plain HTTP `POST`** that the provider sends to **a URL you registered** with it, carrying the event data. It's a **reverse API call**: normally you call their API when you need something; here **they call yours** when something happens.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant Y as Your backend
+  participant P as Provider (Stripe)
+  B->>Y: Buy Pro plan
+  Y->>P: create payment
+  P-->>Y: pending
+  Y-->>B: "processing..."
+  Note over P: payment succeeds (minutes later, maybe)
+  P->>Y: POST /hooks/stripe (type payment.succeeded)
+  Y->>Y: verify, record, unlock plan
+  Y-->>P: 2xx
+  Y-->>B: (SSE / WebSocket / next page load) plan active`} />
+
+### A bit of history 🎓
+- **2007, Jeff Lindsay** proposed that the web needed something like the **Unix pipe**: a primitive where one service's output is pushed to another when an event happens, like redirecting standard output in a terminal. He called them **webhooks**: user-defined callbacks over HTTP `POST`.
+- **Two years later**, engineers at Google built a protocol on the same idea for blog feeds: **PubSubHubbub**.
+
+### Vocabulary (providers use these loosely) 🎓
+| Term | Meaning |
+|---|---|
+| **Provider / sender** | The system where the event happens (Stripe, GitHub) |
+| **Consumer / receiver** | You |
+| **Endpoint** | The URL on your side that receives the `POST` |
+| **Event** | Something predefined that happened: a payment succeeded, a task moved |
+| **Delivery** | **One attempt** to send an event to an endpoint. **One event can have many deliveries** |
+| **Subscription** | Your registration: this URL, these event types |
+
+**Keep "one event, many deliveries" in mind from the start.** Everything about idempotency later follows from it.
+
+---
+
+## 4. What a delivery looks like 🎓
+
+### What the demo shows 🎓
+A Go receiver with three packages: `main` registers one route, `POST /hooks/github`; `inbox` is the handler (read the **whole body**, check the signature with `verify`, store the **delivery ID**, respond); `verify` does the signature check. **That's the typical shape of a webhook handler.**
+
+The receiver runs on a Linux box with **no public address**, so a **tunnel** gives local port **8081** a public HTTPS hostname. On the GitHub repo: add a webhook with that URL, content type JSON, a **secret**, and only the **push** event. GitHub immediately sends a **ping** to the new hook. Push a commit, and the receiver logs one `POST` with the **event name** header, a **delivery ID**, a **signature**, and the receiver's response: **202**. GitHub keeps its own copy under **Recent Deliveries**: same headers, payload and response.
+
+### Anatomy
+```http
+POST /hooks/github HTTP/1.1
+Content-Type: application/json
+X-GitHub-Event: push
+X-GitHub-Delivery: 72d3162e-cc78-11e3-81ab-4c9367dc0958
+X-Hub-Signature-256: sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17
+
+{"ref":"refs/heads/main","commits":[ ... ],"repository":{ ... }}
+```
+
+| Part | Purpose |
+|---|---|
+| `POST` to your URL | The delivery itself |
+| `Content-Type` | Body format (JSON) |
+| `X-GitHub-Event` | Event type, so you can route it |
+| `X-GitHub-Delivery` | **Unique delivery ID** (the idempotency key, section 11) |
+| `X-Hub-Signature-256` | HMAC signature (section 7) |
+| Body | The event data |
+
+### How the provider decides "delivered" 🎓
+1. **Status code:** any **2xx** (200, 202, ...) is success. **Anything else is failure**, including **3xx** and 4xx.
+2. **Time:** you must answer within the provider's deadline:
+
+| Provider | Deadline |
+|---|---|
+| GitHub | 10 s |
+| Shopify | 5 s |
+| Slack | 3 s |
+| Microsoft Graph | 3 s |
+
+Check the docs for every provider you integrate. Miss the deadline and it counts as a failure, which triggers the provider's **retry** mechanism (section 13).
+
+---
+
+## 5. Registration 🎓
+
+A registration form usually has **a URL, a secret and a list of event types**.
+
+### One URL per provider
+Use **`/hooks/github`** and **`/hooks/stripe`**, never a generic `/hooks/callback`. **Why:** each provider has its **own headers, its own signature scheme and its own retry behaviour**, and the handler must account for all of it. Separate endpoints mean separate, simple handlers.
+
+### Handshakes: proving you own the URL
+Some providers verify a new URL before sending real events:
+
+| Provider | Handshake |
+|---|---|
+| Microsoft Graph | Sends a **validation token**; you must echo it back **as plain text** |
+| Discord | Sends a **ping**; expects a **pong** |
+| Amazon SNS | Sends a **SubscriptionConfirmation** message with a **URL you must visit** |
+
+**Why it exists (first principles):** a webhook system calls **whatever URL is registered**. Without a handshake, an attacker could register a **victim's address**, subscribe to **every event type**, and turn the provider into a **DoS cannon** pointed at the victim. The handshake proves the URL's owner actually wants the traffic.
+
+```ts title="graph-handshake.controller.ts"
+@Post('hooks/msgraph')
+handle(@Query('validationToken') token: string | undefined, @Res() res: Response, @Req() req: RawBodyRequest<Request>) {
+  if (token) return res.type('text/plain').status(200).send(token);   // handshake: echo it, plain text
+  // ...normal notification handling
+}
+```
+
+### Local development: inbound requests can't reach your laptop 🎓
+A webhook is **inbound**: it comes from the internet to you. During development:
+- your laptop is behind a **home router** that doesn't forward unsolicited inbound requests to devices (for obvious reasons), and
+- **`localhost` means nothing** to a server on the internet; it needs a domain or IP.
+
+**Fix:** a **tunnel** (ngrok, Cloudflare Tunnel, ...) gives you a temporary public HTTPS URL that forwards securely to your local port. Register that URL with the provider.
+
+```bash
+ngrok http 8081
+cloudflared tunnel --url http://localhost:8081
+stripe listen --forward-to localhost:8081/hooks/stripe   # 🔧 Stripe's CLI does this for Stripe events, and prints a test signing secret
+```
+
+---
+
+## 6. The security hole: a public URL that unlocks paid plans 🎓
+
+Your endpoint is **public**, receives a `POST`, and the result is **unlocking someone's paid plan**. Webhook URLs follow guessable patterns (`/webhooks`, `/hooks`, `/callback`). **Anyone who guesses it can `POST` "payment succeeded for user 42".**
+
+**HTTPS doesn't solve this.** TLS stops anyone **reading or tampering with bytes in transit**. It says **nothing about who wrote them**. You need to **authenticate the sender**.
+
+### Five ways to authenticate the sender 🎓
+
+| # | Method | How | Weakness |
+|---|---|---|---|
+| 1 | **Secret token in the URL** | Like basic auth in the query string | **Weakest.** URLs are logged everywhere (local logs, CloudWatch, Elasticsearch), so the token leaks |
+| 2 | **IP allow list** | Provider publishes its IPs (GitHub, Stripe, Polar...); firewall allows only those | Better, but **not enough alone** (IP lists change; shared cloud IPs) |
+| 3 | **Mutual TLS** | Provider presents a **client certificate** you verify | Operationally heavy |
+| 4 | **HMAC signature (shared secret)** | Provider signs the body with a secret only you and it know | **The standard**: roughly **65 to 80%** of providers |
+| 5 | **Public-key signature** | Provider signs with its **private key**; you verify with its **public key** | No shared secret to leak. **Discord** does this |
+
+The rest of the lesson uses **#4**.
+
+---
+
+## 7. HMAC signatures: the mechanism 🎓
+
+### Why it works (first principles)
+A **hash** maps any input to a fixed-length fingerprint; change one byte and the whole fingerprint changes (from the HTTP and security lessons). **HMAC** (hash-based message authentication code) mixes a **secret key** into that hash. Without the key, you can't produce a valid fingerprint for a body, so **a valid signature proves the sender knows the secret.**
+
+1. **Provider:** computes `HMAC-SHA256(secret, body)` and puts it in a header.
+2. **You:** compute the same thing over **the bytes you received** with **the same secret**.
+3. **Compare.** Match → it came from the provider and wasn't modified. Mismatch → reject.
+
+<Mermaid chart={`sequenceDiagram
+  participant P as Provider
+  participant R as Your receiver
+  Note over P: sig = HMAC_SHA256(secret, signed content)
+  P->>R: POST raw bytes + signature header (+ timestamp, id)
+  R->>R: read RAW bytes (do not parse yet)
+  R->>R: expected = HMAC_SHA256(secret, same signed content)
+  R->>R: constant-time compare(expected, header)
+  alt match and timestamp fresh
+    R->>R: parse JSON, record delivery ID
+    R-->>P: 2xx
+  else mismatch or stale
+    R-->>P: 401 (nothing processed)
+  end`} />
+
+### What exactly gets signed differs per provider 🎓
+The lesson looks at **Stripe's Go SDK** verification code: it parses the header into **`t`** (a Unix timestamp) and one or more **`v1`** signatures (there can be several, e.g. during secret rotation), then compares with `hmac.Equal`.
+
+| Provider | Signed content | Header |
+|---|---|---|
+| **GitHub** | The **body** only | `X-Hub-Signature-256: sha256=` + hex |
+| **Stripe** | **timestamp + `.` + body** (the timestamp blocks replays) | `Stripe-Signature: t=...,v1=...` |
+| **Standard Webhooks** spec | **delivery ID + `.` + timestamp + `.` + body** (the ID is protected too) | `webhook-id`, `webhook-timestamp`, `webhook-signature: v1,` + base64 |
+| **Twilio** | The **full URL** + all form fields **sorted**, with **SHA-1** (so the exact URL must match) | `X-Twilio-Signature` |
+
+**Always read the provider's docs**; get one detail wrong and every verification fails.
+
+### The raw-body trap 🎓
+**Problem:** the signature is over **exact bytes**. In Node with Express, `express.json()` parses the body before your handler runs. If you then `JSON.stringify` the object and HMAC that, the bytes differ: the provider wrote `{"a":1}` with no spaces, your encoder may produce different whitespace, key order or number formatting, and Unicode escaping. **Different bytes, different HMAC, every delivery fails.**
+
+**Rule: read the body as bytes → verify those bytes → only then parse.**
+
+**What the demo shows:** (1) verifying over the raw bytes → **202**. (2) Change the secret on GitHub and redeliver → the header no longer matches → **401**, and GitHub records the 401. (3) Fix the secret, but make the receiver **parse the JSON and re-encode it before verifying** → **verification fails again**, purely because of the parse-then-encode step.
+
+### Constant-time comparison 🎓
+**Problem:** an ordinary `===` on strings **stops at the first differing byte**. That makes comparison time depend on **how many leading bytes match**. An attacker measuring response times across thousands or millions of requests can, in principle, **derive a valid signature byte by byte**.
+
+**Fix:** every language has a **constant-time** compare that takes the same time however different the inputs are: Go `hmac.Equal`, Node `crypto.timingSafeEqual`, Python `hmac.compare_digest`.
+
+### 🔧 Implementation: verifying GitHub in NestJS
+```ts title="main.ts"
+const app = await NestFactory.create(AppModule, { rawBody: true }); // keeps req.rawBody (a Buffer) alongside the parsed body
+```
+
+```ts title="verify.ts"
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+export function safeEqual(a: string, b: string) {
+  const ab = Buffer.from(a), bb = Buffer.from(b);
+  return ab.length === bb.length && timingSafeEqual(ab, bb); // timingSafeEqual throws on unequal lengths
+}
+
+export function verifyGithub(raw: Buffer, header: string | undefined, secret: string) {
+  if (!header?.startsWith('sha256=')) return false;
+  const expected = 'sha256=' + createHmac('sha256', secret).update(raw).digest('hex');
+  return safeEqual(expected, header);
+}
+```
+
+```ts title="github-hooks.controller.ts"
+@Post('hooks/github')
+@HttpCode(202)
+async github(@Req() req: RawBodyRequest<Request>, @Headers() h: Record<string, string>) {
+  if (!verifyGithub(req.rawBody!, h['x-hub-signature-256'], process.env.GITHUB_WEBHOOK_SECRET!)) {
+    throw new UnauthorizedException();
+  }
+  const payload = JSON.parse(req.rawBody!.toString('utf8'));     // parse only AFTER verifying
+  await this.inbox.record('github', h['x-github-delivery'], h['x-github-event'], payload);
+}
+```
+
+🔧 Plain Express: mount the raw parser on **that route only**, before any global JSON parser touches it: `app.post('/hooks/github', express.raw({ type: 'application/json' }), handler)`, then `req.body` is a `Buffer`.
+
+---
+
+## 8. Replay attacks and timestamps 🎓
+
+### The problem
+HMAC proves who **wrote** a request, not **when**. Suppose an attacker **captures one real delivery** (headers, body, everything) and **re-sends it an hour later**, or a thousand times. The signature is genuine, so your handler **verifies it and lets it through**. That's a **replay attack**.
+
+### The mechanism
+Put the **time of the attempt inside the signed string**. Stripe signs `t + "." + body`, so the timestamp **can't be changed without breaking the signature**, and its library **rejects anything older than 5 minutes**. A replay an hour later carries an hour-old `t` and is rejected.
+
+🔧 Stripe also generates a **new timestamp and signature for every retry**, so legitimate retries still pass the freshness check. Keep your server clock synced (NTP). And **don't set the tolerance to 0**, which disables the check.
+
+### 🔧 Implementation: Stripe-style and Standard Webhooks verification
+```ts title="verify-stripe.ts (manual; in practice use stripe.webhooks.constructEvent)"
+const TOLERANCE_S = 300;
+
+export function verifyStripe(raw: Buffer, header: string, secret: string, now = Date.now() / 1000) {
+  const parts = header.split(',').map(p => p.split('=') as [string, string]);
+  const t = Number(parts.find(([k]) => k === 't')?.[1]);
+  const v1s = parts.filter(([k]) => k === 'v1').map(([, v]) => v);  // several during secret rotation; ignore v0
+  if (!t || v1s.length === 0) return false;
+  if (Math.abs(now - t) > TOLERANCE_S) return false;               // replay / stale
+
+  const expected = createHmac('sha256', secret).update(`${t}.`).update(raw).digest('hex');
+  return v1s.some(sig => safeEqual(expected, sig));
+}
+```
+
+```ts title="verify-standard-webhooks.ts (the format our own sender uses in section 15)"
+export function verifyStandard(raw: Buffer, h: Record<string, string>, secret: string) {
+  const id = h['webhook-id'], ts = Number(h['webhook-timestamp']);
+  if (!id || !ts || Math.abs(Date.now() / 1000 - ts) > 300) return false;
+  const key = Buffer.from(secret.replace(/^whsec_/, ''), 'base64');
+  const expected = createHmac('sha256', key).update(`${id}.${ts}.`).update(raw).digest('base64');
+  return (h['webhook-signature'] ?? '').split(' ')                     // "v1,sig1 v1,sig2"
+    .map(s => s.split(','))
+    .some(([ver, sig]) => ver === 'v1' && safeEqual(expected, sig));
+}
+```
+
+🔧 For stronger replay protection, the delivery-ID table in section 11 also rejects an exact replay **inside** the 5-minute window, because the ID was already recorded.
+
+---
+
+## 9. Rotating signing secrets without dropping deliveries ➕
+
+Signatures (sections 7 and 8) are only as good as the secret behind them, and secrets have to change (on a schedule, when someone leaves, or after a leak), so both sides need a way to switch keys **without a window where every delivery fails**.
+
+#### 9.1 Why rotation needs an overlap window ➕
+
+**Problem.** The lesson's demo changed the secret on GitHub and got **401** on every delivery until the receiver was updated. In production that gap is a deploy: minutes to hours of failed deliveries, retries piling up, and for GitHub (no automatic retries) lost events.
+
+**Why (first principles).** A signature check needs the **same secret on both sides at the same moment**. The two sides are different systems, configured at different times, so a single "switch now" can never be atomic. The only way to avoid a gap is a period where **both** the old and the new secret are valid.
+
+**Mechanism.** During the overlap the **sender signs with every active secret**, putting several signatures in the header, and the **receiver accepts the request if any one matches** a secret it knows. Stripe works this way: when you roll an endpoint secret you can expire the old one immediately or keep it valid for **up to 24 hours**, and during that time Stripe sends **one `v1` signature per active secret**. The Standard Webhooks header is a space-separated list of `v1,signature` entries for the same reason.
+
+<Mermaid chart={`sequenceDiagram
+  participant S as Sender
+  participant R as Receiver
+  Note over S: active secrets = old only
+  S->>R: v1,sig_old
+  Note over S: roll adds new, old expires in 24 h
+  S->>R: v1,sig_new v1,sig_old
+  Note over R: deploy config with new + old, accepts either
+  Note over S: old expires
+  S->>R: v1,sig_new
+  Note over R: remove old from config`} />
+
+#### 9.2 Receiver side: accept a list of secrets ➕
+
+**Problem.** Your verification code takes **one** secret from configuration. To survive a rotation without coordinating deploy timing to the minute, it must accept both the outgoing and incoming secret for a while, and you must know when it's safe to drop the old one.
+
+**Why (first principles).** The receiver's job during rotation is "authenticate the sender with **any** currently trusted key". That's a set, not a value. Knowing which key matched tells you when the sender has finished switching.
+
+**Mechanism.** Configure an ordered list (new first), try each secret against each signature in the header, and log **which** secret matched. Once the old one hasn't matched for a full day, remove it.
+
+**Implementation.**
+
+```ts title="verify-standard-multi.ts"
+import { createHmac } from 'node:crypto';
+
+// WEBHOOK_SECRETS="whsec_new...,whsec_old..." (new first)
+const SECRETS = (process.env.WEBHOOK_SECRETS ?? '').split(',').filter(Boolean)
+  .map((s, i) => ({ label: i === 0 ? 'current' : `previous_${i}`, key: Buffer.from(s.replace(/^whsec_/, ''), 'base64') }));
+
+export function verifyStandardMulti(raw: Buffer, h: Record<string, string>): { ok: boolean; matched?: string } {
+  const id = h['webhook-id'], ts = Number(h['webhook-timestamp']);
+  if (!id || !ts || Math.abs(Date.now() / 1000 - ts) > 300) return { ok: false };
+  const sigs = (h['webhook-signature'] ?? '').split(' ').map((s) => s.split(',')).filter(([v]) => v === 'v1').map(([, s]) => s);
+
+  for (const { label, key } of SECRETS) {
+    const expected = createHmac('sha256', key).update(`${id}.${ts}.`).update(raw).digest('base64');
+    if (sigs.some((s) => safeEqual(expected, s))) return { ok: true, matched: label };   // safeEqual from section 7
+  }
+  return { ok: false };
+}
+
+// in the controller: metrics.inc('webhook_signature_matched', { secret: result.matched })
+```
+
+**Edge cases.**
+- Load secrets from a secrets manager (lesson 17), not from the image, so adding the new one doesn't need a code deploy.
+- Cap the list at **two**; a long list of old secrets means a leaked key from last year still works.
+- If the old secret **leaked**, there's no overlap: expire it immediately, accept a short burst of failures, and rely on the sender's retries (or redeliver).
+
+#### 9.3 Sender side: rotating your customers' secrets ➕
+
+**Problem.** Once you're the provider (section 15), customers will ask to rotate their endpoint secret, and you'll need to force rotation after an incident. The `endpoints.secret` column in section 15 holds exactly one.
+
+**Why (first principles).** The sender needs the secret in **plaintext** to compute an HMAC, so it can't store a one-way hash as it would for passwords; it can only **encrypt** it at rest. And to support overlap, an endpoint must be able to have **several** active secrets, each with its own expiry.
+
+**Mechanism.** Move secrets to their own table with `expires_at`. A rotation inserts a new secret and sets the old one's expiry (customer's choice: now, or up to 24 hours). The dispatcher signs with **every non-expired** secret, newest first. Secrets are encrypted with a key from a KMS (envelope encryption), and shown to the customer **once**, at creation.
+
+**Implementation.**
+
+```sql title="schema"
+CREATE TABLE endpoint_secrets (
+  id           bigserial PRIMARY KEY,
+  endpoint_id  bigint      NOT NULL REFERENCES endpoints(id),
+  secret_enc   bytea       NOT NULL,        -- encrypted with a KMS data key
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  expires_at   timestamptz                  -- NULL = active with no planned expiry
+);
+CREATE INDEX ON endpoint_secrets (endpoint_id) WHERE expires_at IS NULL;
+```
+
+```ts title="rotate.service.ts"
+async rotate(endpointId: string, keepOldForHours: number) {
+  if (keepOldForHours < 0 || keepOldForHours > 24) throw new BadRequestException('0 to 24 hours');
+  const plain = 'whsec_' + randomBytes(32).toString('base64');
+  await this.db.tx(async (tx) => {
+    await tx.none(`UPDATE endpoint_secrets SET expires_at = now() + make_interval(hours => $2)
+                   WHERE endpoint_id = $1 AND (expires_at IS NULL OR expires_at > now())`, [endpointId, keepOldForHours]);
+    await tx.none(`INSERT INTO endpoint_secrets (endpoint_id, secret_enc) VALUES ($1, $2)`, [endpointId, await kms.encrypt(plain)]);
+  });
+  return { secret: plain };                                    // shown once
+}
+```
+
+```ts title="dispatcher.ts (signing step)"
+const secrets = await db.any(`SELECT secret_enc FROM endpoint_secrets
+                              WHERE endpoint_id = $1 AND (expires_at IS NULL OR expires_at > now())
+                              ORDER BY created_at DESC`, [row.endpoint_id]);
+const sigs = await Promise.all(secrets.map(async ({ secret_enc }) => {
+  const key = Buffer.from((await kms.decrypt(secret_enc)).replace(/^whsec_/, ''), 'base64');
+  return 'v1,' + createHmac('sha256', key).update(`${row.id}.${ts}.${body}`).digest('base64');
+}));
+headers['webhook-signature'] = sigs.join(' ');
+```
+
+**Edge cases.** Cache decrypted secrets in memory for a short time (a KMS call per delivery is slow and expensive), and drop the cache entry on rotation. Write every rotation to an **audit log** (who, when, which endpoint), since it's a security-relevant event.
+
+---
+
+## 10. SSRF: the provider's side of security 🎓
+
+This one is a problem **for whoever sends webhooks**, which matters once **you** become a provider (section 15).
+
+### The problem
+A provider calls **whatever URL a customer types in**, **from inside its own network**. An attacker registers something like `http://169.254.169.254/...`, which on most clouds is the **instance metadata service**: it hands out **credentials**, or reveals internal hostnames such as an admin service. The provider's dispatcher dutifully `POST`s there. This is **server-side request forgery (SSRF)**.
+
+### Why checking at registration isn't enough
+- The attacker's domain can resolve to a **public IP during registration** (when you check) and to a **private IP later** (DNS rebinding).
+- A public URL can answer with a **redirect** to a private address.
+
+### The defence 🎓
+1. **Resolve the name yourself** and check the resulting IP against a **fixed list of private and reserved ranges**, and do it **on every send**, not just at registration.
+2. **Never follow redirects.** In normal HTTP you follow 3xx; for webhooks, a redirect is a threat. That's exactly why providers treat **only 2xx as success** and anything else, including 3xx, as failure. Do the same as a sender.
+3. If you can, send webhooks from a **separate network via an egress proxy**. Stripe open-sourced one: **Smokescreen**.
+
+<Mermaid chart={`flowchart TD
+  U["Customer URL"] --> R["Resolve DNS at SEND time"]
+  R --> C{"Every resolved IP public?"}
+  C -->|"no: 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, ::1, fc00::/7 ..."| X["Refuse + record reason"]
+  C -->|"yes"| K["Connect to THAT IP (no second lookup)"]
+  K --> P["POST, 10 s timeout, redirects NOT followed"]
+  P --> S{"2xx?"}
+  S -->|"yes"| D["delivered"]
+  S -->|"no, incl. 3xx"| F["failed: schedule retry"]`} />
+
+### 🔧 Implementation: an SSRF-safe POST in Node
+The subtle part is **time-of-check vs time-of-use**: if you resolve, check, then let the HTTP client resolve **again**, a rebinding DNS server can answer differently the second time. So validate **inside** the lookup the socket actually uses.
+
+```ts title="safe-post.ts"
+import https from 'node:https';
+import http from 'node:http';
+import dns from 'node:dns';
+import ipaddr from 'ipaddr.js';
+
+function isPublic(ip: string) {
+  const addr = ipaddr.process(ip);              // also unwraps IPv4-mapped IPv6 (::ffff:127.0.0.1)
+  return addr.range() === 'unicast';            // rejects private, loopback, linkLocal, uniqueLocal, reserved, ...
+}
+
+const safeLookup: typeof dns.lookup = ((host: string, opts: any, cb: any) => {
+  dns.lookup(host, { ...opts, all: true }, (err, addrs: dns.LookupAddress[]) => {
+    if (err) return cb(err);
+    const bad = addrs.find(a => !isPublic(a.address));
+    if (bad) return cb(new Error(`blocked private address ${bad.address}`));
+    opts.all ? cb(null, addrs) : cb(null, addrs[0].address, addrs[0].family);
+  });
+}) as any;
+
+export function safePost(url: string, body: string, headers: Record<string, string>, timeoutMs = 10_000) {
+  const u = new URL(url);
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('bad scheme');
+  const mod = u.protocol === 'https:' ? https : http;
+  return new Promise<{ status: number; body: string; retryAfter?: string }>((resolve, reject) => {
+    const req = mod.request(u, { method: 'POST', headers, lookup: safeLookup, timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', (c) => { if (data.length < 2048) data += c; });   // keep only the first 2 KB
+      res.on('end', () => resolve({ status: res.statusCode!, body: data, retryAfter: res.headers['retry-after'] as string }));
+    });                                                                 // node:http never follows redirects
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+```
+
+🔧 A literal IP in the URL (`http://127.0.0.1/`) skips DNS entirely, so check `ipaddr.isValid(u.hostname)` and apply `isPublic` to it directly too.
+
+---
+
+## 11. At-least-once delivery and idempotency 🎓
+
+### The problem
+The provider sends a delivery. Your handler does its work (writes the DB row) and returns **200**. The **200 is lost** on the way back: the connection dropped, the load balancer restarted. From the provider's point of view the delivery **failed**, so it **retries with the same payload**, seconds or minutes later, in an unpredictable order. **You get the same event twice, though you already did the work.**
+
+That's why provider docs say **"at least once"**: the event **will** reach you, it won't be lost, but it **may arrive more than once**. **Never exactly once**, because the acknowledgement itself can be lost.
+
+<Mermaid chart={`sequenceDiagram
+  participant P as Provider
+  participant R as Receiver
+  participant DB as Postgres
+  P->>R: delivery 1 (event evt_9, delivery id d1)
+  R->>DB: unlock plan for user 42
+  R--xP: 200 (lost on the network)
+  Note over P: no ack within deadline: failed
+  P->>R: retry (same event id / delivery id)
+  R->>DB: INSERT delivery id ... ON CONFLICT DO NOTHING
+  DB-->>R: 0 rows: already processed
+  R-->>P: 200 (no second side effect)`} />
+
+### The mechanism: dedupe on the delivery ID 🎓
+**The receiver must be safe to call any number of times with the same event; side effects must happen once.** That property is **idempotency**.
+
+Every provider gives an ID that **stays the same across retries of the same event**: GitHub's `X-GitHub-Delivery` header, Stripe's **event `id`** in the body, Standard Webhooks' `webhook-id`. Keep a table of processed deliveries with a **unique constraint** on that ID, so there can never be two rows with the same one.
+
+### Same transaction, or it isn't safe 🎓
+The insert of the ID **must be in the same DB transaction as the actual work.** Why both other orders fail:
+
+| Order | Crash in between (OOM, container restart) | Result on retry |
+|---|---|---|
+| Work first, then record ID | Work done, ID **not** stored | No row found → **work done twice** |
+| Record ID first, then work | ID stored, work **failed** | Row found → **work skipped forever** |
+| **Both in one transaction** | Either both commit or neither | Correct in every case |
+
+```sql title="schema"
+CREATE TABLE webhook_inbox (
+  id            bigserial PRIMARY KEY,
+  provider      text        NOT NULL,
+  delivery_id   text        NOT NULL,
+  event_type    text        NOT NULL,
+  payload       jsonb       NOT NULL,
+  received_at   timestamptz NOT NULL DEFAULT now(),
+  processed_at  timestamptz,
+  attempts      int         NOT NULL DEFAULT 0,
+  last_error    text,
+  UNIQUE (provider, delivery_id)
+);
+```
+
+🔧 For Stripe, use the **event `id`**, not anything per-delivery: Stripe docs note it can occasionally emit **two different Event objects** for the same change, which you can only catch by also looking at the object ID plus event type. And the ID of record is per **event**, since one event has many deliveries.
+
+---
+
+## 12. Events arrive out of order 🎓
+
+### The problem
+In **2017**, an engineer working on Stripe's API wrote up this case. The provider emits two events for one object: **created**, then **deleted**. Delivery of *created* fails once (you were deploying) and is retried **5 minutes later**. *Deleted* is delivered after one second and succeeds. You receive **deleted, then created**. A handler that takes events at face value ends up with a row for an object **that no longer exists**.
+
+Stripe's docs say it directly: **events are not delivered in order**. And event timestamps are in **seconds**, so two events created within the same second **share a timestamp**; you can't sort by it.
+
+<Mermaid chart={`sequenceDiagram
+  participant P as Provider
+  participant R as Receiver
+  Note over P: t=0 object.created, t=0 object.deleted
+  P--xR: object.created (fails: deploying)
+  P->>R: object.deleted (succeeds)
+  Note over R: delete a row that doesn't exist yet
+  P->>R: object.created (retry, 5 min later)
+  Note over R: naive handler INSERTs: ghost row`} />
+
+### Three solutions 🎓
+1. **Treat the event as a signal, not as data.** On receipt, **fetch the current state** of the object from the provider's API and act on that. Order stops mattering, since you always use the current truth. Cost: **one API call** per event.
+2. **Version check.** Keep a **version** or **`updated_at`** on your copy, and apply an event **only if it's newer** than what you have, in one transaction.
+3. **Buffer** events per object until all the earlier ones arrive. **Unpredictable**: you can't know how long to wait.
+
+Some providers sell **strict ordering** as a feature, for extra money.
+
+```ts title="solution 1: refetch on signal"
+async function onSubscriptionEvent(evt: Stripe.Event) {
+  const id = (evt.data.object as Stripe.Subscription).id;
+  const current = await stripe.subscriptions.retrieve(id);         // the truth, right now
+  await db.query(
+    `INSERT INTO subscriptions (id, user_id, status, current_period_end)
+     VALUES ($1, $2, $3, to_timestamp($4))
+     ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, current_period_end = EXCLUDED.current_period_end`,
+    [current.id, current.metadata.userId, current.status, current.items.data[0].current_period_end],
+  );
+}
+```
+
+```sql title="solution 2: apply only if newer"
+UPDATE subscriptions
+SET    status = $2, provider_version = $3
+WHERE  id = $1 AND provider_version < $3;   -- 0 rows updated = stale event, ignore it
+```
+
+🔧 Deletes need a **tombstone** with solution 2: mark the row `deleted` with its version instead of removing it, so a late *created* with a lower version can't resurrect it.
+
+---
+
+## 13. Retries, deadlines and the thin receiver 🎓
+
+### Retry schedules differ wildly 🎓
+| Provider | Retry behaviour |
+|---|---|
+| **Stripe** | Exponential backoff for up to **3 days** (live mode). Still failing → it **disables the endpoint** and **emails** you |
+| **Svix** (webhooks-as-a-service) | Immediately, then **5 s, 5 min, 30 min, 2 h, 5 h, 10 h**, and so on |
+| **Shopify, Slack, Polar** | Each has its own schedule |
+| **GitHub** | **Zero retries.** If you were down, that delivery is **gone**. Press **Redeliver** manually, or script it: list failed deliveries via the API and redeliver them |
+
+**Svix** exists because building a proper webhook **sending** system is a lot of engineering: every edge case and security issue in this lesson. Companies delegate it to Svix and use its API or embeddable UI.
+
+🔧 GitHub recovery script sketch (REST endpoints for repository hook deliveries):
+
+```ts title="github-redeliver.ts"
+const { data: deliveries } = await octokit.request('GET /repos/{owner}/{repo}/hooks/{hook_id}/deliveries', { owner, repo, hook_id, per_page: 100 });
+for (const d of deliveries.filter(d => d.status_code >= 400 || d.status_code === 0)) {
+  if (await alreadyProcessed('github', d.guid)) continue;          // our inbox knows
+  await octokit.request('POST /repos/{owner}/{repo}/hooks/{hook_id}/deliveries/{delivery_id}/attempts', { owner, repo, hook_id, delivery_id: d.id });
+}
+```
+
+### The load problem 🎓
+Combine the pieces: you have **3 to 10 s** to answer; every miss becomes a **retry**, and retries **add to your normal user traffic**. Traffic is also **bursty**: a billing provider renews **every subscription on the 1st of the month**; a marketing tool emails **half a million** people and sends you a delivery receipt for each.
+
+If your handler does everything inline (verify, update two or three tables, call other APIs, then respond), it **misses the deadline** under load → retries → **more load** → more misses. A feedback loop.
+
+### The fix: a thin receiver + a queue 🎓
+The receiver does a **fixed, small set of steps** and nothing else:
+1. **Read** the raw body.
+2. **Verify** the signature.
+3. **Store** the delivery (the inbox table, deduped by ID).
+4. **Answer 2xx immediately.** Stop.
+
+A **background worker** (task queues, from the earlier lesson) takes the stored entries and does the real processing **asynchronously**.
+
+<Mermaid chart={`flowchart LR
+  P["Provider"] -->|"POST"| R["Thin receiver<br/>1 raw body 2 verify<br/>3 INSERT inbox ON CONFLICT DO NOTHING<br/>4 return 2xx"]
+  R --> DB[("webhook_inbox")]
+  R -->|"enqueue id"| Q[["Queue (BullMQ / SQS)"]]
+  Q --> W["Worker: one tx =<br/>side effects + processed_at"]
+  W --> DB
+  W -->|"fails N times"| DLQ[["Dead-letter + alert"]]`} />
+
+### 🔧 Implementation
+```ts title="inbox.service.ts (receiver side)"
+async record(provider: string, deliveryId: string, type: string, payload: unknown) {
+  const { rows } = await this.db.query(
+    `INSERT INTO webhook_inbox (provider, delivery_id, event_type, payload)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (provider, delivery_id) DO NOTHING
+     RETURNING id`,
+    [provider, deliveryId, type, payload],
+  );
+  if (rows[0]) await this.queue.add('webhook', { inboxId: rows[0].id }, { attempts: 8, backoff: { type: 'exponential', delay: 5_000 } });
+  // duplicate delivery: nothing enqueued, still answer 2xx so the provider stops retrying
+}
+```
+
+```ts title="webhook.worker.ts (BullMQ)"
+new Worker('webhook', async (job) => {
+  await db.tx(async (tx) => {
+    const { rows: [row] } = await tx.query(
+      `SELECT * FROM webhook_inbox WHERE id = $1 AND processed_at IS NULL FOR UPDATE SKIP LOCKED`, [job.data.inboxId]);
+    if (!row) return;                                  // already done, or another worker has it
+    await handlers[row.provider][row.event_type]?.(tx, row.payload);   // side effects use the SAME tx
+    await tx.query(`UPDATE webhook_inbox SET processed_at = now() WHERE id = $1`, [row.id]);
+  });                                                  // commit: side effects + processed_at together
+}, { connection });
+```
+
+🔧 If the queue enqueue fails after the insert, the row is still in the inbox with `processed_at IS NULL`. A periodic sweeper that re-enqueues old unprocessed rows closes that gap.
+
+---
+
+## 14. Testing a webhook receiver ➕
+
+The receiver is now verify, store, 2xx, process later, plus idempotency and ordering rules; each of those is a place where a small change silently breaks payments, and a real provider is a poor test harness (slow, rate-limited, and you can't make it send duplicates on demand), so the tests have to produce deliveries themselves.
+
+#### 14.1 Signed fixtures: test verification with real bytes ➕
+
+**Problem.** Signature verification is security code that's only ever exercised by real traffic. Someone adds a global `express.json()` or a body-logging middleware, verification starts failing in production (the raw-body trap from section 7), and no test noticed because tests called the handler with an already-parsed object.
+
+**Why (first principles).** The property you rely on is about **bytes on the wire**: the HMAC must be computed over exactly what arrived. So the test must send **raw bytes through the real HTTP stack** (the same middleware order as production), signed the way the provider signs them. And it must check the **negative** cases, because "accepts valid requests" is satisfied by code that accepts **everything**.
+
+**Mechanism.** A small helper that signs a body exactly as the provider does, and tests through the real app for: valid, wrong secret, modified body, stale timestamp, and a body that was re-serialised (different whitespace) after signing.
+
+**Implementation.**
+
+```ts title="test/sign.ts"
+import { createHmac } from 'node:crypto';
+
+export function githubHeaders(body: string, secret: string, deliveryId = crypto.randomUUID()) {
+  return {
+    'content-type': 'application/json',
+    'x-github-event': 'push',
+    'x-github-delivery': deliveryId,
+    'x-hub-signature-256': 'sha256=' + createHmac('sha256', secret).update(body).digest('hex'),
+  };
+}
+```
+
+```ts title="github-hooks.e2e.test.ts (supertest through the real Nest app, rawBody enabled)"
+const SECRET = 'test-secret';
+const body = '{"ref":"refs/heads/main","commits":[]}';   // exact bytes, not an object
+
+test('valid signature is accepted', () =>
+  request(app.getHttpServer()).post('/hooks/github').set(githubHeaders(body, SECRET)).send(body).expect(202));
+
+test('wrong secret is rejected and nothing is stored', async () => {
+  await request(app.getHttpServer()).post('/hooks/github').set(githubHeaders(body, 'other')).send(body).expect(401);
+  expect(await inboxCount()).toBe(0);
+});
+
+test('a body changed after signing is rejected', () =>
+  request(app.getHttpServer()).post('/hooks/github').set(githubHeaders(body, SECRET))
+    .send(body.replace('main', 'evil')).expect(401));
+
+test('whitespace matters: re-serialised JSON fails', () =>
+  request(app.getHttpServer()).post('/hooks/github').set(githubHeaders(body, SECRET))
+    .send(JSON.stringify(JSON.parse(body), null, 2)).expect(401));
+```
+
+**Edge cases.** For timestamp-based schemes (Stripe, Standard Webhooks), add a test with a timestamp **6 minutes old** and one **6 minutes in the future**, using an injected clock rather than real waiting. Send the body as a **string** in supertest (`.send(body)` with an explicit content type); passing an object lets the test library re-serialise it, which hides the very bug you're testing for.
+
+#### 14.2 Behaviour tests: duplicates, disorder and a slow worker ➕
+
+**Problem.** The idempotency and ordering logic (sections 11 and 12) is correct today. A refactor moves the inbox insert out of the transaction, or replaces the version check with a plain `UPSERT`, and the first symptom is a customer charged twice.
+
+**Why (first principles).** These behaviours only show up under **specific delivery patterns**: the same delivery twice, two events in reverse order, a worker that fails halfway. Production produces them rarely and unpredictably, so tests must produce them **deliberately**.
+
+**Mechanism.** Medium tests against real Postgres (testing lesson) that replay crafted sequences through the real receiver and the worker function, asserting on **final state**.
+
+**Implementation.**
+
+```ts title="webhook-behaviour.int.test.ts"
+test('the same delivery twice has one effect and two 2xx', async () => {
+  const headers = githubHeaders(body, SECRET, 'd-1');
+  await post('/hooks/github', body, headers).expect(202);
+  await post('/hooks/github', body, headers).expect(202);   // provider retry after a lost 2xx
+  await drainWorker();
+  expect(await inboxCount()).toBe(1);
+  expect(await sideEffectCount()).toBe(1);
+});
+
+test('deleted before created leaves no ghost row', async () => {
+  await deliverStripe(event('customer.subscription.deleted', { id: 'sub_1', version: 2 }));
+  await deliverStripe(event('customer.subscription.created', { id: 'sub_1', version: 1 }));
+  await drainWorker();
+  expect(await subscription('sub_1')).toMatchObject({ status: 'deleted' });   // tombstone wins
+});
+
+test('the receiver answers 2xx even when the worker is broken', async () => {
+  breakHandler('github', 'push');                          // handler throws
+  await post('/hooks/github', body, githubHeaders(body, SECRET)).expect(202);
+  await drainWorker();
+  expect(await inboxRow()).toMatchObject({ processed_at: null, attempts: 1 });   // retried later, not lost
+});
+```
+
+**Edge cases.** Run the worker function **directly** (`drainWorker` processes the inbox rows in-process) instead of starting BullMQ, except in one wiring test; the behaviours under test are in your code, not in the queue.
+
+#### 14.3 Real payloads and provider tooling ➕
+
+**Problem.** Hand-written fixtures encode **your guess** about the payload (the "don't mock what you don't own" problem from the testing lesson). Real Stripe events have nested objects, nullable fields and expandable IDs your fixture didn't have.
+
+**Why (first principles).** The only authoritative example of a provider's payload is one **the provider produced**. Your fixtures should be copies of real deliveries, refreshed when you upgrade the provider's API version.
+
+**Mechanism.**
+- Generate real events in a sandbox with the provider's tools: `stripe trigger payment_intent.succeeded` creates the objects and fires the event, and `stripe listen --forward-to` delivers it to your local receiver with a test signing secret.
+- Save the raw body of real sandbox deliveries (GitHub's Recent Deliveries view shows headers and payload) as fixture files, **minus personal data**.
+- Re-sign fixtures in tests with your test secret using the helper above, so they verify.
+
+**Implementation.**
+
+```bash
+stripe listen --forward-to localhost:3000/hooks/stripe     # prints a whsec_ test secret
+stripe trigger customer.subscription.created              # real objects, real event, real signature
+```
+
+```ts title="fixtures are real payloads, re-signed in the test"
+const raw = await readFile('test/fixtures/stripe/customer.subscription.created.json', 'utf8');
+await post('/hooks/stripe', raw, stripeHeaders(raw, TEST_SECRET)).expect(200);
+```
+
+**Edge cases.** Pin the provider **API version** your fixtures came from in the file name, and re-capture them when you upgrade; a version bump that changes the payload is exactly what these tests should catch.
+
+---
+
+## 15. Becoming the provider: sending webhooks 🎓
+
+### The requirement
+On the task board, every move emits **`task.moved`** with a **sequence number**, the **task**, **who** moved it and **when**. A customer wants a programmatic signal whenever a task reaches **done**, to post it in a chat channel or run their own logic. They give **you a URL**; you give **them a secret**, exactly as Stripe and GitHub did for you.
+
+### The naive version and its three failures 🎓
+In the move handler: save the move, then `http.post(customerUrl, event)`.
+
+| # | Failure | Why |
+|---|---|---|
+| 1 | **Their latency becomes yours** | If their endpoint is slow or down, your move handler waits on it before answering your own front end |
+| 2 | **Lost event** | Move committed, then your container crashes or redeploys before the POST: the customer never hears about it |
+| 3 | **A lie** | Reverse the order: POST first, then the DB write fails or you crash. You told the customer the move happened; it didn't |
+
+The root cause is the same in 2 and 3: **a DB write and a network call can't be in one transaction.**
+
+### The fix: the transactional outbox 🎓
+**An outbox is just a normal table in the same database as your tasks.**
+1. The move handler opens a transaction, **updates the task** and **inserts the full event into the outbox**, then commits. **Both or neither.**
+2. A **separate background process** reads the outbox and makes the deliveries asynchronously.
+
+This is the **write-ahead log** idea from the databases lesson applied to events: **write your intention somewhere durable first**, then let another process carry it out. And the move handler responds **as fast as before**, since customer latency never touches it.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant API as Move handler
+  participant DB as Postgres
+  participant D as Dispatcher
+  participant C as Customer endpoint
+  B->>API: move task 88 to done
+  API->>DB: BEGIN, UPDATE tasks, INSERT outbox, COMMIT
+  API-->>B: 200 (fast, customer not involved)
+  loop poll outbox
+    D->>DB: claim due rows (FOR UPDATE SKIP LOCKED)
+    D->>D: SSRF check, sign id.timestamp.body
+    D->>C: POST (10 s timeout, no redirects)
+    C-->>D: 500
+    D->>DB: INSERT delivery attempt, next_attempt_at = backoff + jitter
+  end
+  D->>C: POST (later)
+  C-->>D: 200
+  D->>DB: mark delivered`} />
+
+### The demo's design 🎓
+**Three tables:** `endpoints` (URL + secret), `outbox`, and `deliveries` (**one row per attempt**). The move handler inserts into the outbox **inside the same transaction** as the task update. The **dispatcher** takes one outbox row at a time and, per delivery:
+1. **Signs** the **ID, timestamp and body** in the **Standard Webhooks** format with **that endpoint's secret**.
+2. **POSTs** with a **10 s timeout** (no hard rule; it depends on your promises, but 10 s is what most people use).
+3. **Records the attempt:** status code, **first 2 KB** of the response, and the time.
+4. **2xx** → mark **delivered**, no more retries.
+5. Otherwise → compute the next attempt with **exponential backoff and jitter**, and **respect `Retry-After`** if the customer's endpoint sent one (meaning "I'm having trouble, try again in at least an hour").
+6. After the **last attempt** → mark the event **exhausted**. After **10 consecutive failures** → **disable the endpoint** and **email its owner**.
+7. **One queue per endpoint**, so one customer's dead URL **can't stall** everyone else's deliveries.
+8. An **SSRF guard** resolves the URL **before every send** (section 10).
+
+**Exponential backoff:** don't retry at a fixed interval; **stretch** it: 5 s, then 5 min, then 15 min, then 1 h, ...
+**Jitter:** add a **random** amount to each delay, so 5 min becomes 5 min 42 s. **Why:** if 1,000 deliveries fail together (a customer outage), without jitter all 1,000 retries land in the **same instant**; jitter **spreads** them out.
+
+### What the demo shows 🎓
+- Move a task: the **outbox row exists before anything is sent**.
+- The customer endpoint answers **500**: the first attempt fails, and the `deliveries` table already holds **when the next attempt is due**. The gaps **grow** with each attempt (backoff + jitter).
+- Fix the customer endpoint: the next attempt gets **200**, the event is marked **delivered**, no further retries.
+- Register the task board's **own admin route on the loopback address** as a webhook URL → **refused**, with the reason recorded. A hostname that **resolves to a private address** → refused the same way. The check runs **at every send**, so a URL that was public at registration and changed later is still caught.
+
+### 🔧 Implementation
+```sql title="schema"
+CREATE TABLE endpoints (
+  id            bigserial PRIMARY KEY,
+  owner_id      bigint  NOT NULL,
+  url           text    NOT NULL,
+  secret        text    NOT NULL,          -- whsec_ + base64(random 32 bytes)
+  event_types   text[]  NOT NULL,
+  disabled_at   timestamptz,
+  consecutive_failures int NOT NULL DEFAULT 0
+);
+
+CREATE TABLE outbox (
+  id              text PRIMARY KEY,        -- msg_... : the webhook-id, stable across retries
+  endpoint_id     bigint NOT NULL REFERENCES endpoints(id),
+  event_type      text   NOT NULL,
+  payload         jsonb  NOT NULL,
+  status          text   NOT NULL DEFAULT 'pending',   -- pending / delivered / exhausted
+  attempts        int    NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX outbox_due ON outbox (next_attempt_at) WHERE status = 'pending';
+
+CREATE TABLE deliveries (
+  id          bigserial PRIMARY KEY,
+  outbox_id   text NOT NULL REFERENCES outbox(id),
+  status_code int,
+  response    text,                        -- first 2 KB
+  error       text,
+  duration_ms int,
+  attempted_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```ts title="move.service.ts (write side)"
+async move(taskId: string, to: Column, actor: User) {
+  await this.db.tx(async (tx) => {
+    const task = await tx.one(`UPDATE tasks SET column_name = $2, seq = seq + 1 WHERE id = $1 RETURNING *`, [taskId, to]);
+    if (to !== 'done') return;
+    const eps = await tx.any(`SELECT id FROM endpoints WHERE owner_id = $1 AND disabled_at IS NULL AND 'task.moved' = ANY(event_types)`, [task.workspace_id]);
+    for (const ep of eps) {
+      await tx.none(`INSERT INTO outbox (id, endpoint_id, event_type, payload) VALUES ($1, $2, 'task.moved', $3)`,
+        [`msg_${randomUUID()}`, ep.id, { taskId, to, seq: task.seq, by: actor.id, at: new Date().toISOString() }]);
+    }
+  });                                                        // task update + outbox rows commit together
+}
+```
+
+```ts title="dispatcher.ts"
+const DELAYS_S = [5, 300, 900, 3600, 6 * 3600, 12 * 3600, 24 * 3600];   // last index = final attempt
+
+export async function dispatchBatch() {
+  // claim = push next_attempt_at forward by a lease, so other dispatchers skip these rows while we POST
+  const rows = await db.any(
+    `WITH due AS (
+       SELECT o.id FROM outbox o JOIN endpoints e ON e.id = o.endpoint_id
+       WHERE o.status = 'pending' AND o.next_attempt_at <= now() AND e.disabled_at IS NULL
+       ORDER BY o.next_attempt_at
+       LIMIT 50
+       FOR UPDATE OF o SKIP LOCKED
+     )
+     UPDATE outbox o SET next_attempt_at = now() + interval '60 seconds'
+     FROM due, endpoints e
+     WHERE o.id = due.id AND e.id = o.endpoint_id
+     RETURNING o.*, e.url, e.secret`);
+  // (real code: at most one in-flight row per endpoint, i.e. a queue per endpoint)
+  await Promise.all(rows.map(deliver));
+}
+
+async function deliver(row: OutboxRow) {
+  const body = JSON.stringify({ type: row.event_type, data: row.payload });
+  const ts = Math.floor(Date.now() / 1000);
+  const key = Buffer.from(row.secret.replace(/^whsec_/, ''), 'base64');
+  const sig = createHmac('sha256', key).update(`${row.id}.${ts}.${body}`).digest('base64');
+  const started = Date.now();
+
+  let status: number | null = null, response = '', error: string | null = null, retryAfter: string | undefined;
+  try {
+    const r = await safePost(row.url, body, {
+      'content-type': 'application/json',
+      'webhook-id': row.id, 'webhook-timestamp': String(ts), 'webhook-signature': `v1,${sig}`,
+    }, 10_000);
+    status = r.status;
+    response = r.body;
+    retryAfter = r.retryAfter;
+  } catch (e: any) { error = String(e.message).slice(0, 500); }
+
+  await db.none(`INSERT INTO deliveries (outbox_id, status_code, response, error, duration_ms) VALUES ($1,$2,$3,$4,$5)`,
+    [row.id, status, response, error, Date.now() - started]);
+
+  if (status !== null && status >= 200 && status < 300) {
+    await db.none(`UPDATE outbox SET status = 'delivered', attempts = attempts + 1 WHERE id = $1`, [row.id]);
+    await db.none(`UPDATE endpoints SET consecutive_failures = 0 WHERE id = $1`, [row.endpoint_id]);
+    return;
+  }
+
+  const attempt = row.attempts + 1;
+  if (attempt > DELAYS_S.length) {
+    await db.none(`UPDATE outbox SET status = 'exhausted', attempts = $2 WHERE id = $1`, [row.id, attempt]);
+  } else {
+    const base = DELAYS_S[attempt - 1];
+    const jittered = base * (0.8 + Math.random() * 0.4);                 // plus or minus 20%
+    const floor = retryAfterSeconds(retryAfter);                          // respect the customer's Retry-After
+    const delay = Math.max(jittered, floor);
+    await db.none(`UPDATE outbox SET attempts = $2, next_attempt_at = now() + make_interval(secs => $3) WHERE id = $1`,
+      [row.id, attempt, delay]);
+  }
+
+  const { consecutive_failures } = await db.one(
+    `UPDATE endpoints SET consecutive_failures = consecutive_failures + 1 WHERE id = $1 RETURNING consecutive_failures`, [row.endpoint_id]);
+  if (consecutive_failures >= 10) {
+    await db.none(`UPDATE endpoints SET disabled_at = now() WHERE id = $1 AND disabled_at IS NULL`, [row.endpoint_id]);
+    await mailer.endpointDisabled(row.endpoint_id);
+  }
+}
+
+function retryAfterSeconds(h?: string) {
+  if (!h) return 0;
+  const n = Number(h);
+  if (!Number.isNaN(n)) return n;                                         // "3600"
+  const at = Date.parse(h);                                               // HTTP date
+  return Number.isNaN(at) ? 0 : Math.max(0, (at - Date.now()) / 1000);
+}
+```
+
+🔧 Notes on the sender:
+- The **`webhook-id` stays the same** across retries (it's the outbox row ID), so **your customers** can dedupe exactly as you do in section 11. The **timestamp and signature are fresh** per attempt so their replay check passes.
+- The claim query is a **lease**: `SKIP LOCKED` stops two dispatchers grabbing the same row at the same moment, and pushing `next_attempt_at` 60 s ahead keeps others away while the POST runs. If the dispatcher crashes mid-POST, the lease expires and the row becomes due again, so you're **at-least-once** on your side too.
+- Give customers a **"send test event"** button and a **delivery log UI** (the `deliveries` table). It saves you a lot of support tickets.
+
+---
+
+## 16. Designing the event payload, and versioning it ➕
+
+The dispatcher above sends `{ type, data }` and moves on, but as a provider the **payload is a public API**: customers write code against it, and you can't change it later without breaking them, so it deserves the same design care as a REST endpoint (lesson 11).
+
+#### 16.1 An envelope every event shares ➕
+
+**Problem.** Each team that adds an event invents its own shape: one has `event`, another `type`; one puts the time in `at`, another in `timestamp`; some have IDs, some don't. Every customer writes a different parser per event, and generic tooling (dedupe, logging, routing) is impossible.
+
+**Why (first principles).** Consumers do the same things with **every** event before looking at its data: verify it, dedupe it by ID, route it by type, and decide whether it's stale. Those operations need fields that are **always present in the same place**. That's an envelope: a fixed outer structure, with the event-specific part inside.
+
+**Mechanism.** One envelope for every event:
+- `id`: unique, stable across retries (the same value as the `webhook-id` header), for dedupe.
+- `type`: `resource.past_tense_verb` (`task.moved`, `task.deleted`), a closed, documented list.
+- `created_at`: when the event **happened** (not when this attempt was sent), ISO 8601 with milliseconds.
+- `api_version`: which version of the payload schema this is (16.3).
+- `data`: the event-specific body. Include a per-object **version or sequence** so consumers can apply the "only if newer" rule from section 12.
+
+**Implementation.**
+
+```json title="task.moved (envelope + data)"
+{
+  "id": "msg_2f6c1a",
+  "type": "task.moved",
+  "created_at": "2026-10-02T09:14:03.218Z",
+  "api_version": "2026-09-01",
+  "data": {
+    "object": { "id": "task_88", "board_id": "board_412", "column": "done", "seq": 1043 },
+    "previous": { "column": "doing" },
+    "actor": { "id": "user_7" }
+  }
+}
+```
+
+```ts title="events/envelope.ts"
+export type Envelope<T extends string, D> = { id: string; type: T; created_at: string; api_version: string; data: D };
+
+export function envelope<T extends string, D>(type: T, data: D, apiVersion: string, id = `msg_${randomUUID()}`): Envelope<T, D> {
+  return { id, type, created_at: new Date().toISOString(), api_version: apiVersion, data };
+}
+```
+
+**Edge cases.** Don't put the **delivery attempt** number or send time inside the signed body as if it were event data; those belong in headers, so the event body (and anything a customer stored from it) is identical across retries.
+
+#### 16.2 Fat (snapshot) or thin payloads ➕
+
+**Problem.** Should `task.moved` carry the **whole task** (title, assignees, labels, description) or just its **ID**? Each choice causes a different class of bugs.
+
+**Why (first principles).** A fat payload is a **snapshot** taken when the event happened. By the time a retry arrives (section 13 retries for hours), the snapshot may be stale, and with out-of-order delivery (section 12) an older snapshot can arrive after a newer one. It also copies data, possibly personal data, into every customer's logs. A thin payload carries only identifiers, so the consumer **fetches current state** from your API: always fresh, no stale-overwrite problem, but one extra API call per event and a dependency on your API being up. Stripe offers both: **snapshot events** (the full object, versioned, possibly stale) and **thin events** (lightweight notifications with IDs, which Stripe describes as version-stable, with the consumer fetching the latest object).
+
+**Mechanism.** Decide per event type:
+
+| Choose | When | Cost |
+|---|---|---|
+| Thin (IDs plus `seq`) | Consumers need the **current** truth (billing state, permissions) | One API call per event; your API must handle that load |
+| Fat (snapshot) | Consumers need **what it was at that moment** (audit trail, the `previous` column) | Staleness, larger bodies, more data exposure |
+| Hybrid | Most product events | Small fields that never change plus IDs; fetch the rest |
+
+**Implementation.** The hybrid `task.moved` above carries what a chat integration needs to post a message (IDs, the columns, `seq`), and a consumer who needs the full task calls the API with the same credentials as for everything else:
+
+```ts title="consumer side of a thin or hybrid event"
+async function onTaskMoved(e: Envelope<'task.moved', TaskMovedData>) {
+  if (e.data.object.seq <= (await lastSeqFor(e.data.object.id))) return;   // stale, see section 12
+  const task = await boardApi.getTask(e.data.object.id);                  // current truth, when needed
+  await postToChannel(`${task.title} moved to ${e.data.object.column}`);
+}
+```
+
+**Edge cases.** If consumers fetch on every event, a burst of 50,000 events becomes **50,000 API calls** against you; make sure those are rate-limited per customer fairly and cheap (cache, lesson 13), or send enough data that most consumers don't need to fetch.
+
+#### 16.3 Versioning without breaking consumers ➕
+
+**Problem.** You rename `column` to `status` in the task payload. Every customer's integration that reads `data.object.column` breaks at once, and you don't even know who they are.
+
+**Why (first principles).** A webhook consumer's code is deployed on **their** schedule, not yours, and you can't see which fields they read. So a payload change is safe only if **every existing consumer** keeps working without changing anything. Adding a field passes that test **only if** consumers ignore unknown fields; removing, renaming or changing a field's meaning never does.
+
+**Mechanism.**
+- Document that consumers **must ignore unknown fields**, then make additive changes freely.
+- For breaking changes, **pin a version per endpoint**: each endpoint stores the `api_version` it was created with, and the dispatcher **renders the payload for that version** at send time. Stripe works similarly: snapshot events are structured according to an API version, and destinations can be set to a specific version.
+- Changing **meaning** (for example "`task.completed` now also fires for archived tasks") is a breaking change too; prefer a **new event type**.
+- Publish a schema for every event type and version (OpenAPI 3.1 has a `webhooks` section, lesson 29), so customers can generate types and validate.
+
+**Implementation.** Keep **one** internal event shape and a chain of transformers that downgrade it for older endpoint versions:
+
+```ts title="events/versions.ts"
+type Transformer = (e: Envelope<string, any>) => Envelope<string, any>;
+
+// each entry converts FROM this version TO the previous one
+const downgrades: Record<string, Transformer> = {
+  '2026-09-01': (e) => e.type !== 'task.moved' ? e : {        // 2026-09-01 renamed column -> status
+    ...e,
+    api_version: '2026-03-01',
+    data: { ...e.data, object: { ...e.data.object, column: e.data.object.status, status: undefined } },
+  },
+};
+const ORDER = ['2026-09-01', '2026-03-01'];                     // newest first
+
+export function renderFor(endpointVersion: string, latest: Envelope<string, any>) {
+  let e = latest;
+  for (const v of ORDER) {
+    if (v === endpointVersion) return e;
+    e = downgrades[v](e);
+  }
+  throw new Error(`unknown version ${endpointVersion}`);
+}
+// dispatcher: const body = JSON.stringify(renderFor(row.api_version, row.payload));
+```
+
+**Edge cases.**
+- Store the **latest** shape in the outbox and render at send time; then a customer who upgrades their endpoint version gets the new shape for retries too.
+- Give customers a way to **test** a new version (send test events in that version to their endpoint) before they switch, and a deadline after which old versions are retired, announced well in advance.
+
+---
+
+## 17. Fair delivery across tenants ➕
+
+Section 15's step 7 says "one queue per endpoint, so one customer's dead URL can't stall everyone else", and its code leaves that as a comment; this section is the engineering behind that sentence, because with thousands of customers the dispatcher's capacity is a shared resource.
+
+#### 17.1 The noisy neighbour: one slow endpoint eats the dispatcher ➕
+
+**Problem.** One large customer's endpoint starts taking the full **10 s** to time out. They have 50,000 pending events. The dispatcher runs 200 deliveries at a time, all 200 slots fill with that customer's doomed requests, and every other customer's webhooks are delayed by hours.
+
+**Why (first principles).** **Little's law**: concurrency in use = arrival rate × time per request. A healthy endpoint answering in 100 ms needs 1 slot for 10 deliveries per second; a broken one timing out at 10 s needs **100 slots** for the same rate. With a shared pool and oldest-first claiming, the slowest endpoint with the biggest backlog gets the most capacity, which is exactly backwards.
+
+**Mechanism.** Bound each endpoint's share independently of its backlog:
+- A **per-endpoint concurrency cap** (for example at most 5 in-flight deliveries per endpoint, or 1 if the customer needs ordering).
+- **Round-robin claiming** across endpoints, so each claim takes a few rows from each due endpoint instead of the oldest 50 rows overall.
+- **Circuit breaking** (17.2) so an endpoint that's clearly down stops consuming slots at all.
+
+**Implementation.** Give `outbox` a `leased_until timestamptz` column, set when a dispatcher claims a row and cleared when the attempt is recorded, so "in flight" is directly queryable. Then claim at most a few due rows per endpoint, skipping endpoints already at their cap:
+
+```sql title="fair claim (Postgres)"
+WITH inflight AS (
+  SELECT endpoint_id, count(*) AS n
+  FROM outbox
+  WHERE leased_until > now()                                  -- currently being delivered
+  GROUP BY endpoint_id
+),
+ranked AS (
+  SELECT o.id, o.endpoint_id,
+         row_number() OVER (PARTITION BY o.endpoint_id ORDER BY o.next_attempt_at) AS rn
+  FROM outbox o
+  JOIN endpoints e ON e.id = o.endpoint_id
+  WHERE o.status = 'pending' AND o.next_attempt_at <= now()
+    AND (o.leased_until IS NULL OR o.leased_until <= now())
+    AND e.disabled_at IS NULL
+    AND (e.circuit_open_until IS NULL OR e.circuit_open_until <= now())   -- 17.2
+)
+SELECT r.id
+FROM ranked r
+LEFT JOIN inflight i ON i.endpoint_id = r.endpoint_id
+WHERE r.rn <= 5 - coalesce(i.n, 0)                            -- per-endpoint cap of 5
+ORDER BY r.rn, r.endpoint_id                                  -- round-robin: each endpoint's 1st row, then 2nd ...
+LIMIT 200;
+```
+
+Then lock and lease the returned IDs as in section 15: `SELECT ... FOR UPDATE SKIP LOCKED`, then `UPDATE outbox SET leased_until = now() + interval '60 seconds'`. Two dispatchers can briefly both see an endpoint under its cap, so the cap is approximate; for a strict cap, take a per-endpoint advisory lock or a Redis semaphore.
+
+**Edge cases.** The window function scans all due rows; with millions pending, keep the partial index on due rows (section 15) and consider a separate small table of **endpoints with due work** that the dispatcher iterates instead. Ordering per endpoint (cap of 1) slows a healthy high-volume customer; make it an endpoint setting, not a global rule.
+
+#### 17.2 Circuit breaking an endpoint that's down ➕
+
+**Problem.** An endpoint has failed its last 50 attempts in a row. The dispatcher keeps trying every pending event for it, each one waiting for a timeout and burning one of that event's limited attempts, so by the time the customer recovers, many events are already `exhausted`.
+
+**Why (first principles).** Retries assume failures are **independent**: this attempt failed, the next might succeed. When the endpoint itself is down, failures are **correlated**: every attempt will fail until something changes on their side. Spending attempts per event then just converts an outage into data loss.
+
+**Mechanism.** A **circuit breaker per endpoint** (the pattern from the error-handling lesson, 16):
+- **Closed:** deliver normally, count consecutive failures.
+- **Open:** after N consecutive failures, stop delivering to this endpoint for a cool-down period. Pending events **wait without using attempts**.
+- **Half-open:** after the cool-down, let **one** delivery through as a probe. Success closes the circuit and the backlog drains (under the cap from 17.1); failure re-opens it with a longer cool-down.
+
+This complements the lesson's "disable after 10 consecutive failures and email the owner": the breaker handles short outages automatically, and disabling is the last step for endpoints that stay down.
+
+**Implementation.** Two extra columns on `endpoints`: `circuit_open_until timestamptz` and `circuit_trips int NOT NULL DEFAULT 0` (how many times in a row it has opened, to lengthen the cool-down).
+
+```ts title="circuit.ts (called after each attempt)"
+const COOLDOWNS_S = [30, 120, 600, 1800, 3600];
+
+export async function recordOutcome(endpointId: string, ok: boolean) {
+  if (ok) {
+    await db.none(`UPDATE endpoints SET consecutive_failures = 0, circuit_open_until = NULL, circuit_trips = 0 WHERE id = $1`, [endpointId]);
+    return;
+  }
+  const ep = await db.one(`UPDATE endpoints SET consecutive_failures = consecutive_failures + 1
+                           WHERE id = $1 RETURNING consecutive_failures, circuit_trips`, [endpointId]);
+  if (ep.consecutive_failures >= 5) {
+    const cool = COOLDOWNS_S[Math.min(ep.circuit_trips, COOLDOWNS_S.length - 1)];
+    await db.none(`UPDATE endpoints SET circuit_open_until = now() + make_interval(secs => $2), circuit_trips = circuit_trips + 1
+                   WHERE id = $1`, [endpointId, cool]);
+  }
+}
+```
+
+**Edge cases.** While the circuit is open, **don't increment** the waiting events' `attempts`, so they keep their full retry budget for when the endpoint is back. Show the circuit state in the customer's dashboard ("deliveries paused since 09:14, next probe at 09:24"), or the pause looks like your outage.
+
+#### 17.3 Per-endpoint rate limits ➕
+
+**Problem.** The breaker closes after a two-hour outage and the dispatcher releases 50,000 queued events to an endpoint that normally sees 5 per second. It falls over again immediately. Or a customer's endpoint is a small serverless function that can't take more than 10 requests per second on a normal day.
+
+**Why (first principles).** A backlog drained at full speed is a **self-inflicted burst**, the same storm problem as reconnects in the real-time lesson. The receiver's capacity is a property of **their** system, so it should be a setting the customer controls; Svix, for example, offers per-endpoint throttling.
+
+**Mechanism.** A token bucket per endpoint in Redis, checked before each delivery; deliveries that don't get a token are pushed back a moment instead of sent. A `rate_limit_per_s` column on `endpoints` with a sensible default, editable by the customer.
+
+**Implementation.**
+
+```ts title="endpoint-rate-limit.ts"
+// a fixed one-second window: simple, and good enough for smoothing a drain
+export async function allow(endpointId: string, perSecond: number) {
+  const key = `wh:rl:${endpointId}:${Math.floor(Date.now() / 1000)}`;
+  const n = await redis.incr(key);
+  if (n === 1) await redis.expire(key, 2);
+  return n <= perSecond;
+}
+
+// in deliver(): if (!(await allow(row.endpoint_id, row.rate_limit_per_s))) return postpone(row, 1 + Math.random());
+```
+
+**Edge cases.** Postponing must not count as an **attempt**. And honour the customer's `Retry-After` (section 15) as a temporary override of their rate limit, since it's their system telling you it's overloaded right now.
+
+---
+
+## 18. Replay, backfill and recovery for your customers ➕
+
+Retries (section 15) cover failures that fix themselves within the retry schedule; customers also need ways to recover from failures that last longer, and from events they never subscribed to in the first place.
+
+#### 18.1 Replaying failed deliveries after an outage ➕
+
+**Problem.** A customer's endpoint was broken for four days (a bad deploy on their side). All events in that window are `exhausted`, and the endpoint was auto-disabled. They fix it and ask: "can you resend everything we missed?"
+
+**Why (first principles).** The outbox still holds every one of those events with its original ID. Nothing is lost on **your** side; the deliveries just stopped being attempted. Recovery is a matter of **making them due again**, and because each keeps its original `webhook-id`, a consumer that dedupes (section 11) can safely receive a replay even for events it already processed.
+
+**Mechanism.** A "recover since T" operation, available in the dashboard and the API: re-enable the endpoint, reset the circuit, and move every non-delivered event for that endpoint created after T back to `pending`, due now, with a fresh attempt budget. The per-endpoint rate limit (17.3) stops the replay itself from knocking the endpoint over. Svix's API has the same idea as a "recover failed messages" operation.
+
+**Implementation.**
+
+```ts title="recover.service.ts"
+async recover(endpointId: string, since: Date, actor: User) {
+  await this.authz.assertOwnsEndpoint(actor, endpointId);
+  return this.db.tx(async (tx) => {
+    await tx.none(`UPDATE endpoints SET disabled_at = NULL, consecutive_failures = 0, circuit_open_until = NULL WHERE id = $1`, [endpointId]);
+    const { count } = await tx.one(
+      `WITH r AS (
+         UPDATE outbox SET status = 'pending', attempts = 0, next_attempt_at = now()
+         WHERE endpoint_id = $1 AND created_at >= $2 AND status IN ('exhausted', 'pending')
+         RETURNING 1
+       ) SELECT count(*)::int AS count FROM r`, [endpointId, since]);
+    await tx.none(`INSERT INTO audit_log (actor_id, action, target, details) VALUES ($1, 'webhook.recover', $2, $3)`,
+      [actor.id, endpointId, { since, count }]);
+    return { requeued: count };
+  });
+}
+```
+
+**Edge cases.** Retention limits what can be recovered: if outbox rows are deleted after 30 days, say so in the docs and the UI. Replays deliver events **out of their original order** relative to newer events, so this only works for consumers that follow the ordering rules from section 12; document that too.
+
+#### 18.2 Backfilling events for a new endpoint ➕
+
+**Problem.** A customer creates a new endpoint today and wants the `task.moved` events from the last 7 days, to seed their integration. The outbox has no rows for an endpoint that didn't exist.
+
+**Why (first principles).** The outbox in section 15 is **per endpoint**: it records deliveries to make, not events that happened. To backfill you need the events themselves, independent of who was subscribed at the time: a durable **events table** (an event log) from which outbox rows are fanned out.
+
+**Mechanism.** Split the write side into two steps: the move transaction inserts **one row into `events`**, and a fan-out step (in the same transaction, or a worker reading the log) creates **outbox rows per subscribed endpoint**. A backfill is then "create outbox rows for endpoint E from `events` in a time range", marked so the consumer can tell it's historical.
+
+**Implementation.**
+
+```sql title="schema"
+CREATE TABLE events (
+  id          text PRIMARY KEY,                 -- msg_...: the same id the customer sees
+  workspace_id bigint NOT NULL,
+  type        text NOT NULL,
+  payload     jsonb NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON events (workspace_id, created_at);
+-- outbox gains: event_id text REFERENCES events(id), is_backfill boolean NOT NULL DEFAULT false
+```
+
+```sql title="backfill for one endpoint"
+INSERT INTO outbox (id, endpoint_id, event_id, event_type, payload, is_backfill, next_attempt_at)
+SELECT 'del_' || gen_random_uuid(), $1, e.id, e.type, e.payload, true, now()
+FROM events e
+JOIN endpoints ep ON ep.id = $1 AND ep.owner_id = e.workspace_id
+WHERE e.created_at >= now() - interval '7 days'
+  AND e.type = ANY(ep.event_types)
+ORDER BY e.created_at;
+```
+
+With this split, the outbox row's own ID is now a delivery ID, and the **event ID** (`events.id`) is what goes in the `webhook-id` header, so dedupe keys stay stable across live delivery and backfill.
+
+**Edge cases.** Send backfills at a **lower priority** than live events (the fair claim from 17.1 can order by `is_backfill`), and add a header such as `webhook-backfill: true` so consumers can route history differently. Cap the range a customer can request, or one click replays a year of events.
+
+#### 18.3 An events API as the safety net ➕
+
+**Problem.** Some customers can't keep an endpoint reliably up (a desktop tool, a script behind a firewall), or need certainty that they've seen **every** event, which push alone never guarantees.
+
+**Why (first principles).** This is section 21's lesson from the **provider's** side: webhooks are notifications; the reliable way to sync is an **ordered log read from a cursor**. If you offer webhooks, offering the log too lets customers reconcile anything a webhook missed, on their schedule.
+
+**Mechanism.** `GET /events?after=<id>&limit=100`, ordered, filtered to the caller's workspace, with a documented retention period. Customers store the last ID they processed and poll (or poll when a webhook wakes them, exactly as in section 21).
+
+**Implementation.**
+
+```ts title="events.controller.ts"
+@Get('events')
+async list(@Req() req: AuthedRequest, @Query('after') after?: string, @Query('limit') limit = '100') {
+  const n = Math.min(Number(limit) || 100, 500);
+  const rows = await this.db.any(
+    `SELECT id, type, payload, created_at FROM events
+     WHERE workspace_id = $1
+       AND ($2::text IS NULL OR (created_at, id) > (SELECT created_at, id FROM events WHERE id = $2))
+     ORDER BY created_at, id
+     LIMIT $3`, [req.workspaceId, after ?? null, n]);
+  return { data: rows, next_cursor: rows.at(-1)?.id ?? after ?? null };
+}
+```
+
+**Edge cases.** Two events committed in different transactions can become visible **out of `created_at` order** (a long transaction commits after a short one that started later), so a reader can skip an event that appears later with an earlier timestamp. Either assign a sequence at commit time from a single writer (the per-board `seq` idea from the real-time lesson), or have readers re-read a small overlap window behind their cursor and dedupe by ID.
+
+---
+
+## 19. Observability: metrics for you, delivery logs for customers ➕
+
+A webhook system fails **quietly**: nothing errors in your request path, a customer just stops getting events, so you need metrics that show delivery health and a log the customer can read themselves (the general tooling is in the logging and observability lesson, 18).
+
+#### 19.1 Sender metrics that matter ➕
+
+**Problem.** Your API dashboards are green, while a DNS change in your egress network has made **every** delivery fail for 40 minutes. Nobody notices until customers complain, because failed deliveries look like "customer endpoints being flaky", which happens all day.
+
+**Why (first principles).** Individual endpoint failures are **normal** (customers deploy, break things, go down); what signals **your** outage is a failure pattern **across many endpoints at once**. So the useful metrics separate "this endpoint is failing" (the customer's problem, shown to them) from "the global success rate dropped" (your problem, paged to you). And the number customers feel is **lag**: how long after the event did delivery succeed.
+
+**Mechanism.** Track, labelled by outcome class but **not** by endpoint ID in high-cardinality metrics:
+- Attempts by outcome (`2xx`, `4xx`, `5xx`, `timeout`, `connect_error`, `ssrf_blocked`) and the global success ratio.
+- Attempt duration histogram.
+- **End-to-end lag**: event `created_at` to successful delivery.
+- **Backlog**: due rows and the **age of the oldest due row**.
+- Open circuits and disabled endpoints.
+
+Alert on the **global** success ratio falling and on oldest-due age rising; per-endpoint detail goes into the delivery log (19.2), not into the metrics system.
+
+**Implementation.**
+
+```ts title="dispatcher-metrics.ts (prom-client)"
+import { Counter, Histogram, Gauge } from 'prom-client';
+
+export const attempts = new Counter({ name: 'webhook_attempts_total', help: 'delivery attempts', labelNames: ['outcome'] });
+export const attemptSeconds = new Histogram({ name: 'webhook_attempt_seconds', help: 'attempt duration', buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10] });
+export const lagSeconds = new Histogram({ name: 'webhook_delivery_lag_seconds', help: 'event created to delivered', buckets: [1, 5, 30, 60, 300, 1800, 3600, 21600] });
+
+new Gauge({ name: 'webhook_oldest_due_seconds', help: 'age of the oldest due delivery', async collect() {
+  const { age } = await db.one(`SELECT coalesce(extract(epoch FROM now() - min(next_attempt_at)), 0) AS age
+                                FROM outbox WHERE status = 'pending' AND next_attempt_at <= now()`);
+  this.set(Number(age));
+} });
+
+// in deliver(): attempts.inc({ outcome: classify(status, error) }); attemptSeconds.observe(ms / 1000);
+// on success:   lagSeconds.observe((Date.now() - row.created_at.getTime()) / 1000);
+```
+
+**Edge cases.** One huge customer's outage can move the global ratio by itself; also alert on the success ratio **excluding endpoints with open circuits**, which isolates failures caused by you.
+
+#### 19.2 Customer-facing delivery logs ➕
+
+**Problem.** A customer says "we never got the event for task 88". Without a log they can see, every such question becomes a support ticket and an engineer running SQL.
+
+**Why (first principles).** The question is about **their** endpoint's behaviour, and the evidence is in your `deliveries` table: what you sent, when, what their server answered, and when the next try is. Exposing that directly turns "did you send it?" into self-service, which is why the lesson recommends a delivery log UI; GitHub's Recent Deliveries and Stripe's event deliveries tab are exactly this.
+
+**Mechanism.** An API (and UI on top) scoped to the customer's workspace that shows, per event: every attempt with status code, duration, the first part of the response body, error class, and next attempt time, plus **resend** and **recover** buttons (section 18). Decide on retention (for example 30 days) and enforce it with a scheduled delete.
+
+**Implementation.**
+
+```ts title="deliveries.controller.ts"
+@Get('endpoints/:id/deliveries')
+async deliveries(@Req() req: AuthedRequest, @Param('id') endpointId: string, @Query('event_id') eventId?: string) {
+  await this.authz.assertOwnsEndpoint(req.user, endpointId);                 // tenant isolation first
+  return this.db.any(
+    `SELECT o.event_id, o.event_type, o.status, o.next_attempt_at,
+            d.status_code, d.duration_ms, d.error, left(d.response, 500) AS response_excerpt, d.attempted_at
+     FROM outbox o JOIN deliveries d ON d.outbox_id = o.id
+     WHERE o.endpoint_id = $1 AND ($2::text IS NULL OR o.event_id = $2)
+       AND d.attempted_at > now() - interval '30 days'
+     ORDER BY d.attempted_at DESC LIMIT 200`, [endpointId, eventId ?? null]);
+}
+```
+
+**Edge cases.** The stored response bodies came from **the customer's** server and can contain anything (stack traces, tokens); keep them short, show them only to that customer, and delete them on schedule. Never show other tenants' endpoints or payloads; this is an authorisation boundary like any other (lesson 08).
+
+#### 19.3 Receiver-side observability ➕
+
+**Problem.** On the receiving side, a provider's signature scheme changes, or a secret rotation goes wrong (section 9), and every delivery gets a 401. The provider retries for days and eventually disables your endpoint; you find out from an email.
+
+**Why (first principles).** Your receiver answers **2xx fast** (section 13) and processes later, so the HTTP layer looks healthy even when processing is stuck, and a 401 storm looks like normal traffic unless you count it. The receiver's health is in two places: **verification outcomes** at the edge, and **inbox lag** behind it.
+
+**Mechanism.**
+- Count verifications by provider and outcome (`ok`, `bad_signature`, `stale_timestamp`, `matched_previous_secret`). A spike of `bad_signature` is either an attack or a misconfiguration; both deserve an alert.
+- Measure **inbox lag** (received to processed) and the count of unprocessed rows older than a few minutes, and the dead-letter queue size.
+- Log the provider's **delivery ID** on every line, so a customer support question ("Stripe says it delivered `evt_123`") can be traced end to end.
+
+**Implementation.**
+
+```sql title="inbox health (for a gauge or a dashboard)"
+SELECT provider,
+       count(*) FILTER (WHERE processed_at IS NULL AND received_at < now() - interval '5 minutes') AS stuck,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch FROM processed_at - received_at))
+         FILTER (WHERE processed_at > now() - interval '1 hour') AS p95_lag_s
+FROM webhook_inbox
+GROUP BY provider;
+```
+
+**Edge cases.** Don't log raw webhook bodies at info level; they contain customer and payment data. Log the delivery ID, type and outcome, and keep the body in the inbox table, which has its own retention and access rules.
+
+---
+
+## 20. Build or buy: webhook services ➕
+
+The lesson notes that companies delegate sending to Svix; with sections 9 to 19 in view, you can see what such a service actually replaces, and decide with real criteria rather than by habit.
+
+#### 20.1 What a webhook service does for you ➕
+
+**Problem.** Everything from section 15 onward (dispatcher, SSRF protection, signing, rotation, retries with backoff, fairness, circuit breaking, replay, delivery logs, a customer portal, payload versioning) is weeks of work before the first customer gets a webhook, and months of maintenance after.
+
+**Why (first principles).** None of it is your product's differentiator; it's infrastructure every API company rebuilds. The problems are the same for everyone, which is what makes them a good fit for a shared service.
+
+**Mechanism.** Two kinds of services:
+- **Sending** (you are the provider): **Svix** gives you an API to send messages, delivery with retries and Standard Webhooks signatures, an embeddable **app portal** where customers manage endpoints and see delivery logs, event type schemas, message recovery and per-endpoint throttling. Hookdeck's **Outpost** targets the same job.
+- **Receiving** (you are the consumer): Hookdeck's **Event Gateway** receives webhooks for you, queues them, retries delivery to your service at a rate you set, and offers filtering, deduplication and replay: the "thin receiver plus queue" from section 13, run by someone else.
+
+**Implementation.** Even with a service, keep the **transactional outbox** (section 15): the service replaces the **dispatcher**, not the guarantee that an event is sent if and only if the change committed. The dispatcher becomes a call to the service, with your event ID as the idempotency key:
+
+```ts title="outbox-to-svix.ts"
+import { Svix } from 'svix';
+const svix = new Svix(process.env.SVIX_TOKEN!);
+
+export async function forward(row: { event_id: string; workspace_id: string; event_type: string; payload: unknown }) {
+  await svix.message.create(`ws_${row.workspace_id}`, {    // one Svix application per customer workspace
+    eventType: row.event_type,
+    eventId: row.event_id,                                // unique per application: a resend can't duplicate
+    payload: row.payload as Record<string, unknown>,
+  });
+  await db.none(`UPDATE outbox SET status = 'delivered' WHERE event_id = $1`, [row.event_id]);   // "handed off"
+}
+```
+
+**Edge cases.** "Delivered" now means **handed to the service**; the customer-facing truth about delivery lives in the service's logs, so link to them from your dashboard instead of showing a status you don't have.
+
+#### 20.2 Deciding ➕
+
+**Problem.** Buying looks obviously cheaper at the start, building looks obviously cheaper at scale, and both arguments are usually made without numbers.
+
+**Why (first principles).** The trade is **engineering time and operational risk** against **per-message cost and dependency**. Which side wins depends on your volume, your team, and constraints like where data may be stored.
+
+**Mechanism.** Weigh the factors explicitly:
+
+| Factor | Points to buying | Points to building |
+|---|---|---|
+| Stage | Early, few engineers, webhooks aren't the product | Webhooks are core to the product or a big differentiator |
+| Volume | Low to moderate | Very high, where per-message pricing dominates |
+| Data rules | Vendor offers the regions and compliance you need | Payloads can't leave your infrastructure |
+| Customer experience | Want a ready portal and logs | Need deep integration with your own dashboard |
+| Lock-in | Standard Webhooks signatures keep consumers portable | You want no external dependency in the delivery path |
+
+**Implementation.** Keep the switch cheap either way: a `WebhookSender` interface with a self-hosted and a service implementation (the "wrap what you don't own" pattern from the testing lesson), the Standard Webhooks signature format so consumers' verification code doesn't change if you move, and the outbox as your own durable record.
+
+```ts title="webhook-sender.ts"
+export interface WebhookSender {
+  send(e: { eventId: string; workspaceId: string; type: string; payload: unknown }): Promise<void>;
+}
+export class SvixSender implements WebhookSender { /* forward() above */ }
+export class OutboxDispatcherSender implements WebhookSender { /* sections 15 to 19 */ }
+```
+
+**Edge cases.** The service is now in your delivery path: if it's down, your outbox backs up (which is fine, it's durable) and the forwarder must retry with backoff. Monitor the **age of un-forwarded outbox rows** exactly as you would your own dispatcher's backlog (19.1).
+
+---
+
+## 21. When webhooks are the right tool, and when they're not 🎓
+
+### Right: notifications
+A webhook is a **notification**: "this happened, here's the data if you want it". It's the right tool for:
+- post to a chat channel when X happens,
+- start a CI/CD pipeline or GitHub Actions build,
+- unlock a plan when a payment succeeds.
+
+### Wrong: syncing a copy of the provider's data
+**The lesson's example (one the author has hit personally): Clerk**, a popular authentication provider. Instead of building email/password, Google and GitHub sign-in, sign-up and reset emails, session lists and device management yourself, you use Clerk's SDKs on front end and back end, and auth becomes a few lines of code. **All users, organisations, roles and permissions live in Clerk's database.**
+
+**The temptation:** calling Clerk's API for every user lookup costs maybe **500 to 600 ms** versus **50 to 60 ms** for your own DB in the same region. So people keep a **local copy** (users, organisations, roles tables) and **sync it with webhooks**: subscribe to user created/updated/deleted, organisation and role events, and write each one into your tables.
+
+**Keeping a copy isn't wrong. Syncing it by trusting each webhook's payload is.** The copy is only correct if you handle **every** edge case from this lesson: timeouts, retries and duplicates, replays, **out-of-order events**, and GitHub-style dropped deliveries. Miss one and the copy silently drifts.
+
+### Right: sync from the provider's ordered event log 🎓
+Providers (Clerk included) keep an **event log**, viewable in the dashboard or through an API like **`/events`**. It's **ordered**, because it's written inside **their own** infrastructure, in a single transaction with the change. Ordering problems only appear in **distributed** delivery across network calls, which the log doesn't have. It holds every event since the start.
+
+- **Strategy 1: periodic pull.** If a few minutes of staleness is fine, a background worker runs every **5 minutes**, fetches events **after the last event ID you stored**, applies them in order, and saves the new cursor. No redundant work, no ordering problems.
+- **Strategy 2: webhook as a wake-up signal.** Subscribe to a webhook that fires **whenever a new entry is added to the event log**. On receipt, **ignore the payload's data**; immediately start the same worker, which reads the log **from your stored cursor** and applies what's new. Your copy is in sync within **milliseconds to seconds**, and you're using webhooks **as notifications**, which is what they're for.
+
+<Mermaid chart={`sequenceDiagram
+  participant U as User (via provider SDK)
+  participant P as Provider
+  participant L as Provider event log
+  participant R as Your receiver
+  participant W as Sync worker
+  participant DB as Your DB
+  U->>P: change display name
+  P->>L: same tx: update user + append event 1043
+  P->>R: webhook "log has new events" (payload ignored)
+  R-->>P: 2xx
+  R->>W: wake up (dedupe concurrent wakes)
+  W->>DB: read cursor = 1040
+  W->>L: GET /events after 1040
+  L-->>W: 1041, 1042, 1043 in order
+  W->>DB: one tx: apply 1041-1043 + cursor = 1043`} />
+
+🔧 Implementation of the worker (provider-neutral):
+
+```ts title="sync-worker.ts"
+export async function syncFromLog(provider: EventLogClient) {
+  const lock = await db.oneOrNone(`SELECT pg_try_advisory_lock(hashtext('sync:' || $1)) AS ok`, [provider.name]);
+  if (!lock?.ok) return;                                   // another run in progress: one syncer at a time
+  try {
+    let { last_event_id: cursor } = await db.one(`SELECT last_event_id FROM sync_cursors WHERE provider = $1`, [provider.name]);
+    for (;;) {
+      const page = await provider.listEventsAfter(cursor, 100);   // oldest first
+      if (page.length === 0) break;
+      await db.tx(async (tx) => {
+        for (const e of page) await applyEvent(tx, e);             // upserts / soft deletes
+        cursor = page[page.length - 1].id;
+        await tx.none(`UPDATE sync_cursors SET last_event_id = $2 WHERE provider = $1`, [provider.name, cursor]);
+      });                                                           // events + cursor commit together
+    }
+  } finally {
+    await db.none(`SELECT pg_advisory_unlock(hashtext('sync:' || $1))`, [provider.name]);
+  }
+}
+```
+
+🔧 Run it from **both** triggers: the webhook wake-up for freshness, and a cron every few minutes as a safety net for dropped webhooks. Because the cursor and the applied events commit in one transaction, a crash just means the next run redoes the last page, which is safe if `applyEvent` is an upsert. (Advisory locks are per DB session, so run the lock and unlock on the same pooled connection in real code.)
+
+---
+
+## 22. Recap 🎓
+
+- Webhooks are for **service-to-service** signals where the news lives in **another backend**; the browser is neither reliable nor trustworthy enough to carry them.
+- **Polling** a provider is slow, wasteful and gets you **rate-limited**. A webhook is just the provider **POSTing to your URL**.
+- Success means **2xx within the provider's deadline** (3 to 10 s). Use **one endpoint per provider**; some providers **handshake** to stop DoS-by-registration; use a **tunnel** locally.
+- **Authenticate the sender**: HTTPS isn't enough. Use **HMAC over the raw bytes** (verify, then parse), a **signed timestamp** against replays, and a **constant-time compare**.
+- As a sender, defend against **SSRF**: resolve and check IPs at every send, never follow redirects, use an egress proxy.
+- Delivery is **at least once** → **idempotency** via the delivery ID with a **unique constraint**, written **in the same transaction** as the work.
+- Events arrive **out of order** → refetch current state, version checks, or (painfully) buffering.
+- Retry policies vary (Stripe 3 days, Svix schedule, **GitHub none**). Keep the receiver **thin** and do work in a **queue**.
+- As a provider: **outbox** in the same transaction, a **dispatcher** with signing, timeouts, attempt logs, **backoff + jitter**, `Retry-After`, auto-disable, one queue per endpoint.
+- Use webhooks as **notifications**. To **sync data**, read the provider's **ordered event log** from a cursor, and let the webhook just **wake** the syncer.
+
+**Beyond the lesson** ➕
+- ➕ **Secret rotation** needs an **overlap window**: the sender signs with every active secret (Stripe: old one valid for up to 24 hours), the receiver accepts a short list and logs which matched. Senders must **encrypt** secrets, not hash them.
+- ➕ **Test receivers** with **signed raw-byte fixtures** through the real HTTP stack, including negative cases; replay duplicates and reversed events deliberately; capture real payloads with provider tooling.
+- ➕ **Payloads are a public API:** a shared **envelope** (`id`, `type`, `created_at`, `api_version`, `data`); choose **thin, fat or hybrid** per event; additive changes only, and **per-endpoint versions** rendered at send time for breaking ones.
+- ➕ **Fairness:** a slow endpoint eats concurrency (Little's law), so cap in-flight deliveries **per endpoint**, claim **round-robin**, **circuit-break** endpoints that are down without spending attempts, and rate-limit backlog drains.
+- ➕ **Recovery:** "recover since T" requeues exhausted events with their original IDs; an **events table** enables **backfill** for new endpoints; an **events API** with a cursor is the customer's safety net.
+- ➕ **Observability:** alert on the **global** success ratio and **oldest due delivery**, not individual endpoints; give customers a **delivery log**; on the receiving side count signature failures and inbox lag.
+- ➕ **Build or buy:** Svix or Hookdeck Outpost for sending, Hookdeck Event Gateway for receiving. A service replaces the dispatcher, **not the outbox**.
+
+---
+
+## Interview questions
+
+1. **Why not let the browser tell your backend a payment succeeded?** **The user's network or tab can drop the signal, and anything client-side can be forged. The provider must tell your server directly.**
+2. **Why doesn't HTTPS secure a webhook endpoint?** **TLS protects bytes in transit but doesn't authenticate who sent them; anyone can POST to a public URL over HTTPS.**
+3. **Why must you verify the signature over the raw body?** **The HMAC is over exact bytes; parsing and re-serialising changes whitespace, ordering or escaping, so the signature won't match.**
+4. **How do timestamps stop replay attacks?** **The timestamp is inside the signed content, so it can't be altered, and the receiver rejects anything older than a tolerance (Stripe: 5 minutes).**
+5. **Why use a constant-time compare?** **A normal compare exits at the first differing byte, leaking timing that can be used to guess a signature byte by byte.**
+6. **Why is exactly-once delivery impossible, and what do you do instead?** **The acknowledgement itself can be lost, so the provider must retry. Make the handler idempotent: unique delivery ID inserted in the same transaction as the side effects.**
+7. **Created arrives after deleted. How do you stay correct?** **Treat the event as a signal and fetch current state, or apply only events with a newer version (with tombstones for deletes).**
+8. **Why should a webhook receiver be thin?** **Providers give 3 to 10 s; slow handlers miss deadlines under bursts, causing retries that add more load. Verify, store, 2xx, process in a worker.**
+9. **What's SSRF in the context of sending webhooks, and the defence?** **A customer registers an internal URL (like the cloud metadata IP) and your dispatcher calls it from inside your network. Resolve and block private ranges at every send, never follow redirects, use an egress proxy.**
+10. **What problem does the outbox pattern solve?** **You can't put a DB write and an HTTP call in one transaction. Writing the event into an outbox table in the same transaction guarantees it's sent if and only if the change committed.**
+11. **Why jitter on retries?** **Without it, many failed deliveries retry at the same instant and hammer the recovering endpoint; randomness spreads them out.**
+12. **How should you keep a local copy of a provider's data in sync?** **Read the provider's ordered event log from a stored cursor (periodically, or when a webhook wakes you), rather than trusting each webhook payload.**
+13. ➕ **How do you rotate a webhook signing secret without failed deliveries?** **Keep the old and new secret active together for an overlap window: the sender adds one signature per active secret, the receiver accepts any configured secret, then the old one expires. After a leak, expire immediately and rely on retries.**
+14. ➕ **How do you test webhook signature verification properly?** **Send exact raw bytes through the real HTTP stack, signed like the provider does, and test the negatives: wrong secret, modified body, re-serialised JSON, stale timestamp.**
+15. ➕ **Fat or thin webhook payloads?** **Fat snapshots carry state at event time but go stale, can arrive out of order and expose more data; thin payloads carry IDs and the consumer fetches current state at the cost of an API call. Many events use a hybrid.**
+16. ➕ **How do you make breaking changes to a webhook payload?** **Never in place. Additive changes only (consumers must ignore unknown fields); for breaking ones pin an API version per endpoint and render each payload for that version at send time, or introduce a new event type.**
+17. ➕ **One customer's endpoint times out on every request. How do you stop it delaying everyone else's webhooks?** **Cap in-flight deliveries per endpoint, claim work round-robin across endpoints, and open a circuit breaker for that endpoint so pending events wait without using attempts.**
+18. ➕ **A customer was down for four days and all their events are exhausted. What do you offer?** **A "recover since T" operation that re-enables the endpoint and requeues those events with their original IDs (so dedupe works), rate-limited, plus an events API they can read from a cursor.**
+19. ➕ **What do you alert on for a webhook sending system?** **The global success ratio (excluding open circuits), end-to-end lag and the age of the oldest due delivery. Individual endpoint failures go to the customer's delivery log, not your pager.**
+20. ➕ **If you use Svix, do you still need the outbox?** **Yes. The service replaces the dispatcher, but only the outbox guarantees the event is handed off if and only if your transaction committed.**
+
+## Sources
+
+- [Lesson video: Webhooks (Sriniously)](https://youtu.be/eWM0CVReP04)
+- [Stripe: Receive Stripe events in your webhook endpoint (signatures, replay tolerance, retries, ordering)](https://docs.stripe.com/webhooks)
+- [GitHub: Validating webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
+- [GitHub: Handling failed webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries)
+- [Standard Webhooks specification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md)
+- [Svix: Retry schedule](https://docs.svix.com/retries)
+- [Microsoft Graph: Change notification endpoint validation](https://learn.microsoft.com/en-us/graph/change-notifications-delivery-webhooks)
+- [Amazon SNS: Confirming an HTTP/S subscription](https://docs.aws.amazon.com/sns/latest/dg/SendMessageToHttp.confirm.html)
+- [Node.js: crypto.timingSafeEqual](https://nodejs.org/api/crypto.html#cryptotimingsafeequala-b)
+- [NestJS: Raw body](https://docs.nestjs.com/faq/raw-body)
+- [Stripe Smokescreen (egress proxy)](https://github.com/stripe/smokescreen)
+- [OWASP: Server-Side Request Forgery Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
+- ➕ [Stripe: Roll endpoint signing secrets, API versioning of events, manual resend (same page as above)](https://docs.stripe.com/webhooks#roll-endpoint-secrets)
+- ➕ [Stripe: Thin and snapshot events (event destinations)](https://docs.stripe.com/event-destinations)
+- ➕ [Stripe CLI: listen and trigger](https://docs.stripe.com/cli/listen)
+- ➕ [OpenAPI 3.1: webhooks object](https://spec.openapis.org/oas/v3.1.0#oasWebhooks)
+- ➕ [Svix: Quickstart (applications, messages, eventId)](https://docs.svix.com/quickstart)
+- ➕ [Svix documentation (app portal, recovery, throttling)](https://docs.svix.com/)
+- ➕ [Hookdeck: Event Gateway and Outpost](https://hookdeck.com/docs)

@@ -1,0 +1,1272 @@
+---
+title: "24. Production Failures"
+description: "Every production GenAI system fails. The question is not whether but how often, how visibly, and how recoverably. This chapter catalogs the failure modes..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth on topics the chapter already covers.
+  - ➕ **Beyond the handbook**: topics the chapter does not cover, added because a GenAI engineer should know them.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams. Code is TypeScript on Node. Prices quoted in added sections are examples dated September 2026; check the provider pricing pages before you rely on them.
+</Callout>
+
+## 24.1 Concept Explanation
+
+Every production GenAI system fails. The question is not whether but how often, how visibly, and how recoverably. This chapter catalogs the failure modes that recur across teams, the symptoms they produce, the root causes underneath, and the debugging approaches that work.
+
+The mental model: a GenAI system is a stack of dependencies (LLM provider, vector DB, GPU pool, retrieval, application, network), each with its own failure profile, and the failure modes are dominated by the interactions between them.
+
+## 24.2 OOM — Out of Memory
+
+Symptom: pod crashes, "CUDA out of memory," API 500s. Often correlated with traffic spikes or specific request patterns.
+
+Causes:
+- KV cache exhaustion from too many concurrent users.
+- A single request with extremely long context.
+- Memory leak in long-running worker.
+- Model loaded inefficiently (FP32 instead of BF16, wrong sharding).
+
+Debug:
+- Inspect GPU memory at the moment of crash.
+- Identify the request that triggered it (logs).
+- Cap max input tokens at the gateway.
+- Lower max concurrent requests.
+- Switch inference server to one with paged KV cache.
+
+## 24.3 GPU Fragmentation
+
+Symptom: GPU reports memory available but new requests fail to allocate.
+
+Cause: KV cache allocations leaving holes too small for new sequences. Common in inference servers without paged attention.
+
+Debug and fix:
+- Use vLLM or another paged-attention server.
+- Periodic restart of long-running inference pods.
+- Lower max sequence length to bound fragmentation.
+
+## 24.4 Memory Leaks
+
+Symptom: memory usage grows over time even with steady traffic. Eventually OOM.
+
+Causes:
+- Conversation history accumulated without trimming.
+- Cache without eviction policy.
+- Reference cycles in async code.
+- Tokenizer warmups loading new tokenizers per request.
+
+Debug:
+- Memory profiler over time (heaptrack, memray, py-spy).
+- Diff heap snapshots before and after load.
+- Check for unbounded collections in async tasks.
+
+## 24.5 Deadlocks
+
+Symptom: latency climbs to infinity; no obvious load.
+
+Causes:
+- Service A waits on B, B waits on A.
+- Async tasks blocked on each other through shared mutex.
+- Database connection pool exhausted; threads wait forever.
+- Inference server waiting on KV cache pages that will never free.
+
+Debug:
+- Thread dumps.
+- Distributed trace for stuck request.
+- Look for circular waits.
+- Check connection pool metrics.
+
+## 24.6 Queue Overflow
+
+Symptom: requests pile up, timeouts proliferate, no progress.
+
+Causes:
+- Burst traffic.
+- Slow downstream service.
+- Worker pool too small.
+- Backpressure not propagating.
+
+Debug:
+- Queue depth metric over time.
+- Identify slowest dependency.
+- Add load shedding at the entry point.
+- Scale workers up.
+- Apply backpressure all the way to client.
+
+## 24.7 Token Explosion
+
+Symptom: cost spikes 5–50× overnight without traffic increase.
+
+Causes:
+- Retrieval starts returning more or larger chunks (a doc update or config change).
+- A new feature adds long system prompt to every request.
+- Agent loops fail to terminate, producing huge transcripts.
+- A user submits very long inputs (intentional or accidental).
+
+Debug:
+- p99 input and output token counts.
+- Distribution of tokens per request.
+- Recent prompt and retrieval changes.
+- Per-feature, per-user cost breakdown.
+
+Fix:
+- Per-request token cap.
+- Per-user budget.
+- Step limit on agents.
+- Trim retrieval context before prompting.
+
+## 24.7a Token Guards in Code 🔧
+
+The fixes above (per-request cap, per-user budget) only work if they run before the model call, so this section shows where they sit and what they cost.
+
+### Why the cap has to be enforced before the call
+
+**Problem.** A token explosion is usually found on the invoice, days after it started. By then the money is spent.
+
+**Why it happens.** The bill is `input_tokens × input price + output_tokens × output price`, summed over every call. Nothing in the provider API stops a request because it is expensive. A 400k-token prompt is valid if the model has a 1M window. At an example price of $4 per million input tokens (Claude Opus 5.5 list price, September 2026), one such request costs $1.60 in input alone. A bug that sends it 10,000 times a day costs $16,000 a day.
+
+**Mechanism.** Put two checks in the gateway, in front of every model call:
+
+1. A **per-request input cap**, set from the product's needs and not from the model's window. A support bot almost never needs 60k tokens of input.
+2. A **per-user (or per-tenant) daily token budget**. Reserve the worst case before the call (input plus the full `max_tokens`), then refund the unused output afterwards.
+
+### Implementation
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import { Redis } from "ioredis";
+
+const client = new Anthropic();
+const redis = new Redis(process.env.REDIS_URL!);
+
+const MODEL = "claude-opus-5-5";
+const MAX_INPUT_TOKENS = 60_000;          // product limit, far below the model window
+const DAILY_TOKENS_PER_USER = 2_000_000;  // input + output, per UTC day
+
+export class TokenLimitError extends Error {}
+
+function budgetKey(userId: string): string {
+  return `tok:${userId}:${new Date().toISOString().slice(0, 10)}`;
+}
+
+/** Throws before any paid call if the request is too big or the user is over budget. */
+export async function reserveTokens(
+  userId: string,
+  system: string,
+  messages: Anthropic.MessageParam[],
+  maxOutputTokens: number,
+): Promise<{ inputTokens: number; reserved: number }> {
+  // count_tokens is a separate endpoint with its own rate limits, not a paid generation
+  const { input_tokens } = await client.messages.countTokens({ model: MODEL, system, messages });
+  if (input_tokens > MAX_INPUT_TOKENS) {
+    throw new TokenLimitError(`input ${input_tokens} tokens exceeds cap ${MAX_INPUT_TOKENS}`);
+  }
+
+  const reserved = input_tokens + maxOutputTokens;
+  const key = budgetKey(userId);
+  const used = await redis.incrby(key, reserved);
+  if (used === reserved) await redis.expire(key, 26 * 3600); // first write today
+  if (used > DAILY_TOKENS_PER_USER) {
+    await redis.decrby(key, reserved);
+    throw new TokenLimitError("daily token budget exhausted");
+  }
+  return { inputTokens: input_tokens, reserved };
+}
+
+/** Call after the response: give back the output budget the model did not use. */
+export async function settleTokens(userId: string, reserved: number, usage: Anthropic.Usage) {
+  const actual =
+    usage.input_tokens +
+    (usage.cache_creation_input_tokens ?? 0) +
+    (usage.cache_read_input_tokens ?? 0) +
+    usage.output_tokens;
+  if (reserved > actual) await redis.decrby(budgetKey(userId), reserved - actual);
+}
+```
+
+### Edge cases and failure modes
+
+- **The count call adds a round trip.** Counting every request adds tens of milliseconds. A cheap pattern: estimate with characters divided by 4 and only call `countTokens` when the estimate is within about 20% of the cap.
+- **Reservation without settlement leaks budget.** If the process crashes between reserve and settle, the user loses the reserved output tokens for the day. That fails safe (the user is under-served, not over-billed), but log it.
+- **Budgets in tokens hide model mix.** 1M tokens on a small model and 1M on a frontier model differ in price by 10× or more. Budget in tokens for abuse protection and in dollars for cost control (see [25.19a](/docs/genai-handbook/25-cost-optimization#2519a-per-tenant-cost-ledger-and-budgets-)).
+- **Agents call the model many times per user action.** Apply the guard per model call, not per HTTP request, or a single agent run walks past it.
+
+## 24.7b Context-Window Overflow ➕
+
+A different token failure from the one above: the request is not too expensive but too big for the model, and the way your stack handles that decides whether users see an error or a silently wrong answer.
+
+### What overflow looks like
+
+**Problem.** A long conversation, a big retrieved document, or a pasted log pushes the prompt past the model's context window. Depending on the stack, three things happen:
+
+1. The provider rejects the request with a 400 validation error. On the Claude API, input tokens plus `max_tokens` must fit inside the window, so a large `max_tokens` can trigger this even when the input alone fits.
+2. A framework or SDK wrapper truncates the prompt for you, often from the start. The system prompt or the oldest instructions disappear and the model starts ignoring rules.
+3. Your own code trims, but in the wrong order: it keeps stale chat history and drops the retrieved chunk that held the answer.
+
+**Why it happens.** Context use grows on its own. A chat turn adds the user message and the full assistant reply to the history, so a 30-turn conversation with 600-token answers carries about 30 × (100 + 600) = 21,000 tokens of history before any retrieval. An agent adds every tool result. Teams test with fresh sessions and never reach the limit; real users do.
+
+### The mechanism: a token budget with priorities
+
+Treat the window as a budget and fill it in priority order:
+
+| Priority | Content | Rule |
+|---|---|---|
+| 1 | System prompt and tool definitions | Never trimmed |
+| 2 | Latest user message | Never trimmed; reject if it alone is too big |
+| 3 | Output reservation (`max_tokens`) | Reserved up front |
+| 4 | Retrieved context for this turn | Best-ranked chunks first |
+| 5 | Conversation history | Newest turns first; older turns summarised or dropped |
+
+### Implementation
+
+```ts
+type Part = { id: string; text: string; priority: number; order: number; tokens: number };
+
+/**
+ * Keep the highest-priority parts that fit, then restore original order.
+ * `tokens` is an estimate per part; verify the final prompt with countTokens.
+ */
+export function fitToBudget(parts: Part[], budget: number): { kept: Part[]; dropped: string[] } {
+  const byPriority = [...parts].sort((a, b) => a.priority - b.priority || b.order - a.order);
+  const kept: Part[] = [];
+  const dropped: string[] = [];
+  let used = 0;
+  for (const p of byPriority) {
+    if (used + p.tokens <= budget) {
+      kept.push(p);
+      used += p.tokens;
+    } else {
+      dropped.push(p.id);
+    }
+  }
+  kept.sort((a, b) => a.order - b.order);
+  return { kept, dropped };
+}
+
+// budget = context window - max_tokens - safety margin
+const WINDOW = 1_000_000;
+const MAX_TOKENS = 16_000;
+const PRODUCT_CAP = 60_000; // usually the binding limit, not the window
+const budget = Math.min(PRODUCT_CAP, WINDOW - MAX_TOKENS) - 2_000;
+```
+
+Log `dropped` on every request. A sudden rise in dropped parts is an early sign of a retrieval change or a runaway conversation.
+
+### Edge cases and failure modes
+
+- **Tokenizer mismatch.** Estimates from a different tokenizer can be off by 10 to 35%. Anthropic notes that newer Claude tokenizers use up to about 1.35× as many tokens as older ones for the same text. Keep a margin and verify the final prompt.
+- **Images and PDFs.** They count against the window too, and their token cost depends on resolution or page count, not on text length.
+- **Prompt caching interaction.** Dropping old turns from the front changes the prefix and invalidates the cache. Trim in large, infrequent steps rather than one turn at a time (see [25.9a](/docs/genai-handbook/25-cost-optimization#259a-rolling-summarisation-in-code-)).
+- **Server-side compaction.** Some providers now summarise long conversations for you (Anthropic has a compaction beta). It removes the overflow error but moves the quality risk into a summary you did not write, so evaluate it like any other prompt change.
+
+## 24.8 Latency Spikes
+
+Symptom: p99 latency jumps from 2s to 30s.
+
+Causes:
+- Downstream provider rate limiting.
+- Cold starts.
+- KV cache evictions causing recompute.
+- Network blip to provider.
+- Garbage collection in inference server.
+- Long-tail prompts.
+
+Debug:
+- Per-request trace shows where time went.
+- Correlate spikes with deploys, autoscaling events, provider incidents.
+- Check provider status pages.
+
+## 24.8a Streaming Failures Mid-Response ➕
+
+Latency spikes have a streaming-specific relative: the response starts fine and then stops halfway, which the handbook's failure list does not cover.
+
+### Why streams break in the middle
+
+**Problem.** The user sees half an answer, then a spinner forever, or a cut-off sentence that looks complete. Your logs show HTTP 200, so error-rate dashboards stay green.
+
+**Why it happens.** A streamed LLM response is one long-lived HTTP connection, often 30 to 120 seconds for long answers or reasoning models. Every hop in the path has its own idle or total timeout:
+
+- Load balancers and reverse proxies often close connections idle for 60 seconds by default.
+- Reasoning models can think for a long time before emitting visible text, so the visible stream is silent for that time.
+- The provider itself can fail mid-stream. Anthropic documents that an error such as `overloaded_error` can arrive as an event inside a stream that already returned 200.
+- Mobile clients switch networks and drop the socket.
+
+With 1% of streams breaking, a product doing 100,000 chats a day shows 1,000 broken answers a day without a single 5xx in the logs.
+
+### The mechanism
+
+1. **Watchdog on idle time.** Reset a timer on every stream event. If nothing arrives for N seconds, abort and treat it as a failure.
+2. **Classify the outcome.** `complete` (normal stop reason), `partial` (some text, then failure), `failed` (nothing useful).
+3. **Recover by restarting, not continuing.** Recent Claude models reject assistant prefill, so you cannot hand back the partial text and ask the model to carry on mid-sentence. Retry the whole request (optionally on a fallback provider) and replace the partial text in the UI.
+4. **Tell the client.** Send an explicit terminal event (`done` or `error`) to the browser so the UI never waits on a socket that silently closed.
+
+### Implementation
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+type StreamOutcome =
+  | { status: "complete"; text: string; message: Anthropic.Message }
+  | { status: "partial" | "failed"; text: string; error: unknown };
+
+export async function streamWithWatchdog(
+  params: Anthropic.MessageStreamParams,
+  onText: (delta: string) => void,
+  idleMs = 45_000,
+): Promise<StreamOutcome> {
+  const controller = new AbortController();
+  let timer = setTimeout(() => controller.abort(), idleMs);
+  const touch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), idleMs);
+  };
+
+  let text = "";
+  try {
+    const stream = client.messages.stream(params, { signal: controller.signal });
+    for await (const event of stream) {
+      touch(); // any event, including thinking deltas, proves the stream is alive
+      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+        text += event.delta.text;
+        onText(event.delta.text);
+      }
+    }
+    const message = await stream.finalMessage();
+    if (message.stop_reason === "max_tokens") {
+      return { status: "partial", text, error: new Error("hit max_tokens") };
+    }
+    return { status: "complete", text, message };
+  } catch (error) {
+    return { status: text.length > 0 ? "partial" : "failed", text, error };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+```
+
+In the HTTP handler, map `partial` and `failed` to a retry (up to one or two times), then to an explicit error event for the browser.
+
+### Edge cases and failure modes
+
+- **Idle timeout set too low.** With thinking hidden, a reasoning model can be quiet for a long stretch. Measure the longest healthy gap on real traffic before you pick `idleMs`, or ask for summarised thinking so events keep flowing.
+- **`max_tokens` is a silent partial.** A stream that hits the output cap ends normally. Check `stop_reason`, or users get confidently truncated answers.
+- **You pay for the broken half.** Output tokens generated before the failure are billed. A retry pays again. Count partial streams in cost dashboards.
+- **Tool calls in a broken stream.** If the stream dies while a tool call's JSON input is streaming, the input is incomplete. Never execute a tool from a partial stream. Validate the input against its schema first.
+- **Proxies that buffer.** Some proxies buffer the whole response, which turns streaming off without an error. Disable buffering for the SSE route (for nginx, `proxy_buffering off` or the `X-Accel-Buffering: no` response header).
+
+## 24.9 Vector DB Bottlenecks
+
+Symptom: retrieval slow; QPS hits a ceiling.
+
+Causes:
+- Index too large for memory (HNSW).
+- Filter selectivity poor.
+- Hot shard from skewed tenant load.
+- Replication lag.
+- Rebuild in progress.
+
+Debug:
+- Vector DB internal metrics.
+- Query plan inspection.
+- Per-shard QPS.
+- Replication status.
+
+Fix:
+- Resharding, more replicas, switch to a faster index, or use disk-resident at the cost of latency.
+
+## 24.10 Model Drift
+
+Symptom: quality scores degrade without code changes.
+
+Causes:
+- Provider updated their model under the same name.
+- New user populations with different needs (data drift).
+- Retrieval corpus changed.
+- A dependency changed (tokenizer, embedding model).
+
+Debug:
+- Continuous eval over time.
+- Diff against historical baseline.
+- Identify when the regression started.
+
+Fix:
+- Pin model versions where providers allow.
+- Re-evaluate on every dependency change.
+- Update prompts to compensate.
+
+## 24.10a Pinning Models and Gating Upgrades on Evals 🔧
+
+"Pin model versions" and "re-evaluate on every dependency change" are the two fixes above; this section turns them into config and a CI gate, and shows why a small eval set can miss a real regression.
+
+### Pin in config, never in code
+
+**Problem.** Model IDs scattered through the codebase get upgraded one file at a time, or follow a moving alias that the provider re-points to a new snapshot.
+
+**Mechanism.** Keep one registry of model IDs per use case. Check for each ID whether the provider documents it as a fixed snapshot or as an alias that moves (OpenAI, for example, offers dated snapshots next to moving aliases). Change the registry only through a reviewed pull request that also runs the eval gate.
+
+```ts
+// models.ts: the only place model IDs live
+export const MODELS = {
+  supportAnswer: { provider: "anthropic", id: "claude-opus-5-5", promptVersion: "support-v14" },
+  ticketTriage:  { provider: "anthropic", id: "claude-haiku-4-5", promptVersion: "triage-v6" },
+} as const;
+export type UseCase = keyof typeof MODELS;
+```
+
+Log `id`, the model string the API returns in the response, and `promptVersion` on every call. When quality drops, this is how you find out which of the three changed.
+
+### Why small eval sets miss regressions
+
+**Why it happens.** Eval pass rates are noisy. With n test cases and pass rate p, the standard error is the square root of p(1 − p)/n. For n = 200 and p = 0.85 that is about 0.025, so comparing two independent runs has a standard error of about 0.036. A true 3-point drop (85% to 82%) sits inside the noise. A gate that compares only the headline percentage will pass it most of the time.
+
+**Mechanism: paired comparison.** Run baseline and candidate on the same cases and count only the cases that changed:
+
+- `b` = cases the baseline passed and the candidate failed (regressions)
+- `c` = cases the baseline failed and the candidate passed (fixes)
+
+Under "no real difference", regressions and fixes are equally likely, so `z = (b − c) / sqrt(b + c)` is roughly standard normal (this is the idea behind McNemar's test). Block the upgrade if z is above about 1.64 (one-sided 5%), or if any case tagged critical regresses.
+
+### Implementation
+
+```ts
+type EvalCase = { id: string; input: string; critical?: boolean };
+type Grader = (input: string, output: string) => Promise<boolean>;
+type Runner = (modelId: string, input: string) => Promise<string>;
+
+export async function evalGate(
+  cases: EvalCase[],
+  run: Runner,
+  grade: Grader,
+  baselineModel: string,
+  candidateModel: string,
+) {
+  let regressions = 0;
+  let fixes = 0;
+  const criticalFailures: string[] = [];
+
+  for (const c of cases) {
+    const [base, cand] = await Promise.all([run(baselineModel, c.input), run(candidateModel, c.input)]);
+    const [basePass, candPass] = await Promise.all([grade(c.input, base), grade(c.input, cand)]);
+    if (basePass && !candPass) {
+      regressions++;
+      if (c.critical) criticalFailures.push(c.id);
+    }
+    if (!basePass && candPass) fixes++;
+  }
+
+  const discordant = regressions + fixes;
+  const z = discordant === 0 ? 0 : (regressions - fixes) / Math.sqrt(discordant);
+  const pass = criticalFailures.length === 0 && z <= 1.64;
+  return { pass, regressions, fixes, z, criticalFailures };
+}
+```
+
+Run it in CI on every change to `models.ts`, prompt templates, the embedding model or the retrieval config, and fail the build when `pass` is false.
+
+### Edge cases and failure modes
+
+- **Non-determinism.** Even at the same settings, outputs vary. Run each case two or three times and take a majority, or the gate flaps.
+- **Judge drift.** If an LLM judge grades the cases, pin the judge model too. Upgrading the judge and the candidate together hides regressions.
+- **The provider changes behaviour under a fixed ID.** Rare, but safety-system or infrastructure changes can shift outputs. Run the same gate nightly against production config (not only on pull requests) and alert on a significant drop.
+- **Deprecations force upgrades.** Providers retire models on a published schedule. Track retirement dates in the registry so an upgrade is a planned eval run, not a scramble a week before shutdown.
+
+## 24.11 Hallucination at Scale
+
+Symptom: factual errors complaints increase.
+
+Causes:
+- Retrieval quality dropped.
+- New types of questions not in eval set.
+- Provider model change.
+- Bad prompts encouraging speculation.
+
+Debug:
+- Sample bad outputs and inspect retrieved context.
+- Compare against working historical examples.
+- Run LLM-as-judge on production sample.
+
+Fix:
+- Strengthen retrieval.
+- Tighten prompt with citation requirement.
+- Refuse rather than guess when context is empty.
+- Lower temperature.
+
+## 24.12 Prompt Regression
+
+Symptom: a new prompt deployed; quality drops on some queries.
+
+Causes:
+- Prompt change had unintended effect on edge cases.
+- Eval set did not cover those cases.
+- Provider's behavior changed how the prompt is interpreted.
+
+Debug:
+- Run new prompt against old eval set.
+- A/B compare on production traffic.
+- Add failing examples to eval set.
+
+Fix:
+- Roll back via feature flag.
+- Patch prompt with explicit handling for failing case.
+
+## 24.13 Agent Loops
+
+Symptom: agent runs forever, costs spike, no result.
+
+Causes:
+- Tool returns ambiguous result; model keeps trying variants.
+- Termination condition not detected by model.
+- No step limit.
+
+Debug:
+- Inspect agent trace for repeated patterns.
+- Check tool result format.
+
+Fix:
+- Hard step limit.
+- Detect repeated tool calls with same args; break.
+- Tighter tool descriptions and finalization instructions.
+
+## 24.13a Loop Guards in Code 🔧
+
+The three fixes above (step limit, repeat detection, finalization) belong inside the agent loop itself, and the cost maths below shows why a step limit alone is not enough.
+
+### Why runaway agents get expensive so fast
+
+**Problem.** A stuck agent does not cost "steps × price per step". It costs much more, because each step re-sends the whole transcript.
+
+**Why it happens (the numbers).** Say the system prompt and tools are S = 3,000 tokens and every step adds d = 1,500 tokens (the model's tool call plus the tool result). Step k sends roughly S + k × d input tokens. Over n steps the total input is about n × S + d × n²/2.
+
+- n = 10: 30,000 + 75,000 = about 105,000 input tokens.
+- n = 50: 150,000 + 1,875,000 = about 2,000,000 input tokens.
+
+Five times more steps cost almost twenty times more input. At an example $4 per million input tokens (Claude Opus 5.5, September 2026) the 50-step run costs about $8 in input alone without caching. With prompt caching, most of that input is billed as cache reads (on Opus 5.5, $0.20 per million), so the same run costs well under $1. Caching is a cost guard for agents, not only an optimization.
+
+### The mechanism: four independent limits
+
+1. **Step limit.** Hard cap on model calls per run.
+2. **Cost limit.** Running dollar total from `usage`; stop when it crosses the ceiling.
+3. **Wall-clock deadline.** Stops slow loops that the other two miss (for example a tool that hangs).
+4. **Repeat detection.** Hash each tool call (name plus arguments with sorted keys). On the third identical call, return an error result instead of running the tool.
+
+When a limit trips, do not just throw. Make one last call with tools turned off and ask for the best answer from what was gathered, so the user gets something.
+
+### Implementation
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+const MODEL = "claude-opus-5-5";
+// Example prices in USD per million tokens (September 2026). Load from config in real code.
+const PRICE = { input: 4, output: 20, cacheWrite5m: 5, cacheRead: 0.2 };
+
+const LIMITS = { maxSteps: 15, maxCostUsd: 0.5, deadlineMs: 120_000, maxRepeats: 2 };
+
+function costUsd(u: Anthropic.Usage): number {
+  return (
+    (u.input_tokens * PRICE.input +
+      (u.cache_creation_input_tokens ?? 0) * PRICE.cacheWrite5m +
+      (u.cache_read_input_tokens ?? 0) * PRICE.cacheRead +
+      u.output_tokens * PRICE.output) / 1_000_000
+  );
+}
+
+function stableStringify(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(",")}]`;
+  if (v && typeof v === "object") {
+    const entries = Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, x]) => `${JSON.stringify(k)}:${stableStringify(x)}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+export async function runAgent(
+  system: string,
+  tools: Anthropic.Tool[],
+  userMessage: string,
+  runTool: (block: Anthropic.ToolUseBlock) => Promise<Anthropic.ToolResultBlockParam>,
+) {
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: userMessage }];
+  const seen = new Map<string, number>();
+  const deadline = Date.now() + LIMITS.deadlineMs;
+  let spent = 0;
+  let stopReason = "limit";
+
+  for (let step = 0; step < LIMITS.maxSteps; step++) {
+    // Check limits before a call, so the transcript never ends on an unanswered tool_use
+    if (Date.now() > deadline) { stopReason = "deadline"; break; }
+    if (spent > LIMITS.maxCostUsd) { stopReason = "cost"; break; }
+
+    const res = await client.messages.create({
+      model: MODEL,
+      max_tokens: 8_000,
+      cache_control: { type: "ephemeral" }, // cache the growing transcript
+      system,
+      tools,
+      messages,
+    });
+    spent += costUsd(res.usage);
+    messages.push({ role: "assistant", content: res.content });
+
+    if (res.stop_reason !== "tool_use") return { status: "done" as const, message: res, spent };
+
+    const results: Anthropic.ToolResultBlockParam[] = [];
+    for (const block of res.content) {
+      if (block.type !== "tool_use") continue;
+      const sig = `${block.name}:${stableStringify(block.input)}`;
+      const count = (seen.get(sig) ?? 0) + 1;
+      seen.set(sig, count);
+      if (count > LIMITS.maxRepeats) {
+        results.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          is_error: true,
+          content: "This exact call was already made. Use the earlier result or give your final answer.",
+        });
+      } else {
+        results.push(await runTool(block));
+      }
+    }
+    messages.push({ role: "user", content: results });
+  }
+
+  // A limit tripped. Every tool_use in the last turn already has its tool_result,
+  // so one more call with tools disabled asks for the best answer so far.
+  messages.push({ role: "user", content: `Stopped (${stopReason}). Give your best answer from what you have, and say what is missing.` });
+  const final = await client.messages.create({
+    model: MODEL, max_tokens: 4_000, system, tools, tool_choice: { type: "none" }, messages,
+  });
+  spent += costUsd(final.usage);
+  return { status: "stopped" as const, reason: stopReason, message: final, spent };
+}
+```
+
+### Edge cases and failure modes
+
+- **Near-duplicate calls.** The model varies one argument (`page: 2`, `page: 3`, ...) or rewrites a search query slightly. Exact hashing misses this. Add a per-tool call cap (for example at most 8 searches per run) as a second line.
+- **Limits that are too tight.** Legitimate deep-research runs get cut off. Record the stop reason on every run and review the distribution weekly. If 15% of runs stop on the step limit, either the limit or the tool design is wrong.
+- **Parallel sub-agents.** Each sub-agent has its own loop. Put the cost limit on the whole run tree (shared counter keyed by the root run ID), not on each child.
+- **Cost limit checked too late.** The check runs before each call, so the call that crosses the line still completes, and one step with a huge tool result can overshoot a lot. Truncate tool results to a fixed token size before appending them.
+- For more on agent loop design, see [Chapter 11](/docs/genai-handbook/11-ai-agents).
+
+## 24.14 Cascading Failures
+
+Symptom: one minor dependency fails; entire system goes down.
+
+Cause: tightly coupled retries amplify load on the failing service, which causes its other consumers to slow, which causes those consumers' consumers to slow, until the whole system gridlocks.
+
+Fix:
+- Circuit breakers.
+- Timeouts at every layer.
+- Bulkheads to isolate failure domains.
+- Graceful degradation.
+
+**🔧 Further reading.** Circuit breakers, timeouts, bulkheads and retry budgets in general are covered in depth in [Error Handling and Fault Tolerance](/docs/backend-first-principles/16-error-handling-fault-tolerance). The sections below stay with the parts that are specific to LLM systems.
+
+## 24.14a Retries That Duplicate Side Effects ➕
+
+Retries are the first defence in every section above, and in an agent they have a GenAI-specific cost: a retried step can run a real-world action twice.
+
+### Where the duplicates come from
+
+**Problem.** A customer gets two refunds, two emails or two calendar invites. Nothing crashed; every component retried "safely".
+
+**Why it happens.** The model call itself has no side effects, so retrying it is harmless. The tool it asks for may not be. Four paths create a second execution:
+
+1. **Timeout after success.** The tool call (for example a payment API) succeeds, but the response is lost to a timeout. The agent step is retried and the tool runs again.
+2. **Queue redelivery.** Agent steps run as background jobs. Most queues deliver at least once, so a worker that crashes after the tool call but before the acknowledgement causes a redelivery.
+3. **The model repeats itself.** If the tool result was ambiguous ("request accepted"), the model often calls the tool again to make sure.
+4. **The user regenerates.** "Regenerate response" replays the whole turn, including its tool calls.
+
+At a 0.5% timeout rate on a tool called 20,000 times a day, path 1 alone gives about 100 duplicate actions a day.
+
+### The mechanism: idempotency keys on every side-effecting tool
+
+Derive a key from what makes the action unique (run ID, tool name, arguments), record it in Postgres before running the tool, and return the stored result if the key already exists. Pass the same key downstream when the target API supports one (Stripe, for example, accepts an `Idempotency-Key` header).
+
+### Implementation
+
+```sql
+CREATE TABLE tool_executions (
+  idempotency_key text PRIMARY KEY,
+  run_id          uuid NOT NULL,
+  tool_name       text NOT NULL,
+  status          text NOT NULL CHECK (status IN ('started', 'succeeded', 'failed')),
+  result          jsonb,
+  created_at      timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```ts
+import { createHash } from "node:crypto";
+import type { Pool } from "pg";
+
+export async function executeOnce<T>(
+  pool: Pool,
+  runId: string,
+  toolName: string,
+  input: unknown,
+  action: (idempotencyKey: string) => Promise<T>,
+): Promise<T> {
+  // stableStringify sorts object keys (see 24.13a) so equal inputs hash equally
+  const key = createHash("sha256")
+    .update(`${runId}:${toolName}:${stableStringify(input)}`)
+    .digest("hex");
+
+  const inserted = await pool.query(
+    `INSERT INTO tool_executions (idempotency_key, run_id, tool_name, status)
+     VALUES ($1, $2, $3, 'started') ON CONFLICT DO NOTHING`,
+    [key, runId, toolName],
+  );
+
+  if (inserted.rowCount === 0) {
+    const { rows } = await pool.query(
+      `SELECT status, result FROM tool_executions WHERE idempotency_key = $1`,
+      [key],
+    );
+    if (rows[0].status === "succeeded") return rows[0].result as T;
+    // 'started' means another attempt is running or crashed mid-way: do not guess
+    throw new Error(`tool call ${key} is ${rows[0].status}; needs reconciliation`);
+  }
+
+  try {
+    const result = await action(key); // pass key downstream as Idempotency-Key
+    await pool.query(
+      `UPDATE tool_executions SET status = 'succeeded', result = $2 WHERE idempotency_key = $1`,
+      [key, JSON.stringify(result)],
+    );
+    return result;
+  } catch (err) {
+    await pool.query(`UPDATE tool_executions SET status = 'failed' WHERE idempotency_key = $1`, [key]);
+    throw err;
+  }
+}
+```
+
+When the key already exists, return the stored result to the model as the tool result, so it sees "already done" and stops asking.
+
+### Edge cases and failure modes
+
+- **Intentional repeats.** Keying on arguments blocks a deliberate second identical action ("send the reminder again"). For those tools, add an explicit `attempt` or `reason` argument the model must set, so a real second request has a different key.
+- **Stuck in `started`.** A crash mid-action leaves the row in `started`, and the code above refuses to retry. That is correct for payments: a person or a reconciliation job must check the external system first. For harmless tools, allow a retry after a timeout window.
+- **Regenerate needs a new run ID or the same one, on purpose.** Decide per product: reuse the run ID so regenerate never repeats side effects, or issue a new one and ask the user to confirm repeated actions.
+- **Read-only tools do not need this.** Mark tools as read-only or side-effecting in their definitions and only wrap the second group. It keeps the table small.
+
+## 24.15 Cold Starts
+
+Symptom: first request after deploy or scale-up takes 30–300 seconds.
+
+Cause: model weights must load into GPU memory.
+
+Fix:
+- Always-on warm replicas.
+- Pre-load weights into image or local NVMe.
+- Use scale-to-low rather than scale-to-zero for latency-sensitive paths.
+
+## 24.16 Provider Outages
+
+Symptom: every LLM request fails.
+
+Cause: the provider is down.
+
+Defense:
+- Multiple providers behind an LLM gateway.
+- Automatic failover with retries.
+- Status page polling for awareness.
+- Graceful degradation (cached responses, partial functionality).
+- Subscribe to provider status notifications.
+
+## 24.16a Multi-Provider Failover in Code 🔧
+
+"Multiple providers behind an LLM gateway with automatic failover" is the main defence above; here is what that gateway does on each request and where it goes wrong.
+
+### Which errors should fail over
+
+**Problem.** Failing over on every error wastes money and hides bugs. Never failing over means a provider outage is your outage.
+
+**Why it matters.** A provider with 99.9% monthly availability is down about 43 minutes a month. Two independent providers that are both down at the same moment, at that rate, overlap for a few seconds a month. In practice outages correlate somewhat (shared cloud regions, traffic shifting onto the second provider during the first one's outage), but the gain is still large.
+
+Classify errors before deciding:
+
+| Error | Fail over? | Reason |
+|---|---|---|
+| Connection error, timeout | Yes | Provider or network problem |
+| 429 rate limited | Yes, after a short local retry | Your quota, not your request |
+| 500, 503, 529 overloaded | Yes | Provider capacity |
+| 400 invalid request | No | Your bug; the second provider will reject it too or behave differently |
+| 401, 403 | No, page someone | Key or permission problem |
+| Refusal or content policy stop | No, handle separately | A quality or safety outcome, not an outage |
+
+### The mechanism
+
+<Mermaid chart={`sequenceDiagram
+    participant App
+    participant GW as LLM gateway
+    participant A as Primary provider
+    participant B as Secondary provider
+    App->>GW: complete(request)
+    GW->>GW: Is the primary circuit open?
+    GW->>A: request (timeout 30s)
+    A-->>GW: 529 overloaded
+    GW->>GW: Retryable error, record failure
+    GW->>B: same request, provider-specific prompt
+    B-->>GW: 200 OK
+    GW-->>App: text plus provider and model used
+`} />
+
+Each provider has its own prompt variant, tuned and evaluated separately, and its own circuit breaker. After a few consecutive failures the breaker opens and the gateway skips that provider for a cool-down period instead of paying a timeout on every request.
+
+### Implementation
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
+
+type ChatRequest = { system: string; user: string; maxTokens: number };
+type ChatResult = { text: string; provider: string; model: string };
+type Provider = { name: string; call: (req: ChatRequest, signal: AbortSignal) => Promise<ChatResult> };
+
+// The gateway owns retries, so turn off SDK-level retries to avoid retry multiplication.
+const anthropic = new Anthropic({ maxRetries: 0 });
+const openai = new OpenAI({ maxRetries: 0 });
+
+const providers: Provider[] = [
+  {
+    name: "anthropic",
+    async call(req, signal) {
+      const res = await anthropic.messages.create(
+        { model: "claude-opus-5-5", max_tokens: req.maxTokens, system: req.system,
+          messages: [{ role: "user", content: req.user }] },
+        { signal },
+      );
+      const text = res.content.map((b) => (b.type === "text" ? b.text : "")).join("");
+      return { text, provider: "anthropic", model: res.model };
+    },
+  },
+  {
+    name: "openai",
+    async call(req, signal) {
+      const res = await openai.responses.create(
+        { model: process.env.OPENAI_FALLBACK_MODEL!, instructions: req.system,
+          input: req.user, max_output_tokens: req.maxTokens },
+        { signal },
+      );
+      return { text: res.output_text, provider: "openai", model: res.model };
+    },
+  },
+];
+
+// Minimal in-process breaker. Use Redis to share state across a fleet.
+const breaker = new Map<string, { failures: number; openUntil: number }>();
+const FAILS_TO_OPEN = 5;
+const COOL_DOWN_MS = 30_000;
+
+function isRetryable(err: unknown): boolean {
+  // Connection errors include the SDK's own timeouts; user-abort errors are our AbortSignal timeout.
+  if (err instanceof Anthropic.APIConnectionError || err instanceof OpenAI.APIConnectionError) return true;
+  if (err instanceof Anthropic.APIUserAbortError || err instanceof OpenAI.APIUserAbortError) return true;
+  const status = (err as { status?: number }).status;
+  if (status === undefined) return false;
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+export async function completeWithFailover(req: ChatRequest, timeoutMs = 30_000): Promise<ChatResult> {
+  let lastError: unknown;
+  for (const p of providers) {
+    const state = breaker.get(p.name) ?? { failures: 0, openUntil: 0 };
+    if (Date.now() < state.openUntil) continue; // circuit open, skip
+
+    try {
+      const result = await p.call(req, AbortSignal.timeout(timeoutMs));
+      breaker.set(p.name, { failures: 0, openUntil: 0 });
+      return result;
+    } catch (err) {
+      lastError = err;
+      if (!isRetryable(err)) throw err; // a 400 will not get better elsewhere
+      const failures = state.failures + 1;
+      breaker.set(p.name, {
+        failures,
+        openUntil: failures >= FAILS_TO_OPEN ? Date.now() + COOL_DOWN_MS : 0,
+      });
+    }
+  }
+  throw lastError ?? new Error("all providers unavailable (circuits open)");
+}
+```
+
+The prompts here are the same for both providers to keep the example short. In production, `system` comes from a per-provider prompt registry. Note that Claude's API also has a separate server-side fallback option for refusals, which handles policy declines on one model, not outages.
+
+### Edge cases and failure modes
+
+- **The secondary cannot take the load.** If 100% of traffic moves to a provider where you normally send 5%, you hit its rate limits within a minute. Agree capacity in advance, or keep a steady share of traffic there so its quota is already sized.
+- **Contracts and data residency.** Failover sends user data to a second processor. It must be in your DPA, your customer contracts and the right region (see [26.9a](/docs/genai-handbook/26-enterprise-ai#269a-provider-data-retention-zdr-and-regional-processing-)). For some tenants the correct failover target is "none".
+- **Quality differs.** Run the eval gate from 24.10a on the secondary as well. A failover path that has not been evaluated for months is an untested release.
+- **Streaming has already started.** Once tokens reached the user, you cannot fail over silently. Restart on the secondary and replace the partial answer (see 24.8a).
+- **Tool schemas and features differ.** Structured output modes, tool-call formats and caching rules are not identical across providers. Wrap them behind your own interface and test each adapter.
+- **Slow, not down.** Partial outages often show up as latency, not errors. The timeout is what turns "slow" into a failover signal, so set it from your p99, not from the SDK default (often minutes).
+
+## 24.17 Rate Limit Whiplash
+
+Symptom: large fraction of requests fail with 429.
+
+Causes:
+- Burst exceeded provider quota.
+- Account-level limit hit.
+- Per-key rate limit.
+
+Defense:
+- Distribute load across multiple API keys (where TOS allows).
+- Implement client-side rate limiting that respects provider limits.
+- Spread retries with jitter.
+- Pre-arrange higher tier with provider.
+
+## 24.17a Token-Aware Client-Side Rate Limiting 🔧
+
+"Client-side rate limiting that respects provider limits" needs one detail most generic rate limiters miss: LLM providers limit tokens per minute, not just requests.
+
+### Why request counting is not enough
+
+**Problem.** A limiter set to 500 requests per minute still triggers 429s, because the provider also limits input tokens per minute and output tokens per minute.
+
+**Why it happens (the numbers).** Suppose your tier allows 2,000,000 input tokens per minute. At an average of 4,000 input tokens per request, that is 500 requests per minute. If a new feature raises the average to 16,000 tokens (for example, more retrieved chunks), the same 500 requests need 8,000,000 tokens per minute and three quarters of them fail, even though the request rate did not change.
+
+**The storm.** After a 60-second outage, 500 queued requests all retry at once. They exhaust the token budget in the first second, get 429s, retry together again, and the cycle repeats. Jitter spreads the retries; a shared token bucket stops them from exceeding the budget at all.
+
+### The mechanism
+
+- One token bucket per provider, model and limit type, stored in Redis so every pod shares it.
+- Before each call, take the estimated input tokens (from the token guard in 24.7a) out of the bucket. If there are not enough, wait for the time the bucket says, plus jitter.
+- Read the provider's rate-limit response headers (Anthropic sends `anthropic-ratelimit-*` headers, OpenAI sends `x-ratelimit-*` headers) and the `retry-after` header on 429s, and slow down when they say so.
+- Keep the bucket capacity at about 80 to 90% of the real limit, so small estimation errors do not cause 429s.
+
+### Implementation
+
+```ts
+import { Redis, type Result } from "ioredis";
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+// Token bucket in Lua so read-refill-take is atomic across pods.
+// Uses the Redis server clock (TIME), so pod clock skew does not matter.
+redis.defineCommand("takeTokens", {
+  numberOfKeys: 1,
+  lua: `
+    local capacity = tonumber(ARGV[1])
+    local refill_per_ms = tonumber(ARGV[2])
+    local cost = tonumber(ARGV[3])
+    local t = redis.call('TIME')
+    local now = t[1] * 1000 + math.floor(t[2] / 1000)
+    local state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+    local tokens = tonumber(state[1]) or capacity
+    local ts = tonumber(state[2]) or now
+    tokens = math.min(capacity, tokens + (now - ts) * refill_per_ms)
+    if tokens < cost then
+      redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+      return math.ceil((cost - tokens) / refill_per_ms)
+    end
+    redis.call('HSET', KEYS[1], 'tokens', tokens - cost, 'ts', now)
+    redis.call('PEXPIRE', KEYS[1], 120000)
+    return 0
+  `,
+});
+
+declare module "ioredis" {
+  interface RedisCommander<Context> {
+    takeTokens(key: string, capacity: number, refillPerMs: number, cost: number): Result<number, Context>;
+  }
+}
+
+const ITPM_LIMIT = 2_000_000;           // from your provider tier
+const CAPACITY = ITPM_LIMIT * 0.85;     // headroom for estimation error
+const REFILL_PER_MS = CAPACITY / 60_000;
+
+export async function acquireInputTokens(model: string, estimatedTokens: number, maxWaitMs = 20_000) {
+  const key = `rl:anthropic:${model}:itpm`;
+  const cost = Math.min(estimatedTokens, CAPACITY); // a single huge request must still be possible
+  const giveUpAt = Date.now() + maxWaitMs;
+  for (;;) {
+    const waitMs = await redis.takeTokens(key, CAPACITY, REFILL_PER_MS, cost);
+    if (waitMs === 0) return;
+    if (Date.now() + waitMs > giveUpAt) throw new Error("rate limit: shed this request");
+    const jitter = Math.random() * Math.min(1_000, waitMs);
+    await new Promise((r) => setTimeout(r, waitMs + jitter));
+  }
+}
+```
+
+### Edge cases and failure modes
+
+- **Output tokens are unknown up front.** Output-token limits can only be estimated (use the running average per route) and corrected from the headers after the fact.
+- **Cached tokens may count differently.** Some providers do not count cache reads, or count them at a lower rate, against input-token limits. Read your provider's rate-limit docs; if cache reads do not count, your bucket is too strict.
+- **Waiting is not free.** A request that waits 20 seconds for tokens has usually lost the user. Shed load (return a friendly "busy" response or fall back to a cheaper model) instead of queueing forever.
+- **Priority classes.** Let interactive traffic take tokens from a reserved share, and run batch work (embeddings, evals) only from what is left, or a nightly job will starve daytime chat.
+- **Multiple API keys.** Spreading load across keys only helps if the limits are per key and the provider's terms allow it. Many limits are per organization, in which case extra keys change nothing.
+
+## 24.18 Data Pipeline Stalls
+
+Symptom: vector DB stops getting new documents.
+
+Causes:
+- Ingestion worker crashed and did not restart.
+- Embedding API rate limited.
+- Source connector broken.
+- Dead-letter queue full.
+
+Debug:
+- Pipeline freshness metric.
+- Worker logs.
+- Source health.
+
+## 24.19 Tenant Isolation Bugs
+
+Symptom: one user sees another's data.
+
+Causes:
+- Cache keyed by prompt without tenant.
+- Retrieval filter missing for one path.
+- Session mixup.
+
+Debug:
+- Isolation test in CI.
+- Audit retrieval and cache code paths.
+
+Severity: this is a P0. Treat as security incident, not bug.
+
+## 24.19a Canary-Based Isolation Tests 🔧
+
+"Isolation test in CI" is the detection named above; this is a concrete way to write one that covers retrieval, caches and the model output together.
+
+### Why unit tests miss tenant leaks
+
+**Problem.** Each layer has its own test ("the retrieval query has a tenant filter"), and the leak happens on a path nobody tested: a new cache, a background re-ranker, a summary job.
+
+**Why it happens.** In a RAG system a tenant's data can reach another tenant through at least four stores: the vector index, the semantic or response cache, conversation memory, and any precomputed summaries. A filter missing in any one is enough. The number of code paths grows with every feature, so per-layer tests fall behind.
+
+**Mechanism: canaries.** Seed each test tenant with a document that contains a unique random string (a canary) and nothing else of interest. Then, as every other tenant, ask questions designed to pull that document. If a canary ever shows up in another tenant's retrieved chunks, cache hits or answers, the build fails. The test checks outcomes, so it catches leaks on paths you did not know existed.
+
+### Implementation
+
+```ts
+import { randomUUID } from "node:crypto";
+import { describe, it, expect, beforeAll } from "vitest";
+// Test helpers that call your real ingestion and query paths
+import { ingestDocument, askAsTenant } from "./test-harness";
+
+const tenants = ["tenant-a", "tenant-b", "tenant-c"];
+const canaries = new Map<string, string>();
+
+beforeAll(async () => {
+  for (const t of tenants) {
+    const canary = `CANARY-${randomUUID()}`;
+    canaries.set(t, canary);
+    await ingestDocument(t, {
+      title: "Internal escalation code",
+      body: `The internal escalation code for this account is ${canary}.`,
+    });
+  }
+});
+
+describe("tenant isolation", () => {
+  for (const asker of tenants) {
+    it(`${asker} never sees other tenants' canaries`, async () => {
+      // Ask twice: the second call exercises response and semantic caches
+      for (let i = 0; i < 2; i++) {
+        const res = await askAsTenant(asker, "What is the internal escalation code?");
+        const everything = JSON.stringify([res.answer, res.retrievedChunks, res.cacheHit]);
+        for (const [owner, canary] of canaries) {
+          if (owner !== asker) expect(everything).not.toContain(canary);
+        }
+      }
+    });
+  }
+});
+```
+
+Run it against a staging stack with the real vector DB and caches, not mocks. Mocks are exactly where the missing filter hides.
+
+### Edge cases and failure modes
+
+- **Order matters for caches.** Run the owning tenant's query first, then the other tenants' queries, so a cache that ignores tenant IDs gets a chance to serve the poisoned entry.
+- **Paraphrase the questions.** Semantic caches match on meaning. Ask the same question in two or three wordings.
+- **Production canaries.** The same idea works in production: plant canary documents in internal test tenants and alert if any canary string appears in another tenant's logged output.
+- **Shared cache keys.** The most common root cause is a cache key built from the prompt alone. Include tenant ID (and, for user-scoped data, user ID) in every cache key, and assert that in code review.
+
+## 24.20 Bad Deploy Recovery
+
+Symptom: a deploy regressed quality, latency, or cost.
+
+Defense:
+- Canary with auto-rollback on metric regression.
+- Feature flags for fast disable without redeploy.
+- Tagged immutable releases.
+- One-button rollback.
+
+## 24.21 Incident Response Workflow
+
+<Mermaid chart={`flowchart TD
+    D["Detect (monitoring alert)<br/>minute 0"] --> T["Triage (sev assessment, page on-call)<br/>minute 1-5"]
+    T --> C["Contain (disable feature, roll back, kill switch)<br/>minute 5-30"]
+    C --> M["Mitigate (apply patch or workaround)<br/>minute 30-120"]
+    M --> R["Resolve (full fix deployed)"]
+    R --> P["Postmortem (blameless, within 48 hours)"]
+    P --> A["Action items (tracked to completion)"]
+`} />
+
+Without a documented runbook for the common failures above, every incident becomes a research project. Build the runbook over time; revise after each incident.
+
+## 24.21a A Postmortem Template for AI Incidents ➕
+
+The workflow above ends in a postmortem, and AI incidents need fields a standard web-service template leaves out.
+
+### Why the standard template is not enough
+
+**Problem.** A normal postmortem asks "what broke, when, how many errors". Many AI incidents have no errors at all: answers got worse, cost went up, or one tenant saw another's data. Months later nobody can rebuild what the model actually saw.
+
+**Why it happens.** An LLM response depends on at least six versioned inputs: model ID, prompt version, retrieval index snapshot, embedding model, tool definitions and sampling or effort settings. If the postmortem does not record all six, you cannot reproduce the bad output, and "add it to the eval set" never happens.
+
+### The template
+
+```text
+TITLE / SEVERITY / DURATION (detected, contained, resolved timestamps)
+
+1. Impact
+   - Users and tenants affected, requests affected
+   - Harm type: wrong answers / unsafe output / data exposure / cost / latency / outage
+   - Money: extra provider spend, credits issued
+
+2. Detection
+   - Signal that fired (or: who reported it)
+   - Time from start to detection, and the signal that SHOULD have caught it earlier
+
+3. System state at the time (the six versioned inputs)
+   - Model ID requested and model ID returned by the API
+   - Prompt template version
+   - Retrieval index version and embedding model
+   - Tool definitions version
+   - Sampling / effort / max_tokens settings
+   - Feature flags active
+
+4. Evidence
+   - 5-20 sample bad outputs with full prompts (redacted), trace IDs
+   - The same inputs replayed on the last known good configuration
+
+5. Root cause and contributing factors (no names, blameless)
+
+6. What went well / what went badly
+
+7. Action items (owner, due date, ticket)
+   - At least one: add the failing cases to the eval set
+   - At least one: a detection improvement
+```
+
+### Edge cases and failure modes
+
+- **Sample outputs contain personal data.** Store them in the restricted incident store, redact before they go into the shared document, and delete on the same retention schedule as other logs.
+- **The replay does not reproduce.** Non-determinism means one replay is weak evidence. Replay each sample several times and report the rate ("bad in 7 of 10 runs").
+- **Quality incidents have fuzzy start times.** Use the continuous eval history (24.10a) to date the regression, not the first complaint.
+
+## 24.22 Debugging Approaches
+
+- **Read the trace.** Distributed tracing shows where time went.
+- **Inspect at the moment of failure.** Memory, GPU state, logs around the crash.
+- **Bisect deploys.** Did the regression appear after a specific change?
+- **Reproduce.** Try to reproduce the failing input in staging.
+- **Diff configs.** Drift between environments is a frequent culprit.
+- **Compare to baseline.** Same query yesterday vs today.
+
+## 24.23 Tradeoffs
+
+| Choice | Win | Cost |
+|---|---|---|
+| Aggressive retries | Mask transient failures | Amplify load during real outages |
+| Hard timeouts | Bounded blast radius | Some requests truncated |
+| Strict step limits | Cost bounded | Some legitimate agents stopped |
+| Always-warm capacity | No cold start | Idle GPU cost |
+
+## 24.24 Real-World Use Cases
+
+- A 10× cost spike in a single day traced to a doc connector that started pulling images instead of text.
+- A latency spike traced to a tokenizer warmup running per-request after an upgrade.
+- A tenant leak traced to a global retrieval cache without per-user scoping.
+- A quality regression traced to a provider model update on the same alias.
+
+Each of these is real; each has happened to multiple teams.
+
+## 24.24a The Same Incidents as Failure, Detection, Mitigation 🔧
+
+The four cases above are one line each; written out in the failure, detection, mitigation shape they become runbook entries.
+
+### The doc connector that pulled images
+
+- **Failure.** A connector update started extracting image content (base64 or OCR noise) along with text. Chunks grew from about 500 to about 5,000 tokens, and with 8 chunks per prompt, input per request went from roughly 6,000 to 42,000 tokens: a 7× rise, on top of more chunks per document.
+- **Detection.** A daily cost anomaly alert fired the next morning. The signal that should have fired first is p95 tokens per chunk at ingestion time, with an alert on a jump of more than 2× day over day.
+- **Mitigation.** Pause the connector, cap tokens per chunk at ingestion, re-ingest affected sources, and enforce the per-request input cap from 24.7a so the next ingestion bug costs a rejected request, not a bill.
+
+### The tokenizer warm-up on every request
+
+- **Failure.** After a library upgrade, the tokenizer was loaded inside the request handler instead of at startup. Each request paid about 300 ms extra; p99 rose sharply under load because loading also took CPU.
+- **Detection.** p99 latency alert. A trace showed the time inside the token-counting span, before any model call.
+- **Mitigation.** Roll back, then move the load to process start and add a startup readiness check. Prevention: a performance test in CI that fails when the median pre-model overhead rises by more than a set number of milliseconds.
+
+### The global retrieval cache
+
+- **Failure.** A retrieval cache was keyed on the query text only. Two tenants asking similar questions shared cached chunks.
+- **Detection.** A customer report. The canary test from 24.19a would have caught it in CI.
+- **Mitigation.** Treat as a security incident: disable the cache, purge it, find affected requests from logs, notify per contract. Prevention: tenant ID in every cache key and the canary test as a required check.
+
+### The alias that moved
+
+- **Failure.** The app called a model alias. The provider re-pointed the alias to a newer snapshot, and the answer format changed enough to break a downstream parser on about 4% of requests.
+- **Detection.** Parse-error rate rose. The faster signal is logging the model string returned in each response and alerting when it changes.
+- **Mitigation.** Pin the previous snapshot, run the eval gate from 24.10a on the new one, fix the parser or the prompt, then move the pin through a reviewed change.
+
+## 24.25 Interview Questions
+
+- Walk through a P0 incident from detect to postmortem.
+- What is the most expensive failure mode you can think of for an agent?
+- How do you detect tenant leakage?
+- Design a kill switch architecture.
+- Why is rolling forward sometimes worse than rolling back?
+
+➕ Additional questions:
+
+- ➕ Why does a 50-step agent cost much more than 5 times a 10-step agent? **Each step re-sends the growing transcript, so input tokens grow roughly with the square of the step count; prompt caching and per-run cost limits are the controls.**
+- ➕ Which errors should trigger failover to a second LLM provider? **Connection errors, timeouts, 429 and 5xx; not 400s (your bug), auth errors (page someone) or refusals (a quality outcome).**
+- ➕ How do you stop an agent from issuing the same refund twice after a timeout? **Idempotency keys per side-effecting tool call, recorded in a database before execution and passed to the downstream API.**
+- ➕ A stream returned HTTP 200 but the user saw half an answer. What happened and how do you handle it? **An idle timeout, a network drop or an in-stream provider error; use an idle watchdog, check the stop reason, restart the request and send the client an explicit terminal event.**
+- ➕ Your eval pass rate fell from 85% to 82% on 200 cases after a model upgrade. Is that a regression? **Not provable from the headline numbers alone; compare paired results (regressions versus fixes on the same cases) and look at critical cases.**
+
+## 24.26 Hands-on Exercises
+
+1. List the top 10 failure modes for your design from Chapter 1.
+2. Write the runbook for each: detection signal, triage steps, mitigation, fix.
+3. Plan a quarterly fire drill that exercises one runbook.
+
+## 24.27 Common Mistakes
+
+- No runbook; every incident is unique.
+- Retries without circuit breakers.
+- No load shedding; queues grow forever.
+- Skipping postmortems; same incident recurs.
+- Heroic fixes that bypass safety; the next failure is worse.
+
+## 24.28 Enterprise Best Practices
+
+Postmortems for every P0/P1, blameless. Runbooks for known failures. Quarterly fire drills. Tracked action items from every incident. SLOs that drive prioritization. On-call rotations with documented expectations. Treat reliability engineering as a permanent function.
+
+## Sources
+
+Prices and API behaviour checked in September and October 2026. They change often.
+
+- Anthropic, [Pricing](https://platform.claude.com/docs/en/about-claude/pricing): Claude Opus 5.5 at $4 input and $20 output per million tokens, cache reads $0.20 per million, cache writes 1.25× (5-minute TTL).
+- Anthropic, [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching): usage fields `cache_creation_input_tokens` and `cache_read_input_tokens`.
+- Anthropic, [Streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming): error events inside a stream, such as `overloaded_error`.
+- Anthropic, [Errors](https://platform.claude.com/docs/en/api/errors) and [Rate limits](https://platform.claude.com/docs/en/api/rate-limits): 429 and 529 semantics, `retry-after`, `anthropic-ratelimit-*` response headers, input and output tokens-per-minute limits.
+- Anthropic, [Token counting](https://platform.claude.com/docs/en/build-with-claude/token-counting).
+- OpenAI, [Responses API reference](https://platform.openai.com/docs/api-reference/responses) and [Rate limits guide](https://platform.openai.com/docs/guides/rate-limits): `x-ratelimit-*` headers.
+- Stripe, [Idempotent requests](https://docs.stripe.com/api/idempotent_requests): the `Idempotency-Key` header pattern.
+- Q. McNemar (1947), "Note on the sampling error of the difference between correlated proportions or percentages", Psychometrika 12: the paired test behind the eval gate in 24.10a.
+- Google, [Site Reliability Engineering, chapter 15: Postmortem Culture](https://sre.google/sre-book/postmortem-culture/): blameless postmortem practice.

@@ -1,0 +1,232 @@
+---
+title: "7.4 Domain events and an in-process event bus"
+---
+
+## Intuition
+
+After an order is placed, many things should happen: send an SMS, update analytics, reserve margin, write an audit log. If `OrderService.place()` calls all of them, it knows too much, and each new side effect edits the core use case. Instead, the service **announces a fact** (`OrderPlaced`), and interested handlers subscribe. This is the Observer pattern with a typed event map.
+
+## The rule
+
+- Events are **past-tense facts** carrying the minimum data: `OrderPlaced`, `PaymentFailed`.
+- The **core invariant** stays inside the transaction (debit the wallet). **Side effects** go to handlers (notify, analytics).
+- One failing handler must not break the others or the publisher.
+
+```ts
+type DomainEvents = {
+  OrderPlaced: { orderId: string; userId: string; amountPaise: number };
+  OrderFilled: { orderId: string; fillPricePaise: number };
+  PaymentFailed: { orderId: string; reason: string };
+};
+
+type Handler<P> = (payload: P) => void | Promise<void>;
+
+class EventBus<E extends Record<string, object>> {
+  private readonly handlers: { [K in keyof E]?: Array<Handler<E[K]>> } = {};
+
+  constructor(private readonly onHandlerError: (type: string, err: unknown) => void) {}
+
+  on<K extends keyof E & string>(type: K, handler: Handler<E[K]>): () => void {
+    const list = (this.handlers[type] ??= []);
+    list.push(handler);
+    return () => {
+      const i = list.indexOf(handler);
+      if (i >= 0) list.splice(i, 1);
+    };
+  }
+
+  async publish<K extends keyof E & string>(type: K, payload: E[K]): Promise<void> {
+    const list = [...(this.handlers[type] ?? [])]; // snapshot: handlers may unsubscribe while running
+    for (const handler of list) {
+      try {
+        await handler(payload);
+      } catch (err) {
+        this.onHandlerError(type, err); // isolate failures
+      }
+    }
+  }
+}
+
+const bus = new EventBus<DomainEvents>((type, err) =>
+  console.log(`  ! handler for ${type} failed: ${err instanceof Error ? err.message : String(err)}`),
+);
+
+bus.on('OrderPlaced', e => console.log(`  notify: order ${e.orderId} placed for ${e.userId}`));
+bus.on('OrderPlaced', () => {
+  throw new Error('analytics endpoint down');
+});
+const stopAudit = bus.on('OrderPlaced', async e => {
+  await Promise.resolve();
+  console.log(`  audit: ${e.orderId} amount=${e.amountPaise}`);
+});
+bus.on('OrderFilled', e => console.log(`  contract note for ${e.orderId} @ ${e.fillPricePaise}`));
+
+// bus.publish('OrderPlaced', { orderId: 'x' });          // compile error: missing fields
+// bus.publish('OrderShipped', {});                       // compile error: unknown event
+
+class OrderService {
+  private n = 0;
+  constructor(private readonly events: EventBus<DomainEvents>) {}
+  async place(userId: string, amountPaise: number): Promise<string> {
+    const orderId = `ORD-${++this.n}`;
+    // ...validate, save order (the core invariant) ...
+    await this.events.publish('OrderPlaced', { orderId, userId, amountPaise });
+    return orderId;
+  }
+}
+
+const orders = new OrderService(bus);
+console.log('place #1');
+const id = await orders.place('u1', 150_000);
+console.log('fill #1');
+await bus.publish('OrderFilled', { orderId: id, fillPricePaise: 149_950 });
+stopAudit();
+console.log('place #2 (audit unsubscribed)');
+await orders.place('u2', 99_000);
+```
+
+```text
+place #1
+  notify: order ORD-1 placed for u1
+  ! handler for OrderPlaced failed: analytics endpoint down
+  audit: ORD-1 amount=150000
+fill #1
+  contract note for ORD-1 @ 149950
+place #2 (audit unsubscribed)
+  notify: order ORD-2 placed for u2
+  ! handler for OrderPlaced failed: analytics endpoint down
+```
+
+## Design choices to mention
+
+| Choice | Option A | Option B |
+|---|---|---|
+| Dispatch | `await` each handler (ordered, slower) | fire-and-forget (fast, errors need a sink) |
+| Timing | publish **after** commit (safe) | publish inside the transaction (handlers may see uncommitted data) |
+| Delivery | in-process (lost on crash) | durable broker (Kafka/BullMQ) via an **outbox** |
+
+## The transactional outbox (conceptual, with a small simulation)
+
+The classic bug is the **dual write**: `db.save(order)` succeeds, then `kafka.publish(OrderPlaced)` fails (or the process dies in between). Now the DB and the event stream disagree. The fix is to write the event into an `outbox` table **in the same DB transaction** as the order. A separate relay reads unpublished rows, publishes them, and marks them as sent. This gives **at-least-once** delivery, so consumers must be idempotent (dedupe by event id, sometimes called an "inbox" table).
+
+<Mermaid chart={`sequenceDiagram
+  participant S as OrderService
+  participant DB as Database
+  participant R as Outbox Relay
+  participant K as Kafka
+  participant C as Consumer
+  S->>DB: BEGIN#59; insert order#59; insert outbox row#59; COMMIT
+  loop every few hundred ms
+    R->>DB: select unpublished rows order by id
+    R->>K: publish event (id = outbox row id)
+    R->>DB: mark row published
+  end
+  K->>C: deliver (maybe twice)
+  C->>C: skip if event id already processed`} />
+
+```ts
+interface OutboxRow {
+  id: number;
+  type: string;
+  payload: string;
+  publishedAt: number | null;
+}
+interface Tables {
+  orders: Map<string, string>;
+  outbox: OutboxRow[];
+}
+
+class FakeDb {
+  private tables: Tables = { orders: new Map(), outbox: [] };
+  private nextOutboxId = 1;
+  // All-or-nothing: work on copies, swap in only if fn succeeds.
+  transaction<T>(fn: (tx: Tables, nextId: () => number) => T): T {
+    const draft: Tables = { orders: new Map(this.tables.orders), outbox: [...this.tables.outbox] };
+    let id = this.nextOutboxId;
+    const result = fn(draft, () => id++);
+    this.tables = draft;
+    this.nextOutboxId = id;
+    return result;
+  }
+  get outbox(): OutboxRow[] {
+    return this.tables.outbox;
+  }
+  get orderCount(): number {
+    return this.tables.orders.size;
+  }
+}
+
+function placeOrder(db: FakeDb, orderId: string, failAfterInsert = false): void {
+  db.transaction((tx, nextId) => {
+    tx.orders.set(orderId, 'OPEN');
+    tx.outbox.push({ id: nextId(), type: 'OrderPlaced', payload: JSON.stringify({ orderId }), publishedAt: null });
+    if (failAfterInsert) throw new Error('constraint violation');
+  });
+}
+
+type Publish = (id: number, type: string, payload: string) => Promise<void>;
+
+async function relayOnce(db: FakeDb, publish: Publish, now: number, crashBeforeMark = false): Promise<void> {
+  for (const row of db.outbox.filter(r => r.publishedAt === null)) {
+    try {
+      await publish(row.id, row.type, row.payload);
+    } catch (err) {
+      console.log(`  relay: publish of #${row.id} failed (${err instanceof Error ? err.message : String(err)}), will retry`);
+      return; // stop to preserve ordering
+    }
+    if (crashBeforeMark) {
+      console.log(`  relay: crashed before marking #${row.id}`);
+      return;
+    }
+    row.publishedAt = now;
+  }
+}
+
+// Consumer with an "inbox" for dedupe
+const processed = new Set<number>();
+let brokerUp = false;
+const publish: Publish = async (id, type, payload) => {
+  if (!brokerUp) throw new Error('broker unavailable');
+  if (processed.has(id)) {
+    console.log(`  consumer: duplicate #${id} ignored`);
+    return;
+  }
+  processed.add(id);
+  console.log(`  consumer: handled #${id} ${type} ${payload}`);
+};
+
+const db = new FakeDb();
+placeOrder(db, 'ORD-1');
+try {
+  placeOrder(db, 'ORD-2', true);
+} catch (err) {
+  console.log(`ORD-2 rolled back: ${err instanceof Error ? err.message : String(err)}`);
+}
+console.log(`orders=${db.orderCount}, outbox rows=${db.outbox.length}`);
+
+console.log('relay run 1 (broker down):');
+await relayOnce(db, publish, 1_000);
+brokerUp = true;
+console.log('relay run 2 (crash after publish):');
+await relayOnce(db, publish, 2_000, true);
+console.log('relay run 3:');
+await relayOnce(db, publish, 3_000);
+console.log(`pending=${db.outbox.filter(r => r.publishedAt === null).length}`);
+```
+
+```text
+ORD-2 rolled back: constraint violation
+orders=1, outbox rows=1
+relay run 1 (broker down):
+  relay: publish of #1 failed (broker unavailable), will retry
+relay run 2 (crash after publish):
+  consumer: handled #1 OrderPlaced {"orderId":"ORD-1"}
+  relay: crashed before marking #1
+relay run 3:
+  consumer: duplicate #1 ignored
+pending=0
+```
+
+## How to say it in an interview
+
+> "The service publishes `OrderPlaced` and side effects subscribe, so adding a new notification doesn't touch the use case. In-process events are lost if the process crashes, so for anything that must happen I'd use a transactional outbox: the event row is committed with the order, a relay publishes it at-least-once, and consumers dedupe by event id."

@@ -1,0 +1,347 @@
+---
+title: "4.5 Builder"
+---
+
+## Intent
+
+Construct a complex object step by step, validating as you go, so the final object is always complete and consistent. The same construction process can produce different results.
+
+## Problem
+
+A trading order has symbol, side, quantity, order type, price (only for LIMIT), trigger price (only for SL), validity (DAY/IOC), product (CNC/MIS), disclosed quantity, tag... A constructor with 10 positional parameters is unreadable and error-prone:
+
+```ts
+// ❌ Telescoping constructor: which number is price and which is trigger?
+new Order('INFY', 'BUY', 10, 'SL', 1500, 1495, 'DAY', 'MIS', 0, undefined);
+```
+
+A plain object literal is readable but cannot enforce rules like "LIMIT requires price" or "trigger must be below price for a BUY stop-loss". Builder gives you named steps plus validation in one `build()`.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class HttpRequestBuilder {
+        -string method
+        -string url
+        -Map headers
+        -Map query
+        -string body
+        +get(url) HttpRequestBuilder
+        +post(url) HttpRequestBuilder
+        +header(k, v) HttpRequestBuilder
+        +query(k, v) HttpRequestBuilder
+        +json(body) HttpRequestBuilder
+        +timeout(ms) HttpRequestBuilder
+        +build() HttpRequest
+    }
+    class HttpRequest {
+        +string method
+        +string url
+        +Record headers
+        +string body
+        +number timeoutMs
+    }
+    class ApiClient
+    HttpRequestBuilder ..> HttpRequest : builds
+    ApiClient --> HttpRequestBuilder : uses`} />
+
+## TypeScript implementation
+
+**1. Fluent builder** (method chaining, each setter returns `this`). Example: an HTTP request builder for calling a broker's REST API.
+
+```ts
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE';
+
+interface HttpRequest {
+  readonly method: HttpMethod;
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body?: string;
+  readonly timeoutMs: number;
+}
+
+class HttpRequestBuilder {
+  private method: HttpMethod = 'GET';
+  private baseUrl = '';
+  private readonly headers = new Map<string, string>();
+  private readonly params = new URLSearchParams();
+  private body: string | undefined;
+  private timeoutMs = 5_000;
+
+  static get(url: string): HttpRequestBuilder {
+    return new HttpRequestBuilder().to('GET', url);
+  }
+
+  static post(url: string): HttpRequestBuilder {
+    return new HttpRequestBuilder().to('POST', url);
+  }
+
+  private to(method: HttpMethod, url: string): this {
+    this.method = method;
+    this.baseUrl = url;
+    return this;
+  }
+
+  header(name: string, value: string): this {
+    this.headers.set(name.toLowerCase(), value);
+    return this;
+  }
+
+  bearer(token: string): this {
+    return this.header('Authorization', `Bearer ${token}`);
+  }
+
+  query(name: string, value: string | number): this {
+    this.params.append(name, String(value));
+    return this;
+  }
+
+  json(payload: unknown): this {
+    this.body = JSON.stringify(payload);
+    return this.header('Content-Type', 'application/json');
+  }
+
+  timeout(ms: number): this {
+    this.timeoutMs = ms;
+    return this;
+  }
+
+  build(): HttpRequest {
+    if (!this.baseUrl) throw new Error('URL is required');
+    if (this.method === 'GET' && this.body !== undefined) {
+      throw new Error('GET requests cannot have a body');
+    }
+    if (this.timeoutMs <= 0 || this.timeoutMs > 30_000) {
+      throw new Error('timeout must be in (0, 30000] ms');
+    }
+    const qs = this.params.toString();
+    return Object.freeze({
+      method: this.method,
+      url: qs ? `${this.baseUrl}?${qs}` : this.baseUrl,
+      headers: Object.freeze(Object.fromEntries(this.headers)),
+      body: this.body,
+      timeoutMs: this.timeoutMs,
+    });
+  }
+}
+
+const holdings = HttpRequestBuilder.get('https://api.broker.test/v1/holdings')
+  .bearer('tok_123')
+  .query('segment', 'equity')
+  .query('page', 2)
+  .build();
+console.log(`${holdings.method} ${holdings.url}`);
+console.log(`headers=${JSON.stringify(holdings.headers)} timeout=${holdings.timeoutMs}`);
+
+const place = HttpRequestBuilder.post('https://api.broker.test/v1/orders')
+  .bearer('tok_123')
+  .json({ symbol: 'INFY', side: 'BUY', qty: 10 })
+  .timeout(2_000)
+  .build();
+console.log(`${place.method} ${place.url} body=${place.body}`);
+
+for (const make of [
+  () => HttpRequestBuilder.get('https://x.test').json({ a: 1 }).build(),
+  () => HttpRequestBuilder.post('https://x.test').timeout(60_000).build(),
+]) {
+  try {
+    make();
+  } catch (err) {
+    console.log(`invalid: ${(err as Error).message}`);
+  }
+}
+```
+
+```text
+GET https://api.broker.test/v1/holdings?segment=equity&page=2
+headers={"authorization":"Bearer tok_123"} timeout=5000
+POST https://api.broker.test/v1/orders body={"symbol":"INFY","side":"BUY","qty":10}
+invalid: GET requests cannot have a body
+invalid: timeout must be in (0, 30000] ms
+```
+
+The product is frozen, so once built it can't be half-modified. Returning `this` (rather than `HttpRequestBuilder`) keeps chaining correct if someone subclasses the builder.
+
+The weakness of a fluent builder: required fields are only checked at **runtime**, inside `build()`. Nothing stops `HttpRequestBuilder.get('')...build()` from compiling.
+
+**2. Step builder** (type-state builder). Each step returns a *different interface* that only exposes the next legal step, so the compiler enforces order and required fields. TypeScript's structural types make this pleasant. Example: a trading order where the price step depends on the order type.
+
+```ts
+type Side = 'BUY' | 'SELL';
+type Validity = 'DAY' | 'IOC';
+
+interface Order {
+  readonly symbol: string;
+  readonly side: Side;
+  readonly qty: number;
+  readonly type: 'MARKET' | 'LIMIT' | 'SL';
+  readonly price?: number;
+  readonly triggerPrice?: number;
+  readonly validity: Validity;
+  readonly tag?: string;
+}
+
+// Each interface = one state. Only the next legal calls are visible.
+interface SymbolStep {
+  symbol(symbol: string): SideStep;
+}
+interface SideStep {
+  buy(qty: number): TypeStep;
+  sell(qty: number): TypeStep;
+}
+interface TypeStep {
+  market(): OptionalStep;
+  limit(price: number): OptionalStep;
+  stopLoss(trigger: number, price: number): OptionalStep;
+}
+interface OptionalStep {
+  validity(v: Validity): OptionalStep;
+  tag(t: string): OptionalStep;
+  build(): Order;
+}
+
+class OrderBuilder implements SymbolStep, SideStep, TypeStep, OptionalStep {
+  private draft: {
+    symbol?: string;
+    side?: Side;
+    qty?: number;
+    type?: Order['type'];
+    price?: number;
+    triggerPrice?: number;
+    validity: Validity;
+    tag?: string;
+  } = { validity: 'DAY' };
+
+  private constructor() {}
+
+  // The only public entry point returns the FIRST step's interface.
+  static create(): SymbolStep {
+    return new OrderBuilder();
+  }
+
+  symbol(symbol: string): SideStep {
+    this.draft.symbol = symbol.toUpperCase();
+    return this;
+  }
+  buy(qty: number): TypeStep {
+    return this.sided('BUY', qty);
+  }
+  sell(qty: number): TypeStep {
+    return this.sided('SELL', qty);
+  }
+  market(): OptionalStep {
+    this.draft.type = 'MARKET';
+    return this;
+  }
+  limit(price: number): OptionalStep {
+    this.draft.type = 'LIMIT';
+    this.draft.price = price;
+    return this;
+  }
+  stopLoss(trigger: number, price: number): OptionalStep {
+    this.draft.type = 'SL';
+    this.draft.triggerPrice = trigger;
+    this.draft.price = price;
+    return this;
+  }
+  validity(v: Validity): OptionalStep {
+    this.draft.validity = v;
+    return this;
+  }
+  tag(t: string): OptionalStep {
+    this.draft.tag = t;
+    return this;
+  }
+
+  build(): Order {
+    const { symbol, side, qty, type, price, triggerPrice, validity, tag } = this.draft;
+    // The type-state guarantees these are set; this guard narrows the types.
+    if (!symbol || !side || !qty || !type) throw new Error('incomplete order');
+    if (qty <= 0 || !Number.isInteger(qty)) throw new Error('qty must be a positive integer');
+    if (type === 'SL' && triggerPrice !== undefined && price !== undefined) {
+      const ok = side === 'BUY' ? triggerPrice <= price : triggerPrice >= price;
+      if (!ok) throw new Error(`invalid trigger ${triggerPrice} for ${side} SL at ${price}`);
+    }
+    return Object.freeze({ symbol, side, qty, type, price, triggerPrice, validity, tag });
+  }
+
+  private sided(side: Side, qty: number): TypeStep {
+    this.draft.side = side;
+    this.draft.qty = qty;
+    return this;
+  }
+}
+
+const describe = (o: Order): string =>
+  `${o.side} ${o.qty} ${o.symbol} ${o.type}` +
+  (o.triggerPrice !== undefined ? ` trg=${o.triggerPrice}` : '') +
+  (o.price !== undefined ? ` px=${o.price}` : '') +
+  ` ${o.validity}` +
+  (o.tag ? ` #${o.tag}` : '');
+
+console.log(describe(OrderBuilder.create().symbol('infy').buy(10).market().build()));
+console.log(describe(OrderBuilder.create().symbol('tcs').sell(5).limit(4100).validity('IOC').tag('swing').build()));
+console.log(describe(OrderBuilder.create().symbol('sbin').buy(50).stopLoss(801, 802).build()));
+
+try {
+  OrderBuilder.create().symbol('sbin').buy(50).stopLoss(805, 802).build();
+} catch (err) {
+  console.log(`rejected: ${(err as Error).message}`);
+}
+
+// These do not compile, which is the whole point:
+// OrderBuilder.create().buy(10);                 // 'buy' does not exist on SymbolStep
+// OrderBuilder.create().symbol('x').build();     // 'build' does not exist on SideStep
+```
+
+```text
+BUY 10 INFY MARKET DAY
+SELL 5 TCS LIMIT px=4100 IOC #swing
+BUY 50 SBIN SL trg=801 px=802 DAY
+rejected: invalid trigger 805 for BUY SL at 802
+```
+
+## When to use / when NOT to use
+
+- **Use** when an object has many optional parts, construction has rules between fields, you want immutable results, or you build the same kind of object in several configurations (tests love builders: `anOrder().withQty(0).build()`).
+- **Use a step builder** when the order of steps or required fields matters enough to enforce at compile time (public SDKs, trading orders).
+- **Don't use** for objects with 2–3 fields; an options object with defaults (`{ timeoutMs = 5000, ...rest }`) is idiomatic TS and simpler.
+
+## Pitfalls
+
+- **Reusing a builder** after `build()`: if the builder keeps mutable collections and the product shares them, later calls mutate "built" objects. Copy on build (we used `Object.fromEntries` + `freeze`).
+- Validation spread across setters *and* `build()`: keep cross-field rules in `build()`.
+- A step builder with a single class implementing every step interface can still be abused via a cast; it guards honest callers, not malicious ones.
+- Builders that silently default required fields hide bugs; throw instead.
+
+## Related patterns
+
+- **Abstract Factory** returns finished objects immediately; Builder assembles one object gradually and returns it at the end.
+- **Composite** trees (Chapter 5) are often built with a builder.
+- **Fluent interface** is a style; Builder is a pattern that often uses that style (so do query builders like Knex/TypeORM's `createQueryBuilder`).
+- **Director** (classic GoF): an object that runs a fixed sequence of builder steps, e.g. `OrderPresets.bracketOrder(builder)`.
+
+## Where it shows up in LLD interview problems
+
+- Pizza / Burger / Sandwich ordering: base, size, toppings, extra cheese.
+- E-commerce order or cart checkout request.
+- Trading: order placement with conditional fields.
+- HTTP client, SQL query builder, email/notification message builder, resume/profile builder.
+- Test data builders in any LLD solution.
+
+Interview line: *"The order has many optional and interdependent fields, so I'll use a builder: named steps for readability, cross-field validation in `build()`, and an immutable result. If we want compile-time guarantees, I'd make it a step builder."*
+
+## Quick check
+
+1. Why do the fluent setters return `this` rather than `HttpRequestBuilder`?
+2. What does a step builder give you that a fluent builder can't?
+3. Where should the rule "a BUY stop-loss trigger must be at or below its limit price" live, and why?
+
+<details>
+<summary>Answers</summary>
+
+1. The polymorphic `this` type keeps the subclass type during chaining, so a `SignedRequestBuilder extends HttpRequestBuilder` can call its own methods after `header()`.
+2. Compile-time enforcement of required steps and their order: you can't call `build()` before choosing a symbol, side and order type.
+3. In `build()`. It is a cross-field rule (it involves side, trigger and price), and `build()` is the one place where all fields are known, so the product is validated exactly once before it is frozen.
+
+</details>

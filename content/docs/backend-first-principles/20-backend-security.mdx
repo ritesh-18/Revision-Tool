@@ -1,0 +1,2026 @@
+---
+title: "Backend Security: Everything You Need to Know"
+description: Injection, password storage, sessions and JWTs, rate limiting, broken authorization, XSS, CSRF and misconfiguration, each explained from the attack to the mechanism and code that stops it.
+---
+
+<Callout type="info">
+  Notes for [Backend Security: Everything You Need to Know](https://youtu.be/xB1C1xZZW4k) by **Sriniously**, part of the *Backend from First Principles* series. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+This lesson doesn't hand you a checklist. Its goal is to make you **paranoid in a useful way**: to read every line of backend code and ask *what assumption am I making here, and what happens if it's wrong?* Every attack below is the same story told in a different place: **data crossed a boundary and was trusted more than it deserved.**
+
+<Mermaid chart={`flowchart LR
+  A["Mindset: find the assumption"] --> B["Injection<br/>SQL, NoSQL, shell"]
+  B --> B2["➕ Paths, SSRF,<br/>parser attacks"]
+  B2 --> C["Authentication<br/>passwords, sessions, JWT"]
+  C --> D["Rate limiting<br/>➕ resource limits"]
+  D --> E["Authorization<br/>BOLA, BFLA, IDOR<br/>➕ fields, business logic"]
+  E --> F["XSS + CSP"]
+  F --> G["CSRF"]
+  G --> H["Misconfiguration<br/>secrets, debug, headers"]
+  H --> H2["➕ Encryption, supply chain,<br/>audit logging"]
+  H2 --> I["Boundaries + defence in depth"]
+  I --> J["➕ Threat modelling"]`} />
+
+---
+
+## 1. Scope and mindset 🎓
+
+### Security has many contexts
+Security is huge, so the lesson first draws a fence around what it covers:
+
+| Context | What lives there | Covered here? |
+|---|---|---|
+| **Browser security** | HTML, cookies, local storage, scripts | Only where the backend influences it |
+| **Network security** | HTTP vs HTTPS, TLS, encryption | Only where it touches cookies |
+| **Server (OS) security** | The operating system your process runs in | No |
+| **Backend security** | Vulnerabilities caused by *your* code | **Yes, this is the lesson** |
+
+Two framing points:
+- **No application is ever "truly secure".** Languages, libraries and techniques keep evolving, and so do vulnerabilities. You aim to do your best, not to reach a finish line.
+- **The point is a mindset, not a bag of tricks.** You won't implement everything tomorrow. You'll start *questioning* code as you write it.
+
+### Think like an attacker: where did the developer assume?
+The lesson deliberately avoids a list of abstract vulnerabilities. Instead it asks you to think like an **attacker** (it avoids the word "hacker"), someone who doesn't care about your framework or language, only about **where you made an assumption**. Typical assumptions:
+
+- the input from the frontend will be **clean**;
+- the user **is who they say** they are;
+- the request **came from my frontend**;
+- nobody will **open the network tab**, read the calls and **change the parameters**.
+
+Under deadline these feel reasonable, because you design for the **happy path**: users fill forms correctly and navigate the way you meant. Attackers do the opposite. They poke every boundary and test every assumption. The habit to build: **every time you write code, ask "what could go wrong here?"**, whatever the language.
+
+---
+
+## 2. Injection: the root cause 🎓
+
+### Your app speaks many languages
+A backend isn't one language. It talks **SQL** to the database, **HTML/CSS/JS** to browsers, **shell** to the operating system, and possibly more. Each language has its **own grammar, its own special characters and its own way of separating commands from data.**
+
+<Mermaid chart={`flowchart LR
+  U["User in a browser<br/>speaks HTML / JS"] --> APP["Your backend"]
+  APP -->|"SQL"| DB[(Database)]
+  APP -->|"HTML / JS"| BR["Other users browsers"]
+  APP -->|"shell"| OS["Operating system"]
+  X["Danger zone: user text crosses into<br/>another language where some of its<br/>characters mean COMMANDS"] -.-> APP`} />
+
+**Injection** happens when input written in one context crosses into another and some of its characters carry **special meaning** in the new language. SQL injection and XSS are both instances of this.
+
+**The one-sentence root cause: the system confused data with code.** Text meant as *data* got interpreted as part of the *program*.
+
+---
+
+## 3. SQL injection 🎓
+
+### The setup
+A login page sends `email` and `password`; the server looks up the user by email. The vulnerable part is **how the query is built**: by **string concatenation**, dropping user text between a pair of quotes in a query template.
+
+```ts title="login.vulnerable.ts"
+// VULNERABLE: user text becomes part of the SQL program
+const sql = "SELECT * FROM users WHERE email = '" + req.body.email + "'";
+const { rows } = await pool.query(sql);
+```
+
+**Happy path:** the user types `alice@gmail.com`, so the query reads `... WHERE email = 'alice@gmail.com'`, the row returns, login proceeds.
+
+### Attack 1: the always-true condition
+
+**What the demo shows:** in a DB explorer on Postgres, the lesson creates a `users` table (columns `name`, `email`) and inserts Alice and Bob. The honest query returns only Alice. The attacker instead types a crafted string into the email field whose effect, once concatenated, is to **close the opening quote early, add an `OR` clause that is always true, and comment out the trailing quote** so nothing is left dangling. Running the resulting query returns **every row**, Alice *and* Bob, with no valid email given at all.
+
+**Why it works, step by step:**
+
+<Mermaid chart={`flowchart TD
+  A["Template: ... email = ' [INPUT] '"] --> B["Leading quote in input<br/>closes the pair early"]
+  B --> C["email = '' is now a complete, FALSE condition"]
+  C --> D["OR joins a second condition that is<br/>always TRUE (a constant comparison)"]
+  D --> E["Double-dash comments out the<br/>templates leftover trailing quote"]
+  E --> F["Net query = SELECT * FROM users<br/>(WHERE is effectively removed)"]`} />
+
+- The template already has an opening single quote. The attacker's **first character is also a quote**, which *closes* the pair. `email = ''` is a complete, false condition.
+- An `OR` then adds a second condition that is a **constant that's always true**, so the whole `WHERE` is true for every row.
+- The **double dash** starts a SQL comment, so the template's leftover trailing quote is ignored instead of causing a syntax error.
+- The net effect is `SELECT * FROM users` with no filter. In production the `users` table holds **password hashes, addresses, phone numbers**, so the leak is severe.
+
+### Attack 2: stacked statements (the destructive one)
+By closing the string, adding a **semicolon**, a second destructive statement (such as dropping the `users` table), another semicolon, and a comment, an attacker can try to **run two statements back to back**.
+
+**What the demo shows:** pasting such a payload into the DB explorer runs the first statement but the `DROP` does *not* execute. Why? The explorer's proprietary driver, like **most modern drivers, blocks multiple back-to-back statements by default** because SQL injection has been a classic vulnerability for decades. **Edge case:** an old or minimal driver *without* that guard would actually run it. Attackers can also use `UNION` to read other tables (payments), call DB functions to read server files, or in some configs reach the OS.
+
+### Mechanism 1 (defence in depth): least-privilege DB credentials
+The account your app connects with should only have **DML** rights (`INSERT`, `UPDATE`, `DELETE`, `SELECT`), never **DDL** (`DROP`, `ALTER`). Then even a successful `DROP TABLE` injection "succeeds" with an empty result but changes nothing.
+
+```sql title="least-privilege.sql"
+-- app role can read/write rows but cannot alter schema
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
+REVOKE CREATE ON SCHEMA public FROM app_user;   -- no CREATE/DROP/ALTER
+```
+
+### Mechanism 2 (the real fix): parameterized queries / prepared statements
+Stop building one string. Send the database **two things**: a **query template with placeholder slots** (`$1`, `$2`, ...) and a **separate array of values**. The template contains **no user data**; the values are passed alongside.
+
+```ts title="login.fixed.ts"
+// SAFE: template and data travel separately
+const sql = "SELECT * FROM users WHERE email = $1";
+const { rows } = await pool.query(sql, [req.body.email]);
+```
+
+**Why this closes the hole from first principles:** the database parses the template **first**, learns its structure (one slot in a `WHERE`), and only *then* binds the value into the slot as **pure data**. A quote inside the value is just a character in a string; it can never close a quote in the template or start a new statement. The malicious login string simply becomes a garbage email that matches no row.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant App as Backend
+  participant DB as Database
+  Note over App,DB: Concatenation (vulnerable)
+  App->>DB: one finished string (structure + data fused)
+  Note over DB: parses structure and data TOGETHER -> confusion
+  Note over App,DB: Parameterized (safe)
+  App->>DB: template "... = $1" + values ["x' OR ..."]
+  Note over DB: parse template first, fix the structure
+  DB->>DB: bind value into slot as pure data
+  Note over DB: no character in the value can change structure`} />
+
+**Edge cases & notes:**
+- Nearly every driver and every ORM uses parameterized queries by default. The only way to be vulnerable is to **deliberately build raw strings** yourself.
+- A **validation layer** should reject a non-email-shaped string long before the query. Parameterization is the backstop if validation is weak.
+- 🔧 **Placeholders bind *values*, not identifiers.** You cannot parameterize a table or column name or `ORDER BY` direction. For those, **allow-list** against a fixed set of strings; never interpolate user text into identifiers.
+
+### NoSQL injection
+"I use MongoDB, so I'm safe" is false. Mongo queries are **JSON-like objects**, and objects can contain **operators** keyed by a leading `$` (`$ne`, `$gt`, `$exists`). If you take a JSON body from the user and pass it **straight into the query**, an attacker can control not just the *value* but the *structure*, swapping a plain match for an always-true operator object.
+
+```ts title="nosql.ts"
+// VULNERABLE: attacker sends { "password": { "$ne": null } } -> matches any password
+await users.findOne({ email: req.body.email, password: req.body.password });
+
+// SAFER: coerce to primitives so operators cannot slip in
+await users.findOne({
+  email: String(req.body.email),
+  password: String(req.body.password),
+});
+```
+
+🔧 Beyond coercion, **validate the shape** of input with a schema (Zod/Joi) so only primitive strings reach the query, and disable operator injection at the ODM layer where available.
+
+---
+
+## 4. Command injection 🎓
+
+Same root cause as SQL injection, but the target is the **operating system**. Example: a service lets users upload images and resizes them by shelling out to a CLI tool like **FFmpeg**, where the **output filename comes from the user**. If you concatenate that name into a shell command string and the user supplies a name containing a **`;` then another command**, the shell treats the semicolon as a statement separator and runs the attacker's command (classically `rm -rf /`).
+
+<Mermaid chart={`flowchart TD
+  A["Build: ffmpeg ... -o [USER FILENAME]"] --> B["Passed to a SHELL as one string"]
+  B --> C["Shell sees ; | and runs<br/>the attackers extra command"]
+  B2["Fix: pass command + ARGUMENT ARRAY<br/>directly to the process, no shell"] --> D["User text is just one argv entry<br/>never parsed as commands"]`} />
+
+Attackers can also use **pipes** to redirect output into a nastier command, or `&` to run something **in the background** as spyware. Each shell (bash, zsh, fish) has its own metacharacters and escapes.
+
+**The fix mirrors the SQL fix: separate the command from its arguments.** Use the language API that takes the **executable as one parameter and an array of arguments as another**, passing arguments **directly to the process without a shell interpreter**. User text then becomes a single `argv` entry, never parsed as commands.
+
+```ts title="command.ts"
+import { execFile, exec } from "node:child_process";
+
+// VULNERABLE: exec runs a shell; metacharacters in output are live
+exec(`ffmpeg -i in.jpg -s 220x120 -o ${userName}`);
+
+// SAFE: execFile does NOT spawn a shell; args is an array
+execFile("ffmpeg", ["-i", "in.jpg", "-s", "220x120", "-o", userName]);
+```
+
+🔧 **Verified against the Node docs:** `exec()` spawns a shell and runs the command inside it; its docs warn **never to pass unsanitized input**. `execFile()` does **not** spawn a shell by default. The same warning applies to `spawn`/`execFile` **only if you turn the `shell` option on**, so don't. On Windows, `.bat`/`.cmd` still need a shell, which is a sharp edge to avoid. Even with an argument array, **validate the filename** (allow-list characters) so it can't escape the output directory via `../`.
+
+### Injection, generalized
+Whenever user input (SQL, NoSQL, shell, HTML, LDAP, XML, anything) crosses into a system that interprets a language, it must be treated **purely as data**, never as something executable. The safe way is always an **API that separates structure from data**: parameterized queries for SQL, **argument arrays** for shell. Never mix user input with control syntax via string concatenation or template strings.
+
+---
+
+## 5. Path traversal and unsafe file handling ➕
+
+Command injection ended with a warning about `../` in filenames, and that warning is a vulnerability class of its own: **a filesystem path is one more language your backend speaks**.
+
+**The attack.** A download endpoint takes a file name from the query string and joins it onto an uploads directory. Path grammar has special segments: `..` means "go up one directory" and a leading `/` means "start at the root". An attacker who sends a name made of enough parent segments followed by a target such as the app's `.env` climbs out of the uploads folder and reads configuration, private keys or source code. On endpoints that **write** (uploads, exports, archive extraction) the same trick overwrites files, which can become code execution on the next restart.
+
+**Why it works (first principles):** the developer treats the name as *data* (a label), but the filesystem treats it as *structure* (navigation instructions). `path.join` does not protect you: it normalizes `..` segments by **applying** them, so the result is a valid path that simply points somewhere else.
+
+<Mermaid chart={`flowchart LR
+  A["User-supplied name"] --> B["path.join(UPLOAD_DIR, name)"]
+  B --> C{"Contains .. or<br/>starts with /"}
+  C -->|"no"| D["File inside uploads"]
+  C -->|"yes"| E["Normalized path points<br/>OUTSIDE uploads"]
+  E --> F["Read secrets or<br/>overwrite code"]`} />
+
+#### Resolve the path, then prove it is still inside the base ➕
+**Problem.** Filters that search the input for `../` and strip it are brittle: removing one occurrence from a nested sequence can leave a fresh one behind, and there are many other spellings (next subsection).
+
+**Mechanism.** Don't inspect the *input*, inspect the *result*. Resolve the absolute path the OS would actually open, then check that it starts with the base directory **plus a separator**.
+
+```ts title="safe-resolve.ts"
+import path from "node:path";
+import { createReadStream } from "node:fs";
+
+const UPLOAD_DIR = path.resolve("/srv/app/uploads");
+
+// VULNERABLE: join happily follows ".." segments out of UPLOAD_DIR
+app.get("/files", (req, res) => {
+  createReadStream(path.join(UPLOAD_DIR, String(req.query.name))).pipe(res);
+});
+
+// FIXED: resolve to an absolute path, then prove it is still under the base
+export function safeResolve(base: string, userPath: string): string {
+  const target = path.resolve(base, userPath);
+  if (target !== base && !target.startsWith(base + path.sep)) {
+    throw new ForbiddenException("path escapes base directory");
+  }
+  return target;
+}
+```
+
+**Edge cases:**
+- Compare against `base + path.sep`, not `base`. Otherwise a sibling folder such as `/srv/app/uploads-archive` passes a naive prefix check.
+- `path.resolve` **discards the base** when the user part is absolute. The containment check catches that case too, which is why you check the result rather than the input.
+- Run the check on the platform that opens the file. On Windows a backslash is a separator and `C:` starts an absolute path; on Linux a backslash is an ordinary character. Node's `path` uses the current platform's rules, which is what you want.
+- Express's `res.sendFile` has a `root` option that applies a similar containment check. Use it instead of building absolute paths by hand.
+
+#### Encodings, null bytes and "validated one form, opened another" ➕
+**Problem.** Input arrives encoded: percent-encoded dots and slashes, double-encoded sequences, Unicode look-alikes, Windows separators. If a filter runs before decoding, or code decodes a second time after the filter, the filter approves one string and the filesystem receives a different one. Historically, a **null byte** truncated paths in C-level APIs, so a check that the name ended in `.pdf` passed while a different file was opened.
+
+**Why it works:** validation and use operate on **different representations** of the same value.
+
+**Mechanism.** Decode exactly once (your framework already decoded route and query parameters), then validate the decoded form with the containment check above. When the value is a **file name** rather than a path, use a strict allow-list.
+
+```ts title="filename-allowlist.ts"
+// letters, digits, dot, dash, underscore; no leading dot; bounded length
+const SAFE_NAME = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,99}$/;
+
+export function assertSafeName(name: unknown): string {
+  if (typeof name !== "string" || !SAFE_NAME.test(name) || name.includes("..")) {
+    throw new BadRequestException("invalid file name");
+  }
+  return name;
+}
+```
+
+**Edge cases:**
+- Node's `fs` functions throw `ERR_INVALID_ARG_VALUE` for paths containing null bytes, but the CLI tools, native addons or other services you pass the name to may not. Reject control characters at the boundary.
+- Never call `decodeURIComponent` on a value the framework already decoded. Double decoding is how double-encoded sequences get through.
+- On Windows, NTFS short names (8.3 aliases) and trailing dots or spaces can make two different strings open the same file. Generated names (below) avoid the whole problem.
+
+#### Symlinks: the lexical check passes, the file is elsewhere ➕
+**Problem.** If anyone can create a **symbolic link** inside the directory (an extracted archive, a shared volume, another tenant's upload), a path that sits lexically inside the base can point at `/etc` or at another user's files.
+
+**Why it works:** `path.resolve` is **purely lexical**. It never touches the disk, so it cannot know that a segment is a link.
+
+**Mechanism.** After the lexical check, resolve the real path on disk with `fs.realpath` (which follows links) and check containment again against the real path of the base.
+
+```ts title="safe-realpath.ts"
+import { realpath } from "node:fs/promises";
+
+export async function safeRealPath(base: string, userPath: string): Promise<string> {
+  const lexical = safeResolve(base, userPath);   // cheap first gate
+  const real = await realpath(lexical);          // follows symlinks on disk
+  const realBase = await realpath(base);
+  if (real !== realBase && !real.startsWith(realBase + path.sep)) {
+    throw new ForbiddenException("symlink escapes base directory");
+  }
+  return real;
+}
+```
+
+**Edge cases:**
+- There is still a **time-of-check to time-of-use** gap: a link could be swapped in between `realpath` and `open`. The robust fix is to make link creation impossible: never recreate symlinks from untrusted archives and don't share writable directories between tenants.
+- On POSIX you can open with `fs.constants.O_NOFOLLOW`, which refuses to open a file whose **final** component is a symlink (it does not cover links in parent directories).
+- Run the service as an unprivileged user with read-only mounts wherever possible, so a traversal that slips through can reach little.
+
+#### Archive extraction ("zip slip") ➕
+**Problem.** Every entry inside a zip or tar carries **its own name**, chosen by whoever built the archive, and that name can contain parent segments or be absolute. An extractor that writes each entry to `join(dest, entry.name)` writes files anywhere the process can write.
+
+**Why it works:** the archive is untrusted input that happens to contain *many* paths at once, and each one crosses the same boundary.
+
+**Mechanism.** Apply the same containment check to **every entry**, skip link entries, and bound the total work.
+
+```ts title="extract-safely.ts"
+let count = 0;
+let totalBytes = 0;
+for await (const entry of archive.entries()) {        // whichever zip/tar library you use
+  if (entry.type !== "file") continue;                // skip symlinks, hard links, devices
+  const dest = safeResolve(EXTRACT_DIR, entry.name);  // same containment check, per entry
+  if (++count > 1_000) throw new BadRequestException("too many entries");
+  totalBytes += await writeEntryCapped(entry, dest, 200 * 1024 * 1024 - totalBytes);
+}
+```
+
+**Edge cases:**
+- The uncompressed size written in an archive header can **lie**. Count bytes as you stream them (`writeEntryCapped` above stops at the remaining budget) to defeat **zip bombs**, a tiny archive that inflates to gigabytes (see section 13).
+- Extract into a fresh, empty temporary directory and move validated results into place, so a partial failure can't leave half-written files in a live folder.
+
+#### Don't let users name stored files at all ➕
+**Problem.** Every subsection above exists because a user-chosen name reaches the filesystem. Even "safe" names collide (one user overwrites another's file) and leak information.
+
+**Mechanism (OWASP's recommendation):** generate the storage name yourself, keep the original name only as **metadata** in the database, and look files up by ID **and owner**.
+
+```ts title="uploads.ts"
+import { randomUUID } from "node:crypto";
+import { writeFile } from "node:fs/promises";
+
+// upload: the disk name is ours, the user's name is just a column
+const id = randomUUID();
+await writeFile(path.join(UPLOAD_DIR, id), file.buffer, { flag: "wx" }); // wx: fail if it exists
+await db.query(
+  "INSERT INTO files (id, owner_id, original_name, mime) VALUES ($1, $2, $3, $4)",
+  [id, ctx.userId, file.originalname.slice(0, 200), detectedMime],
+);
+
+// download: look up by id AND owner, never by a client-supplied path
+const { rows } = await db.query(
+  "SELECT id, original_name, mime FROM files WHERE id = $1 AND owner_id = $2",
+  [req.params.id, ctx.userId],
+);
+if (!rows[0]) return res.sendStatus(404);
+res.attachment(rows[0].original_name);            // Content-Disposition, safely encoded
+res.type(rows[0].mime);
+res.sendFile(rows[0].id, { root: UPLOAD_DIR });
+```
+
+**Edge cases:**
+- Validate `req.params.id` as a UUID (a Postgres `uuid` column rejects anything else), so the ID can never smuggle path syntax.
+- Don't trust the client's MIME type; detect it from the content and serve with `X-Content-Type-Options: nosniff` so a browser doesn't execute an uploaded file as HTML.
+- Keep uploads **outside the web root**, or better, in object storage. Bucket keys, presigned URLs and upload validation are covered in [Object storage part 1](/docs/backend-first-principles/24-object-storage-part-1) and [part 2](/docs/backend-first-principles/object-storage-part-2).
+
+---
+
+## 6. SSRF: making your server fetch for the attacker ➕
+
+Path traversal abuses a path your server **opens**; **server-side request forgery (SSRF)** abuses a URL your server **fetches**, and the boundary crossed is your network perimeter. The [Webhooks](/docs/backend-first-principles/30-webhooks) lesson covers SSRF for webhook senders, including a resolve-and-pin implementation in Node; this section covers the wider class.
+
+**The attack.** Any feature where the server fetches a URL the user influences: import from URL, avatar by URL, link previews, PDF or screenshot generators, OpenID discovery documents, XML that references external entities. The attacker supplies an address that only the server can reach.
+
+**Why it works (first principles):** the request carries the server's **network position and identity**. From inside the VPC it can reach localhost-only admin ports, caches and search clusters that have no authentication on the private network, internal HTTP APIs that trust "anything from inside", and the cloud metadata service. The firewall that stops the attacker does not stop your own server. SSRF comes in two flavours: **full** (the response is shown to the attacker) and **blind** (only side effects, timing or error differences are visible), and blind SSRF is still enough to map an internal network or trigger internal actions.
+
+<Mermaid chart={`flowchart LR
+  ATK["Attacker"] -->|"POST /import with a URL"| APP["Your backend<br/>inside the VPC"]
+  APP -->|"fetch"| META["Cloud metadata<br/>169.254.169.254"]
+  APP -->|"fetch"| ADM["Internal admin API<br/>trusts internal callers"]
+  APP -->|"fetch"| RDS["Redis or Elasticsearch<br/>no auth on private network"]
+  FW["Firewall blocks the attacker<br/>but not your own server"] -.-> APP`} />
+
+#### Cloud metadata endpoints and IMDSv2 ➕
+**Problem.** Every major cloud exposes a link-local **metadata service** at `169.254.169.254`. On AWS it returns instance details and, crucially, **temporary credentials for the instance's IAM role**. With the original IMDSv1 a single plain `GET` is enough, so an SSRF that only lets the attacker choose a URL can read those credentials and use them from anywhere until they expire.
+
+**Why it works:** IMDSv1 is plain request/response with no authentication. **Being able to reach it is the only check.**
+
+**Mechanism: IMDSv2 (session-oriented).** A client first sends a `PUT` to the token endpoint with a header giving the token's TTL (one second to six hours). The returned token must be sent in the `X-aws-ec2-metadata-token` header on every later `GET`; when tokens are **required**, requests without one get `401`. This defeats most SSRF because a typical SSRF primitive can only trigger a `GET`, can't add custom headers, and can't read one response to build the next request. AWS adds two more guards: `PUT` requests carrying `X-Forwarded-For` are rejected (blocking open reverse proxies), and the token response has an IP **hop limit of 1** by default, so it can't travel beyond the instance.
+
+```bash title="enforce IMDSv2 on an existing instance"
+aws ec2 modify-instance-metadata-options \
+  --instance-id i-0123456789abcdef0 \
+  --http-tokens required \
+  --http-put-response-hop-limit 1 \
+  --http-endpoint enabled
+```
+
+```hcl title="main.tf"
+resource "aws_instance" "api" {
+  # ...
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+    http_endpoint               = "enabled"
+  }
+}
+```
+
+**Edge cases:**
+- Containers on EC2 sit one network hop further away, so they need hop limit 2 to reach IMDS, which also lets **every** container on the host fetch the instance role. Prefer per-workload identities (ECS task roles, EKS Pod Identity or IRSA) so application containers never need IMDS.
+- Old SDKs don't speak IMDSv2. Upgrade before switching tokens to `required`, or the app loses its credentials.
+- GCP and Azure require a fixed request header (`Metadata-Flavor: Google`, `Metadata: true`), which only stops SSRF that can't set headers.
+- IMDSv2 is **defence in depth**. It protects one target; your internal services still need the controls below.
+
+#### Validate the destination: allow-list first, then check every resolved IP ➕
+**Problem.** Block-lists of strings like `localhost` or `169.254` fail. The same address has many spellings (a single decimal integer, octal or hex parts, shortened forms, IPv6 forms, IPv4-mapped IPv6), any DNS name can be pointed at a private IP, and public wildcard-DNS services exist for exactly that purpose.
+
+**Why it works:** the hostname in the URL is **not** the address you connect to. Only the resolved IP is.
+
+**Mechanism (OWASP).** When the set of destinations is known (partner APIs, your CDN), use an **exact hostname allow-list** with HTTPS only and port 443. When destinations must be arbitrary (link previews, customer webhooks), resolve the name and reject it if **any** A or AAAA record is non-public, and do that check **at connect time** so DNS rebinding can't swap the answer. The connect-time `lookup` hook is implemented in the [Webhooks lesson, section 9](/docs/backend-first-principles/30-webhooks).
+
+```ts title="outbound-url.ts"
+import net from "node:net";
+
+const ALLOWED_HOSTS = new Set(["api.partner.example", "images.cdn.example"]);
+
+export function parseOutboundUrl(raw: string): URL {
+  let url: URL;
+  try { url = new URL(raw); } catch { throw new BadRequestException("invalid URL"); }
+
+  if (url.protocol !== "https:") throw new BadRequestException("https only");
+  if (url.port && url.port !== "443") throw new BadRequestException("port not allowed");
+  if (url.username || url.password) throw new BadRequestException("credentials in URL not allowed");
+  const host = url.hostname.replace(/^\[|\]$/g, "");     // strip IPv6 brackets
+  if (net.isIP(host)) throw new BadRequestException("use a hostname, not an IP literal");
+  if (!ALLOWED_HOSTS.has(host)) throw new BadRequestException("host not allowed");
+  return url;
+}
+```
+
+**Edge cases:**
+- Always compare the **parsed** `url.hostname`, never a regex over the raw string. The WHATWG URL parser lowercases names, converts international names to punycode and normalizes numeric IPv4 spellings into dotted form, so the parsed value is the canonical one.
+- Match hosts **exactly**. A check like "ends with `partner.example`" also accepts `evilpartner.example`. If subdomains are needed, match a suffix that starts with a dot.
+- An allow-listed domain can still resolve inside your network (a dangling DNS record, a subdomain takeover), so keep the connect-time IP check even with an allow-list.
+- Node's global `fetch` (undici) ignores `http.Agent`. Pass the checked lookup through an undici `Agent`'s `connect` options, or use `node:https` with a `lookup` option, and test that a private address is really refused.
+
+#### Redirects, schemes and what you send back ➕
+**Problem.** A validated public URL can answer with a `3xx` pointing at an internal address, and most clients follow redirects by default (`fetch` uses `redirect: "follow"`). Libraries that accept many schemes turn an "image URL" field into a local file read through `file:` or a raw TCP client through `gopher:`. Finally, echoing the fetched body or detailed network errors back to the user turns blind SSRF into full SSRF and gives the attacker a port scanner ("connection refused" versus "timed out").
+
+**Mechanism.** Handle redirects yourself and re-validate every hop, allow only `https:`, cap time and size, and return generic errors.
+
+```ts title="fetch-validated.ts"
+const MAX_BYTES = 5 * 1024 * 1024;
+
+export async function fetchValidated(raw: string, maxHops = 3): Promise<Buffer> {
+  let url = parseOutboundUrl(raw);
+  for (let hop = 0; hop <= maxHops; hop++) {
+    const res = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(5_000) });
+    if (res.status >= 300 && res.status < 400) {
+      const next = res.headers.get("location");
+      if (!next) throw new BadGatewayException("upstream error");
+      url = parseOutboundUrl(new URL(next, url).toString());  // every hop is re-checked
+      continue;
+    }
+    if (!res.ok || !res.body) throw new BadGatewayException("upstream error");  // generic on purpose
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of res.body) {
+      size += chunk.length;
+      if (size > MAX_BYTES) throw new PayloadTooLargeException("upstream response too large");
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+  throw new BadGatewayException("too many redirects");
+}
+```
+
+**Edge cases:**
+- Check the response `Content-Type` against what the feature expects (an avatar import should only accept images) and re-encode images before storing them, so the fetched bytes are never served raw.
+- Log the real error server-side with the destination IP; return the same message to the user for every failure.
+
+#### Indirect fetchers: renderers, parsers and SDKs ➕
+**Problem.** You never call `fetch`, but a component does: a headless browser rendering user HTML into a PDF (image sources, iframes, CSS URLs), image libraries that follow remote references inside SVG files, XML parsers that resolve **external entities** (XXE, which yields both SSRF and local file reads), document converters.
+
+**Why it works:** each of these is an HTTP client with its own resolver and redirect logic, so your URL validator **never sees** its requests.
+
+**Mechanism.** Switch off network access inside the component, and isolate it at the network level as the real boundary.
+
+```ts title="render-pdf.ts"
+await page.setRequestInterception(true);
+page.on("request", (req) => {
+  const u = new URL(req.url());
+  if (u.protocol === "data:" || ALLOWED_ASSET_HOSTS.has(u.hostname)) req.continue();
+  else req.abort();                       // everything else, including internal hosts, is refused
+});
+await page.setContent(userHtml, { waitUntil: "networkidle0" });
+const pdf = await page.pdf();
+```
+
+**Edge cases:**
+- Request interception doesn't see everything a browser can do. Run renderers in a separate container whose network can't route to private ranges (next subsection).
+- For XML, keep DTD processing and external entities **disabled** (most Node XML parsers don't resolve them, but check any library that wraps libxml2), or accept JSON instead.
+
+#### Egress controls: the layer that doesn't trust your code ➕
+**Problem.** Every application-level check above can have a bug, and new fetchers get added without review.
+
+**Mechanism.** Move outbound fetching into a **separate workload** and restrict its egress at the network layer: allow the public internet on 443 and DNS, deny private ranges and metadata. The main API keeps its internal access; the fetcher has none. An egress proxy such as Stripe's Smokescreen (see [Webhooks](/docs/backend-first-principles/30-webhooks)) does the same at the HTTP layer.
+
+```yaml title="fetcher-networkpolicy.yaml"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: url-fetcher-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: url-fetcher
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8"]
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+```
+
+**Edge cases:**
+- NetworkPolicy is only enforced if the cluster's network plugin supports it (Calico, Cilium and others); on a plugin without support the object is silently ignored. Test it from inside the pod.
+- Remember IPv6 ranges if the cluster is dual-stack, and add your VPC's own CIDR if it isn't in the private ranges listed.
+
+---
+
+## 7. Parser-level attacks in Node: prototype pollution, unsafe deserialization, ReDoS ➕
+
+Paths and URLs are abused through what your server **does** with input; the next three attacks abuse how JavaScript **parses and processes** it, before business logic even runs. The [Serialization](/docs/backend-first-principles/07-serialization-deserialization) lesson notes that a parsed body can carry keys like `__proto__`; this section explains why that matters.
+
+#### Prototype pollution ➕
+**The attack.** A JSON body contains a key named `__proto__` holding an object such as `isAdmin: true`. A recursive merge or "set by path" helper walks the keys and ends up writing `isAdmin` onto **`Object.prototype`**, the object every plain object inherits from. From then on, every object in the process that lacks its own `isAdmin` reports `true`. Depending on the code this means an authorization bypass, a crash (polluting a property like `toString`), or, through certain library "gadgets" that read options from plain objects, remote code execution.
+
+**Why it works (first principles):** JavaScript looks up a missing property by walking the **prototype chain**. `JSON.parse` creates `__proto__` as a harmless **own** data property. The danger starts when a merge reads that key and then evaluates `target["__proto__"]` on an ordinary object: that hits the **accessor** inherited from `Object.prototype`, which returns the shared prototype itself, and the merge recurses into it and writes there.
+
+```ts title="pollution.vulnerable.ts"
+// VULNERABLE: a typical hand-written deep merge
+function deepMerge(target: any, source: any) {
+  for (const key of Object.keys(source)) {
+    if (typeof source[key] === "object" && source[key] !== null) {
+      target[key] ??= {};                // for "__proto__" this returns Object.prototype
+      deepMerge(target[key], source[key]);
+    } else {
+      target[key] = source[key];
+    }
+  }
+  return target;
+}
+deepMerge(userSettings, req.body);       // a "__proto__" key now writes to every object
+
+// later, anywhere in the same process
+const session = {};
+if ((session as any).isAdmin) { /* reached for everyone */ }
+```
+
+**Mechanism.** Never let input-controlled keys walk the prototype chain, and keep user-keyed data out of plain objects.
+
+```ts title="safe-merge.ts"
+const BLOCKED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && Object.getPrototypeOf(v) === Object.prototype;
+}
+
+export function safeMerge(target: Record<string, unknown>, source: Record<string, unknown>) {
+  for (const key of Object.keys(source)) {
+    if (BLOCKED_KEYS.has(key)) continue;                   // never walk into the prototype chain
+    const value = source[key];
+    if (isPlainObject(value)) {
+      if (!Object.hasOwn(target, key) || !isPlainObject(target[key])) target[key] = {};
+      safeMerge(target[key] as Record<string, unknown>, value);
+    } else {
+      target[key] = value;
+    }
+  }
+  return target;
+}
+
+// dictionaries keyed by user input: a Map has no prototype chain to pollute
+const countsByTag = new Map<string, number>();
+countsByTag.set(tag, (countsByTag.get(tag) ?? 0) + 1);
+```
+
+The layers OWASP recommends on top: validate bodies with a schema that rebuilds a fresh object containing **only declared keys** (Zod, class-validator with `whitelist`); use `new Map()`, `new Set()` or `Object.create(null)` for user-keyed data; start Node with `--disable-proto=delete` to remove the `__proto__` accessor entirely; optionally `Object.freeze(Object.prototype)` at startup.
+
+**Edge cases:**
+- `--disable-proto` doesn't cover the `constructor.prototype` path, which is why `constructor` and `prototype` are blocked keys too.
+- Freezing `Object.prototype` can break libraries that patch built-ins. Try it in CI before production.
+- Query strings can build nested objects (`a[b][c]=1`). The `qs` library refuses prototype keys by default, and Express 5 switched its default query parser to the simple one. Keep that default unless you need nesting.
+- Older versions of popular merge and set-by-path utilities shipped exactly this bug. Keep them patched and prefer `structuredClone` or explicit mapping over generic deep merges of request data.
+
+#### Unsafe deserialization and code-evaluating sinks ➕
+**The attack.** Some formats and libraries can rebuild **functions, class instances or arbitrary types** from data. In the Node world the classic case is a serializer that stores functions and revives them with `eval` (the `node-serialize` package, CVE-2017-5941: a crafted payload containing an immediately invoked function ran on deserialization). YAML loaders that support JavaScript-specific types had the same problem (js-yaml version 4 removed those unsafe types from its default schema). The same family includes passing user strings to `eval`, `new Function`, string-form `setTimeout`, or compiling a user-supplied template (**server-side template injection**).
+
+**Why it works:** a deserializer that can construct executable behaviour turns data into code, the root cause from section 2 again.
+
+**Mechanism.** Accept only **data-only formats** from untrusted sources, parse, validate the shape, then map into your own objects. Never let the input name a type to construct. If data round-trips through the client (state in a cookie or hidden field), sign it with an HMAC and verify the signature before parsing.
+
+```ts title="deserialize-safely.ts"
+import { load } from "js-yaml";        // v4: load() only builds plain data by default
+import { z } from "zod";
+
+const ImportFile = z.strictObject({
+  version: z.literal(1),
+  items: z.array(z.strictObject({
+    sku: z.string().max(64),
+    qty: z.number().int().positive(),
+  })).max(1_000),
+});
+
+export function parseImport(text: string) {
+  if (text.length > 1_000_000) throw new PayloadTooLargeException("file too large");
+  const raw = load(text);              // objects, arrays, strings, numbers, booleans, null
+  return ImportFile.parse(raw);        // exactly the shape we expect, nothing else
+}
+
+// NEVER with untrusted input:
+//   eval(text), new Function(text), setTimeout(text), vm.runInNewContext(text)
+//   serializers that revive functions or class types named inside the payload
+```
+
+**Edge cases:**
+- The Node docs state plainly that the `node:vm` module **is not a security mechanism** and must not run untrusted code. If you must run user code, use a separate process or container with no secrets and no network.
+- `JSON.parse` can't execute code, but it still feeds prototype pollution (above) and denial of service through huge or deeply nested payloads. Cap body size first.
+- YAML anchors and aliases can expand a small document into a huge object. Size-cap the input and prefer JSON for machine-to-machine data.
+
+#### ReDoS: catastrophic regex backtracking ➕
+**The attack.** A validation regex with a **nested quantifier** (OWASP's textbook example is `(a+)+$`) is fed a long run of matching characters followed by one character that makes the match fail. The engine takes seconds, minutes or longer to give up. Because Node runs your JavaScript on **one event-loop thread**, that single request freezes every other request on the process (see [Concurrency](/docs/backend-first-principles/23-concurrency-parallelism)).
+
+**Why it works (first principles):** V8's regex engine is a **backtracking** engine. When a match fails it goes back and tries every other way the pattern could have consumed the input. With `(a+)+`, a run of `n` letters can be split between the inner and outer `+` in about `2^n` ways, and on a near miss the engine tries all of them. OWASP's numbers: 4 characters give 16 paths, 17 characters give 65,536.
+
+**Mechanism.** Write patterns with **only one way to match**, bound input length before matching, and use a linear-time engine for anything user-supplied.
+
+```ts title="redos.ts"
+// VULNERABLE: a slug = one or more chunks, each one or more chars plus an optional hyphen.
+// A long run of letters can be cut into chunks in exponentially many ways.
+const SLUG_BAD = /^([a-z0-9]+-?)+$/;
+
+// FIXED: same intent, one unambiguous path: words joined by single hyphens
+const SLUG_OK = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+export function isSlug(input: string): boolean {
+  if (input.length > 100) return false;   // bound the work before matching
+  return SLUG_OK.test(input);
+}
+
+// patterns supplied by users (search filters, rules): use a linear-time engine
+import RE2 from "re2";                     // no backreferences or lookaround, guaranteed linear
+const userRule = new RE2(patternFromUser);
+```
+
+**Edge cases:**
+- The fixed slug also rejects a trailing hyphen, which is usually what you wanted. Check that a rewrite keeps the intended language.
+- Not every slow pattern is exponential. Patterns like `.*a.*b` are **polynomial**, harmless on 50 characters and painful on a 1 MB string, so length limits matter for every regex on user input.
+- Catch these in CI: `eslint-plugin-regexp` has a `no-super-linear-backtracking` rule. Validator libraries (email, user agent, URL parsers) have had ReDoS advisories, so keep dependencies patched.
+- If a heavy match is unavoidable, run it in a `worker_threads` worker you can terminate on a timeout, so it can't stall the main loop.
+
+---
+
+## 8. Authentication: should you build it at all? 🎓
+
+Authentication answers *which row in the `users` table is this request?* Get it wrong and attackers **impersonate users, read private data, act on their behalf and steal money**. Account-takeover breaches happen daily.
+
+**The lesson's blunt advice: if you can, don't implement the full auth flow yourself in production, use a provider** (it names Clerk, and mentions social providers). This is *not* about avoiding cryptography primitives; it's about the whole flow being far larger than "sign a JWT, store it, verify it":
+
+- **Stateful sessions**: list a user's devices, let the user (or you) **revoke** any or all sessions instantly.
+- **Social login** (Google, GitHub, Twitter): full OAuth redirect flows in **both** frontend and backend for a smooth UX.
+- **Account linking**: when a user who signed up with email/password later clicks "Sign in with Google" with the *same email*, the systems must **link to one account**, not create a second.
+
+Each is weeks of edge cases; cutting corners trades away either security or UX. A provider is a **security company** with a dedicated team that tracks new attacks 24/7 and has already solved these. When the bill reaches tens of thousands (you'll have revenue by then), consider migrating to your own.
+
+**But you still must understand auth** to configure a provider safely and know what can go wrong, which is the rest of this section.
+
+---
+
+## 9. Password storage 🎓
+
+A user signs up with an email and password. What do you store so you can verify later? The lesson builds up the answer by breaking each naive version.
+
+<Mermaid chart={`flowchart LR
+  A["Plaintext"] -->|"breach leaks<br/>real passwords"| B["Hash"]
+  B -->|"rainbow table<br/>reverses common ones"| C["Hash + unique salt"]
+  C -->|"GPU brute-forces<br/>billions/sec"| D["SLOW hash + salt<br/>(Argon2id / bcrypt / scrypt)"]`} />
+
+### Stage 1: plaintext (wrong)
+Store the password as text. **Databases get breached constantly**, for many reasons (insider, a breached third party). On a breach, every password leaks. Worse, **70%+ of users reuse passwords**, so a leak compromises their accounts on *other* sites too. Even with no breach, **every employee, DBA, contractor** with DB access can read everyone's password.
+
+### Stage 2: hashing
+A **hash function** maps input of any length to a **fixed-length** output, is **deterministic** (same input -> same output), and is **one-way** (you cannot compute the input from the output with current compute). Store `hash(password)`; on login, hash the attempt and compare to the stored hash. A breach now leaks only hashes, not passwords.
+
+```ts title="hash-only.ts"
+// Illustrative only - see stage 4 for the real recommendation
+const stored = await bcrypt.hash(password, 12);
+const ok = await bcrypt.compare(attempt, stored);
+```
+
+### Stage 3: salting (defeats rainbow tables)
+Because everyone uses the same popular hash, attackers precompute **rainbow tables**: huge maps from common passwords to their hashes. After a breach they look up each stolen hash and recover the common ones.
+
+**Salting** kills the "same input -> same output" property that rainbow tables rely on. Generate a **random, per-user salt** with a **cryptographically secure RNG**, store it next to the hash, and hash **password + salt**. Now two users with password `12345` get **different** hashes, and no precomputed table matches, because the salt was never in it.
+
+<Mermaid chart={`flowchart TD
+  P["Password 12345"] --> M["hash(password + per-user random salt)"]
+  S["Random salt (unique per user, stored)"] --> M
+  M --> H["Stored hash"]
+  R["Attackers rainbow table<br/>of common password hashes"] -. "no match:<br/>salt was never in it" .-> H`} />
+
+### Stage 4: slow hashing (defeats GPU brute force)
+Salting still leaves **offline brute force**. General-purpose hashes (MD5, SHA-256) are *fast*, and a single GPU computes **billions of SHA-256 per second**. With the salt in hand, an attacker hashes candidate passwords until one matches, cracking up to 8-character passwords in days.
+
+The fix: **don't use general-purpose hashes for passwords.** Use a **slow hash** built for the job (**bcrypt**, **scrypt**, or the current recommendation **Argon2id**). They expose a **cost / work factor** you tune: pick, say, **~400 ms per hash**. A real user never notices ~400-600 ms at login, but the attacker drops from a billion/sec to a handful/sec, turning days into **decades or centuries**.
+
+```ts title="password.argon2.ts"
+import argon2 from "argon2";
+
+// Argon2id bundles a random salt into the output string
+const hash = await argon2.hash(password, {
+  type: argon2.argon2id,
+  memoryCost: 19456, // 19 MiB
+  timeCost: 2,
+  parallelism: 1,
+});
+const ok = await argon2.verify(hash, attempt); // constant-time compare inside
+```
+
+🔧 **Verified against OWASP's Password Storage Cheat Sheet:**
+- **Argon2id** baseline: `m = 19456` (19 MiB), `t = 2`, `p = 1` (other memory/CPU trade-offs are listed).
+- **scrypt** when Argon2 is unavailable: `N = 2^17`, `r = 8`, `p = 1`.
+- **bcrypt** only for legacy; **minimum work factor 10**; it **truncates input at 72 bytes**, so pre-hash long inputs or cap length.
+- A **pepper** (a secret shared across all hashes, kept in a vault/HSM, *not* in the DB) adds defence if the DB alone leaks. It's optional and separate from the per-user salt.
+- The lesson points to **Lucia** (now a *guide* to rolling your own auth, not a library) as a good primitives reference.
+
+---
+
+## 10. Sessions (stateful auth) 🎓
+
+You can't make users retype their password on every request. After a successful login the server does **three things**:
+
+1. **Generate a random session ID**: a long string (the lesson says 128-256 characters) from a **cryptographically secure RNG**. If an attacker can *guess* it, they hijack the session. With 128 bits of entropy there are more possible IDs than atoms in the universe, so guessing is hopeless.
+2. **Store the ID server-side** (Redis for speed, or Postgres/MySQL) with **metadata**: owner, created-at, expiry (e.g. 7 days), IP (for the "where you're signed in" list), and **user-agent** (device/browser).
+3. **Send the ID to the browser in a cookie.** Every later request carries it back; the server looks it up and resolves the user.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant S as Server
+  participant R as Redis/DB
+  B->>S: POST /login (email, password)
+  S->>S: verify with slow hash
+  S->>S: generate CSPRNG session id (128+ bits)
+  S->>R: store id -> {userId, ip, ua, createdAt, expiry}
+  S-->>B: Set-Cookie: session=... (HttpOnly, Secure, SameSite)
+  B->>S: later request (cookie auto-attached)
+  S->>R: look up id
+  R-->>S: userId
+  S-->>B: response as that user`} />
+
+### Cookie flags that matter
+| Flag | What it does | Why |
+|---|---|---|
+| **HttpOnly** | JavaScript cannot read the cookie | If your site has an **XSS** hole, a script still can't steal the session ID. (This is why you must **not** keep session IDs / tokens in `localStorage`, which JS can always read.) |
+| **Secure** | Cookie sent only over HTTPS | Stops interception on public Wi-Fi, malicious ISPs or routers, or anyone sniffing with Wireshark. |
+| **SameSite** | Controls whether the cookie rides **cross-site** requests | Blocks the **CSRF** class (section 18). |
+
+**SameSite values:**
+- **Strict**: sent only when the request originates from your own site. A link to your site hosted elsewhere won't carry it. Best for session cookies.
+- **Lax**: sent on **top-level navigations** (clicking a direct link) but **not** on sub-resource triggers like `<img>` or `<iframe>`, exactly the vectors CSRF abuses.
+- **None**: sent on all cross-site requests; **requires `Secure`**.
+
+For a session cookie use **Strict** (or Lax if your frontend and backend are on different domains); **never None**.
+
+🔧 **Verified against OWASP + MDN:**
+- OWASP's minimum is **64 bits of entropy** for a session ID (the lesson is more generous). Use a CSPRNG.
+- **Regenerate the session ID on login** (and any privilege change) to prevent **session fixation**.
+- Prefer the **`__Host-` cookie prefix** for session IDs: it forces `Secure`, no `Domain`, and `Path=/`, blocking subdomain forgery and HTTPS downgrade. Example: `Set-Cookie: __Host-sid=...; Secure; HttpOnly; SameSite=Strict; Path=/`.
+- Modern browsers already default unspecified `SameSite` to **Lax**, so you're protected unless you explicitly set `None`.
+
+```ts title="session-cookie.ts"
+res.cookie("__Host-sid", sessionId, {
+  httpOnly: true,
+  secure: true,
+  sameSite: "strict",
+  path: "/",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+});
+```
+
+---
+
+## 11. JWTs (stateless auth) 🎓
+
+With sessions the server stores the data and gives the client only an **ID**. With **JWTs** the **whole payload** travels to the client, who tells the server who they are on each request. The obvious worry, "can't the client just claim to be someone else?", is answered by the **signature**.
+
+A JWT has three dot-separated parts:
+
+| Part | Contents |
+|---|---|
+| **Header** | token type and signing algorithm |
+| **Payload** | **claims** (key/value facts): `sub` (user id), `iat` (issued-at, used for expiry), plus custom claims like `name`, `admin` |
+| **Signature** | `sign(header + payload, secret)` using a server-only secret |
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant S as Server
+  B->>S: POST /login (email, password)
+  S->>S: verify password (same hashing + salt)
+  S->>S: build payload {sub, name, admin, iat}
+  S->>S: sign(header+payload, SECRET) -> signature
+  S-->>B: JWT (header.payload.signature)
+  B->>S: later request, Authorization: Bearer JWT
+  S->>S: verify(JWT, SECRET)
+  alt signature valid
+    S-->>B: trust claims, respond
+  else tampered
+    S-->>B: 401 (verification failed)
+  end`} />
+
+On each request the client sends the JWT in the **`Authorization`** header; the server runs `verify(token, secret)`. If the signature checks out, the payload is untampered. **Advantage:** no DB/Redis lookup, so horizontal scaling is easy.
+
+### The downsides the lesson stresses
+- **Revocation is hard.** You can't delete a token from the client. If an account is compromised and the user asks you to log out all devices, a pure-JWT system **can't** do it instantly the way sessions can. Workarounds:
+  - **Blacklist** tokens in Redis/DB and reject any request bearing one (this reintroduces server state).
+  - **Short-lived access token + longer-lived refresh token.** Access token expires in ~5-10 min; on a `401` the client sends the refresh token (saved safely) to mint a new pair. A stolen access token is useful for only minutes; a stolen refresh token still expires in a day or so.
+- **The payload is only Base64, not encrypted.** Anyone can decode it (the lesson decodes one live). Editing it, though, breaks the signature and the server rejects it. So **never put sensitive data in the payload**, only facts that are harmless if seen.
+- **Storage is a dilemma.** `localStorage` is XSS-stealable; cookies need to be **HttpOnly**, at which point you're back to the cookie-based session model anyway.
+
+**The lesson's recommendation:** prefer **stateful sessions** unless you have a specific horizontal-scaling need, and even then back them with Redis. If you do use JWTs, use **short expiry (minutes to hours, not days)**, **refresh-token flows with server-side storage**, and **HttpOnly cookies** rather than `localStorage`.
+
+🔧 **JWT pitfalls (verified against RFC 8725):** pin the accepted **algorithm allow-list** in `verify` and never let the token's own `alg` header pick it (the classic **`alg: none`** and **RS256->HS256 confusion** attacks). Validate **`exp`**, and validate **`iss`/`aud`** when multiple parties share tokens.
+
+---
+
+## 12. Rate limiting 🎓
+
+Without it, an attacker can fire **thousands to millions of requests** at your auth endpoint, either **brute-forcing** a password match or **overloading** the server until it crashes. Rate limiting is **mandatory** for auth. Be **strict on auth endpoints**, more **generous elsewhere**. The lesson stacks **three layers**, because each has a blind spot:
+
+<Mermaid chart={`flowchart TD
+  A["Login attempt"] --> L1{"Per-IP limit<br/>e.g. 10/min"}
+  L1 -->|"blind to: shared office IPs<br/>+ botnets/VPN/rotating IPs"| L2{"Per-account limit<br/>e.g. 5 fails / 15 min -> lock"}
+  L2 -->|"blind to: one password<br/>sprayed across many accounts"| L3{"Global limit<br/>e.g. 100 fails/min system-wide"}
+  L3 --> ALERT["Over threshold -> alert,<br/>CAPTCHA, block IP ranges"]`} />
+
+1. **Per-IP** (e.g. 10 attempts/min): stops naive automation. **Blind spot:** a university/office NATs many users behind **one IP** (false positives), and attackers rotate IPs via **botnets, proxies, VPNs**.
+2. **Per-account** (e.g. 5 failures / 15 min then lock 24 h): stops IP-rotating attacks on one account. **Blind spot:** **password spraying**, one common password tried once across **many** accounts, trips neither per-IP nor per-account limits.
+3. **Global** (e.g. 100 failed logins/min system-wide): catches spraying. Crossing it should **raise an alert**, so you can block IP ranges or show CAPTCHAs to separate real users from bots.
+
+Together they block **both** account takeover and server overload.
+
+```ts title="rate-limit.ts"
+// sketch: per-IP + per-account counters in Redis with TTL windows
+async function allowLogin(ip: string, email: string): Promise<boolean> {
+  const perIp = await redis.incr(`rl:ip:${ip}`);
+  if (perIp === 1) await redis.expire(`rl:ip:${ip}`, 60);
+  if (perIp > 10) return false;
+
+  const perAcct = await redis.incr(`rl:acct:${email}`);
+  if (perAcct === 1) await redis.expire(`rl:acct:${email}`, 15 * 60);
+  if (perAcct > 5) return false;
+
+  const global = await redis.incr(`rl:global`);
+  if (global === 1) await redis.expire(`rl:global`, 60);
+  if (global > 100) { await alertSecurity("login spike"); return false; }
+  return true;
+}
+```
+
+🔧 Count **failures**, not successes, so you don't lock out a busy legitimate user; and prefer **lock + notify** over permanent locks to avoid a denial-of-service against your own users.
+
+---
+
+## 13. Application-layer denial of service ➕
+
+Rate limiting counts **requests**, but one request that is cheap to send can trigger very expensive work, so you also have to cap **how much each request is allowed to cost**. OWASP lists this as API4:2023, Unrestricted Resource Consumption. Body-size limits are covered in [Validations](/docs/backend-first-principles/09-validations-transformations) and [Serialization](/docs/backend-first-principles/07-serialization-deserialization); this section covers the other costs.
+
+<Mermaid chart={`flowchart LR
+  R["One request"] --> P["Parse<br/>size, depth"]
+  P --> W["Work<br/>hashing, regex, rendering"]
+  W --> D["Database<br/>rows scanned, query time"]
+  W --> X["Third parties<br/>SMS, email, paid APIs"]
+  P -.->|"cap"| C1["size and time limits"]
+  W -.->|"cap"| C2["concurrency limits"]
+  D -.->|"cap"| C3["page size + statement_timeout"]
+  X -.->|"cap"| C4["quotas + spend limits"]`} />
+
+#### Expensive endpoints: cap concurrent work, not just request rate ➕
+**The attack.** The attacker picks the endpoint with the worst cost per request and calls it from many IPs, each staying under its per-IP limit. Login is the sharpest example on this page: the Argon2id settings from section 9 use about 19 MiB per hash, so **200 concurrent login attempts want roughly 3.8 GB of memory**, however well each IP is rate-limited. Report generation, image resizing, exports and full-text search behave the same way.
+
+**Why it works:** a request-rate limit bounds the **count** of requests, not their **cost**, and the cost of different requests varies by orders of magnitude.
+
+**Mechanism.** Give each expensive operation a **bounded number of concurrent slots** and shed load quickly when they're full (a `503` with `Retry-After`) instead of letting an unbounded queue build up. Do the cheap checks (rate limit, validation) **before** the expensive one, and move heavy work to a [background job queue](/docs/backend-first-principles/14-task-queues-background-jobs).
+
+```ts title="bounded-hashing.ts"
+import pLimit from "p-limit";
+import argon2 from "argon2";
+
+const hashSlots = pLimit(8);       // at most 8 Argon2 operations in flight per process
+const MAX_WAITING = 50;
+
+export async function verifyPassword(stored: string, attempt: string): Promise<boolean> {
+  if (attempt.length > 256) return false;           // never hash a megabyte "password"
+  if (hashSlots.pendingCount > MAX_WAITING) {
+    throw new ServiceUnavailableException("busy, retry later");   // shed load, don't queue forever
+  }
+  return hashSlots(() => argon2.verify(stored, attempt));
+}
+```
+
+**Edge cases:**
+- Limits are **per process**: total capacity is the per-process limit times the number of instances. Size them from a load test, not a guess.
+- Autoscaling on CPU can turn this attack into a cloud bill. Set a maximum instance count and alert when you reach it.
+- Set a generous **maximum password length** (well above 64 characters, which OWASP says to allow at minimum) so long-input hashing can't be used as an amplifier.
+
+#### Bounded queries: page sizes and statement timeouts ➕
+**The attack.** `?limit=1000000`, a page number deep enough to force a huge `OFFSET` scan, a sort on an unindexed column, or a search filter that defeats every index. Each turns one HTTP request into a full table scan.
+
+**Why it works:** the database does work proportional to the rows it touches, and these parameters let the **client choose** that number.
+
+**Mechanism.** Clamp page size on the server, allow-list sortable columns (only indexed ones), use keyset pagination for deep paging (implemented in [REST API design](/docs/backend-first-principles/11-rest-api-design)), and set a **`statement_timeout`** as a backstop so a runaway query is cancelled by Postgres itself.
+
+```ts title="bounded-list.ts"
+const SORTABLE = new Set(["created_at", "title"]);          // both indexed
+
+export function listParams(q: Record<string, unknown>) {
+  const raw = Number(q.limit);
+  const limit = Number.isInteger(raw) ? Math.min(Math.max(raw, 1), 100) : 20;
+  const sort = typeof q.sort === "string" && SORTABLE.has(q.sort) ? q.sort : "created_at";
+  return { limit, sort };     // sort is from a fixed set, so it is safe to place in SQL
+}
+```
+
+```sql title="statement-timeout.sql"
+-- every query the app role runs is cancelled after 5 seconds
+ALTER ROLE app_user SET statement_timeout = '5s';
+
+-- a known-heavy report can opt into more, for one transaction only
+BEGIN;
+SET LOCAL statement_timeout = '30s';
+-- ... report query ...
+COMMIT;
+```
+
+**Edge cases:**
+- A cancelled query raises SQLSTATE `57014`. Map it to a `503` or `504`, not a generic `500`, so clients and dashboards can tell overload from bugs (see [Error handling](/docs/backend-first-principles/16-error-handling-fault-tolerance)).
+- `SELECT count(*)` over a large table is itself expensive. Don't compute exact totals on every page request.
+- Large exports belong in an async job that writes a file, not in a request that streams millions of rows.
+
+#### Slow clients and connection exhaustion ➕
+**The attack.** "Slowloris": open many connections and send the headers or body a few bytes at a time. Each connection holds a socket and memory on the server while costing the attacker almost nothing.
+
+**Why it works:** server resources are allocated **per connection**, and Node's defaults are generous: 60 seconds to receive the headers (`headersTimeout`) and 300 seconds for the whole request (`requestTimeout`).
+
+**Mechanism.** Tighten the server timeouts, and terminate client connections at a reverse proxy or load balancer that buffers requests and limits connections per IP, so slow clients tie up the proxy, not your Node processes.
+
+```ts title="server-timeouts.ts"
+const server = app.listen(3000);
+server.headersTimeout = 20_000;   // complete headers within 20 s (Node default 60 s)
+server.requestTimeout = 30_000;   // complete request within 30 s (Node default 300 s)
+```
+
+**Edge cases:**
+- A short `requestTimeout` also cuts off honest slow uploads. Send large uploads straight to object storage with presigned URLs ([Object storage part 2](/docs/backend-first-principles/object-storage-part-2)) instead of through the API.
+- Keep the keep-alive timeouts consistent with your load balancer's, as explained in the [HTTP lesson](/docs/backend-first-principles/05-http).
+
+#### Amplification: batching and GraphQL ➕
+**The attack.** One HTTP request that carries **many operations**: a batch endpoint taking an array of thousands of items, a GraphQL query with deeply nested relations (posts, their authors, those authors' posts, and so on), or the same expensive field repeated many times under different **aliases**. Per-request rate limits count it once.
+
+**Why it works:** the work grows with the **shape** of the request (depth, breadth, repetition), not with the number of requests, and nested resolvers can multiply database calls.
+
+**Mechanism.** Cap array lengths in batch endpoints and count each item against the rate limit. For GraphQL, reject queries over a **depth limit**, compute a **cost** (complexity) per query and reject expensive ones, and for first-party clients accept only **persisted queries** (an allow-list of known operations).
+
+```ts title="graphql-limits.ts"
+import depthLimit from "graphql-depth-limit";
+
+const server = new ApolloServer({
+  schema,
+  validationRules: [depthLimit(7)],   // reject queries nested deeper than 7 levels
+});
+```
+
+**Edge cases:**
+- Depth alone misses alias repetition: 500 aliases of one expensive field sit at depth 1. That's why a cost limit is needed too (libraries such as `graphql-query-complexity`).
+- Turning off introspection hides the schema but doesn't limit cost. It is not a defence by itself.
+
+#### Cost amplification through third parties ➕
+**The attack.** Endpoints that trigger **paid** actions: sending an SMS one-time code, emails, calls to paid AI or data APIs. In "SMS pumping", attackers request codes to premium-rate numbers they profit from; your bill is their revenue. Email bombing uses your sign-up form to flood a victim.
+
+**Why it works:** the request is free for the attacker and costs you money per call, often with no limit except your card.
+
+**Mechanism.** Quotas per user, per destination and per IP; a CAPTCHA or other friction before anonymous triggers; and **provider-side spending limits** and country allow-lists, which OWASP also recommends.
+
+```ts title="otp-quota.ts"
+export async function allowOtp(phoneE164: string, ip: string): Promise<boolean> {
+  const day = new Date().toISOString().slice(0, 10);
+  const perPhone = await redis.incr(`otp:phone:${phoneE164}:${day}`);
+  if (perPhone === 1) await redis.expire(`otp:phone:${phoneE164}:${day}`, 86_400);
+  const perIp = await redis.incr(`otp:ip:${ip}:${day}`);
+  if (perIp === 1) await redis.expire(`otp:ip:${ip}:${day}`, 86_400);
+  if (!ALLOWED_COUNTRY_PREFIXES.some((p) => phoneE164.startsWith(p))) return false;
+  return perPhone <= 5 && perIp <= 20;
+}
+```
+
+**Edge cases:**
+- Pumping spreads across **many** destination numbers, so add a global daily cap and an alert on unusual spend, not only per-number limits.
+- Configure billing alerts at the provider even when your own limits look solid.
+
+---
+
+## 14. Authorization 🎓
+
+Authentication = *who are you*. Authorization = *what are you allowed to do*. The dangerous confusion isn't the definitions, it's the **implementation**: checks placed at the wrong layer.
+
+### The false sense of security
+A typical backend has layers: **routing -> handler (parse/validate) -> service -> repository**. Auth middleware (`requireAuth`) usually sits at the **routing layer**, plus coarse checks like role or a granular permission (`read:books`). The trap: once a request passes those, engineers assume it may touch **any** resource.
+
+<Mermaid chart={`flowchart TD
+  R["Routing layer<br/>requireAuth + has read:books?"] --> H[Handler]
+  H --> SVC[Service]
+  SVC --> REPO["Repository<br/>SELECT * FROM books WHERE id = 5"]
+  X["MISSING: AND owner_id = currentUser<br/>-> user reads someone elses book"] -.-> REPO`} />
+
+`GET /books?id=5` passes auth and the `read:books` permission, and the repository runs `SELECT * FROM books WHERE id = 5`, **but book 5 isn't this user's**. Having permission to read books in general is not permission to read **this** book.
+
+### BOLA / IDOR (horizontal attack)
+**Broken Object Level Authorization** (a.k.a. **Insecure Direct Object Reference**): the system never checks ownership **at the data layer**. An attacker scripts a loop over IDs and downloads **every** invoice, every user's financial data, maybe tampering with them.
+
+**Fix: authorize at the point of access.** Carry the authenticated user id in the request context and **put it in the query**, for **every** read *and* write:
+
+```ts title="bola-fix.ts"
+// VULNERABLE
+const book = await db.query("SELECT * FROM books WHERE id = $1", [id]);
+
+// FIXED: ownership is part of the query itself
+const book = await db.query(
+  "SELECT * FROM books WHERE id = $1 AND owner_id = $2",
+  [id, ctx.userId],
+);
+```
+
+### 404 vs 403: don't leak existence
+A subtle mistake: fetch the invoice, then `if (ctx.userId !== invoice.ownerId) return 403`. Technically correct, but a **403 confirms the invoice exists**. An attacker enumerating IDs learns which ones are real and plans further attacks (e.g. social engineering).
+
+**Better: fold ownership into the query and return 404 when no row matches.** Now the attacker can't tell "doesn't exist" from "exists but not yours".
+
+<Mermaid chart={`flowchart TD
+  A["GET /invoices/7"] --> B["SELECT * FROM invoices<br/>WHERE id = 7 AND owner_id = me"]
+  B -->|"row found"| C[200 return it]
+  B -->|"no row"| D["404 Not Found<br/>(same answer for not-yours and not-exists)"]
+  E["403 leaks: this invoice exists"] -. avoid .-> D`} />
+
+### BFLA (vertical attack)
+**Broken Function Level Authorization** is about **functions**, not rows: admin-only endpoints. For `GET /admin/invoices` you **can't** add `WHERE owner_id = me`, the admin must see all. The wrong "defence" is **security through obscurity**: keeping the admin URL secret. Anyone who sees the URL in traffic and finds no role check gets every invoice.
+
+**Fix:** a **role middleware** in addition to the permission check, requiring `role = admin` for admin functions.
+
+```ts title="bfla-fix.ts"
+router.get("/admin/invoices",
+  requireAuth,
+  requireRole("admin"),   // vertical check: not just authenticated, but admin
+  listAllInvoices,
+);
+```
+
+### Sequential IDs make enumeration easy
+Sequential integer IDs (`101`, `102`, ...) in URLs let attackers guess neighbouring resources. Prefer **UUIDs** as public identifiers (URL-friendly, unguessable). 🔧 Random UUIDs can hurt index locality in Postgres; **UUIDv7** (time-ordered) keeps inserts B-tree-friendly while staying unguessable.
+
+### Two mental models, four rules
+
+<Mermaid chart={`flowchart LR
+  H["Horizontal attack<br/>user A reaches user Bs data"] --> H1["BOLA / IDOR"]
+  V["Vertical attack<br/>user reaches admin functions"] --> V1["BFLA"]`} />
+
+- **Horizontal**: reach *another user's* data (BOLA/IDOR). Scope widens sideways.
+- **Vertical**: climb to *higher-privilege* functions (BFLA). Scope widens upward.
+
+How to defend:
+1. **Centralize authorization logic** in one layer, so it isn't scattered, inconsistent or forgotten.
+2. **Default deny**: anything not explicitly allowed is denied, so new endpoints/resources are protected until you grant access.
+3. **Test authorization explicitly**, with automated tests: user A can't read user B's data; a member can't hit admin functions; an anonymous user can't reach protected resources. Run them in CI so later changes can't silently reopen a hole.
+4. **Audit logs**: log access to sensitive resources (admin endpoints), and **flag every failed authorization check** as a potential probe.
+
+---
+
+## 15. Property-level authorization: which fields a user may write and read ➕
+
+BOLA asks "may this user touch this **row**?"; property-level authorization asks "may they touch this **field**?". OWASP's API Top 10 (2023) groups mass assignment and excessive data exposure under **API3, Broken Object Property Level Authorization**. The basic over-posting defence, stripping undeclared fields with a whitelist DTO, is covered in [Validations](/docs/backend-first-principles/09-validations-transformations); the problems below survive a whitelist.
+
+#### Role-dependent writable fields ➕
+**The attack.** `UpdateUserDto` declares `role`, `plan` and `emailVerified` because the admin screen needs them. A member sends `PATCH /users/me` with `role` set to `admin`. Validation passes, because `role` **is** a declared field.
+
+**Why it works:** a whitelist answers "is this a known field?", not "may **this caller** set it?". One DTO shared by two privilege levels gives the lower level the higher level's fields.
+
+**Mechanism.** One DTO per caller type and endpoint, with the privileged one only reachable behind the role guard from section 14.
+
+```ts title="users.dto.ts (NestJS)"
+export class UpdateMyProfileDto {            // what a member may change about themselves
+  @IsOptional() @IsString() @MaxLength(80) displayName?: string;
+  @IsOptional() @IsUrl() avatarUrl?: string;
+}
+
+export class AdminUpdateUserDto extends UpdateMyProfileDto {   // admin-only extras
+  @IsOptional() @IsIn(["member", "admin"]) role?: "member" | "admin";
+  @IsOptional() @IsBoolean() emailVerified?: boolean;
+}
+
+@Patch("me")
+updateMe(@Req() req: AuthedRequest, @Body() dto: UpdateMyProfileDto) {
+  return this.users.updateProfile(req.user.id, dto);
+}
+
+@Patch(":id")
+@Roles("admin")
+adminUpdate(@Param("id", ParseUUIDPipe) id: string, @Body() dto: AdminUpdateUserDto) {
+  return this.users.adminUpdate(id, dto);
+}
+```
+
+**Edge cases:**
+- With `forbidNonWhitelisted: true`, a member sending `role` gets a `400` instead of a silent strip. Write a test that asserts it, as in section 14's rule 3.
+- Admins changing roles is itself sensitive: record it as an audit event (section 22) and stop admins from raising their **own** role.
+
+#### Server-owned fields and nested writes ➕
+**The attack.** The body includes `ownerId`, `tenantId` or `createdBy` with someone else's ID, or uses an ORM's **nested write** syntax (for example Prisma's `connect` on a relation) to attach a new record to another tenant's project.
+
+**Why it works:** ownership is a fact about the **session**, not something the client gets to assert. Spreading the DTO into the ORM call passes along whatever the DTO allows, including fields added to it later.
+
+**Mechanism.** Build the ORM's `data` object **explicitly**, taking ownership from the authenticated context, and never accept relation objects from the body.
+
+```ts title="projects.service.ts"
+// FIXED: every column is chosen here, ownership comes from the session
+await prisma.project.create({
+  data: {
+    name: dto.name,
+    description: dto.description,
+    ownerId: ctx.userId,
+    organizationId: ctx.orgId,
+  },
+});
+
+// VULNERABLE: any field the DTO gains later (or a nested relation object) flows straight in
+// await prisma.project.create({ data: { ...dto, ownerId: ctx.userId } });
+```
+
+**Edge cases:**
+- Updates must not move a resource either: changing `organizationId` on an existing row is a cross-tenant transfer. Leave such columns out of update DTOs entirely.
+- Combine with BOLA: the `WHERE` of the update still needs the ownership condition from section 14.
+
+#### Excessive data exposure on reads ➕
+**The attack.** `return user` serializes everything on the object: `passwordHash`, MFA secrets, reset tokens, internal flags, and other users' email addresses inside nested relations. The frontend only displays the name, so nobody notices, but every field is visible in the network tab.
+
+**Why it works:** the serializer emits whatever the object holds, and **the UI is not a security boundary**. Hiding a field in React does not stop it from being sent.
+
+**Mechanism.** An allow-list on **output** too: explicit `select` lists or response DTOs, with separate views for "public", "self" and "admin".
+
+```ts title="user.views.ts"
+// the query itself only fetches what the public view may show
+const publicUser = await prisma.user.findUniqueOrThrow({
+  where: { id },
+  select: { id: true, displayName: true, avatarUrl: true },
+});
+
+// or, in NestJS, a response class whose fields are opt-in
+@Exclude()
+export class UserResponse {
+  @Expose() id!: string;
+  @Expose() displayName!: string;
+  @Expose({ groups: ["self", "admin"] }) email!: string;
+}
+// with ClassSerializerInterceptor enabled, only @Expose fields are serialized
+```
+
+**Edge cases:**
+- Errors and logs echo whole objects too. Don't put an ORM entity in an error message.
+- A cache that stores the **full** object can later serve it through a different endpoint. Cache the view, not the entity.
+- In GraphQL, every field is an endpoint: put authorization on field resolvers for sensitive fields.
+
+---
+
+## 16. Business-logic abuse ➕
+
+Every section so far looks for a **malformed or unauthorized** request; business-logic attacks use **valid, authorized** requests in an order, quantity or timing you didn't plan for, so validation and access checks all pass. (Account enumeration through login and reset messages is covered in [Authentication](/docs/backend-first-principles/08-authentication-authorization).)
+
+#### Limit-overrun races: one coupon, redeemed twenty times ➕
+**The attack.** Anything limited to "once" or "up to N": a coupon, a gift card balance, a free trial, a vote, a withdrawal. The attacker sends twenty identical requests **at the same moment** (tooling exists to make them arrive within a millisecond of each other). Every request passes the "not yet used" check before any of them records the use.
+
+**Why it works:** the check and the act are separate steps, and under Postgres's default `READ COMMITTED` isolation every concurrent transaction reads the coupon as unused. The [Concurrency](/docs/backend-first-principles/23-concurrency-parallelism) lesson explains check-then-act races and the conditional-`UPDATE` fix; the security twist is that **the attacker creates the concurrency on purpose**, so "it rarely happens" offers no protection.
+
+**Mechanism.** Let the **database** enforce each limit: a conditional update whose row count tells you who won for global caps, a unique constraint for per-user caps, and the side effect in the same transaction.
+
+```sql title="coupon-redemptions.sql"
+CREATE TABLE coupon_redemptions (
+  coupon_id uuid NOT NULL REFERENCES coupons(id),
+  user_id   uuid NOT NULL REFERENCES users(id),
+  order_id  uuid NOT NULL REFERENCES orders(id),
+  PRIMARY KEY (coupon_id, user_id)          -- one redemption per user, enforced by the DB
+);
+```
+
+```ts title="redeem.ts"
+await withTransaction(async (t) => {        // your driver's transaction helper
+  // global cap: the condition and the increment are one atomic statement
+  const { rowCount } = await t.query(
+    "UPDATE coupons SET uses = uses + 1 WHERE id = $1 AND uses < max_uses AND expires_at > now()",
+    [couponId],
+  );
+  if (rowCount !== 1) throw new ConflictException("coupon not available");
+
+  // per-user cap: a concurrent second insert fails with unique_violation (23505)
+  await t.query(
+    "INSERT INTO coupon_redemptions (coupon_id, user_id, order_id) VALUES ($1, $2, $3)",
+    [couponId, ctx.userId, orderId],
+  );
+
+  await t.query(
+    "UPDATE orders SET discount_cents = $2 WHERE id = $1 AND user_id = $3 AND status = 'draft'",
+    [orderId, discountCents, ctx.userId],
+  );
+});
+```
+
+**Edge cases:**
+- An in-memory lock protects one process only; you run several. Redis locks with a TTL can expire in the middle of the operation. Prefer constraints in the database that owns the data.
+- When the side effect lives outside your database (charging a card), pair the DB constraint with an **idempotency key** at the provider (see [Webhooks](/docs/backend-first-principles/30-webhooks)).
+- Test it: an integration test that fires 20 parallel redemptions and asserts exactly one succeeds.
+
+#### Trusting client-supplied business values ➕
+**The attack.** The checkout request includes `price`, `total` or `discount`, and the server uses them. Or it accepts a **negative quantity** (turning a purchase into a credit), a quantity so large that totals overflow, or a fractional amount that rounds in the attacker's favour.
+
+**Why it works:** validation checks **types** ("is it a number?"), not **business truth** ("is that the price?"). Anything the client sends is attacker-controlled.
+
+**Mechanism.** The client sends only **intent** (which item, how many); the server looks up authoritative values and computes the result, in integer minor units.
+
+```ts title="checkout.ts"
+const Line = z.strictObject({
+  sku: z.string().max(64),
+  qty: z.number().int().min(1).max(100),     // no zero, no negatives, no absurd sizes
+});
+const Body = z.strictObject({ lines: z.array(Line).min(1).max(50) });
+
+const { lines } = Body.parse(req.body);
+const { rows } = await db.query(
+  "SELECT sku, price_cents FROM products WHERE sku = ANY($1) AND active",
+  [lines.map((l) => l.sku)],
+);
+const price = new Map(rows.map((r) => [r.sku, r.price_cents as number]));
+if (price.size !== new Set(lines.map((l) => l.sku)).size) throw new BadRequestException("unknown item");
+
+const totalCents = lines.reduce((sum, l) => sum + price.get(l.sku)! * l.qty, 0);  // server-computed
+```
+
+**Edge cases:**
+- Refunds need the same care: cap them at the captured amount minus what was already refunded, using a conditional update so two parallel refunds can't both pass.
+- Apply percentage discounts in integers and round **once**, at a documented point.
+- Currency comes from the product or the account, never from the request.
+
+#### Workflow bypass: skipping steps in a multi-step flow ➕
+**The attack.** A flow spread over several endpoints (cart, pay, confirm; or request reset, verify token, set password) where a later step doesn't check that the earlier one happened. The attacker calls "confirm" or "ship" directly, or replays a step that should only work once.
+
+**Why it works:** each handler assumes the previous step ran, because **the UI only links forward**. The API has no such guarantee.
+
+**Mechanism.** Model the flow as an explicit **state machine** stored in the database, and enforce each transition atomically with the current state in the `WHERE` clause.
+
+```ts title="order-state.ts"
+// allowed transitions, documented in one place
+export const TRANSITIONS = {
+  pending_payment: ["paid", "cancelled"],
+  paid: ["shipped", "refunded"],
+  shipped: ["delivered"],
+} as const;
+
+// enforced where the data lives: only a paid order can become shipped, exactly once
+const { rowCount } = await db.query(
+  "UPDATE orders SET status = 'shipped', shipped_at = now() WHERE id = $1 AND status = 'paid'",
+  [orderId],
+);
+if (rowCount !== 1) throw new ConflictException("order is not in a shippable state");
+```
+
+**Edge cases:**
+- "Paid" must come from the payment provider (a verified webhook or a server-side API call), never from the client reaching a "success" page.
+- One-time tokens (password reset, email verification) should be bound to a user and a purpose, expire, and be consumed in the same statement that checks them (`DELETE ... RETURNING`), so they can't be replayed in parallel.
+
+---
+
+## 17. XSS (cross-site scripting) 🎓
+
+**XSS = an attacker gets their JavaScript to run in another user's browser, in the context of your site.** That's dangerous because in-page JS can **read everything on the page** (including sensitive data), **call your API as the logged-in user** (it has the cookies / `localStorage`), **redirect to a phishing page**, and **rewrite the page** to fool the user.
+
+### Stored XSS (the demo scenario)
+A blog comment system supports Markdown. The usual pipeline: user writes Markdown -> you convert it to **HTML** -> you **inject that HTML into the DOM** (in React, via `dangerouslySetInnerHTML`). React names the prop "dangerously" on purpose: it's warning you about XSS. If the conversion lets a `<script>` through and you inject the result, **the script executes as first-party JS**. With **stored** XSS it's saved in the DB and runs in **every viewer's** browser, letting the attacker exfiltrate cookies/`localStorage` to their own server.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant A as Attacker
+  participant S as Server/DB
+  participant V as Victim browser
+  A->>S: comment containing a script tag (no sanitization)
+  S->>S: store raw HTML
+  V->>S: open the thread
+  S-->>V: send stored HTML
+  V->>V: inject into DOM -> attackers script RUNS as first-party
+  V->>A: script sends cookies / localStorage to attacker`} />
+
+Other variants: **reflected XSS** (script echoed from the URL) and **DOM-based XSS** (unsafe client-side DOM writes). All share the same root cause as SQL injection: **user content treated as code instead of data**, this time in the browser's HTML/JS context.
+
+### Mechanism 1: sanitize on the way in
+Before storing user markup, **sanitize** it: strip dangerous constructs like `<script>` and keep only safe HTML.
+
+```ts title="sanitize.ts"
+import DOMPurify from "isomorphic-dompurify";
+
+// strip scripts/handlers; keep safe formatting
+const safeHtml = DOMPurify.sanitize(renderedHtml, {
+  ALLOWED_TAGS: ["p", "ul", "li", "strong", "em", "a", "code", "pre", "h1", "h2"],
+  ALLOWED_ATTR: ["href"],
+});
+```
+
+🔧 Prefer **contextual output encoding / auto-escaping** (what React, and template engines like Handlebars, do by default) over hand-rolled sanitization; only reach for `dangerouslySetInnerHTML` with a vetted sanitizer like DOMPurify. The deeper point from the lesson: **whenever you handle user data, be mindful**, for storage, for queries, for file handling. That habit removes ~99% of vulnerabilities.
+
+### Mechanism 2: Content-Security-Policy (the backstop)
+**CSP** is an HTTP response header where your server tells the browser **exactly which resources to trust**: run scripts only from listed sources, **block inline scripts** (which kills injected `<script>` blocks), restrict image origins, and so on. If an injected script slips through, the browser **refuses to run it**.
+
+```http title="CSP header"
+Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'self'
+```
+
+**Crucial nuance the lesson makes:** CSP is **not a fix, it's a last line of defence.** You must still fix the root cause by sanitizing/encoding. CSP is there for the remote edge case that slips past everything else.
+
+---
+
+## 18. CSRF (cross-site request forgery) 🎓
+
+The lesson covers CSRF **briefly** and says it's **not a major threat for modern apps** (legacy systems aside). It works because of the **cross-site nature of cookies**: your browser **auto-attaches** a site's cookies to **any** request to that site, **even one triggered from another site**.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant V as Victim (logged into bank.com)
+  participant E as evil.com
+  participant Bk as bank.com
+  V->>E: visits malicious page
+  E->>V: auto-submitting form / img tag -> request to bank.com
+  V->>Bk: request to bank.com (browser attaches bank.com cookie)
+  Bk-->>V: sees valid cookie -> treats it as genuine -> acts
+  Note over Bk: SameSite cookie would have blocked the cross-site send`} />
+
+Example: you're logged into `bank.com`; you visit `evil.com`, which auto-submits a form or uses an `<img>` to fire a request at `bank.com`. Your browser attaches the `bank.com` cookie, so the bank sees a "genuine" request and performs the action.
+
+**Why it's mostly solved today:**
+- **SameSite cookies.** With `Strict` (or `Lax`), the session cookie **isn't sent** on these cross-site, sub-resource-triggered requests. Modern browsers **default to Lax**, so unless you set `None`, you're protected.
+- **CORS** is a secondary line: it's not really a security mechanism, but a backend that only accepts requests from its own frontend won't set permissive CORS headers, and the browser blocks the response.
+
+So with current frameworks and `SameSite` defaults, CSRF rarely needs dedicated effort. 🔧 For state-changing endpoints that must allow some cross-site use, add the classic **synchronizer / double-submit CSRF token**.
+
+---
+
+## 19. Misconfiguration 🎓
+
+Vulnerabilities aren't only in code; **configuration** opens holes too.
+
+### Secrets management
+Never store secrets (API keys, DB passwords, encryption keys, JWT/auth secrets) **in source code**, they land in Git and everyone with repo access can read them. Keep them in **environment variables** or a **secret manager** (AWS Parameter Store, HashiCorp Vault).
+
+**Critical edge case:** deleting a committed secret **doesn't** remove it, it's still in **Git history**. The moment a secret is committed, **rotate it** (revoke and reissue), don't just delete the line.
+
+<Mermaid chart={`flowchart LR
+  A["Secret committed to Git"] --> B["Pushed to GitHub/GitLab"]
+  B --> C["Everyone with repo access can read it"]
+  C --> D["Delete the line?"]
+  D -->|"still in commit history"| E["Only safe move: ROTATE the secret"]`} />
+
+### Debug mode in production
+Locally you log at **debug** level: full **stack traces** (revealing file/function structure), **SQL queries**, DB configs, even sensitive user data. In production, set the level to **info**, so that detail never appears in production logs. If you forget and logs are breached, the attacker learns your internals. Be deliberate about the **log level per environment** (local vs staging vs production).
+
+### Security headers
+Beyond CSP, several HTTP headers prevent whole attack classes, e.g. **`X-Frame-Options`** (and the modern **`frame-ancestors`** CSP directive) stop other sites embedding yours in an `<iframe>`, defeating **clickjacking** (an invisible overlay tricks the user into clicking/typing on your site). You rarely set these by hand: a **security-headers middleware** sets the industry-standard set in one line, in any framework (Express/Helmet, Django, Go, etc.).
+
+```ts title="headers.ts"
+import helmet from "helmet";
+app.use(helmet()); // one line sets ~13 security headers with safe defaults
+```
+
+🔧 **Helmet's defaults (verified):** a restrictive `Content-Security-Policy` (`default-src 'self'`, `object-src 'none'`, `frame-ancestors 'self'`, ...), `X-Frame-Options: SAMEORIGIN`, `Strict-Transport-Security: max-age=31536000; includeSubDomains`, `X-Content-Type-Options: nosniff` (stops MIME sniffing), `Referrer-Policy: no-referrer`, and it removes `X-Powered-By`. `X-XSS-Protection` is set to `0` on purpose (the legacy filter caused bugs; CSP replaces it).
+
+---
+
+## 20. Encryption at rest and field-level encryption ➕
+
+Misconfiguration covered where **secrets** live (secret managers and rotation are covered in depth in [Configuration management](/docs/backend-first-principles/17-configuration-management)); the next question is what protects the **data itself** when a database, a backup or a dump leaks.
+
+#### What disk encryption does and doesn't protect ➕
+**Problem.** "Encryption at rest is enabled, so our PII is encrypted" is only partly true. Volume or storage encryption (RDS, EBS, S3 server-side encryption, Postgres on an encrypted disk) encrypts the **blocks** on disk, including backups and snapshots.
+
+**Why it's limited:** the database engine decrypts **transparently** for every authenticated connection. SQL injection, a leaked application credential, an over-privileged analyst or a `pg_dump` all see plaintext.
+
+| Threat | Volume or storage encryption | Field-level encryption (keys outside the DB) |
+|---|---|---|
+| Stolen disk, snapshot or backup file | Protected | Protected |
+| SQL injection reading the table | Not protected | Protected |
+| Leaked DB credentials or a dump | Not protected | Protected |
+| Compromised application server | Not protected | Not protected (the app holds the keys) |
+
+**Mechanism.** Turn on storage encryption everywhere (it's cheap and covers lost media), and add **field-level encryption** for the few columns whose leak would be a disaster: government IDs, bank details, third-party OAuth tokens, MFA secrets.
+
+```hcl title="rds.tf"
+resource "aws_db_instance" "main" {
+  # ...
+  storage_encrypted = true
+  kms_key_id        = aws_kms_key.rds.arn   # a customer-managed key you can audit and restrict
+}
+```
+
+**Edge cases:**
+- On RDS, encryption is chosen when the instance is created; an existing unencrypted instance is migrated by snapshotting, copying the snapshot with encryption, and restoring from it.
+- Exports leave the encrypted volume: CSVs for analytics, logical dumps copied to laptops. Those need their own controls.
+
+#### Field-level encryption with AES-256-GCM ➕
+**Problem.** Encrypting a column naively (a homemade cipher mode, a fixed IV, no integrity check) gives a false sense of safety: identical values produce identical ciphertexts, and an attacker with write access can tamper or swap values undetected.
+
+**Why GCM:** AES-GCM is **authenticated encryption**. It produces ciphertext plus an **authentication tag**, and decryption fails loudly if either was modified. It also accepts **additional authenticated data (AAD)**: context that isn't encrypted but is bound into the tag. Using the row ID and column name as AAD means an attacker with database write access can't move a valid ciphertext from one row to another, because it would no longer verify.
+
+```ts title="field-crypto.ts"
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+
+// stored format: version.iv.ciphertext.tag (all base64)
+export function encryptField(keys: KeyRing, plaintext: string, aad: string): string {
+  const iv = randomBytes(12);                                  // 96-bit nonce, never reused with a key
+  const cipher = createCipheriv("aes-256-gcm", keys.current.key, iv);
+  cipher.setAAD(Buffer.from(aad));                             // e.g. "users:42:national_id"
+  const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();                             // 16 bytes
+  return [keys.current.version, iv, ct, tag].map((p) => (typeof p === "string" ? p : p.toString("base64"))).join(".");
+}
+
+export function decryptField(keys: KeyRing, stored: string, aad: string): string {
+  const [version, ivB64, ctB64, tagB64] = stored.split(".");
+  const key = keys.byVersion(version);                         // old versions stay decryptable
+  const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(ivB64, "base64"), { authTagLength: 16 });
+  decipher.setAAD(Buffer.from(aad));
+  decipher.setAuthTag(Buffer.from(tagB64, "base64"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(ctB64, "base64")),
+    decipher.final(),                                          // throws if anything was tampered with
+  ]).toString("utf8");
+}
+```
+
+**Edge cases:**
+- **Never reuse an IV with the same key.** In GCM a repeated nonce leaks the relationship between the two plaintexts and lets an attacker forge tags. Random 96-bit IVs are safe up to roughly 2^32 encryptions per key (NIST's guidance), which is one more reason to use per-record or per-tenant data keys (next subsection).
+- Pass `authTagLength: 16` when decrypting so a truncated tag is rejected rather than accepted.
+- Encrypted columns can't be indexed, sorted, range-queried or searched with `LIKE`. Decide which queries you still need before encrypting (see blind indexes below).
+- For production systems prefer a vetted library (the AWS Encryption SDK, or your platform's equivalent) over hand-assembled formats; the code above shows the mechanism.
+
+#### Envelope encryption and KMS ➕
+**Problem.** Where does the key come from? An environment variable means anyone who can read the environment can decrypt every row, and rotating it means re-encrypting the whole table.
+
+**Why envelope encryption:** a **key management service** (AWS KMS, GCP KMS, Vault Transit) keeps a **root key** inside hardware it never leaves, but you can't send every field to KMS: it adds latency and has request quotas, and AWS KMS's `Encrypt` only accepts up to 4 KB. So you encrypt data **locally** with a **data key (DEK)**, and ask KMS to encrypt only the small DEK.
+
+**Mechanism.** `GenerateDataKey` returns a DEK twice: once in plaintext and once encrypted under the KMS key. Encrypt with the plaintext copy, store the **encrypted** copy beside the data, and drop the plaintext from memory. To decrypt, send the encrypted DEK to KMS `Decrypt`, which checks IAM permissions and records the call in CloudTrail.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant App as Backend
+  participant KMS as KMS (root key never leaves)
+  participant DB as Database
+  App->>KMS: GenerateDataKey (key id, encryption context)
+  KMS-->>App: plaintext DEK + encrypted DEK
+  App->>App: AES-GCM encrypt field with plaintext DEK
+  App->>DB: store ciphertext + encrypted DEK
+  App->>App: discard plaintext DEK
+  Note over App,DB: later, to read
+  App->>DB: load ciphertext + encrypted DEK
+  App->>KMS: Decrypt (encrypted DEK, same context)
+  KMS-->>App: plaintext DEK (IAM checked, logged)
+  App->>App: decrypt field`} />
+
+```ts title="data-keys.ts"
+import { KMSClient, GenerateDataKeyCommand, DecryptCommand } from "@aws-sdk/client-kms";
+
+const kms = new KMSClient({});
+const CONTEXT = { purpose: "user-pii" };   // must match on decrypt, and appears in CloudTrail
+
+export async function newDataKey() {
+  const out = await kms.send(new GenerateDataKeyCommand({
+    KeyId: process.env.PII_KMS_KEY_ARN,
+    KeySpec: "AES_256",
+    EncryptionContext: CONTEXT,
+  }));
+  return { plaintext: Buffer.from(out.Plaintext!), encrypted: Buffer.from(out.CiphertextBlob!) };
+}
+
+export async function unwrapDataKey(encrypted: Buffer): Promise<Buffer> {
+  const out = await kms.send(new DecryptCommand({ CiphertextBlob: encrypted, EncryptionContext: CONTEXT }));
+  return Buffer.from(out.Plaintext!);
+}
+```
+
+**Edge cases:**
+- **Granularity is a design choice.** A DEK per tenant enables **crypto-shredding**: delete that tenant's encrypted DEK and all their data, including copies in old backups, becomes unreadable. That is useful for erasure requests.
+- Cache unwrapped DEKs in memory for a short time to stay within KMS quotas, and never write them to disk or logs.
+- Restrict `kms:Decrypt` with IAM conditions on the encryption context, and grant it only to the services that genuinely need plaintext. A compromised app server can still decrypt what its role allows, so fewer roles holding `Decrypt` means a smaller blast radius.
+
+#### Searching encrypted fields: blind indexes ➕
+**Problem.** With random IVs, the same email encrypts to a different ciphertext every time, so `WHERE email = $1` and a unique constraint no longer work.
+
+**Why not deterministic encryption:** encrypting identical inputs to identical outputs **leaks equality and frequency** to anyone who reads the table.
+
+**Mechanism.** Store a **blind index** next to the ciphertext: an HMAC of the normalized value under a **separate** key, in an indexed column. Queries compare HMACs; the plaintext never appears in the table.
+
+```ts title="blind-index.ts"
+import { createHmac } from "node:crypto";
+
+export const blindIndex = (indexKey: Buffer, value: string) =>
+  createHmac("sha256", indexKey).update(value.trim().toLowerCase()).digest("base64url");
+
+// write: INSERT ... (email_enc, email_bidx) VALUES ($1, $2)
+// read:  SELECT id, email_enc FROM users WHERE email_bidx = $1   -- exact match only
+// unique: CREATE UNIQUE INDEX ON users (email_bidx)
+```
+
+**Edge cases:**
+- **Low-entropy fields** (dates of birth, four-digit PINs, yes/no flags) can be brute-forced from the HMAC if the index key leaks, and they leak frequency even if it doesn't. Don't blind-index them, or truncate the HMAC so many values share an index entry (accepting false positives you filter after decryption).
+- Blind indexes support exact matches only: no ranges, no prefixes.
+
+#### Key rotation and versioning ➕
+**Problem.** Keys must be rotated (policy, a staff member leaving, suspected exposure) without downtime and without breaking rows written under the old key.
+
+**Mechanism.** Prefix every ciphertext with a **key version** (as `encryptField` does), keep old keys available for **decrypt only**, encrypt new writes with the current key, and re-encrypt old rows in a background job. With envelope encryption, rotating the KMS root key is cheaper: AWS KMS automatic rotation keeps the older key material so existing encrypted DEKs still decrypt, and `ReEncrypt` re-wraps a DEK under a new key without touching the data it protects.
+
+```ts title="key-ring.ts"
+export class KeyRing {
+  constructor(private keys: Record<string, Buffer>, private currentVersion: string) {}
+  get current() { return { version: this.currentVersion, key: this.keys[this.currentVersion] }; }
+  byVersion(v: string): Buffer {
+    const k = this.keys[v];
+    if (!k) throw new Error(`unknown key version ${v}`);   // fail closed
+    return k;
+  }
+}
+// rotation: add "v3", make it current, run the re-encryption job, then remove "v1"
+```
+
+**Edge cases:**
+- Rotation after a **known compromise** isn't enough on its own: data already stolen stays readable with the old key. Re-encrypt, then destroy the old key.
+- Rotating a blind-index key means recomputing every index value, so plan for a dual-index migration window.
+
+---
+
+## 21. npm supply-chain attacks a lockfile doesn't stop ➕
+
+Encryption protects data from people who steal it; the **supply chain** is how attackers get code running **inside** your process, where everything is already decrypted. The [DevOps](/docs/backend-first-principles/31-devops) lesson covers pinning, `npm ci`, `npm audit`, `npm audit signatures` and dependency bots; this section covers the attacks that get through those controls.
+
+#### Typosquatting and invented package names ➕
+**The attack.** Attackers publish packages whose names are one keystroke away from popular ones, or plausible-sounding names that don't exist yet, including names that AI coding assistants tend to invent (nicknamed "slopsquatting"). A developer installs the wrong name, and the package's code runs at install and at import time.
+
+**Why it works:** `npm install` trusts the name you typed, and **a lockfile faithfully pins the malicious package**. Pinning guarantees you get the same bytes every time, not that they are the right bytes.
+
+**Mechanism.** Treat every **new** dependency as a code review item: check the name, publisher, age, download history and linked repository before merging. Automate the gate so it can't be skipped.
+
+```yaml title=".github/workflows/dependency-review.yml"
+name: dependency-review
+on: [pull_request]
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: always    # every added or changed dependency is listed on the PR
+```
+
+**Edge cases:**
+- Transitive dependencies can be squatted too. The lockfile diff shows them; reviewers should read it, not collapse it.
+- Before installing a suggested package, `npm view` it and check that it exists, is old enough to have a history, and points to the repository you expect.
+
+#### Dependency confusion ➕
+**The attack.** Your private registry hosts an internal package named `billing-client`. An attacker publishes `billing-client` on the **public** registry with a higher version number. A build whose resolver can see both registries picks the public one.
+
+**Why it works:** when one name can be served by two registries, resolution rules (often "highest version wins") let an outsider decide which code you get.
+
+**Mechanism (npm's recommendation):** give every internal package a **scope** (`@acme/billing-client`), map that scope to your private registry, and claim the scope on the public registry so nobody else can publish under it.
+
+```ini title=".npmrc"
+@acme:registry=https://npm.internal.acme.example/
+//npm.internal.acme.example/:_authToken=${NPM_TOKEN}
+```
+
+```bash title="CI: every package must come from an expected host over HTTPS"
+npx lockfile-lint --path package-lock.json --allowed-hosts npm npm.internal.acme.example --validate-https
+```
+
+**Edge cases:**
+- A private registry that **proxies** the public one must not fall through to public npm for your internal names; configure the proxy to block them upstream.
+- Watch lockfile diffs for `resolved` URLs changing host. That is what a confusion attack looks like in review.
+
+#### Install scripts: code that runs before you import anything ➕
+**The attack.** Packages can declare `preinstall`, `install` and `postinstall` scripts, which run **during installation** with your user's permissions: on developer laptops full of SSH keys and on CI runners holding cloud and registry tokens. In September 2025 a self-replicating npm worm (nicknamed Shai-Hulud) used this to steal tokens and publish infected versions of the victims' own packages.
+
+**Why it works:** the lockfile pins **which** code is installed, not **whether it runs**, and install time is exactly when secrets are most exposed.
+
+**Mechanism.** Turn lifecycle scripts off by default and opt in per package. pnpm 10 already does this: dependency scripts don't run unless the package is allow-listed.
+
+```ini title=".npmrc"
+ignore-scripts=true
+```
+
+```bash title="CI install"
+npm ci                                    # no dependency scripts run
+npm rebuild sharp --ignore-scripts=false  # opt in for the one package you know needs a build step
+```
+
+```json title="package.json (pnpm 10)"
+{
+  "pnpm": {
+    "onlyBuiltDependencies": ["sharp", "esbuild"]
+  }
+}
+```
+
+**Edge cases:**
+- `ignore-scripts` also skips your **own** project's install hooks (such as a `prepare` script that sets up git hooks); commands you run explicitly, like `npm test`, still run their scripts.
+- Git-hosted dependencies have had script-execution bypasses even with scripts disabled. Avoid them, or vendor the code.
+- Install in a CI step that has **no deploy credentials** in its environment, and use short-lived OIDC credentials for the steps that need them (see [DevOps](/docs/backend-first-principles/31-devops)).
+- Disabling scripts only removes the **earliest** execution point; the package's code still runs when you import it.
+
+#### Fresh-release cooldown and publisher trust ➕
+**The attack.** A maintainer's account is hijacked and a malicious **patch release** of a popular package is published. Caret ranges plus an automated update PR pull it into thousands of projects within hours.
+
+**Why it works:** most malicious releases are found and removed quickly (pnpm's docs note that it's often within an hour), so the risk is concentrated in a version's **first day**, precisely when automation is fastest to adopt it.
+
+**Mechanism.** Refuse to install versions younger than a cooldown period, and prefer packages whose releases carry **provenance** (a signed link from the published tarball to the source commit and CI build, checked by `npm audit signatures`).
+
+```yaml title="pnpm-workspace.yaml"
+minimumReleaseAge: 1440          # minutes: ignore versions published in the last day
+minimumReleaseAgeExclude:
+  - "@acme/*"                    # your own internal packages may update immediately
+```
+
+```json title="renovate.json"
+{ "minimumReleaseAge": "3 days" }
+```
+
+**Edge cases:**
+- Keep an override path for urgent security fixes, which you **do** want immediately.
+- Cooldowns don't help against long-dormant backdoors (the xz case in the DevOps lesson). Review, provenance and runtime least privilege cover those.
+- For packages **you** publish: require 2FA, publish only from CI with provenance (`npm publish --provenance`), and never from a laptop.
+
+---
+
+## 22. Security logging, audit trails and detection ➕
+
+Defence in depth ends with "monitoring and logging" (section 23), and authorization rule 4 in section 14 asks for audit logs; this section makes both concrete. General logging (levels, structure, tracing) is in [Logging and observability](/docs/backend-first-principles/18-logging-monitoring-observability), and keeping secrets and PII out of logs is in [Configuration management](/docs/backend-first-principles/17-configuration-management) and [Error handling](/docs/backend-first-principles/16-error-handling-fault-tolerance).
+
+#### Which security events to record, and in what shape ➕
+**Problem.** In an incident the first questions are "what did this account do, from where, and since when?". Typical logs are full of debug noise yet missing the logins, permission denials and admin actions that would answer them. OWASP lists this as **A09, Security Logging and Alerting Failures**.
+
+**Why it matters:** you can't detect or reconstruct what you never recorded, and attackers count on that.
+
+**Mechanism.** A **fixed vocabulary** of security events, written as structured JSON with OWASP's when, where, who and what: authentication successes and failures, MFA and password changes, session revocations, authorization denials, bursts of validation failures, admin actions and privilege changes, sensitive data exports, and key or configuration changes.
+
+```ts title="security-events.ts"
+type SecurityEvent =
+  | "auth.login.success" | "auth.login.failure" | "auth.mfa.disabled"
+  | "auth.password_reset.requested" | "auth.session.revoked"
+  | "authz.denied" | "admin.role.changed" | "data.export";
+
+export function securityLog(event: SecurityEvent, ctx: RequestContext, details: Record<string, unknown> = {}) {
+  logger.info({
+    type: "security",
+    event,
+    at: new Date().toISOString(),          // when
+    service: "api", requestId: ctx.requestId,  // where, and the link to traces
+    actor: ctx.userId ?? "anonymous",      // who
+    ip: ctx.ip, userAgent: ctx.userAgent,
+    ...details,                            // what: target, outcome, reason. Never tokens or passwords
+  });
+}
+
+securityLog("authz.denied", ctx, { target: `invoice:${invoiceId}`, outcome: "denied", reason: "not_owner" });
+```
+
+**Edge cases:**
+- For failed logins, log a **hash** of the submitted identifier rather than the raw value: users sometimes type their password into the username field.
+- Behind a proxy, take the client IP only from a header your own proxy sets (Express's `trust proxy` setting); otherwise attackers can write any IP they like into the log.
+- Never sample security events, even if you sample debug logs.
+
+#### Log injection and forged entries ➕
+**The attack.** A username or header contains carriage-return and line-feed characters. In a plain-text log the current line ends early and the attacker's text appears as a **new, fake line**, for example a forged successful admin login. Control characters can also garble terminals, and a log viewer that renders entries as HTML can execute script injected through a logged field (stored XSS in your admin tooling).
+
+**Why it works:** a text log uses newlines as its record separator, which makes the log **one more grammar** that user data can break out of.
+
+**Mechanism.** Log **structured JSON**, where the serializer escapes control characters inside string values, and keep user data in its own fields rather than interpolated into a message. If you must write text, strip control characters first. Encode on display in log viewers.
+
+```ts title="log-injection.ts"
+// VULNERABLE: user text becomes part of the line structure
+console.log(`login failed for ${req.body.username}`);
+
+// FIXED: the value is a JSON string field, so newlines are escaped as data
+logger.warn({ event: "auth.login.failure", username: req.body.username });
+
+// text sinks only: neutralize CR, LF and other control characters
+const clean = (s: string) => s.replace(/[\u0000-\u001f\u007f]/g, "_");
+```
+
+**Edge cases:**
+- CSV exports of logs or user data have their own injection: a cell starting with `=`, `+`, `-` or `@` can run as a formula when opened in a spreadsheet. Prefix such cells with a single quote when exporting.
+
+#### Tamper-evident audit logs ➕
+**The attack.** An attacker (or an insider) with application or database access **deletes or edits audit rows** to hide what they did: STRIDE's *repudiation* (section 24).
+
+**Why it works:** if the same credential that writes audit rows can also update and delete them, the audit log is only as trustworthy as that credential.
+
+**Mechanism.** Three layers: (1) **privileges**: the app role may only `INSERT` and `SELECT`; (2) a **hash chain**: each entry stores the hash of the previous entry plus its own content, so editing or deleting a row in the middle breaks every hash after it (detection, not prevention); (3) **off-box copies** in append-only storage (for example S3 Object Lock in compliance mode, which no user, including the account root, can shorten or delete), plus periodically recording the latest hash somewhere the database admins can't write.
+
+```sql title="audit-log.sql"
+CREATE TABLE audit_log (
+  id        bigserial PRIMARY KEY,
+  payload   text NOT NULL,          -- canonical JSON exactly as hashed
+  prev_hash text NOT NULL,
+  hash      text NOT NULL
+);
+REVOKE ALL ON audit_log FROM app_user;
+GRANT INSERT, SELECT ON audit_log TO app_user;            -- no UPDATE, DELETE or TRUNCATE
+GRANT USAGE ON SEQUENCE audit_log_id_seq TO app_user;
+```
+
+```ts title="append-audit.ts"
+import { createHash } from "node:crypto";
+
+export async function appendAudit(t: Tx, entry: { actor: string; action: string; target?: string }) {
+  await t.query("SELECT pg_advisory_xact_lock(hashtext('audit_log'))"); // one writer at a time
+  const { rows } = await t.query("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1");
+  const prevHash = rows[0]?.hash ?? "GENESIS";
+  const payload = JSON.stringify({ at: new Date().toISOString(), ...entry });
+  const hash = createHash("sha256").update(prevHash + payload).digest("hex");
+  await t.query(
+    "INSERT INTO audit_log (payload, prev_hash, hash) VALUES ($1, $2, $3)",
+    [payload, prevHash, hash],
+  );
+}
+// verification job: walk rows in id order, recompute each hash, alert on the first mismatch
+```
+
+**Edge cases:**
+- Hash the **exact stored text**. A `jsonb` column reorders keys, so recomputing from it would never match; that's why `payload` is plain `text`.
+- Without the advisory lock, two concurrent writers read the same previous hash and the chain forks. For high volume, chain per partition (per tenant or per hour) instead of globally.
+- A hash chain doesn't stop someone who can rewrite the **entire** table and recompute every hash. Anchoring the head hash outside the database is what catches that.
+
+#### From logs to detection: alerts that catch attacks ➕
+**Problem.** Logs that nobody reads detect nothing. Breaches are often discovered months later, by a third party.
+
+**Mechanism.** Alert rules over security events that match attack patterns from this page: a spike in failed logins system-wide (password spraying, section 12), one IP failing against many accounts, one user collecting many **authorization denials across distinct IDs** (BOLA probing, section 14), MFA disabled followed quickly by an email change (account takeover), admin actions at unusual hours. **Canary tokens** add high-confidence signals: a fake API key or a decoy admin route that nobody legitimate ever uses, which alerts the moment it's touched.
+
+```sql title="detect-id-enumeration.sql"
+-- users with many authorization denials across distinct objects in 10 minutes
+SELECT actor,
+       count(*)               AS denials,
+       count(DISTINCT target) AS distinct_targets
+FROM security_events
+WHERE event = 'authz.denied'
+  AND at > now() - interval '10 minutes'
+GROUP BY actor
+HAVING count(DISTINCT target) > 20;
+```
+
+**Edge cases:**
+- **Alert fatigue** kills detection. Page a human only for high-confidence rules, and route the rest to a daily review.
+- Keep security logs long enough to investigate a breach found late (months, not days), and protect the pipeline itself: attacker-controlled events can flood it, so rate-limit per source rather than dropping security events.
+
+---
+
+## 23. The unifying idea: boundaries + defence in depth 🎓
+
+Every vulnerability here, and the hundreds not covered, is really about **boundaries**: data crossing between systems, privilege levels, languages or markup contexts.
+
+| Attack | Boundary crossed |
+|---|---|
+| SQL injection | user input -> SQL grammar |
+| Command injection | user input -> shell grammar |
+| XSS | user Markdown -> HTML/JS in a browser |
+| Broken authorization | request -> data a different user/role should reach |
+
+So at every boundary, ask three questions:
+1. **Where is data crossing a boundary?**
+2. **What assumptions am I making about it?**
+3. **What if those assumptions are wrong?**
+
+Ask them habitually and you avoid ~99% of real-world backend vulnerabilities.
+
+**And layer your defences**, no single one is perfect:
+
+<Mermaid chart={`flowchart TD
+  L1["1. Input validation<br/>strict schema at the first entry point"] --> L2["2. Parameterized operations<br/>separate code from data (SQL, shell)"]
+  L2 --> L3["3. Authorization at the point of access<br/>check at the repository, not just routing"]
+  L3 --> L4["4. Security headers & policies<br/>CORS, CSP, headers limit the blast radius"]
+  L4 --> L5["5. Monitoring & logging<br/>detect and alert on suspicious activity"]`} />
+
+1. **Input validation first.** Validate everything right after routing; what reaches your handler must be exactly the expected shape, no surprises.
+2. **Parameterized operations.** Explicit parameters / argument arrays for DBs and OS calls; never string-concatenate commands.
+3. **Authorization at the point of access.** Verify where the access actually happens (the repository), not two layers upstream.
+4. **Security headers and policies.** Not robust on their own, but they **shrink the blast radius** when something slips through.
+5. **Monitoring and logging.** Watch for suspicious activity, log it, raise alerts.
+
+An attacker then has to beat **all** layers at once, which is far harder. The closing thought: **security is a mindset you bring before every line of code**, think about boundaries and assumptions.
+
+### 🔧 Where this maps to the OWASP Top 10 (2025)
+The lesson's topics line up with the current OWASP list:
+
+| Lesson topic | OWASP Top 10 (2025) |
+|---|---|
+| BOLA / BFLA / IDOR | **A01 Broken Access Control** |
+| Debug mode, secrets, headers | **A02 Security Misconfiguration** |
+| Password storage, cookies over HTTPS | **A04 Cryptographic Failures** |
+| SQL / NoSQL / command injection, XSS | **A05 Injection** |
+| Weak auth, sessions, rate limiting | **A07 Authentication Failures** |
+| Audit logs, alerting | **A09 Security Logging and Alerting Failures** |
+
+### Where to learn more (the lesson's picks)
+- **PortSwigger Web Security Academy** (makers of Burp Suite): free labs and theory for SQL injection, XSS, CSRF, clickjacking, SSRF, OS command injection, auth/OAuth/JWT and more.
+- **OWASP** and the **OWASP Top 10** (refreshed every few years), plus the **OWASP Cheat Sheet Series** for per-topic best practices (authentication, session management, ...).
+
+---
+
+## 24. Threat modelling with STRIDE ➕
+
+The three boundary questions above are the heart of threat modelling; **STRIDE** turns them into a repeatable checklist you can run on a **design**, before any code exists. OWASP frames the whole exercise as four questions: *What are we working on? What can go wrong? What are we going to do about it? Did we do a good enough job?*
+
+#### Draw the data flow and mark the trust boundaries ➕
+**Problem.** Code review finds bugs in **lines**. Design flaws, such as an internal service with no authentication, a worker that fetches arbitrary URLs from inside the VPC, or a queue anyone can publish to, live **between** components, where no single diff shows them.
+
+**Why it works:** every attack on this page happened where data crossed a boundary, and you can only check the boundaries you have drawn.
+
+**Mechanism.** A **data-flow diagram** for the feature: external entities, processes, data stores, the flows between them, and **trust boundaries** wherever the level of trust changes. Example: an "import avatar from URL" feature.
+
+<Mermaid chart={`flowchart LR
+  U["User browser"] -->|"HTTPS: image URL"| API["API service"]
+  subgraph VPC["Trust boundary: VPC"]
+    API -->|"enqueue job"| Q[("Queue")]
+    Q --> W["Fetcher worker"]
+    W -->|"store image"| S[("Object storage")]
+    API -->|"SQL"| DB[("Postgres")]
+  end
+  W -->|"HTTP GET"| EXT["Arbitrary internet host"]`} />
+
+**Edge cases:**
+- Keep it at **feature** size. A diagram of the whole company is never finished and never read.
+- A whiteboard photo is enough; tools such as OWASP Threat Dragon help once diagrams are shared and versioned.
+- Redraw when the architecture changes. A stale diagram hides exactly the new boundary that matters.
+
+#### Walk STRIDE across every element and flow ➕
+**Problem.** "What can go wrong?" with no structure produces whatever the loudest person in the room remembers.
+
+**Mechanism.** For each element and each arrow that crosses a boundary, ask the six STRIDE questions. Each letter is the violation of one security property:
+
+| Letter | Threat | Property violated | Ask | Seen on this page |
+|---|---|---|---|---|
+| **S** | Spoofing | Authentication | Can someone pretend to be a user or a service? | Session theft (10), forged JWTs (11) |
+| **T** | Tampering | Integrity | Can data be changed in transit or at rest? | Mass assignment (15), swapped ciphertexts (20) |
+| **R** | Repudiation | Accountability | Could someone deny doing something? | Missing or editable audit logs (22) |
+| **I** | Information disclosure | Confidentiality | Can data leak? | SQL injection (3), SSRF (6), over-exposure (15) |
+| **D** | Denial of service | Availability | Can someone exhaust it? | ReDoS (7), expensive endpoints (13) |
+| **E** | Elevation of privilege | Authorization | Can someone gain rights they shouldn't have? | BFLA (14), prototype pollution (7) |
+
+Walking the **fetcher worker to internet** arrow of the example gives: **I**, SSRF to the metadata service or internal APIs; **D**, a huge image or a host that never finishes responding; **T**, a file that claims to be an image but isn't; **E**, an exploit in the image-decoding library. Each threat gets a mitigation from earlier sections: egress policy and IMDSv2, size and time caps, content detection and re-encoding, and running the decoder in a sandboxed worker.
+
+**Implementation.** Record threats as structured data in the repo, next to the code they describe, so they're reviewed like code.
+
+```yaml title="docs/threats/avatar-import.yaml"
+feature: avatar-import
+threats:
+  - id: AVT-1
+    stride: I
+    element: "fetcher worker -> internet"
+    threat: "SSRF reaches the metadata service or internal APIs"
+    mitigation: "egress NetworkPolicy, IMDSv2 required, https-only allow-list, redirects re-validated"
+    verified_by: "test/avatar-import.ssrf.e2e.spec.ts"
+    status: mitigated
+  - id: AVT-2
+    stride: D
+    element: "fetcher worker"
+    threat: "huge or never-ending response exhausts memory or workers"
+    mitigation: "5 MB cap, 5 s timeout, bounded worker concurrency"
+    verified_by: "test/avatar-import.limits.spec.ts"
+    status: mitigated
+```
+
+**Edge cases:**
+- One threat often carries several letters (stealing a session token is **S** and **I**). Don't argue about classification; the letters exist to prompt questions, not to file answers.
+- Rank threats by likelihood and impact, and **explicitly accept** the low ones with a named owner rather than leaving them silently open.
+
+#### Turn threats into tests ➕
+**Problem.** A threat-model document rots the moment it's written; a later refactor quietly removes a mitigation and nothing notices.
+
+**Mechanism.** Every mitigated threat links to an **abuse-case test** that fails if the mitigation disappears, run in CI like the authorization tests in section 14.
+
+```ts title="avatar-import.ssrf.e2e.spec.ts"
+it("refuses to fetch from a link-local or private address", async () => {
+  await request(app)
+    .post("/avatars/import")
+    .set(authHeader(alice))
+    .send({ url: "https://169.254.169.254/" })
+    .expect(400);
+});
+
+it("rejects a role field sent by a member", async () => {
+  await request(app)
+    .patch("/users/me")
+    .set(authHeader(alice))
+    .send({ displayName: "Alice", role: "admin" })
+    .expect(400);
+});
+```
+
+**Edge cases:**
+- Tests prove the mitigations you thought of. "Did we do a good enough job?" still needs outside eyes: code review by someone who didn't build it, and periodic penetration tests.
+
+#### When to do it, and how small it can be ➕
+**Problem.** A heavyweight process gets skipped under deadline, which is exactly when shortcuts get taken.
+
+**Mechanism.** Make it **cheap and triggered**: a 30-to-60-minute session whenever a change adds a **new trust boundary**: a new source of external input, a new outbound call, a new data store holding personal data, a new role or privilege level, a new third-party integration. Put the trigger in the pull-request template so the question gets asked every time.
+
+```md title=".github/pull_request_template.md"
+### Security
+- [ ] Does this add a trust boundary? (new input, outbound call, data store, role, integration)
+- [ ] If yes: STRIDE pass done and threats recorded in docs/threats/
+- [ ] New request or response fields reviewed for property-level authorization
+```
+
+**Edge cases:**
+- Threat modelling complements, and doesn't replace, secure defaults (parameterized queries, output encoding, default deny). Those handle the threats you never thought to list.
+- Start with the features that touch money, credentials or personal data; that's where an hour of design review pays back most.
+
+---
+
+## Interview questions
+
+1. **What single root cause do SQL injection, command injection and XSS share?** **Data being treated as code.** User input crosses into another language's grammar (SQL, shell, HTML/JS) where some of its characters mean commands. The fix in each case is to keep structure and data separate: parameterized queries, argument arrays, output encoding/sanitization.
+2. **Why do parameterized queries actually stop SQL injection?** **The database parses the query template first and fixes its structure, then binds values as pure data.** A quote inside a value can't close a quote in the template or start a new statement.
+3. **Can you parameterize a table or column name?** **No, placeholders bind values only.** For identifiers or `ORDER BY` direction, use an allow-list of fixed strings; never interpolate user text.
+4. **Is NoSQL immune to injection?** **No.** Mongo queries are objects that can carry operators (`$ne`, `$gt`). If the user controls the structure, they can inject operators; coerce inputs to primitives and validate the shape.
+5. **Walk through plaintext -> hash -> salt -> slow hash.** **Plaintext leaks on breach; hashing is reversible via rainbow tables for common passwords; a per-user random salt defeats rainbow tables; a slow hash (Argon2id/bcrypt/scrypt) with a tunable cost defeats GPU brute force** by making each guess expensive.
+6. **Why not MD5/SHA-256 for passwords?** **They're fast**, a GPU does billions/sec, so offline brute force is cheap. Slow hashes have a work factor you tune (e.g. ~400 ms), cutting attackers to a few guesses/sec.
+7. **Sessions vs JWTs, when to pick which?** **Prefer stateful sessions** unless you need horizontal scaling (and even then back them with Redis). JWTs scale without a lookup but make **revocation hard** and tempt unsafe storage. If you use JWTs: short expiry, refresh tokens with server-side storage, HttpOnly cookies.
+8. **What do HttpOnly, Secure and SameSite each defend against?** **HttpOnly**: JS can't read the cookie (limits XSS theft). **Secure**: cookie only over HTTPS (stops sniffing). **SameSite** Strict/Lax: cookie not sent on cross-site sub-resource requests (stops CSRF).
+9. **Why three layers of rate limiting?** Each covers another's blind spot: **per-IP** misses botnets and shared office IPs; **per-account** misses password spraying; **global** catches spraying and triggers alerts. Together they stop takeover and overload.
+10. **BOLA vs BFLA, and the fix for each?** **BOLA/IDOR (horizontal)**: reaching another user's rows, fix by checking ownership in the query at the repository (`AND owner_id = me`). **BFLA (vertical)**: reaching admin functions, fix with a role check middleware. Never rely on secret URLs.
+11. **Why return 404 instead of 403 for someone else's resource?** **403 confirms the resource exists**, enabling enumeration and follow-on attacks. Folding ownership into the query and returning 404 makes "not yours" indistinguishable from "doesn't exist".
+12. **Is CSP a fix for XSS?** **No, it's a last line of defence.** You must still sanitize/encode; CSP (block inline scripts, trusted sources) stops a script that slips through from running.
+13. **Why is CSRF less of a worry now?** **SameSite cookies default to Lax** in modern browsers, so session cookies aren't sent on cross-site sub-resource requests; CORS adds a secondary barrier. It still matters for legacy/`SameSite=None` setups.
+14. **A secret was committed to Git, deleting the line is enough?** **No**, it's still in history. **Rotate** the secret (revoke and reissue) immediately.
+15. ➕ **How do you stop path traversal?** **Resolve the final absolute path and check it still starts with the base directory plus a separator** (then re-check with `realpath` if links are possible). Better still, store files under generated IDs and keep the user's name only as metadata.
+16. ➕ **What is SSRF and why is the cloud metadata service the classic target?** **The attacker makes your server fetch a URL, borrowing its network position.** The metadata IP hands out the instance role's credentials; IMDSv2 requires a token obtained with a `PUT`, which most SSRF can't do. The real fixes are destination allow-lists, checking the resolved IP at connect time, re-validating redirects and egress rules.
+17. ➕ **How does prototype pollution happen in Node, and how do you prevent it?** **A deep merge or set-by-path helper follows a `__proto__` key from input and writes onto `Object.prototype`, so every object inherits the value.** Block prototype keys, use `Map` or `Object.create(null)` for user-keyed data, validate with schemas that rebuild objects, and consider `--disable-proto=delete`.
+18. ➕ **Why can one regex take down a Node server?** **Backtracking engines try every way an ambiguous pattern (nested quantifiers) can match, which is exponential on a near miss, and the event loop is single-threaded.** Write unambiguous patterns, cap input length, and use RE2 for user-supplied patterns.
+19. ➕ **Rate limiting is in place. How can an attacker still exhaust the service?** **By choosing requests with a high cost each**: expensive hashing, unbounded page sizes, slow-sending clients, GraphQL depth or alias amplification, paid SMS sends. Cap concurrency per expensive operation, clamp queries and set `statement_timeout`, tighten server timeouts, and add quotas plus spend limits.
+20. ➕ **A DTO whitelist is enabled. How can mass assignment still happen?** **When one DTO serves several roles, when ownership fields or nested relation writes come from the body, or on reads, when the whole entity is serialized.** Use per-role DTOs, set ownership from the session, and allow-list output fields too.
+21. ➕ **How do you make "one coupon per user" safe against parallel requests?** **Let the database enforce it**: a unique constraint on (coupon, user) plus a conditional `UPDATE ... WHERE uses < max_uses` checked by row count, all in one transaction with the side effect.
+22. ➕ **Disk encryption is on. Why add field-level encryption?** **The database decrypts transparently for any authenticated connection**, so SQL injection, leaked credentials and dumps still see plaintext. AES-256-GCM per field with keys held outside the DB (envelope encryption with KMS) protects against those.
+23. ➕ **Explain envelope encryption.** **Encrypt data locally with a data key, and have KMS encrypt that data key under a root key that never leaves its hardware.** Store the encrypted data key beside the data; decrypting it is an IAM-checked, logged KMS call. Rotation and crypto-shredding then operate on small keys, not on all the data.
+24. ➕ **What supply-chain attacks does a lockfile not stop?** **Installing the wrong package in the first place (typosquatting), dependency confusion between private and public registries, install scripts that run at install time, and malicious fresh releases.** Review new dependencies, scope internal packages, disable install scripts by default, and add a release-age cooldown.
+25. ➕ **What makes an audit log trustworthy?** **The app can only append to it, each entry is hash-chained to the previous one, and copies live in append-only storage outside the attacker's reach**, so edits and deletions are detectable.
+26. ➕ **What is STRIDE?** **Spoofing, Tampering, Repudiation, Information disclosure, Denial of service, Elevation of privilege**: one question per security property, asked of every element and boundary-crossing flow in a data-flow diagram, with each threat tied to a mitigation and a test.
+
+## Recap
+
+- **Think like an attacker**: find the assumption. Almost every vulnerability is **data trusted as code** or **access assumed instead of checked**.
+- **Injection** (SQL, NoSQL, shell): separate structure from data, parameterized queries and argument arrays; add least-privilege DB creds.
+- ➕ **Path traversal**: resolve and prove containment, watch symlinks and archive entries, and store files under generated IDs.
+- ➕ **SSRF**: allow-list destinations, check the resolved IP at connect time, re-validate redirects, require IMDSv2, and restrict egress.
+- ➕ **Parser-level attacks**: block prototype keys in merges, accept only data-only formats, and keep regexes unambiguous and inputs bounded.
+- **Passwords**: Argon2id (or bcrypt/scrypt) with a **per-user salt** and a tuned **work factor**.
+- **Auth**: prefer **stateful sessions** with HttpOnly/Secure/SameSite cookies; if JWT, keep it short-lived with refresh tokens; consider a provider.
+- **Rate limit** auth in three layers (IP, account, global).
+- ➕ **Application-layer DoS**: cap the **cost** of each request with concurrency limits, clamped queries, `statement_timeout`, server timeouts, GraphQL depth and cost limits, and spend quotas.
+- **Authorization**: check **at the point of access**, default deny, centralize, test it, return **404 not 403**, use UUIDs.
+- ➕ **Property-level authorization**: per-role DTOs, ownership from the session, explicit output fields.
+- ➕ **Business logic**: let the database enforce limits against deliberate races, recompute prices on the server, and enforce workflow state transitions atomically.
+- **XSS**: sanitize/encode user content; **CSP** as backstop.
+- **CSRF**: mostly handled by SameSite; CORS as a secondary line.
+- **Misconfiguration**: secrets out of code (rotate if leaked), **info-level logs** in prod, a **security-headers** middleware.
+- ➕ **Encryption at rest**: disk encryption for lost media, AES-256-GCM field encryption with KMS envelope keys for the columns that matter, blind indexes for lookups, versioned keys for rotation.
+- ➕ **Supply chain**: review new dependencies, scope internal packages, disable install scripts by default, and wait out fresh releases.
+- ➕ **Security logging**: a fixed vocabulary of structured security events, injection-safe logs, a tamper-evident audit trail and alert rules.
+- **Boundaries + defence in depth**: validation, parameterized ops, access checks, headers, monitoring, no single layer is enough.
+- ➕ **Threat modelling**: draw the data flow and trust boundaries, walk STRIDE, and turn every threat into a mitigation and a test.
+
+## Sources
+
+- [Lesson video: Backend Security, Everything You Need to Know (Sriniously)](https://youtu.be/xB1C1xZZW4k)
+- [OWASP Top 10 (2025)](https://top10.owasp.org/2025)
+- [OWASP Cheat Sheet: Password Storage](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+- [OWASP Cheat Sheet: Session Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+- [OWASP Cheat Sheet: SQL Injection Prevention](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html)
+- [MDN: Set-Cookie (SameSite, Secure, HttpOnly)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)
+- [MDN: Content-Security-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy)
+- [Node.js docs: child_process (exec vs execFile, shell warnings)](https://nodejs.org/api/child_process.html)
+- [RFC 8725: JSON Web Token Best Current Practices](https://www.rfc-editor.org/rfc/rfc8725.html)
+- [Helmet.js: default security headers](https://helmet.js.org/)
+- [PortSwigger Web Security Academy](https://portswigger.net/web-security)
+- [OWASP Cheat Sheet: Server-Side Request Forgery Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
+- [AWS EC2: Use the Instance Metadata Service (IMDSv2)](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
+- [OWASP Cheat Sheet: File Upload](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html)
+- [OWASP Cheat Sheet: Prototype Pollution Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Prototype_Pollution_Prevention_Cheat_Sheet.html)
+- [Node.js docs: command-line options (--disable-proto)](https://nodejs.org/api/cli.html)
+- [Node.js docs: vm is not a security mechanism](https://nodejs.org/api/vm.html)
+- [OWASP: Regular expression Denial of Service (ReDoS)](https://community.owasp.org/attacks/Regular_expression_Denial_of_Service_-_ReDoS)
+- [Node.js docs: http (server.headersTimeout, server.requestTimeout)](https://nodejs.org/api/http.html)
+- [OWASP API Security Top 10 (2023): API4 Unrestricted Resource Consumption](https://api-security.owasp.org/editions/2023/en/0xa4-unrestricted-resource-consumption)
+- [OWASP Cheat Sheet: Mass Assignment](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html)
+- [NestJS docs: Validation (whitelist, forbidNonWhitelisted)](https://docs.nestjs.com/techniques/validation)
+- [PortSwigger: Race conditions](https://portswigger.net/web-security/race-conditions)
+- [AWS KMS: Cryptography essentials and envelope encryption](https://docs.aws.amazon.com/kms/latest/developerguide/kms-cryptography.html)
+- [OWASP Cheat Sheet: Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html)
+- [npm docs: Threats and mitigations](https://docs.npmjs.com/threats-and-mitigations)
+- [npm docs: npm ci](https://docs.npmjs.com/cli/v10/commands/npm-ci)
+- [npm docs: Generating provenance statements](https://docs.npmjs.com/generating-provenance-statements)
+- [pnpm docs: settings (minimumReleaseAge, onlyBuiltDependencies)](https://pnpm.io/settings)
+- [OWASP Cheat Sheet: Logging](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [OWASP Cheat Sheet: Threat Modeling](https://cheatsheetseries.owasp.org/cheatsheets/Threat_Modeling_Cheat_Sheet.html)

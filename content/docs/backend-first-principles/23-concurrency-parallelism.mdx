@@ -1,0 +1,1408 @@
+---
+title: "Concurrency & Parallelism: IO Bound vs CPU Bound"
+description: How a backend does many things at once, from threads and OS scheduling to event loops, goroutines and async/await, and why knowing whether work is IO bound or CPU bound decides which tool to use.
+---
+
+<Callout type="info">
+  Notes for [Concurrency & Parallelism: IO Bound vs CPU Bound](https://youtu.be/bs9MEYRTA30) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (Node.js code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The lesson is about a **mental model**, not a recipe. You already write `async`/`await`, spawn goroutines or use thread pools. The goal here is to understand **what those keywords make the machine do**, so you can debug latency, structure handlers, and choose the right tool for a workload. Its own summary of the goal: if you leave knowing the difference between **IO bound** and **CPU bound** work, the lesson has done its job.
+
+<Mermaid chart={`flowchart LR
+  A["Why a server must do many things at once"] --> B["Quantifying idle CPU"]
+  B --> C["Concurrency vs parallelism"]
+  C --> D["IO bound vs CPU bound"]
+  D --> E["Mechanism 1: OS threads"]
+  E --> F["Mechanism 2: event loop"]
+  F --> G["Request walkthroughs"]
+  G --> H["Go: goroutines"]
+  H --> I["async/await as a state machine"]
+  I --> J["Shared state + race conditions"]
+  J --> X1["➕ Locks across machines"]
+  X1 --> X2["➕ Deadlock, livelock, starvation"]
+  X2 --> K["Recap"]`} />
+
+---
+
+## 1. The requirement every backend shares 🎓
+
+### Problem
+Imagine an HTTP server that can process **exactly one request at a time**. While it handles one user, a thousand other users either wait in line or get a "server busy" error. That cannot work for a real product.
+
+### Why it matters to understand the mechanism
+Every runtime (Node.js, Python, Go, Rust, Java) gives you some way to express "handle many things at once". They look different on the surface (`async`/`await`, threads, goroutines), but they rest on a small number of underlying mechanisms. Knowing them helps you:
+- **debug** (why does one slow endpoint make every endpoint slow?),
+- **structure** code (which calls can run side by side?),
+- make **architecture** decisions (when to move work to a worker or a separate service).
+
+---
+
+## 2. What is the server doing while it waits? 🎓
+
+### The scenario
+A browser sends a request. Your server goes through routing, handler, service and repository layers, sends a **query to the database**, waits for the database to execute it, then sends the response back.
+
+How long is that wait? The lesson's rough numbers for a simple query:
+
+| Where the database is | Round trip for a simple query |
+|---|---|
+| Same machine (localhost) | about 1–2 ms |
+| Different availability zone | about 20–30 ms |
+| Different, far region | about 90–100 ms |
+
+### The naive answer: nothing
+If the server runs **synchronously** (line by line, no concurrency), then during those milliseconds the **CPU is idle**. It's just waiting for the database's network packets to arrive.
+
+### Quantifying the waste
+- A modern CPU executes roughly **3 billion instructions per second**, so about **3 million per millisecond**.
+- Waiting **100 ms** idle means about **300 million instructions** that could have run, and **zero** did.
+
+Now a realistic API call:
+
+| Work | Count | Time |
+|---|---|---|
+| Network operations (3–5 DB queries, a Redis call, an email provider) | 5 | 5 × 50 ms = **250 ms waiting** |
+| Actual CPU work (parsing, validation, building the response) | – | **about 10 ms** |
+
+So the CPU and memory are idle roughly **95% of the request**. Across a typical backend, the lesson estimates **more than 70% of time is spent waiting on IO**.
+
+<Mermaid chart={`gantt
+  title One request, synchronous server (ms)
+  dateFormat x
+  axisFormat %L
+  section CPU
+  parse and validate      :a1, 0, 4
+  build response          :a2, 254, 260
+  section Waiting on IO
+  DB query 1              :b1, 4, 54
+  DB query 2              :b2, 54, 104
+  Redis                   :b3, 104, 154
+  DB query 3              :b4, 154, 204
+  email API               :b5, 204, 254`} />
+
+### Vocabulary: IO
+**IO (input/output)** is any operation where the CPU sends something out to a device or another system and waits for the answer: network calls (DB, cache, HTTP APIs), files, standard input/output (including logging to stdout), keyboard and display.
+
+### The problem concurrency solves
+**While one task waits on IO, use the CPU and memory for other tasks.** That's the whole point of concurrency.
+
+---
+
+## 3. Concurrency vs parallelism 🎓
+
+### Parallelism
+**Executing multiple instructions at the same instant.** One CPU core executes one instruction stream at a time, so parallelism **needs hardware support**: at least two cores for two simultaneous instructions.
+
+### Concurrency
+**Structuring a program so that many tasks can be started, paused and resumed**, so that they all make progress, even if only one runs at any instant. It works on **a single core**. It's about **structure**, not hardware.
+
+> Parallelism is **doing** many things at once. Concurrency is **dealing with** many things at once.
+
+### The lesson's timeline, one core
+Requests A and B arrive together, and there is one core.
+
+1. A gets the CPU first: validation, routing, JSON deserialization, about **5 ms**. B waits.
+2. A sends a DB query and doesn't need the CPU, so the **scheduler** (OS or language runtime) gives the CPU to **B**.
+3. B does about **15 ms** of CPU work (heavier validation, a long loop), then sends its own DB query.
+4. A's DB response arrives at about **40 ms**, but A doesn't get the CPU the instant it arrives. Scheduling and priorities apply, and A resumes at about **50 ms**, filters the results and responds.
+5. B's response arrives in the meantime, then B finishes.
+
+<Mermaid chart={`gantt
+  title Concurrency on 1 core (ms)
+  dateFormat x
+  axisFormat %L
+  section Request A
+  CPU parse          :a1, 0, 5
+  waiting for DB     :a2, 5, 40
+  ready not running  :a3, 40, 50
+  CPU finish         :a4, 50, 58
+  section Request B
+  waiting for CPU    :b0, 0, 5
+  CPU parse          :b1, 5, 20
+  waiting for DB     :b2, 20, 58
+  CPU finish         :b3, 58, 64`} />
+
+Key observations:
+- From the client's point of view, **both requests are in progress** the whole time.
+- Zoom into any time slice and **only one is using the CPU**.
+- **No CPU time was wasted** while either was waiting on IO.
+- In reality the CPU is shared by far more than two requests: logging to stdout, telemetry calls, background jobs and so on. The CPU keeps jumping to whichever task is ready and away from any task that starts waiting on IO.
+
+### Same requests with two cores (parallelism)
+When B arrives and a second core is free, B starts **immediately**. Both are in progress *and* both run in the same time window.
+
+<Mermaid chart={`gantt
+  title Parallelism on 2 cores (ms)
+  dateFormat x
+  axisFormat %L
+  section Core 1 - A
+  CPU parse      :a1, 0, 5
+  waiting for DB :a2, 5, 40
+  CPU finish     :a3, 40, 48
+  section Core 2 - B
+  CPU parse      :b1, 0, 15
+  waiting for DB :b2, 15, 45
+  CPU finish     :b3, 45, 51`} />
+
+---
+
+## 4. IO bound vs CPU bound 🎓
+
+| | IO bound | CPU bound |
+|---|---|---|
+| Time spent | Waiting for something external | Executing instructions |
+| Examples | DB queries, HTTP calls, file reads, logging, cache | Validation, JSON parsing (light); image processing, video encoding, encryption, password hashing, ML (heavy) |
+| What helps | **Concurrency**: overlap the waits | **Parallelism**: more cores finish sooner |
+| More cores help? | Barely. The bottleneck is IO either way | Yes, roughly linearly for parallelizable work |
+
+Points the lesson makes:
+- **Most backend work is IO bound.** Light CPU work like validation or JSON parsing usually takes 1–2 ms because CPUs are fast, so you don't notice it.
+- **Heavy CPU bound work** exists: image processing (lots of matrix math), cryptography (the lesson cites JWT verification in auth middleware), video encoding, ML.
+- For IO bound work, **concurrency is mandatory**. Whether you have 1 core or 8, the bottleneck is IO.
+- A real backend **needs both**: concurrency for DB connections, APIs, files, logging and background jobs; parallelism for the heavy computations.
+
+🔧 **How to tell which one you have, in practice:** measure. If a request takes 300 ms but the process uses almost no CPU, it's IO bound, so look at queries, network round trips and pool waits. If the CPU sits near 100% per core and latency grows with load, it's CPU bound. In Node, `--cpu-prof` or `clinic flame` shows where CPU time goes, and the event-loop delay metric (section 7) tells you whether CPU work is starving IO.
+
+<Mermaid chart={`flowchart TD
+  Q{"Where does the time go?"}
+  Q -->|"waiting on network, disk, DB"| IO["IO bound"]
+  Q -->|"executing instructions"| CPU["CPU bound"]
+  IO --> C1["Concurrency:<br/>event loop, async/await,<br/>goroutines, virtual threads"]
+  CPU --> P1["Parallelism:<br/>threads on many cores,<br/>worker_threads, process pool"]
+  C1 --> T1["Tip: overlap independent waits<br/>(Promise.all) and cap fan-out"]
+  P1 --> T2["Tip: keep heavy work<br/>off the request thread"]`} />
+
+---
+
+## 5. How a computer does many things at once: two mechanisms 🎓
+
+At bottom there are essentially **two** mechanisms:
+1. **Threads**
+2. **Event loops**
+
+Every concurrency feature you meet is built on one of these, or a combination: **goroutines** in Go, **async/await** in JavaScript/TypeScript, **virtual threads** in Java. They usually don't expose raw threads, but they're built on top of threads, an event loop, or both.
+
+---
+
+## 6. Mechanism 1: OS threads 🎓
+
+### What a thread is
+A **thread** is an independent stream of execution that the **operating system** manages. When one is created, the OS allocates:
+- a **stack**: the chain of function calls (main → `getUsers` → …) and their **local variables** (`let a = 3` lives in the stack frame),
+- an **instruction pointer**: where in the code this thread currently is, so it can **resume** at that exact spot after being switched out,
+- plus internal bookkeeping (saved registers, state).
+
+### The scheduler (OS controlled)
+The **scheduler** decides which thread runs, stops, blocks and resumes. For classic threads, **the OS controls it**. That's the key difference from runtimes that add their own scheduler on top (Go, section 9).
+
+- Each thread gets a **time slice** of CPU, typically measured in milliseconds.
+- When the slice ends, the scheduler **saves the thread's state** (last instruction, registers) and switches to another thread.
+- This is **preemptive scheduling**: threads are stopped before they finish, whether they like it or not.
+
+📚 The lesson recommends **"Operating Systems: Three Easy Pieces"** if you want to go deep on schedulers.
+
+### What happens on blocking IO
+A **blocking operation** is one where the CPU can do nothing useful: network calls (the NIC, packets, TCP, HTTP), DB calls (network calls too, but a category of their own), logging and other device IO.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Runnable : created
+  Runnable --> Running : scheduler picks it
+  Running --> Runnable : time slice ends (preempted)
+  Running --> Blocked : blocking read on a socket
+  Blocked --> Runnable : IO completes (DB replied)
+  Running --> [*] : finished`} />
+
+1. The thread hits a blocking call, so it tells the OS it can't continue until the IO completes.
+2. The OS marks it **blocked** and runs another thread.
+3. When the IO completes, the thread becomes **runnable**. It doesn't get the CPU instantly; it waits until the scheduler picks it.
+
+### Processes vs threads: who shares memory
+
+<Mermaid chart={`flowchart LR
+  subgraph P1["Process 1"]
+    direction TB
+    H1[("Heap + globals<br/>(shared)")]
+    T1["Thread 1<br/>own stack + IP"] --- H1
+    T2["Thread 2<br/>own stack + IP"] --- H1
+  end
+  subgraph P2["Process 2"]
+    direction TB
+    H2[("Heap + globals")]
+    T3["Thread 1<br/>own stack + IP"] --- H2
+  end
+  P1 -. "isolated: cannot read each other's memory" .- P2`} />
+
+- **Every running program is a process.** Two processes (even of the same program) are **isolated** and can't see each other's memory, for security and to prevent corruption.
+- **Threads in the same process share memory**: the heap, globals, anything allocated dynamically. If thread 1 allocates an object (a struct in Go, an object in JS), thread 2 can reach it through its **address**.
+- Benefit: threads communicate by **reading and writing the same data structure**. No copying, no serialization, so it's fast.
+- Danger: the same sharing is the root of race conditions (section 11).
+- With **multiple cores**, threads of one process truly run **in parallel**: 2 cores → 2 threads at once, 4 cores → 4. This is what speeds up CPU bound work.
+
+### The three overheads of threads
+
+**1. Memory.**
+- Each thread gets its own stack. On Linux the default stack reservation is about **8 MB**. Most of it is **virtual** (physical pages are only committed when touched), but each thread still costs real memory.
+- The lesson's what-if: a framework that creates **one thread per request** (most don't) hits a traffic spike of **10,000 requests**. At about 500 KB–1 MB each, that's **around 8–9 GB** just for request threads, before the rest of the server's needs. The process or the server runs out of memory and crashes.
+
+**2. Creation cost.**
+- Creating a thread is a **system call**. The kernel sets up the stack, allocates its internal structures, initializes the instruction pointer and registers the thread with the scheduler.
+- That takes from **a few microseconds to a few milliseconds**: negligible to a human, significant on a hot request path.
+
+**3. Context switches**, the biggest latency cost. Every switch from one thread to another means:
+1. save the current thread's CPU registers,
+2. update the scheduler's bookkeeping,
+3. pick the next thread,
+4. restore that thread's registers and state.
+
+This costs roughly **1–10 µs** on modern hardware, more when the data isn't in CPU cache. With 4 cores and 100 threads the scheduler is constantly juggling; with thousands of threads the switching adds up to many milliseconds of **pure maintenance work**. That's why **thread-per-request** has always struggled with very high concurrency.
+
+🔧 **How production thread-based servers cope:** they use a **fixed thread pool** (for example a few hundred threads), not one thread per request. Requests queue when the pool is busy. This caps memory and switching, but now **the pool size caps concurrent IO waits**. With 200 threads all blocked on a slow DB, request 201 waits even though the CPU is idle.
+
+---
+
+## 7. Mechanism 2: the event loop 🎓
+
+### The idea
+Instead of many threads, there is usually **one thread**. Tasks never sit and wait on IO. Instead, they say: *"start this DB query, and when the result arrives, resume me. Until then, take the CPU back."*
+
+1. The task starts the IO and **registers a callback** (or, with `async`/`await`, the rest of the function becomes the callback).
+2. It **returns control to the event loop** immediately.
+3. The event loop keeps track of all pending operations. Conceptually it's an **infinite loop**; on each iteration it:
+   - asks the OS which IO operations have completed,
+   - queues the callbacks for those (with priorities),
+   - runs them, then loops again.
+
+### Why the OS must help
+A language can't build this alone. The OS provides a way to **watch thousands of sockets at once** and be told which are ready:
+- **epoll** on Linux,
+- **kqueue** on macOS/BSD,
+- 🔧 **IOCP** (I/O Completion Ports) on Windows.
+
+<Mermaid chart={`flowchart TD
+  subgraph JS["Single JS thread"]
+    L(("Event loop"))
+    CB["Run ready callbacks<br/>(must be quick)"]
+  end
+  subgraph OS["Kernel"]
+    EP["epoll / kqueue / IOCP<br/>watching 10,000 sockets"]
+  end
+  subgraph TP["libuv threadpool (default 4)"]
+    W1["fs, dns.lookup,<br/>crypto.pbkdf2/scrypt, zlib"]
+  end
+  REQ["Handler: await db.query(...)"] -->|"register interest + callback"| EP
+  REQ -->|"file read"| W1
+  L -->|"which sockets are ready?"| EP
+  EP -->|"socket B readable"| L
+  W1 -->|"done"| L
+  L --> CB
+  CB -->|"next iteration"| L`} />
+
+### Why it wins for IO bound work
+- **No context switches** between request handlers: one thread.
+- **No per-request stacks** of megabytes: a pending request is a small object (a callback or promise plus its captured variables).
+- So for IO bound workloads, **more threads don't help; they hurt**, because more threads mean more switching. That's why an event loop is **more efficient than threads for IO bound work**.
+
+### The trade-off: never block the event loop
+If any callback does CPU heavy work, for example **100 ms** of computation, **nothing else runs for 100 ms**: no other request, no timers, no IO callbacks. So in an event-loop runtime, **callbacks must be fast**.
+
+The lesson's realism check: typical SaaS backends rarely have 100 ms CPU tasks. Those show up with **images, animations, video rendering and ML**. The latency of typical endpoints comes from IO.
+
+### Callbacks, promises and async/await are tools for this model
+JavaScript's callbacks, promises and `async`/`await` exist to **make yielding explicit**. Writing `await db.query(...)` means *"I give up the CPU here; give it back when this IO finishes"*. They're **syntactic conveniences** that keep you from writing blocking code by accident.
+
+### 🔧 Going deeper: Node's actual event loop
+
+Node's loop (libuv) runs in **phases**, in this order, every iteration:
+
+<Mermaid chart={`flowchart LR
+  T["timers<br/>setTimeout / setInterval"] --> PC["pending callbacks"]
+  PC --> IP["idle, prepare<br/>(internal)"]
+  IP --> PO["poll<br/>new IO events + IO callbacks"]
+  PO --> CH["check<br/>setImmediate"]
+  CH --> CL["close callbacks<br/>socket.on('close')"]
+  CL --> T
+  M["process.nextTick queue, then promise microtasks:<br/>drained after EVERY callback, before moving on"] -.-> PO`} />
+
+- **`process.nextTick` and promise continuations are not phases.** They run right after the current operation finishes, before the loop moves on. A recursive `nextTick` or an endless chain of resolved promises can **starve IO** just like a CPU loop.
+- **Not everything uses epoll.** File system calls, `dns.lookup`, `crypto.pbkdf2`, `crypto.scrypt`, `crypto.randomBytes` (async), `crypto.generateKeyPair` and zlib run on the **libuv threadpool**, which has **4 threads by default** (`UV_THREADPOOL_SIZE`, up to 1024, set before the pool is first used).
+- **Edge case: threadpool starvation.** Hash 4 passwords with async `scrypt` at once and the pool is full, so a 5th hash **and every `fs.readFile` and `dns.lookup`** queue behind them. Symptom: file reads or outbound connections (the hostname lookup) get slow under login spikes even though the CPU isn't maxed. Fixes: raise `UV_THREADPOOL_SIZE`, or move hashing to `worker_threads`.
+
+### Which callback runs first: nextTick, promises, timers and setImmediate ➕
+
+The phase diagram above says *where* callbacks run; to predict real behaviour you also need the exact ordering rules between the queues, because code that "defers" work with the wrong primitive either starves IO or runs later than you expect.
+
+#### The two microtask-like queues and when they drain ➕
+**Problem.** Two pieces of code both "run soon": a `process.nextTick` callback and a `.then` handler. Engineers assume they're interchangeable, then hit ordering bugs (an event emitted before a listener is attached, a cleanup that runs after the next request).
+
+**Why it happens.** Node has **two** queues that are not loop phases:
+1. the **next-tick queue** (owned by Node, filled by `process.nextTick`),
+2. V8's **microtask queue** (filled by promise reactions and `queueMicrotask`).
+
+Every time Node finishes running a JavaScript callback from the loop, it drains the next-tick queue **completely**, then the microtask queue **completely**, and repeats until both are empty. Only then does the loop move to the next callback or phase.
+
+**Mechanism, with the one surprise.** In a CommonJS module, nextTick callbacks run before promise reactions. In an **ES module** the order flips, because the module body itself is evaluated as part of the microtask queue, so Node is already draining microtasks when your top-level code queues more.
+
+```ts title="ordering.mjs vs ordering.cjs"
+Promise.resolve().then(() => console.log('promise'));
+queueMicrotask(() => console.log('microtask'));
+process.nextTick(() => console.log('nextTick'));
+setTimeout(() => console.log('timeout'), 0);
+setImmediate(() => console.log('immediate'));
+console.log('sync');
+
+// CommonJS: sync, nextTick, promise, microtask, then timeout/immediate (order varies, see below)
+// ESM:      sync, promise, microtask, nextTick, then timeout/immediate
+```
+
+**Implementation guidance.**
+- Prefer `queueMicrotask` (portable, same queue as promises) for "run after the current operation". Node's own docs recommend it over `process.nextTick` for most userland code.
+- Use `process.nextTick` only for the classic API-design case: you return an object and must emit an event or call a callback **after** the caller has had a chance to attach listeners, but **before** any IO.
+
+**Edge cases.**
+- Never write a test that depends on nextTick-vs-promise order. Converting a file from CJS to ESM changes it.
+- An `await` on an already-resolved value still yields to the microtask queue, so code after it runs after other queued microtasks, not immediately.
+
+#### `setTimeout(fn, 0)` vs `setImmediate(fn)` ➕
+**Problem.** Both look like "next iteration", and code that relies on one running first is flaky in some places and deterministic in others.
+
+**Why.** `setTimeout(fn, 0)` is really a timer of at least 1 ms, checked in the **timers** phase. `setImmediate` runs in the **check** phase, right after **poll**.
+- **From the main module** the order is **non-deterministic**: it depends on whether 1 ms has elapsed by the time the loop first reaches the timers phase, which depends on machine load.
+- **Inside an IO callback** (you're in the poll phase), `setImmediate` **always** runs first, because check comes right after poll, while timers wait for the next iteration.
+
+**Implementation rule.** When you want "after the IO I'm handling, before any new timers", use `setImmediate`. When you want a real delay, use a timer with a real duration. Don't use `setTimeout(fn, 0)` as a scheduling primitive.
+
+#### Partitioning CPU work so the loop keeps breathing ➕
+**Problem.** A handler must process 200,000 rows in JavaScript (aggregation, CSV building). It takes 400 ms, and for that time no other request runs (section 7). Moving it to a worker (section 8) is the full fix, but sometimes the job is modest and you just need to stop it from monopolising the loop.
+
+**Why yielding with microtasks doesn't help.** `await Promise.resolve()` inside the loop yields only to the **microtask queue**, which is drained before the event loop advances. Other requests' IO callbacks still can't run. A microtask "yield" is not a yield to the event loop.
+
+**Mechanism.** Split the work into chunks and schedule each chunk as a **macrotask** with `setImmediate`. Between chunks, the loop runs its poll phase, so other requests make progress.
+
+```ts title="partition.ts"
+import { setImmediate as nextLoopTurn } from 'node:timers/promises';
+
+export async function processInChunks<T>(items: T[], fn: (item: T) => void, budgetMs = 10, signal?: AbortSignal) {
+  let i = 0;
+  while (i < items.length) {
+    const sliceStart = performance.now();
+    while (i < items.length && performance.now() - sliceStart < budgetMs) fn(items[i++]); // work for ~10 ms
+    signal?.throwIfAborted();                        // stop if the request was cancelled (section 8)
+    await nextLoopTurn();                            // a REAL yield: poll phase runs, other requests progress
+  }
+}
+```
+
+**Edge cases.**
+- Total time goes **up** slightly (scheduling overhead), but the **tail latency of everyone else** goes down. That's the trade.
+- Shared state can change between chunks, because other handlers run in the gaps. Everything from section 11 about check-then-act across a yield applies.
+- If a single item is expensive (one 300 ms regex), chunking can't help; that needs a worker.
+
+### 🔧 Going deeper: seeing a blocked loop
+
+```ts title="block-demo.ts"
+import http from 'node:http';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const lag = monitorEventLoopDelay({ resolution: 10 });
+lag.enable();
+
+http.createServer((req, res) => {
+  if (req.url === '/block') {
+    const end = Date.now() + 2000;
+    while (Date.now() < end) {}          // 2 s of CPU work on the ONLY JS thread
+    return res.end('blocked for 2s\n');
+  }
+  res.end('fast\n');                     // normally under 1 ms
+}).listen(3000);
+
+setInterval(() => {
+  console.log(`event-loop delay p99: ${(lag.percentile(99) / 1e6).toFixed(1)} ms`);
+  lag.reset();
+}, 5000);
+```
+
+Run `curl localhost:3000/block` in one terminal and `curl localhost:3000/` in another: the "fast" request takes about 2 s, because it can't start until the loop is free. The p99 delay jumps to about 2000 ms. **Alert on event-loop delay in production**; it's the most direct sign of CPU work starving IO.
+
+### Event loop utilization: the saturation metric ➕
+
+Event-loop delay tells you that callbacks are waiting; a second built-in metric tells you **how close the loop is to its capacity** before the delay explodes, which is what you need for autoscaling and load shedding.
+
+#### Why delay alone misleads ➕
+**Problem.** Delay is a *symptom*. A loop can be 90% busy with many short callbacks and still show a low p99 delay, then fall off a cliff when traffic grows another 10%. Process CPU% doesn't help either: it mixes the main thread with the libuv threadpool, GC threads and workers.
+
+**First principles.** The loop is a single server in a queue. Queueing theory says waiting time stays low until utilisation gets close to 100%, then grows very fast. So you want to measure **utilisation of the loop itself**.
+
+#### The mechanism: `performance.eventLoopUtilization()` ➕
+Node tracks how long the loop spends **idle** (blocked in the poll phase waiting for the OS) versus **active** (running JS and internal work). The ratio active ÷ (active + idle) is **ELU**, from 0 to 1. Passing a previous reading returns the **delta** for the interval.
+
+```ts title="elu.ts"
+import { performance } from 'node:perf_hooks';
+
+let last = performance.eventLoopUtilization();
+setInterval(() => {
+  const delta = performance.eventLoopUtilization(last);   // only the last 5 s
+  last = performance.eventLoopUtilization();
+  metrics.gauge('nodejs.elu', delta.utilization);          // 0.0 to 1.0
+}, 5_000).unref();                                         // don't keep the process alive for metrics
+```
+
+#### Using ELU to shed load before latency collapses ➕
+**Problem.** When the loop saturates, every request gets slower, including health checks, so the orchestrator may kill the instance during a traffic spike.
+
+**Mechanism.** Read ELU on a short interval and reject *new, low-priority* work with 503 while it's above a threshold, so in-flight requests finish quickly. It's the same idea as the bounded queue in the worker pool (section 8), applied to the main loop.
+
+```ts title="shed-load.middleware.ts"
+let busy = false;
+let prev = performance.eventLoopUtilization();
+setInterval(() => {
+  busy = performance.eventLoopUtilization(prev).utilization > 0.9;
+  prev = performance.eventLoopUtilization();
+}, 500).unref();
+
+export function shedLoad(req: Request, res: Response, next: NextFunction) {
+  if (busy && req.path !== '/healthz') return res.status(503).set('Retry-After', '1').end();
+  next();
+}
+```
+
+**Edge cases.**
+- ELU is per thread. Each `worker_threads` worker has its own, read through `worker.performance.eventLoopUtilization()`. That's a good signal for sizing a worker pool.
+- High ELU with low delay means "busy but coping". High delay with modest ELU usually means a few long callbacks: look for one blocking call, not general overload.
+- Thresholds like 0.9 are starting points. Tune them against your latency SLO with a load test (see [lesson 21](/docs/backend-first-principles/21-scaling-performance-part-1)).
+
+---
+
+## 8. Walkthrough: two requests under each model 🎓
+
+The **sequence of work** is the same in both models. What differs is **how a request is paused and resumed**, and how cheap that is.
+
+### Threading model
+1. **Request A** arrives on thread 1. **Parse** the JSON body and query params (CPU: reading bytes into memory).
+2. Validate, then run `SELECT * FROM users`:
+   - take a TCP connection from the **pool** (or open one),
+   - **send** the query bytes over the socket,
+   - call **`read`** on the socket and wait for the reply. This is the **blocking** IO call.
+3. Thread 1 blocks, so the OS switches to **thread 2**, which is handling **request B** (parse, validate, `SELECT * FROM orders`, send, `read`, block).
+4. If another thread exists (thread-per-request, or a free pool thread), the OS runs it. If not, everything waits until some IO completes.
+5. Packets arrive at the network card, so the OS **wakes thread 1**. It then:
+   - parses the DB's bytes into native structures (JS objects, Python dicts, Go structs),
+   - processes them,
+   - **serializes to JSON** and sends the HTTP response,
+   - **returns to the thread pool**.
+
+```python title="threaded handler (Python, as in the lesson)"
+def handle_request(user_id):
+    # Looks sequential. The thread really BLOCKS on this line,
+    # and the OS quietly runs other threads meanwhile.
+    user = db.query("SELECT * FROM users WHERE id = %s", (user_id,))
+    return to_json(user)
+```
+
+The switching is **invisible in the code**. It reads top to bottom, and the pausing happens in the OS.
+
+<Mermaid chart={`sequenceDiagram
+  participant T1 as Thread 1 (req A)
+  participant OS as OS scheduler
+  participant T2 as Thread 2 (req B)
+  participant DB as Database
+  T1->>DB: send SELECT users
+  T1->>OS: read() blocks
+  OS->>T2: switch (save T1 registers, restore T2)
+  T2->>DB: send SELECT orders
+  T2->>OS: read() blocks
+  DB-->>OS: packets for A arrive
+  OS->>T1: wake (runnable, then running)
+  T1->>T1: parse rows, serialize JSON, respond
+  DB-->>OS: packets for B arrive
+  OS->>T2: wake
+  T2->>T2: parse, serialize, respond`} />
+
+### Event-loop model
+1. Request A: parse, validate, send the query bytes, **register a callback**, and **return** to the loop. "Return" means *give up the CPU*, not *send the HTTP response*.
+2. The loop picks up **request B**: parse, send its query, register its callback, return.
+3. Each loop iteration asks epoll/kqueue whether A's or B's socket is readable, and handles other work meanwhile (logging, sending emails…).
+4. epoll reports **socket B readable** first, so B's callback runs: parse rows, serialize, respond.
+5. Later A's socket is readable, so A's callback runs and responds.
+
+The difference: threads pause and resume using **heavy OS structures** (stacks, saved registers, the instruction pointer). The event loop pauses and resumes using **callbacks**.
+
+### From callbacks to async/await
+
+```js title="before ES6: callbacks"
+function getUser(req, sendResponse) {
+  db.query('SELECT * FROM users WHERE id = ?', [req.userId], function (err, user) {
+    if (err) return sendResponse(500, { error: 'db' });
+    sendResponse(200, user);                     // runs LATER, when the DB replies
+  });
+}
+```
+
+Several dependent IO steps (user → orders → external API…) mean a callback inside a callback inside a callback: **callback hell**.
+
+```js title="after: async/await"
+async function getUser(req, sendResponse) {
+  const user = await db.query('SELECT * FROM users WHERE id = ?', [req.userId]);
+  sendResponse(200, user);
+}
+```
+
+Mental model: **everything after an `await`, to the end of that function, is the callback** for that IO. You get the same single-threaded, no-switch efficiency with flat, readable code.
+
+### 🔧 Going deeper: overlap independent waits
+
+`await` pauses **this function**, not the server. Inside a handler, sequential awaits still add up:
+
+```ts title="sequential vs concurrent"
+// Sequential: about 50 + 50 + 50 = 150 ms, because each await waits for the previous one.
+const user   = await db.getUser(id);
+const orders = await db.getOrders(id);
+const prefs  = await cache.get(`prefs:${id}`);
+
+// Concurrent: about max(50, 50, 50) = 50 ms. Start all three, then wait once.
+const [user2, orders2, prefs2] = await Promise.all([
+  db.getUser(id),
+  db.getOrders(id),
+  cache.get(`prefs:${id}`),
+]);
+```
+
+Edge cases:
+- Only parallelize **independent** calls. If `getOrders` needs `user.accountId`, it must wait.
+- `Promise.all` rejects on the **first** failure, but the other calls **keep running** (promises can't be cancelled). Use `Promise.allSettled` when you want every result, and an `AbortSignal` when the library supports cancellation.
+- Firing 500 queries at once doesn't make them faster: they **queue for the DB connection pool** (say 10 connections) and can starve other requests. Cap the fan-out:
+
+```ts title="map-limit.ts"
+export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>) {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;                 // safe: no await between the read and the increment
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// await mapLimit(userIds, 8, id => sendEmail(id));   // at most 8 in flight
+```
+
+### Cancelling concurrent work ➕
+
+Starting work concurrently is half the job; the other half is **stopping** it when the result is no longer needed, because abandoned work keeps consuming connections, CPU and downstream capacity. Request-wide deadlines and the `AbortSignal` plumbing in middleware are covered in [lesson 10](/docs/backend-first-principles/10-controllers-services-repositories-middleware) and timeouts in [lesson 16](/docs/backend-first-principles/16-error-handling-fault-tolerance); this section is about cancellation *between concurrent tasks*.
+
+#### Why a rejected `Promise.all` leaves work running ➕
+**Problem.** A handler fans out to three services with `Promise.all`. One fails after 20 ms, the handler returns 502, but the other two calls run for another 2 seconds, holding sockets and pool connections for a response nobody will read. Under an outage this doubles the load on the struggling dependency.
+
+**First principles.** A promise is only a **placeholder for a result**. It has no handle on the operation that produces it, so "rejecting" the combined promise can't reach into the socket and stop it. Cancellation must be a **separate signal** that every operation agrees to listen to. In JavaScript that signal is `AbortSignal`.
+
+**Mechanism: fail fast, cancel siblings.** Create one `AbortController` for the group, pass its signal to every task, and abort it on the first failure.
+
+```ts title="all-or-cancel.ts"
+export async function allOrCancel<T>(
+  tasks: Array<(signal: AbortSignal) => Promise<T>>,
+  parent?: AbortSignal,
+): Promise<T[]> {
+  const group = new AbortController();
+  const signal = parent ? AbortSignal.any([parent, group.signal]) : group.signal; // parent cancel also cancels us
+  try {
+    return await Promise.all(tasks.map(t => t(signal).catch(err => {
+      group.abort(err);                    // first failure cancels every sibling
+      throw err;
+    })));
+  } finally {
+    group.abort();                         // success or failure: nothing outlives this call
+  }
+}
+
+// usage inside a handler; requestSignal = the per-request signal from your context middleware (lesson 10)
+const [user, orders] = await allOrCancel([
+  s => fetch(`${USERS}/u/${id}`, { signal: s }).then(r => r.json()),
+  s => fetch(`${ORDERS}/u/${id}`, { signal: s }).then(r => r.json()),
+], requestSignal);
+```
+
+#### Racing and hedging: cancel the loser ➕
+**Problem.** You send the same read to two replicas and take whichever answers first (a **hedged request**, a common tail-latency trick), or you race a cache against the DB. With `Promise.race` alone, the loser keeps running, so hedging silently doubles load.
+
+**Mechanism.** Same pattern: one controller, abort it as soon as a winner exists.
+
+```ts title="race-and-cancel.ts"
+import { setTimeout as delay } from 'node:timers/promises';
+
+export async function firstOf<T>(tasks: Array<(s: AbortSignal) => Promise<T>>): Promise<T> {
+  const ac = new AbortController();
+  try {
+    return await Promise.any(tasks.map(t => t(ac.signal)));  // first SUCCESS wins (race would take first settle)
+  } finally {
+    ac.abort();                                              // stop the losers
+  }
+}
+
+// hedge: start the backup only if the primary is slow
+const user = await firstOf([
+  s => replicaA.get(id, { signal: s }),
+  s => delay(50, undefined, { signal: s }).then(() => replicaB.get(id, { signal: s })),
+]);
+```
+
+The promise version of `setTimeout` accepts a signal, so the backup never starts if the primary wins within 50 ms. Only hedge **idempotent reads**; hedging a write can apply it twice.
+
+#### Making your own loops and libraries cancellable ➕
+**Problem.** Your signal reaches `fetch`, but your own code (a retry loop, a paginated export, the `mapLimit` above) ignores it and keeps going.
+
+**Mechanism.** Check the signal at every **yield point**: before each iteration, before each retry, and pass it into every await that accepts one. `signal.throwIfAborted()` throws the abort reason.
+
+```ts title="map-limit with cancellation"
+export async function mapLimitSignal<T, R>(items: T[], limit: number, fn: (item: T, s: AbortSignal) => Promise<R>, signal: AbortSignal) {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      signal.throwIfAborted();            // don't START new work after cancellation
+      const i = next++;
+      results[i] = await fn(items[i], signal);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+```
+
+AWS SDK v3 clients accept a signal per call: `s3.send(command, { abortSignal: signal })`.
+
+#### Cancelling a running Postgres query ➕
+**Problem.** Aborting the Node side of a query doesn't stop the database. `node-postgres` queries don't take an `AbortSignal`; if you just stop waiting, the backend keeps executing a 30-second report, holding locks and a pool connection.
+
+**Mechanism.** Postgres cancels a query through a **separate** request that names the backend process. Each `pg` client knows its backend PID (`client.processID`), so a second connection can call `pg_cancel_backend`. The canceled query fails with SQLSTATE `57014`.
+
+```ts title="cancellable-query.ts"
+import { Pool } from 'pg';
+const pool = new Pool();
+
+export async function queryWithSignal(sql: string, params: unknown[], signal: AbortSignal) {
+  const client = await pool.connect();
+  const onAbort = () => { pool.query('SELECT pg_cancel_backend($1)', [client.processID]).catch(() => {}); };
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await client.query(sql, params);   // rejects with code 57014 if canceled
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    client.release();
+  }
+}
+```
+
+**Edge cases.**
+- `pg_cancel_backend` needs a **free pool connection**. If the pool is exhausted, the cancel itself waits. Keep `statement_timeout` (lesson 16) as the backstop.
+- The cancel is asynchronous: the query may finish just before it arrives. Treat "canceled" and "completed" as both possible outcomes.
+
+#### Cancellation is not rollback ➕
+**Edge case that bites.** Aborting a request that already sent a `POST /charge` doesn't un-charge the card. Cancellation only stops *future* work. Anything with side effects needs idempotency keys and a compensation path (see the withdraw example in section 11, and [lesson 14](/docs/backend-first-principles/14-task-queues-background-jobs) for moving such work to a queue).
+
+### A shared limit for a downstream: semaphores and load shedding ➕
+
+`mapLimit` caps the fan-out of **one** call; the next failure mode appears when **many concurrent requests** each fan out to the same dependency, so the per-call limit multiplies by the number of requests in flight.
+
+#### Why per-call limits aren't enough ➕
+**Problem.** Each request sends at most 8 calls to a pricing service. At 200 concurrent requests that's 1,600 in-flight calls. The pricing service slows down, your requests stay open longer, more requests pile up, and the in-flight count grows further: a **feedback loop** that turns a slow dependency into an outage of yours.
+
+**First principles.** By Little's law ([lesson 21](/docs/backend-first-principles/21-scaling-performance-part-1)), in-flight work = arrival rate × latency. When a dependency's latency grows, in-flight work grows with it unless something **caps it**. The cap has to be **process-wide per dependency**, not per call.
+
+#### The mechanism: a counting semaphore with a bounded wait ➕
+A **semaphore** holds N permits. Acquire takes one (or waits), release returns it. Two extra rules make it production-safe: a **maximum queue length** and a **maximum wait time**, so callers fail fast instead of queueing forever.
+
+```ts title="semaphore.ts"
+export class Semaphore {
+  private waiters: Array<() => void> = [];
+  constructor(private permits: number, private maxQueue = 100) {}
+
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (this.permits > 0) { this.permits--; return this.releaser(); }
+    if (this.waiters.length >= this.maxQueue) throw new Error('downstream saturated'); // shed instead of queueing
+    await new Promise<void>((resolve, reject) => {
+      const wake = () => { signal?.removeEventListener('abort', onAbort); resolve(); };
+      const onAbort = () => { this.waiters = this.waiters.filter(w => w !== wake); reject(signal!.reason); };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.waiters.push(wake);
+    });
+    return this.releaser();                    // the permit was handed to us directly by release()
+  }
+
+  private releaser() {
+    let done = false;
+    return () => {
+      if (done) return;                        // double release would mint a permit out of thin air
+      done = true;
+      const next = this.waiters.shift();
+      if (next) next(); else this.permits++;   // hand the permit over, or return it to the pool
+    };
+  }
+}
+
+// one per dependency, module-level
+export const pricingLimit = new Semaphore(50, 200);
+
+export async function getPrice(sku: string, signal: AbortSignal) {
+  const release = await pricingLimit.acquire(AbortSignal.any([signal, AbortSignal.timeout(200)])); // wait at most 200 ms
+  try { return await pricingClient.get(sku, { signal }); }
+  finally { release(); }
+}
+```
+
+#### Sizing the limit ➕
+- Start from the dependency's capacity and its normal latency: if pricing handles about 500 req/s per your instance's share and answers in 50 ms, about 25 calls are in flight in steady state. A limit of 2× that (50) absorbs bursts without letting a slowdown grow unbounded.
+- For the database, the **connection pool is already the semaphore**. Its `connectionTimeoutMillis` is the bounded wait. Don't put a second, larger limit in front of it.
+- The limit is **per process**. With 10 instances, the dependency sees up to 10 × 50. Size against the total, or use a distributed rate limiter if the provider enforces a global quota.
+
+#### Failure modes of a shared limit ➕
+- **Release in `finally`, exactly once.** A missing release leaks a permit forever; after 50 leaks the dependency is unreachable from that instance with no error in its own logs. The guard in `releaser` makes double release harmless.
+- **Separate semaphores per dependency** (the *bulkhead* pattern): one slow service can then exhaust only its own permits, not every outbound call.
+- **Nested acquisition of the same semaphore deadlocks** when all permits are held by callers waiting for a second permit. Section 13 covers this shape.
+
+### 🔧 Going deeper: CPU bound work in Node with `worker_threads`
+
+The event loop can't run CPU work in parallel, but **`worker_threads`** gives you real OS threads, each with its **own** V8 isolate and event loop. They communicate by **message passing** (structured clone) or explicit `SharedArrayBuffer`. Create workers **once** and reuse them; a worker takes milliseconds to start.
+
+```ts title="primes.worker.ts (compiled to .js)"
+import { parentPort } from 'node:worker_threads';
+
+function countPrimes(limit: number) {   // stand-in for any heavy pure-JS work
+  let count = 0;
+  for (let n = 2; n < limit; n++) {
+    let prime = true;
+    for (let d = 2; d * d <= n; d++) if (n % d === 0) { prime = false; break; }
+    if (prime) count++;
+  }
+  return count;
+}
+
+parentPort!.on('message', (limit: number) => parentPort!.postMessage(countPrimes(limit)));
+```
+
+```ts title="worker-pool.ts"
+import { Worker } from 'node:worker_threads';
+import os from 'node:os';
+
+type Job = { payload: unknown; resolve: (v: any) => void; reject: (e: unknown) => void };
+
+export class WorkerPool {
+  private idle: Worker[] = [];
+  private queue: Job[] = [];
+
+  constructor(private file: URL, size = Math.max(1, os.availableParallelism() - 1)) {
+    for (let i = 0; i < size; i++) this.idle.push(new Worker(file));   // leave a core for the main loop
+  }
+
+  run<T>(payload: unknown): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push({ payload, resolve, reject });
+      this.drain();
+    });
+  }
+
+  private drain() {
+    while (this.idle.length && this.queue.length) {
+      const worker = this.idle.pop()!;
+      const job = this.queue.shift()!;
+      const cleanup = () => { worker.off('message', onMessage); worker.off('error', onError); };
+      const onMessage = (result: unknown) => { cleanup(); job.resolve(result); this.idle.push(worker); this.drain(); };
+      const onError = (err: unknown) => { cleanup(); job.reject(err); this.idle.push(new Worker(this.file)); this.drain(); }; // replace the dead worker
+      worker.on('message', onMessage);
+      worker.on('error', onError);
+      worker.postMessage(job.payload);
+    }
+  }
+}
+
+// const pool = new WorkerPool(new URL('./primes.worker.js', import.meta.url));
+// app.get('/report', async (_req, res) => res.json({ primes: await pool.run<number>(5_000_000) }));
+```
+
+Notes:
+- The queue is **back-pressure**. Under heavy load jobs wait instead of oversubscribing the cores. In production, cap the queue length and return 503 when it's full, or use a library such as **Piscina**.
+- Large payloads are **copied** on `postMessage`. Pass an `ArrayBuffer` in the transfer list to move it without copying.
+- For **very** heavy or long jobs (video transcoding), use a **separate process or service behind a queue** so a crash or memory blowup can't take the API down.
+
+### Where CPU work should run: worker threads, child processes or a separate service ➕
+
+The worker pool above is one of three places CPU work can live in a Node system, and picking the wrong one shows up later as memory blowups, crashes that take the API down, or a pool that can't scale past one machine.
+
+#### Option 1: `worker_threads` in the same process ➕
+**What it shares.** One process, one address space, but each worker has its own V8 isolate, heap and event loop. Data crosses by structured clone (a copy), transfer (a move of an `ArrayBuffer`) or `SharedArrayBuffer`.
+
+**Why it's the default for short CPU tasks.** Startup is milliseconds, messages are cheap, and the pool lives inside your existing deployment.
+
+**Failure modes and how to contain them.**
+- An **uncaught exception** in a worker ends only that worker (the pool above replaces it), but an **out-of-memory in native code** or a crash in a native addon kills the **whole process**, API included.
+- A runaway worker can grow its heap until the container is OOM-killed. Cap it per worker:
+
+```ts
+new Worker(file, { resourceLimits: { maxOldGenerationSizeMb: 256 } }); // the worker dies, not the API
+```
+
+- A worker stuck in an infinite loop can't be interrupted by messages, because its own loop is blocked. Enforce a deadline from the parent with `worker.terminate()` and replace it.
+
+#### Option 2: a child process (`child_process.fork`) ➕
+**What changes.** A separate OS process with its own memory, file descriptors and crash domain, talking over an IPC channel (`process.send`). It costs tens of MB of memory and noticeable startup time per process, so you keep a small pool of them alive.
+
+**When it's the right tool.**
+- The work uses **native code or a binary** you don't fully trust (image libraries, PDF renderers, `ffmpeg`). A segfault ends the child, not the API.
+- You need **hard memory limits or OS-level isolation** (separate cgroup, lower privileges).
+- The task isn't JavaScript at all: `spawn` the tool directly and stream its stdin and stdout.
+
+```ts title="run-isolated.ts"
+import { fork } from 'node:child_process';
+
+export function runIsolated<T>(script: string, payload: unknown, timeoutMs = 30_000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const child = fork(script, [], { execArgv: ['--max-old-space-size=512'], signal: AbortSignal.timeout(timeoutMs) });
+    child.once('message', (result) => { resolve(result as T); child.kill(); });
+    child.once('error', reject);                                   // includes the timeout abort
+    child.once('exit', (code) => { if (code !== 0) reject(new Error(`worker exited ${code}`)); });
+    child.send(payload);
+  });
+}
+```
+
+**Not to be confused with `cluster`.** The `cluster` module (or several container replicas) runs **copies of your API** on every core to scale IO-bound request handling. It doesn't offload one heavy task; each copy still blocks its own loop if a handler does CPU work.
+
+#### Option 3: a separate service behind a queue ➕
+**When the task is long, heavy or bursty** (transcoding, large exports, ML inference), the API should **enqueue a job and return 202**, and a separate worker deployment consumes the queue. This decouples:
+- **scaling**: workers scale on queue depth, the API on request rate,
+- **failure**: a worker OOM can't touch API latency,
+- **hardware**: workers can run on GPU or high-CPU nodes.
+
+The queue mechanics (retries, idempotency, dead letters) are the subject of [lesson 14](/docs/backend-first-principles/14-task-queues-background-jobs).
+
+#### Choosing ➕
+
+| Task shape | Run it in | Why |
+|---|---|---|
+| Under about 100 ms, pure JS, request needs the result | `worker_threads` pool | Cheapest handoff, same deployment |
+| Native code, untrusted input, needs its own memory cap | Child process pool | Separate crash and memory domain |
+| Seconds to hours, or bursty, result can arrive later | Queue + separate worker service | Independent scaling and failure isolation |
+| Many cores but the work is IO bound | `cluster` or more replicas | More event loops, not offloading |
+
+---
+
+## 9. Go: goroutines, threads managed by the runtime 🎓
+
+### What a goroutine is
+Conceptually a **virtual thread**: a thread-like unit managed by **the Go runtime**, not the OS. Go's docs never call it a virtual thread; it's a **goroutine**. A Go program starts as the main goroutine, which can start others with the `go` keyword.
+
+### Go's HTTP server uses a goroutine per connection
+The lesson shows the standard library's `Serve` loop: accept a connection, then **`go c.serve(...)`**, which runs the configured handler in a new goroutine. With OS threads that would be the memory disaster from section 6; with goroutines it's fine.
+
+```go title="simplified from net/http (Go)"
+for {
+    rw, err := l.Accept()
+    if err != nil { /* ... */ }
+    c := srv.newConn(rw)
+    go c.serve(connCtx) // new goroutine: cheap enough to do for every connection
+}
+```
+
+🔧 Precisely: it's one goroutine **per connection**. An HTTP/1.1 keep-alive connection serves its requests one after another in that goroutine; HTTP/2 runs each stream's handler in its own goroutine.
+
+### Two layers of scheduling
+
+<Mermaid chart={`flowchart TB
+  subgraph RT["Go runtime scheduler (user space)"]
+    direction LR
+    Q1["run queue<br/>G1 G5 G9"] --> M1
+    Q2["run queue<br/>G2 G6"] --> M2
+    Q3["run queue<br/>G3 G7 G8"] --> M3
+    Q4["run queue<br/>G4"] --> M4
+    NP["netpoller (epoll/kqueue)<br/>parks goroutines waiting on sockets"]
+  end
+  subgraph OSL["OS threads (GOMAXPROCS = number of cores)"]
+    M1["M1"] --> C1["core 1"]
+    M2["M2"] --> C2["core 2"]
+    M3["M3"] --> C3["core 3"]
+    M4["M4"] --> C4["core 4"]
+  end
+  NP -. "socket ready: G back into a run queue" .-> Q1`} />
+
+- **Bottom layer:** a small number of OS threads, `GOMAXPROCS` of them, **defaulting to the number of CPU cores**. With 4 cores you get threads M1–M4. These are what actually run on the cores.
+- **Top layer:** the **Go runtime scheduler** puts goroutines into **queues**, one per OS thread conceptually, so **one OS thread runs many goroutines** over time.
+- When goroutine **G1 blocks on IO** (a DB query), the runtime **parks G1**, and M1 runs **G2**. When G1's response arrives, G1 becomes runnable and resumes.
+- Switching goroutines is roughly **a pointer swap in user space**. No kernel call, no heavy register-and-bookkeeping switch, so you can run **thousands to millions** of goroutines, about **100× more** than OS threads before memory runs out.
+
+```go title="Go handler: looks blocking, isn't (Go)"
+func getUser(w http.ResponseWriter, r *http.Request) {
+    var u User
+    // This goroutine parks here. M1 runs another goroutine meanwhile.
+    err := db.QueryRowContext(r.Context(), "SELECT id, name FROM users WHERE id = $1", r.URL.Query().Get("id")).Scan(&u.ID, &u.Name)
+    if err != nil { http.Error(w, "not found", http.StatusNotFound); return }
+    json.NewEncoder(w).Encode(u)
+}
+```
+
+So the goroutine model is the **threading model with an extra layer of abstraction**: the Go scheduler instead of the OS scheduler, goroutines instead of OS threads. That's why it's lightweight, and why Go handles both IO bound concurrency and CPU bound parallelism well.
+
+🔧 **Why it's cheap, concretely:**
+- A goroutine starts with a stack of about **2 KB** that **grows and shrinks** as needed, versus an MB-scale OS thread stack.
+- For **network** IO, the runtime puts the socket in non-blocking mode and uses a **netpoller** (epoll/kqueue/IOCP). A goroutine waiting on a socket is parked, and **no OS thread is blocked**. Go is an **event loop under the hood with thread-style code on top**.
+- For a **blocking syscall** (some file IO, cgo), the runtime hands the core to another thread so other goroutines keep running.
+
+🔧 **Java** took the same route: **virtual threads**, final in **JDK 21**, schedule many (M) virtual threads onto a few (N) OS "carrier" threads.
+
+---
+
+## 10. async/await is a state machine 🎓
+
+Take this function:
+
+```ts
+async function fetchUserData(userId: string) {
+  const user = await db.getUser(userId);
+  const orders = await db.getOrders(user.id);
+  return { user, orders };
+}
+```
+
+Conceptually, the runtime turns it into a **state machine**: a `state` variable, saved locals (`user`, `orders`), and a `step` function that runs the code for the current state and moves to the next one when an awaited promise settles.
+
+```js title="roughly what the runtime builds"
+function fetchUserData(userId) {
+  let state = 0, user, orders;
+  return new Promise((resolve, reject) => {
+    function step() {
+      try {
+        switch (state) {
+          case 0:
+            state = 1;
+            return db.getUser(userId).then(r => { user = r; step(); }, reject);       // await #1
+          case 1:
+            state = 2;
+            return db.getOrders(user.id).then(r => { orders = r; step(); }, reject);  // await #2
+          case 2:
+            return resolve({ user, orders });
+        }
+      } catch (e) { reject(e); }
+    }
+    step();
+  });
+}
+```
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> S0 : call fetchUserData
+  S0 --> Suspended1 : await getUser, loop is free
+  Suspended1 --> S1 : user arrives
+  S1 --> Suspended2 : await getOrders, loop is free
+  Suspended2 --> S2 : orders arrive
+  S2 --> [*] : resolve user + orders`} />
+
+Between states, **the event loop is free to run other functions**. It just isn't running this one.
+
+This explains two rules:
+1. **Why `await` only works inside `async` functions:** `async` is what tells the compiler to turn the function into a state machine. Without it there are no states to suspend between. (🔧 ES modules allow top-level `await`, because the module itself is treated as async.)
+2. **Why blocking the loop is so bad:** a state machine only advances when the loop runs its next step. Block the loop and **every** in-flight state machine is frozen in place.
+
+---
+
+## 11. The cost of concurrency: shared state 🎓
+
+Most concurrency bugs have a single root cause: **shared state (shared memory)**.
+
+### Race 1: the lost update (threads)
+Two threads each run `counter++` on a shared `counter = 0`. One increment is really **three steps**:
+1. **read** `counter` into a CPU register,
+2. **add 1** in the register,
+3. **write** the register back to `counter`.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Thread A
+  participant C as counter (memory)
+  participant B as Thread B
+  A->>C: t1 read 0 into register
+  B->>C: t2 read 0 into register
+  A->>A: t3 register = 1
+  B->>B: t4 register = 1
+  A->>C: t5 write 1
+  B->>C: t6 write 1 (A's increment is lost)
+  Note over C: expected 2, actual 1`} />
+
+The steps interleave, so the final value is **1, not 2**. That's a **lost update**, one form of **race condition**: the result depends on timing.
+
+### Race 2: async/await isn't immune (single thread)
+"JavaScript is single-threaded, so no races" is **false**. Every `await` is a point where **other code runs**.
+
+```ts title="the lesson's bug"
+let balance = 100;
+
+async function withdraw(amount: number) {
+  if (balance >= amount) {            // 1. check
+    await processWithdrawal(amount);  // 2. yield: other code runs here
+    balance -= amount;                // 3. act on a stale check
+  }
+}
+
+withdraw(100);
+withdraw(100);
+```
+
+1. Call #1 checks `100 ≥ 100`, true, and awaits (yields).
+2. Call #2 runs and checks `100 ≥ 100`, still true, and awaits.
+3. Call #1 resumes: `balance = 0`.
+4. Call #2 resumes: `balance = 0 − 100 = −100`, an invalid state.
+
+**First principles:** any **check-then-act** sequence that spans a yield point (an `await` in JS, a preemption with threads) is a race, because the world can change between the check and the act.
+
+### Fixes the lesson names 🎓
+
+**Locks / mutexes (mutual exclusion):** only one thread may be inside the critical section; others wait for the lock.
+
+```python title="Python (as in the lesson)"
+import threading
+
+counter = 0
+lock = threading.Lock()
+
+def increment():
+    global counter
+    with lock:          # acquire; other threads block here until release
+        counter += 1    # read-modify-write is now effectively one step
+```
+
+**Channels (Go):** instead of many goroutines touching one variable, they **send messages** to one goroutine that **owns** the variable. Only the owner mutates it, so there's nothing to race on.
+
+```go title="Go: mutex vs channel ownership (Go)"
+// Mutex
+var mu sync.Mutex
+var counter int
+func inc() { mu.Lock(); counter++; mu.Unlock() }
+
+// Channel: one owner goroutine, everyone else sends requests
+incs := make(chan struct{})
+go func() {
+    n := 0
+    for range incs { n++ } // only this goroutine ever touches n
+}()
+incs <- struct{}{}
+```
+
+🔧 Run Go tests with `go test -race`. The race detector flags unsynchronized access at runtime.
+
+### 🔧 Going deeper: fixing it in Node and in a real system
+
+**Fix A: make check-and-act atomic in the event loop.** Don't put an `await` between the check and the write. Reserve first, compensate on failure:
+
+```ts
+async function withdraw(amount: number) {
+  if (balance < amount) throw new Error('insufficient funds');
+  balance -= amount;                     // check + write with no await between: atomic in a single thread
+  try {
+    await processWithdrawal(amount);
+  } catch (e) {
+    balance += amount;                   // compensate if the side effect failed
+    throw e;
+  }
+}
+```
+
+**Fix B: an async mutex** when the critical section must contain awaits:
+
+```ts title="mutex.ts"
+export class Mutex {
+  private tail: Promise<void> = Promise.resolve();
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(fn);                 // start after the previous holder finishes
+    this.tail = result.then(() => undefined, () => undefined); // never let the chain reject
+    return result;
+  }
+}
+
+const accountLock = new Mutex();
+await accountLock.run(async () => {
+  if (balance < amount) throw new Error('insufficient funds');
+  await processWithdrawal(amount);
+  balance -= amount;
+});
+```
+
+**Fix C, the one production needs: let the database decide.** Real balances live in a DB, and you run **several server instances**. An in-memory lock only protects one process, so make the operation atomic where the data lives:
+
+```sql
+-- One statement: the check and the write happen atomically inside the DB.
+UPDATE accounts
+SET balance = balance - $1
+WHERE id = $2 AND balance >= $1
+RETURNING balance;            -- 0 rows returned = insufficient funds (or no such account)
+```
+
+Alternatives: `SELECT ... FOR UPDATE` inside a transaction (pessimistic locking), or a `version` column checked on update (optimistic locking).
+
+**Fix D, for real threads in Node:** `worker_threads` with a `SharedArrayBuffer` hit exactly the lost update from Race 1 if you write `arr[0]++`. Use `Atomics`, which performs read-modify-write as one indivisible operation:
+
+```ts
+const counter = new Int32Array(new SharedArrayBuffer(4)); // share this buffer with the workers
+Atomics.add(counter, 0, 1);                                // never counter[0]++
+```
+
+<Mermaid chart={`flowchart TD
+  R{"Where does the shared state live?"}
+  R -->|"one JS process, no await inside"| A["Check + write synchronously<br/>(no yield in between)"]
+  R -->|"one process, awaits inside"| B["Async mutex / queue per key"]
+  R -->|"threads sharing memory"| C["Mutex, Atomics,<br/>or channels (single owner)"]
+  R -->|"database, many instances"| D["Atomic SQL, row locks,<br/>optimistic version check"]`} />
+
+---
+
+## 12. Locks that span processes and machines ➕
+
+Fix C works when the shared state is a database row; the harder case is mutual exclusion over something that **isn't** a single row (a cron job that must run once across 10 instances, a call to a third-party API that must not happen twice, a file being rebuilt), which needs a lock every instance can see. Row locks (`SELECT ... FOR UPDATE`) and optimistic version columns are covered in depth in [lesson 12](/docs/backend-first-principles/12-databases-postgres); this section covers the general-purpose distributed lock and its traps.
+
+<Mermaid chart={`flowchart TD
+  Q{"What must be exclusive?"}
+  Q -->|"one DB row"| R["Atomic UPDATE, FOR UPDATE,<br/>version column (lesson 12)"]
+  Q -->|"a named job or resource,<br/>and you already run Postgres"| A["Postgres advisory lock"]
+  Q -->|"short critical section,<br/>occasional double run is tolerable"| S["Redis SET NX PX<br/>+ safe release"]
+  Q -->|"double run is NOT tolerable"| F["Any lock + fencing token<br/>checked by the resource"]`} />
+
+#### Postgres advisory locks: a named mutex in the database you already have ➕
+**Problem.** A "rebuild search index" job is triggered by a cron on every instance. It must run on exactly one at a time.
+
+**Mechanism.** Postgres lets you lock an **arbitrary 64-bit number** that means whatever your app decides. Postgres tracks it like any other lock, including deadlock detection, but attaches no meaning to it.
+- `pg_try_advisory_lock(key)` returns true or false immediately (non-blocking).
+- `pg_advisory_lock(key)` waits.
+- **Session-level** locks last until `pg_advisory_unlock` or the connection closes. **Transaction-level** (`pg_advisory_xact_lock`) locks are released automatically at commit or rollback.
+
+```ts title="run-exclusive.ts"
+export async function runExclusive(name: string, job: () => Promise<void>) {
+  const client = await pool.connect();                 // ONE connection for lock, work and unlock
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS ok', [name]); // text name to 64-bit key
+    if (!rows[0].ok) { await client.query('ROLLBACK'); return false; }           // another instance holds it
+    await job();
+    await client.query('COMMIT');                      // releases the lock
+    return true;
+  } catch (e) {
+    await client.query('ROLLBACK');                    // also releases the lock
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+```
+
+**Why it's often the best choice.** No new infrastructure, and the lock dies with the connection: if the instance crashes, Postgres releases the lock when the TCP session ends. There's no TTL to guess.
+
+**Edge cases.**
+- **Session locks and connection pools don't mix.** Lock on one pooled connection and unlock on another, and the unlock silently does nothing. Transaction-level locks avoid this. PgBouncer in transaction mode breaks session advisory locks entirely (lesson 21).
+- Holding a transaction open for a long job keeps a snapshot alive, which delays vacuum. For hour-long jobs, use a lease row with an expiry instead.
+- Keys share one namespace across the database. Derive them from a prefixed name (`'job:reindex'`) so two features don't collide.
+
+#### A Redis lock done correctly (single instance) ➕
+**Problem.** You don't have a shared Postgres (or the lock is very hot) and reach for Redis.
+
+**Mechanism.** Acquire with **one atomic command**: set the key only if absent (`NX`) with an expiry (`PX`) and a **random token** as the value. Release with a **compare-and-delete**, so you only delete the lock if it's still yours.
+
+```ts title="redis-lock.ts"
+import { randomUUID } from 'node:crypto';
+
+const RELEASE = `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`;
+
+export async function withRedisLock<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T | null> {
+  const token = randomUUID();
+  const ok = await redis.set(key, token, 'PX', ttlMs, 'NX');   // atomic: exists-check + set + expiry
+  if (ok !== 'OK') return null;                                // someone else holds it
+  try {
+    return await fn();
+  } finally {
+    await redis.eval(RELEASE, 1, key, token);                  // never DEL blindly
+  }
+}
+```
+
+**Why each detail exists.**
+- **Expiry:** without it, a crashed holder keeps the lock forever.
+- **Random token + compare-and-delete:** holder A pauses longer than the TTL, the lock expires, B acquires it, then A finishes and runs `DEL`, deleting **B's** lock. The token makes A's release a no-op. (Redis 8.4 adds a `DELEX ... IFEQ` command that does the same without a script.)
+
+**Edge case.** Redis replication is **asynchronous**. If the primary acknowledges your lock and crashes before replicating it, the promoted replica has no lock, and a second client acquires it. A single-instance Redis lock is an **efficiency** lock (prevents most duplicate work), not a **correctness** guarantee.
+
+#### Redlock, and why it's debated ➕
+**What it is.** Redis's documented algorithm for surviving node failure: run **N independent Redis primaries** (typically 5), try to acquire the same key with the same token on all of them with short per-node timeouts, and consider the lock held only if you got a **majority** (3 of 5) **and** the elapsed time is less than the TTL. Validity = TTL minus elapsed time minus a clock-drift allowance.
+
+**The critique (Martin Kleppmann, 2016).** Redlock's safety depends on **timing assumptions**: bounded network delay, bounded process pauses and clocks that advance at roughly the same rate. Real systems violate all three:
+- a **GC pause or VM freeze** longer than the TTL lets the lock expire while the holder still believes it owns it,
+- a **wall-clock jump** on a Redis node (NTP correction, manual change) can expire a key early, and Redis TTLs aren't based on a monotonic clock.
+
+In each case two clients act as holders at once. Kleppmann's conclusion: if you need a lock for **efficiency**, a single Redis instance is enough; if you need it for **correctness**, Redlock isn't sufficient, and you need fencing (below) or a consensus system (etcd, ZooKeeper, a database).
+
+**The counterpoint (antirez, Redis's author)** argues the assumptions are reasonable in practice and that fencing needs a resource that can check tokens, in which case that resource could provide the mutual exclusion itself. The Redis docs now link both and **recommend fencing tokens** for long operations. The practical takeaway is the same either way: **no lease-based lock is safe on its own against a paused holder.**
+
+#### Fencing tokens: making a lock safe against paused holders ➕
+**Problem.** Every lease-based lock (Redis, Redlock, a lease row, the S3 lease in [object storage Part 1](/docs/backend-first-principles/24-object-storage-part-1)) has the same hole: holder A pauses, the lease expires, B takes over, A wakes up and writes.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Client A
+  participant L as Lock service
+  participant B as Client B
+  participant S as Storage (checks tokens)
+  A->>L: acquire
+  L-->>A: granted, token 33
+  Note over A: long GC pause, lease expires
+  B->>L: acquire
+  L-->>B: granted, token 34
+  B->>S: write with token 34
+  S-->>B: ok, highest seen = 34
+  A->>S: write with token 33 (stale)
+  S-->>A: rejected, 33 is lower than 34`} />
+
+**Mechanism.** The lock service hands out a **monotonically increasing number** with each grant. Every write to the protected resource carries the token, and the **resource** rejects any token lower than the highest it has seen. Safety now lives in the resource's check, not in timing.
+
+```sql title="fenced write in Postgres"
+-- the lock grant: an atomic counter
+UPDATE locks SET token = token + 1, holder = $2, expires_at = now() + interval '30 seconds'
+WHERE name = $1 AND (expires_at < now() OR holder = $2)
+RETURNING token;
+
+-- every protected write carries the token; stale holders match 0 rows
+UPDATE reports SET body = $1, fence = $2
+WHERE id = $3 AND fence < $2;
+```
+
+**Edge case.** Fencing only works if the **resource can check the token**. A third-party API that sends an email can't, so for those, combine the lock with an **idempotency key** sent to the provider.
+
+---
+
+## 13. Deadlock, livelock and starvation in application code ➕
+
+Locks, pools and semaphores fix races but introduce the opposite failure, where tasks **stop making progress**; database deadlocks (SQLSTATE `40P01`, lock ordering) are covered in [lesson 16](/docs/backend-first-principles/16-error-handling-fault-tolerance), and this section covers the shapes that appear in your own Node code, where nothing detects them for you.
+
+#### The four conditions, and why breaking one is enough ➕
+A deadlock needs all four **Coffman conditions** at once: **mutual exclusion** (a resource has one holder), **hold and wait** (holding one resource while waiting for another), **no preemption** (nobody can take it away) and **circular wait** (A waits for B, which waits for A). Every prevention technique removes one: lock ordering removes circular wait, timeouts add preemption, acquiring everything up front removes hold-and-wait.
+
+#### Pool-exhaustion deadlock: the one most Node services hit ➕
+**Problem.** Under load, every request hangs forever, CPU is idle, the database shows idle-in-transaction sessions, and there's no error.
+
+**Why.** A function holds a pooled connection (inside a transaction) and, deeper in the call stack, a helper does `pool.query(...)`, which needs a **second** connection. With a pool of 10 and 10 concurrent requests, each holds one connection and waits for another that will never come free. That's hold-and-wait plus circular wait on the pool.
+
+```ts title="the bug"
+await withTransaction(async (tx) => {           // holds connection 1 of 10
+  await tx.query('UPDATE orders SET status = $1 WHERE id = $2', ['paid', id]);
+  await audit.log('order.paid', id);            // audit.log uses pool.query: needs ANOTHER connection
+});
+```
+
+**Fixes.**
+- **Pass the transaction client down** (`audit.log(tx, ...)`), so a unit of work uses exactly one connection. Repositories that accept an optional executor make this natural.
+- Set `connectionTimeoutMillis` on the pool, so a wait for a connection **fails** instead of hanging. That turns a silent deadlock into a visible error (preemption).
+- Alert on "pool waiting count above 0 for N seconds".
+
+#### Async-mutex deadlock: non-reentrant locks and lock ordering ➕
+**Problem.** With the promise-chain `Mutex` from section 11, a function that holds `accountLock` calls a helper that also does `accountLock.run(...)`. The helper's task is queued **behind** the outer one, and the outer one waits for the helper: it hangs forever.
+
+**Why.** That mutex is **non-reentrant**: it doesn't know the second request comes from the same logical task. And with two mutexes, the classic **ordering** deadlock appears: transfer(A, B) locks A then B, transfer(B, A) locks B then A.
+
+**Fixes.**
+- Never call code that takes the same lock while holding it. Structure it as an outer function that locks and an inner `...Unlocked` function that assumes the lock is held.
+- When you need several locks, **acquire them in a global order** (sort by ID), exactly as the database lesson does for rows.
+- Give every acquire a **timeout** (the `Semaphore` above accepts a signal), so a bug becomes an error with a stack trace instead of a hung request.
+
+```ts title="ordered multi-lock"
+export async function withLocks<T>(locks: Map<string, Mutex>, ids: string[], fn: () => Promise<T>): Promise<T> {
+  const ordered = [...new Set(ids)].sort();                 // global order + no duplicate locking
+  const run = (i: number): Promise<T> =>
+    i === ordered.length ? fn() : locks.get(ordered[i])!.run(() => run(i + 1));
+  return run(0);
+}
+// transfer(A, B) and transfer(B, A) both lock A first: no cycle is possible
+```
+
+#### Livelock: everyone retries, nobody wins ➕
+**Problem.** Ten workers try an optimistic update (version check) or a lock, all fail, all wait exactly 100 ms, all retry together, and all fail again. Every worker is busy and nothing completes.
+
+**Why.** Retrying with **deterministic** delays keeps colliding tasks synchronized. Unlike a deadlock, everyone is running, which is why it often looks like "high CPU, zero throughput".
+
+**Fix.** **Randomized** backoff (jitter), as in the `updateJson` retry in [object storage Part 1](/docs/backend-first-principles/24-object-storage-part-1) and the retry helper in lesson 16, plus a cap on attempts. Randomness breaks the symmetry, so one task wins each round.
+
+#### Starvation: progress for most, never for some ➕
+**Problem.** The system makes progress overall, but one kind of task waits indefinitely.
+
+**Three shapes you'll meet in Node:**
+1. **Microtask starvation.** A recursive `process.nextTick` or an endless promise chain never lets the loop reach the poll phase, so IO callbacks never run (section 7).
+2. **Threadpool starvation.** Slow `fs` or `crypto` jobs occupy all libuv threads, and DNS lookups wait behind them (section 7).
+3. **Unfair queues.** A semaphore or job queue that serves a "priority" lane first can starve the normal lane forever under sustained load. Use **FIFO** within a lane (the semaphore above wakes waiters in arrival order) and **weighted** sharing between lanes, for example serving one normal job for every four priority jobs.
+
+**Detection.** Starvation hides behind healthy averages. Track the **age of the oldest waiting item** per queue, not just its length, and alert on it.
+
+---
+
+## 14. Recap 🎓
+
+- **IO bound, high-concurrency workloads** (web servers, API gateways, services that call many other services) → lightweight concurrency: **async/await on an event loop**, **goroutines**, **Java virtual threads**. These beat a thread-per-request model.
+- **CPU bound workloads** (number crunching, string, image and video manipulation, anything that keeps cores busy) → **threads running in parallel** on multiple cores, not an event loop.
+- **Concurrency** keeps the program productive and stops it from wasting CPU while it waits on IO (network card, stdin/stdout, external APIs, databases).
+- **Parallelism** uses several cores to do several things at the same instant.
+- **Most backend work leans on concurrency.** Some cases need both, or mostly parallelism. If you understand the difference, you can pick the right tool.
+- ➕ **Node ordering:** after every callback, the next-tick queue then the microtask queue drain fully (order flips in ESM). A microtask isn't a yield to the loop; `setImmediate` is. Chunk modest CPU work with `setImmediate`.
+- ➕ **Measure saturation with ELU**, not only delay, and shed low-priority load before the loop hits 100%.
+- ➕ **Cancel what you start:** one `AbortController` per group of concurrent tasks; abort siblings on first failure and losers of a race. Cancelling a Postgres query needs `pg_cancel_backend`. Cancellation is never rollback.
+- ➕ **Cap concurrency per downstream, process-wide**, with a semaphore that has a bounded queue and wait time.
+- ➕ **Place CPU work deliberately:** `worker_threads` for short JS tasks, child processes for native or untrusted work, a queue plus worker service for long jobs.
+- ➕ **Cross-machine exclusion:** advisory locks if you have Postgres, a token-checked Redis lock for efficiency, and **fencing tokens** whenever a double run is unacceptable (Redlock alone isn't enough).
+- ➕ **Progress failures:** pool-exhaustion and non-reentrant-mutex deadlocks, livelock from synchronized retries, starvation from unfair queues. Timeouts, lock ordering, jitter and FIFO queues prevent them.
+
+---
+
+## Interview questions
+
+1. **Concurrency vs parallelism in one sentence each?** **Concurrency is structuring work so many tasks make progress by interleaving, even on one core; parallelism is executing several tasks at the same instant on several cores.**
+2. **Why does a synchronous server waste about 95% of its resources?** **A typical request spends about 250 ms waiting on 5 network calls and about 10 ms on CPU; during the waits the CPU sits idle, and 100 ms idle is about 300 million instructions not executed.**
+3. **What happens when a thread does a blocking read on a socket?** **The OS marks it blocked and switches to another thread; when the data arrives it becomes runnable and resumes once the scheduler picks it.**
+4. **Three overheads of OS threads?** **Memory (a per-thread stack, about 8 MB reserved on Linux), creation (a syscall plus kernel setup, µs to ms) and context switches (save and restore registers and bookkeeping, about 1–10 µs each).**
+5. **Why is an event loop more efficient for IO bound work?** **One thread, no context switches and no per-request stacks; the OS (epoll/kqueue) reports which sockets are ready and the loop runs their callbacks.**
+6. **What's the event loop's main constraint?** **Never block it: any long CPU task freezes every request, timer and IO callback until it finishes.**
+7. **What does `await` actually do?** **It suspends the current async function (one step of its state machine), returns control to the event loop, and schedules the rest of the function to run when the promise settles.**
+8. **Why can `await` only appear in `async` functions?** **`async` is what makes the compiler turn the function into a resumable state machine; without it there is nothing to suspend.**
+9. **How do goroutines differ from OS threads?** **The Go runtime schedules them onto `GOMAXPROCS` OS threads; they start with small growable stacks and switch in user space, so millions are feasible, and network waits use a netpoller instead of blocking a thread.**
+10. **Can single-threaded async code have race conditions?** **Yes: any check-then-act that spans an `await` can interleave with other calls, as in the withdraw example that ends at −100.**
+11. **How do you fix a balance race across several server instances?** **Make it atomic in the database: `UPDATE ... SET balance = balance - x WHERE balance >= x` (or row locks or optimistic versioning); in-process locks can't see the other instances.**
+12. 🔧 **Which Node APIs use the libuv threadpool, and why does that matter?** **fs, `dns.lookup`, async crypto like pbkdf2 and scrypt, and zlib share 4 threads by default, so heavy hashing can starve file reads and DNS lookups; raise `UV_THREADPOOL_SIZE` or use `worker_threads`.**
+13. 🔧 **How would you run a CPU-heavy task in a Node API?** **Use a reusable `worker_threads` pool sized to the cores with a bounded queue, or for long jobs a separate worker process or service behind a message queue.**
+14. ➕ **In what order do `process.nextTick`, a resolved promise's `.then` and `setImmediate` run?** **In CommonJS: nextTick, then the promise reaction, then (on a later loop phase) setImmediate. In an ES module the promise runs before nextTick, because module evaluation already happens inside the microtask queue.**
+15. ➕ **Why doesn't `await Promise.resolve()` inside a long loop keep the server responsive?** **It only yields to the microtask queue, which drains before the loop advances; IO callbacks still can't run. Yield with `setImmediate` (a macrotask), or move the work to a worker.**
+16. ➕ **What does event loop utilization tell you that event-loop delay doesn't?** **How close the loop is to saturation (active time ÷ total time) before latency explodes; it's the better signal for autoscaling and load shedding.**
+17. ➕ **How do you stop the other calls when one call in a `Promise.all` fails?** **Pass one shared `AbortSignal` to every task and abort its controller on the first failure (and in `finally`), since promises themselves can't be cancelled.**
+18. ➕ **Why isn't a per-call concurrency limit enough to protect a downstream?** **Concurrent requests multiply it; when the dependency slows down, in-flight calls grow with latency (Little's law). Use a process-wide semaphore per dependency with a bounded queue and wait time.**
+19. ➕ **`worker_threads` vs `child_process` vs a separate service for CPU work?** **Workers for short pure-JS tasks (cheap, same process); child processes for native or untrusted code that needs its own crash and memory domain; a queue plus worker service for long or bursty jobs that should scale and fail independently.**
+20. ➕ **Why is Redlock controversial, and what makes any lease lock safe?** **Its safety assumes bounded pauses, network delays and clock drift; a GC pause or clock jump can give two clients the lock. Fencing tokens, checked by the protected resource, make stale holders' writes fail.**
+21. ➕ **Describe a deadlock that needs no database locks at all.** **Pool exhaustion: every request holds a pooled connection inside a transaction and waits for a second one from the same pool. Fix it by passing the transaction client down and setting a connection-acquire timeout.**
+22. ➕ **Livelock vs starvation?** **Livelock: everyone is active but no one progresses, typically synchronized retries (fix with jitter). Starvation: the system progresses but some task never gets its turn, such as an unfair priority queue or a nextTick loop (fix with FIFO and fair scheduling).**
+
+## Sources
+
+- [Lesson video: Concurrency & Parallelism, IO Bound vs CPU Bound (Sriniously)](https://youtu.be/bs9MEYRTA30)
+- [Node.js: The event loop, timers and process.nextTick](https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick)
+- [Node.js: Don't block the event loop (or the worker pool)](https://nodejs.org/en/learn/asynchronous-work/dont-block-the-event-loop)
+- [libuv: Thread pool work scheduling (default size 4, max 1024)](https://docs.libuv.org/en/v1.x/threadpool.html)
+- [Node.js: worker_threads API](https://nodejs.org/api/worker_threads.html)
+- [Node.js: perf_hooks monitorEventLoopDelay](https://nodejs.org/api/perf_hooks.html)
+- [Go source: runtime/netpoll.go](https://go.googlesource.com/go/+/HEAD/src/runtime/netpoll.go)
+- [Go: Data race detector](https://go.dev/doc/articles/race_detector)
+- [JEP 444: Virtual Threads (JDK 21)](https://openjdk.org/jeps/444)
+- [Operating Systems: Three Easy Pieces (book recommended in the lesson)](https://pages.cs.wisc.edu/~remzi/OSTEP/)
+- [Node.js: process.nextTick and when to use queueMicrotask (CJS vs ESM ordering)](https://nodejs.org/api/process.html#when-to-use-queuemicrotask-vs-processnexttick)
+- [Node.js: perf_hooks eventLoopUtilization](https://nodejs.org/api/perf_hooks.html#performanceeventlooputilizationutilization1-utilization2)
+- [Node.js: AbortSignal.any, AbortSignal.timeout, throwIfAborted](https://nodejs.org/api/globals.html#class-abortsignal)
+- [Node.js: timers/promises (setTimeout and setImmediate with signals)](https://nodejs.org/api/timers.html#timers-promises-api)
+- [Node.js: worker_threads resourceLimits](https://nodejs.org/api/worker_threads.html#worker_threadsresourcelimits)
+- [Node.js: child_process.fork](https://nodejs.org/api/child_process.html#child_processforkmodulepath-args-options)
+- [node-postgres source: Client.processID and query cancel](https://github.com/brianc/node-postgres/blob/master/packages/pg/lib/client.js)
+- [PostgreSQL: Server signaling functions (pg_cancel_backend)](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SIGNAL)
+- [PostgreSQL: Advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)
+- [PostgreSQL: Advisory lock functions](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADVISORY-LOCKS)
+- [Redis: Distributed locks with Redis (SET NX PX, Redlock, fencing note)](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/)
+- [Martin Kleppmann: How to do distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
+- [antirez: Is Redlock safe?](http://antirez.com/news/101)

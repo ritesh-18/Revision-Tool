@@ -1,0 +1,724 @@
+---
+title: "9.4 Vending Machine (State pattern)"
+---
+
+## Problem & where it's asked
+
+The vending machine is the textbook State-pattern problem. In the research notes it's reported at **Microsoft** (2026 list). That version asked for inventory and prices, an **exact-payment** variant, and explicitly wanted *selection, validation and dispensing kept separate*. It's also a standard entry in general LLD guides (the awesome-low-level-design list and InterviewBit). A **coffee machine** variant exists too. Reported and inferred follow-ups: **return change** and **admin restock**. Other Indian companies aren't reliably reported for this problem, so treat any specific company claim beyond Microsoft as uncertain. It's still worth mastering, because the same State-pattern skeleton reappears in ATM, elevator and order-lifecycle problems.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Select first or pay first? | Select first, then pay. It's simpler to validate stock before taking money. |
+| Accepted money? | Indian coins and notes: ₹1, 2, 5, 10, 20, 50, 100. Anything else is rejected. |
+| Overpayment? | Two policies: *return change* (default) and *exact payment only* (the Microsoft variant). |
+| What if change can't be made? | Refund everything that was inserted and cancel. Never keep the customer's money. |
+| One item per transaction? | Yes. |
+| Cancel? | Allowed any time before dispensing, with a full refund of the inserted coins. |
+| Admin operations? | A maintenance mode (PIN-protected) for restocking and adding change. User operations are blocked in it. |
+| Card or UPI? | Out of scope for the core, but discussed in Concurrency (late UPI callbacks). |
+
+## Requirements
+
+**Functional**: list products; select a product (validate code and stock); insert money (validate denomination); dispense when paid and return change; cancel and refund; maintenance: restock, add change, exit maintenance.
+
+**Non-functional**: every operation's behaviour depends on the current state, and invalid operations give clear errors. Money is integer rupees. The machine never loses or invents money: the cash box always balances. Easy to add a state (e.g. `OutOfOrder`) or a payment policy.
+
+**Out of scope**: hardware drivers, multiple items per transaction, card payments, persistence.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Product` | Code, name, price | Held in `Inventory` slots |
+| `Inventory` | Stock per product code | Owned by the machine |
+| `CashBox` | Count per denomination; makes change | Owned by the machine |
+| `PaymentPolicy` | Whether a coin is acceptable (exact vs change) | Injected Strategy |
+| `MachineState` | Behaviour for select, insert, cancel and admin ops | `IdleState`, `ProductSelectedState`, `DispensingState`, `MaintenanceState` |
+| `VendingMachine` | Context: holds the current state and the transaction | Delegates to the state |
+| `Transaction` | Selected product plus inserted coins | Lives while a purchase is in progress |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class VendingMachine {
+        -MachineState state
+        -Transaction txn
+        +select(code) string
+        +insert(amount) string
+        +cancel() string
+        +enterMaintenance(pin) string
+        +restock(code, qty) string
+        +exitMaintenance() string
+    }
+    class MachineState {
+        <<interface>>
+        +select(m, code) string
+        +insert(m, amount) string
+        +cancel(m) string
+        +enterMaintenance(m, pin) string
+        +restock(m, code, qty) string
+        +exitMaintenance(m) string
+    }
+    class IdleState
+    class ProductSelectedState
+    class DispensingState
+    class MaintenanceState
+    class Inventory
+    class CashBox {
+        +deposit(coins) void
+        +makeChange(amount) number[]
+    }
+    class PaymentPolicy {
+        <<interface>>
+        +accepts(price, paid, coin) bool
+    }
+    class ChangeReturningPolicy
+    class ExactPaymentPolicy
+    MachineState <|.. IdleState
+    MachineState <|.. ProductSelectedState
+    MachineState <|.. DispensingState
+    MachineState <|.. MaintenanceState
+    VendingMachine --> MachineState
+    VendingMachine *-- Inventory
+    VendingMachine *-- CashBox
+    VendingMachine --> PaymentPolicy
+    PaymentPolicy <|.. ChangeReturningPolicy
+    PaymentPolicy <|.. ExactPaymentPolicy`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> Idle
+    Idle --> ProductSelected : select (in stock)
+    ProductSelected --> ProductSelected : insert (not enough yet)
+    ProductSelected --> Dispensing : insert (paid in full)
+    ProductSelected --> Idle : cancel / refund
+    Dispensing --> Idle : item + change delivered
+    Dispensing --> Idle : change impossible, refund
+    Idle --> Maintenance : enterMaintenance (PIN)
+    Maintenance --> Idle : exitMaintenance`} />
+
+## Design decisions & patterns
+
+- **State pattern.** Every user action means something different per state: `insert` in `Idle` is an error, in `ProductSelected` it's a payment, and in `Maintenance` it's blocked. Without State you'd write `if (state === …)` in every method, and adding `OutOfOrder` would mean editing all of them. With State, each class answers "what does this action mean *here*?", and adding a state is one new class plus its transitions.
+- **A base class that rejects everything.** `BaseState` implements every method by throwing `InvalidOperationError`. Concrete states override only the actions they allow. That keeps each state small and makes "not allowed here" the safe default.
+- **States are stateless singletons; the context holds the data.** The transaction (product plus coins) lives on `VendingMachine`, so a state object can be shared and has no fields to reset.
+- **Strategy for payment policy.** Exact payment and change-returning differ in one decision ("may I accept this coin?"), so they're a tiny Strategy rather than two more states.
+- **`Dispensing` is a real state even though it's brief.** On a real machine, the motor takes seconds, and during that time `select` and `cancel` must be rejected. Modelling it now makes the async version straightforward.
+- **Separate `Inventory` and `CashBox`** (SRP, as Microsoft asked): selection validates against inventory, payment validates against the policy, and dispensing coordinates both.
+- **Rejected:** an enum plus a big `switch` (fine for three states and one action, messy for four states × six actions), and one class per product type (products have no behaviour).
+
+## Implementation
+
+**Part 1: errors, money, inventory and cash box.** `CashBox.makeChange` is greedy over the available coins. It's optimal for Indian denominations when coins are unlimited, but it can fail with limited stock. The DP fix is in the extension.
+
+```ts
+class VendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class InvalidOperationError extends VendingError {}
+class InvalidCoinError extends VendingError {}
+class OutOfStockError extends VendingError {}
+class UnknownProductError extends VendingError {}
+class AuthError extends VendingError {}
+
+const DENOMINATIONS = [100, 50, 20, 10, 5, 2, 1] as const;
+type Denomination = (typeof DENOMINATIONS)[number];
+
+function toDenomination(amount: number): Denomination {
+  const d = DENOMINATIONS.find((x) => x === amount);
+  if (d === undefined) throw new InvalidCoinError(`Rs ${amount} is not an accepted coin or note`);
+  return d;
+}
+
+const sum = (coins: readonly number[]) => coins.reduce((a, b) => a + b, 0);
+const fmt = (coins: readonly number[]) => (coins.length ? `[${coins.join(', ')}]` : '[]');
+
+interface Product { readonly code: string; readonly name: string; readonly price: number }
+
+class Inventory {
+  private readonly slots = new Map<string, { product: Product; qty: number }>();
+
+  add(product: Product, qty: number): void {
+    if (product.price <= 0 || !Number.isInteger(product.price)) throw new VendingError(`Bad price for ${product.code}`);
+    this.slots.set(product.code, { product, qty });
+  }
+  get(code: string): Product {
+    const slot = this.slots.get(code);
+    if (!slot) throw new UnknownProductError(`No product at ${code}`);
+    return slot.product;
+  }
+  stock(code: string): number { return this.slots.get(code)?.qty ?? 0; }
+  take(code: string): void {
+    const slot = this.slots.get(code);
+    if (!slot || slot.qty === 0) throw new OutOfStockError(`${code} is sold out`);
+    slot.qty--;
+  }
+  restock(code: string, qty: number): void {
+    const slot = this.slots.get(code);
+    if (!slot) throw new UnknownProductError(`No product at ${code}`);
+    if (!Number.isInteger(qty) || qty <= 0) throw new VendingError('Restock quantity must be a positive integer');
+    slot.qty += qty;
+  }
+}
+
+class CashBox {
+  private readonly counts = new Map<Denomination, number>();
+
+  constructor(initial: Partial<Record<Denomination, number>> = {}) {
+    for (const d of DENOMINATIONS) this.counts.set(d, initial[d] ?? 0);
+  }
+
+  deposit(coins: readonly Denomination[]): void {
+    for (const c of coins) this.counts.set(c, (this.counts.get(c) ?? 0) + 1);
+  }
+
+  /** Removes and returns coins worth `amount`, or returns null and changes nothing. */
+  makeChange(amount: number): Denomination[] | null {
+    const picked: Denomination[] = [];
+    let left = amount;
+    for (const d of DENOMINATIONS) {
+      let available = this.counts.get(d) ?? 0;
+      while (left >= d && available > 0) {
+        picked.push(d);
+        left -= d;
+        available--;
+      }
+    }
+    if (left !== 0) return null;
+    for (const c of picked) this.counts.set(c, (this.counts.get(c) ?? 0) - 1);
+    return picked;
+  }
+
+  withdraw(coins: readonly Denomination[]): void {
+    for (const c of coins) {
+      const n = this.counts.get(c) ?? 0;
+      if (n === 0) throw new VendingError(`Cash box has no Rs ${c}`);
+      this.counts.set(c, n - 1);
+    }
+  }
+
+  total(): number {
+    let t = 0;
+    for (const [d, n] of this.counts) t += d * n;
+    return t;
+  }
+}
+
+interface PaymentPolicy {
+  readonly name: string;
+  accepts(price: number, paidSoFar: number, coin: number): boolean;
+}
+
+class ChangeReturningPolicy implements PaymentPolicy {
+  readonly name = 'change-returning';
+  accepts(): boolean { return true; }
+}
+
+class ExactPaymentPolicy implements PaymentPolicy {
+  readonly name = 'exact-payment';
+  accepts(price: number, paidSoFar: number, coin: number): boolean { return paidSoFar + coin <= price; }
+}
+```
+
+**Part 2: the states.** Read `ProductSelectedState.insert` and `DispensingState.complete` together. They are the whole purchase flow, and neither contains a single `if (state === …)`.
+
+```ts
+interface MachineState {
+  readonly name: string;
+  select(m: VendingMachine, code: string): string;
+  insert(m: VendingMachine, coin: Denomination): string;
+  cancel(m: VendingMachine): string;
+  enterMaintenance(m: VendingMachine, pin: string): string;
+  restock(m: VendingMachine, code: string, qty: number): string;
+  exitMaintenance(m: VendingMachine): string;
+}
+
+abstract class BaseState implements MachineState {
+  abstract readonly name: string;
+  protected reject(action: string): never {
+    throw new InvalidOperationError(`Cannot ${action} while ${this.name}`);
+  }
+  select(_m: VendingMachine, _code: string): string { return this.reject('select'); }
+  insert(_m: VendingMachine, _coin: Denomination): string { return this.reject('insert money'); }
+  cancel(_m: VendingMachine): string { return this.reject('cancel'); }
+  enterMaintenance(_m: VendingMachine, _pin: string): string { return this.reject('enter maintenance'); }
+  restock(_m: VendingMachine, _code: string, _qty: number): string { return this.reject('restock'); }
+  exitMaintenance(_m: VendingMachine): string { return this.reject('exit maintenance'); }
+}
+
+class IdleState extends BaseState {
+  readonly name = 'IDLE';
+  override select(m: VendingMachine, code: string): string {
+    const product = m.inventory.get(code);
+    if (m.inventory.stock(code) === 0) throw new OutOfStockError(`${product.name} (${code}) is sold out`);
+    m.startTransaction(product);
+    m.transition(STATES.selected);
+    return `selected ${product.name}, pay Rs ${product.price}`;
+  }
+  override insert(_m: VendingMachine, coin: Denomination): string {
+    throw new InvalidOperationError(`Select a product first (Rs ${coin} returned)`);
+  }
+  override enterMaintenance(m: VendingMachine, pin: string): string {
+    if (!m.checkPin(pin)) throw new AuthError('Wrong maintenance PIN');
+    m.transition(STATES.maintenance);
+    return 'maintenance mode on';
+  }
+}
+
+class ProductSelectedState extends BaseState {
+  readonly name = 'PRODUCT_SELECTED';
+  override insert(m: VendingMachine, coin: Denomination): string {
+    const txn = m.requireTransaction();
+    const paid = sum(txn.coins);
+    if (!m.policy.accepts(txn.product.price, paid, coin)) {
+      return `Rs ${coin} rejected by ${m.policy.name} policy (needs Rs ${txn.product.price - paid} more)`;
+    }
+    txn.coins.push(coin);
+    const nowPaid = paid + coin;
+    if (nowPaid < txn.product.price) return `paid Rs ${nowPaid}/${txn.product.price}`;
+    m.transition(STATES.dispensing);
+    return STATES.dispensing.complete(m);
+  }
+  override cancel(m: VendingMachine): string {
+    const txn = m.endTransaction();
+    m.transition(STATES.idle);
+    return `cancelled, refunded ${fmt(txn.coins)}`;
+  }
+}
+
+class DispensingState extends BaseState {
+  readonly name = 'DISPENSING';
+  complete(m: VendingMachine): string {
+    const txn = m.requireTransaction();
+    const changeDue = sum(txn.coins) - txn.product.price;
+    m.cashBox.deposit(txn.coins); // inserted coins can be used for change
+    const change = m.cashBox.makeChange(changeDue);
+    if (change === null) {
+      m.cashBox.withdraw(txn.coins); // give back exactly what was inserted
+      m.endTransaction();
+      m.transition(STATES.idle);
+      return `cannot make change of Rs ${changeDue}, refunded ${fmt(txn.coins)}`;
+    }
+    m.inventory.take(txn.product.code);
+    m.endTransaction();
+    m.transition(STATES.idle);
+    return `dispensed ${txn.product.name}, change ${fmt(change)}`;
+  }
+}
+
+class MaintenanceState extends BaseState {
+  readonly name = 'MAINTENANCE';
+  override restock(m: VendingMachine, code: string, qty: number): string {
+    m.inventory.restock(code, qty);
+    return `restocked ${code} to ${m.inventory.stock(code)}`;
+  }
+  override exitMaintenance(m: VendingMachine): string {
+    m.transition(STATES.idle);
+    return 'maintenance mode off';
+  }
+}
+
+// States hold no data, so one shared instance of each is enough.
+const STATES = {
+  idle: new IdleState(),
+  selected: new ProductSelectedState(),
+  dispensing: new DispensingState(),
+  maintenance: new MaintenanceState(),
+};
+```
+
+**Part 3: the context.** `VendingMachine` is thin. It validates the raw input (turning numbers into `Denomination`) and delegates everything else.
+
+```ts
+interface Transaction { product: Product; coins: Denomination[] }
+
+class VendingMachine {
+  private state: MachineState = STATES.idle;
+  private txn: Transaction | null = null;
+
+  constructor(
+    readonly inventory: Inventory,
+    readonly cashBox: CashBox,
+    readonly policy: PaymentPolicy,
+    private readonly adminPin: string,
+  ) {}
+
+  // ---- public API: validate input, then delegate ----
+  select(code: string): string { return this.state.select(this, code.trim().toUpperCase()); }
+  insert(amount: number): string { return this.state.insert(this, toDenomination(amount)); }
+  cancel(): string { return this.state.cancel(this); }
+  enterMaintenance(pin: string): string { return this.state.enterMaintenance(this, pin); }
+  restock(code: string, qty: number): string { return this.state.restock(this, code, qty); }
+  exitMaintenance(): string { return this.state.exitMaintenance(this); }
+  get stateName(): string { return this.state.name; }
+
+  // ---- used by states ----
+  transition(next: MachineState): void { this.state = next; }
+  checkPin(pin: string): boolean { return pin === this.adminPin; }
+  startTransaction(product: Product): void { this.txn = { product, coins: [] }; }
+  requireTransaction(): Transaction {
+    if (!this.txn) throw new VendingError('No active transaction');
+    return this.txn;
+  }
+  endTransaction(): Transaction {
+    const txn = this.requireTransaction();
+    this.txn = null;
+    return txn;
+  }
+}
+```
+
+**Part 4: driver.**
+
+```ts
+function stockedInventory(): Inventory {
+  const inv = new Inventory();
+  inv.add({ code: 'A1', name: 'Chips', price: 20 }, 2);
+  inv.add({ code: 'B1', name: 'Cola', price: 40 }, 1);
+  inv.add({ code: 'C1', name: 'Water', price: 15 }, 0);
+  return inv;
+}
+
+function run(m: VendingMachine, label: string, action: () => string): void {
+  try {
+    console.log(`${label.padEnd(18)} ${action()}  [${m.stateName}]`);
+  } catch (err) {
+    if (err instanceof VendingError) console.log(`${label.padEnd(18)} ${err.name}: ${err.message}  [${m.stateName}]`);
+    else throw err;
+  }
+}
+
+console.log('--- change-returning machine ---');
+const box = new CashBox({ 1: 2, 2: 2, 5: 1 });
+const vm = new VendingMachine(stockedInventory(), box, new ChangeReturningPolicy(), '4321');
+console.log(`cash box starts with Rs ${box.total()}`);
+run(vm, 'insert 10', () => vm.insert(10));
+run(vm, 'select C1', () => vm.select('C1'));
+run(vm, 'select Z9', () => vm.select('Z9'));
+run(vm, 'select a1', () => vm.select('a1'));
+run(vm, 'select B1', () => vm.select('B1'));
+run(vm, 'insert 7', () => vm.insert(7));
+run(vm, 'insert 10', () => vm.insert(10));
+run(vm, 'insert 20', () => vm.insert(20));
+run(vm, 'select B1', () => vm.select('B1'));
+run(vm, 'insert 50', () => vm.insert(50));
+run(vm, 'select A1', () => vm.select('A1'));
+run(vm, 'insert 5', () => vm.insert(5));
+run(vm, 'insert 2', () => vm.insert(2));
+run(vm, 'cancel', () => vm.cancel());
+run(vm, 'select A1', () => vm.select('A1'));
+run(vm, 'insert 100', () => vm.insert(100));
+console.log(`cash box now Rs ${box.total()} (started 11, + 20 chips + 40 cola = 71)`);
+console.log(`stock A1=${vm.inventory.stock('A1')} B1=${vm.inventory.stock('B1')}`);
+
+console.log('--- maintenance ---');
+run(vm, 'maintenance 0000', () => vm.enterMaintenance('0000'));
+run(vm, 'maintenance 4321', () => vm.enterMaintenance('4321'));
+run(vm, 'select A1', () => vm.select('A1'));
+run(vm, 'restock C1 5', () => vm.restock('C1', 5));
+run(vm, 'exit', () => vm.exitMaintenance());
+run(vm, 'select C1', () => vm.select('C1'));
+run(vm, 'insert 10', () => vm.insert(10));
+run(vm, 'insert 5', () => vm.insert(5));
+
+console.log('--- exact-payment machine ---');
+const exact = new VendingMachine(stockedInventory(), new CashBox(), new ExactPaymentPolicy(), '1111');
+run(exact, 'select A1', () => exact.select('A1'));
+run(exact, 'insert 50', () => exact.insert(50));
+run(exact, 'insert 10', () => exact.insert(10));
+run(exact, 'insert 10', () => exact.insert(10));
+```
+
+## Demo output
+
+```text
+--- change-returning machine ---
+cash box starts with Rs 11
+insert 10          InvalidOperationError: Select a product first (Rs 10 returned)  [IDLE]
+select C1          OutOfStockError: Water (C1) is sold out  [IDLE]
+select Z9          UnknownProductError: No product at Z9  [IDLE]
+select a1          selected Chips, pay Rs 20  [PRODUCT_SELECTED]
+select B1          InvalidOperationError: Cannot select while PRODUCT_SELECTED  [PRODUCT_SELECTED]
+insert 7           InvalidCoinError: Rs 7 is not an accepted coin or note  [PRODUCT_SELECTED]
+insert 10          paid Rs 10/20  [PRODUCT_SELECTED]
+insert 20          dispensed Chips, change [10]  [IDLE]
+select B1          selected Cola, pay Rs 40  [PRODUCT_SELECTED]
+insert 50          dispensed Cola, change [5, 2, 2, 1]  [IDLE]
+select A1          selected Chips, pay Rs 20  [PRODUCT_SELECTED]
+insert 5           paid Rs 5/20  [PRODUCT_SELECTED]
+insert 2           paid Rs 7/20  [PRODUCT_SELECTED]
+cancel             cancelled, refunded [5, 2]  [IDLE]
+select A1          selected Chips, pay Rs 20  [PRODUCT_SELECTED]
+insert 100         cannot make change of Rs 80, refunded [100]  [IDLE]
+cash box now Rs 71 (started 11, + 20 chips + 40 cola = 71)
+stock A1=1 B1=0
+--- maintenance ---
+maintenance 0000   AuthError: Wrong maintenance PIN  [IDLE]
+maintenance 4321   maintenance mode on  [MAINTENANCE]
+select A1          InvalidOperationError: Cannot select while MAINTENANCE  [MAINTENANCE]
+restock C1 5       restocked C1 to 5  [MAINTENANCE]
+exit               maintenance mode off  [IDLE]
+select C1          selected Water, pay Rs 15  [PRODUCT_SELECTED]
+insert 10          paid Rs 10/15  [PRODUCT_SELECTED]
+insert 5           dispensed Water, change []  [IDLE]
+--- exact-payment machine ---
+select A1          selected Chips, pay Rs 20  [PRODUCT_SELECTED]
+insert 50          Rs 50 rejected by exact-payment policy (needs Rs 20 more)  [PRODUCT_SELECTED]
+insert 10          paid Rs 10/20  [PRODUCT_SELECTED]
+insert 10          dispensed Chips, change []  [IDLE]
+
+```
+
+Notice two things. The first chips purchase gets its change from the ₹10 note the customer just inserted, because inserted money goes into the cash box before change is computed. And the ₹100 purchase is refunded rather than half-completed: the box holds ₹71, but no combination of those coins makes ₹80.
+
+## Concurrency
+
+A physical machine serves one person at a time, but modern machines in India also take **UPI**. That brings in an async actor: the payment webhook. Here's the race. The customer selects Cola, a QR code is shown, the customer gets impatient and presses cancel, and *then* the PSP's success callback arrives. A naive handler dispenses to nobody (or to the next customer), or keeps the money with no product. Duplicate webhooks (PSPs retry) are a second problem.
+
+The fix: every purchase gets a **session ID**, and the webhook carries it. The handler acts only if that session is still the active, unpaid one. A callback for a cancelled session triggers a **refund**, never a dispense. Processed payment IDs are remembered for idempotency.
+
+```ts
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+interface UpiCallback { sessionId: string; paymentId: string; amount: number }
+
+class NaiveUpiMachine {
+  private selected: string | null = null;
+  select(item: string): void { this.selected = item; }
+  cancel(): void { this.selected = null; }
+  onPaymentSuccess(cb: UpiCallback): string {
+    // ❌ ignores which session the payment belongs to
+    return `dispensed ${this.selected ?? 'NOTHING'} for ${cb.paymentId} (customer charged Rs ${cb.amount})`;
+  }
+}
+
+type SessionStatus = 'AWAITING_PAYMENT' | 'CANCELLED' | 'PAID';
+
+class SafeUpiMachine {
+  private readonly sessions = new Map<string, { item: string; status: SessionStatus }>();
+  private readonly seenPayments = new Set<string>();
+  private counter = 0;
+  readonly refunds: string[] = [];
+
+  select(item: string): string {
+    const id = `S${++this.counter}`;
+    this.sessions.set(id, { item, status: 'AWAITING_PAYMENT' });
+    return id;
+  }
+
+  cancel(sessionId: string): void {
+    const s = this.sessions.get(sessionId);
+    if (s?.status === 'AWAITING_PAYMENT') s.status = 'CANCELLED';
+  }
+
+  onPaymentSuccess(cb: UpiCallback): string {
+    if (this.seenPayments.has(cb.paymentId)) return `${cb.paymentId}: duplicate callback ignored`;
+    this.seenPayments.add(cb.paymentId);
+    const s = this.sessions.get(cb.sessionId);
+    if (!s || s.status !== 'AWAITING_PAYMENT') {
+      this.refunds.push(cb.paymentId);
+      return `${cb.paymentId}: session ${cb.sessionId} is ${s?.status ?? 'UNKNOWN'}, refund initiated`;
+    }
+    s.status = 'PAID'; // check and set in the same synchronous step
+    return `${cb.paymentId}: dispensed ${s.item} for ${cb.sessionId}`;
+  }
+}
+
+// PSP calls back 20 ms after payment; the customer cancels at 5 ms.
+async function pspCallback<T>(handler: (cb: UpiCallback) => T, cb: UpiCallback): Promise<T> {
+  await sleep(20);
+  return handler(cb);
+}
+
+const naive = new NaiveUpiMachine();
+naive.select('Cola');
+const naivePending = pspCallback((cb) => naive.onPaymentSuccess(cb), { sessionId: '-', paymentId: 'pay_1', amount: 40 });
+await sleep(5);
+naive.cancel();
+console.log(`naive: ${await naivePending}`);
+
+const safe = new SafeUpiMachine();
+const s1 = safe.select('Cola');
+const late = pspCallback((cb) => safe.onPaymentSuccess(cb), { sessionId: s1, paymentId: 'pay_2', amount: 40 });
+await sleep(5);
+safe.cancel(s1);
+console.log(`safe: ${await late}`);
+
+const s2 = safe.select('Chips');
+const results = await Promise.all([
+  pspCallback((cb) => safe.onPaymentSuccess(cb), { sessionId: s2, paymentId: 'pay_3', amount: 20 }),
+  pspCallback((cb) => safe.onPaymentSuccess(cb), { sessionId: s2, paymentId: 'pay_3', amount: 20 }),
+]);
+console.log(`safe: ${results.join(' | ')}`);
+console.log(`refunds: ${safe.refunds.join(', ')}`);
+```
+
+```text
+naive: dispensed NOTHING for pay_1 (customer charged Rs 40)
+safe: pay_2: session S1 is CANCELLED, refund initiated
+safe: pay_3: dispensed Chips for S2 | pay_3: duplicate callback ignored
+refunds: pay_2
+
+```
+
+On a machine with one controller, this is all in one process, so "check and set in one synchronous step" is enough. In a cloud backend that manages a fleet of machines, the same rule becomes a conditional update: `UPDATE sessions SET status='PAID' WHERE id=$1 AND status='AWAITING_PAYMENT'`, plus a unique constraint on `payment_id`.
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|-----------|---------------|
+| **Return change** | Done. Greedy over the available coins. |
+| **Greedy fails with limited coins** | Switch `makeChange` to a bounded-coin DP. Implemented below. |
+| **Admin restock / collect cash** | Done via `MaintenanceState`. Add `collectCash()` there only. |
+| **Exact-payment variant** (Microsoft) | Done via `ExactPaymentPolicy`. |
+| **Out-of-order state** (motor jam) | New `OutOfOrderState`, entered from `Dispensing` on a hardware error, with an automatic refund. |
+| **Coffee machine variant** | Products become recipes that consume ingredients. `Inventory.take` checks every ingredient. Add a `Preparing` state. |
+| **Card/UPI** | New `AwaitingExternalPayment` state plus session IDs (see Concurrency). |
+| **Timeout** | Inject a `Clock`. If no coin arrives for 60 s in `ProductSelected`, auto-cancel and refund. |
+
+Bounded-coin change making. Say the box holds one ₹50 note and three ₹20 notes, and the change due is ₹60. Greedy takes the ₹50, then can't make ₹10, and fails, even though 20 + 20 + 20 works. A small DP over amounts finds it and also minimises the number of coins.
+
+```ts
+type Counts = Map<number, number>;
+
+function greedyChange(amount: number, available: Counts): number[] | null {
+  const out: number[] = [];
+  let left = amount;
+  for (const d of [...available.keys()].sort((a, b) => b - a)) {
+    let n = available.get(d) ?? 0;
+    while (left >= d && n > 0) { out.push(d); left -= d; n--; }
+  }
+  return left === 0 ? out : null;
+}
+
+/** Bounded coin change: fewest coins using at most available[d] of each denomination. */
+function dpChange(amount: number, available: Counts): number[] | null {
+  // best[a] = fewest-coin list that makes exactly a, using the coins processed so far
+  const best: (number[] | null)[] = Array.from({ length: amount + 1 }, () => null);
+  best[0] = [];
+  for (const [coin, count] of available) {
+    // Each physical coin is a 0/1 item. Iterating amounts downwards means
+    // best[a - coin] never already contains this particular copy.
+    for (let copy = 0; copy < count; copy++) {
+      for (let a = amount; a >= coin; a--) {
+        const base = best[a - coin];
+        const current = best[a];
+        if (base && (!current || base.length + 1 < current.length)) best[a] = [...base, coin];
+      }
+    }
+  }
+  const result = best[amount];
+  return result ? [...result].sort((x, y) => y - x) : null;
+}
+
+const show = (c: number[] | null) => (c ? `[${c.join(', ')}]` : 'impossible');
+const cases: [number, Counts][] = [
+  [60, new Map([[50, 1], [20, 3]])],
+  [80, new Map([[50, 1], [20, 1], [1, 1]])],
+  [30, new Map([[20, 1], [10, 2], [5, 2]])],
+];
+for (const [amount, coins] of cases) {
+  const stock = [...coins].map(([d, n]) => `${n}x${d}`).join(' ');
+  console.log(`change ${amount} from {${stock}}: greedy=${show(greedyChange(amount, coins))} dp=${show(dpChange(amount, coins))}`);
+}
+```
+
+```text
+change 60 from {1x50 3x20}: greedy=impossible dp=[20, 20, 20]
+change 80 from {1x50 1x20 1x1}: greedy=impossible dp=impossible
+change 30 from {1x20 2x10 2x5}: greedy=[20, 10] dp=[20, 10]
+```
+
+The DP costs O(A · C) steps for amount A and C physical coins (plus copying the short coin lists). That's tiny for vending amounts. Mention that with *unlimited* Indian denominations greedy is already optimal. The DP only matters once the coin stock is limited.
+
+## Edge cases
+
+- Inserting money before selecting: rejected, and the coin is returned.
+- Invalid denominations (₹7, ₹0, negative, ₹500 if not accepted): `InvalidCoinError`, and the state doesn't change.
+- Selecting a sold-out or unknown product: rejected before any money is taken.
+- Selecting again while a product is already selected: `InvalidOperationError`. The customer must cancel first. (You could also allow switching, but say so explicitly.)
+- Overpayment when change is impossible: full refund of the *exact coins inserted*, not "equivalent value".
+- Exact-payment policy with an overshooting coin: the coin is rejected, the transaction continues.
+- Wrong PIN; user actions during maintenance; restocking an unknown code or a non-positive quantity.
+- Cancel with nothing inserted: allowed, refunds `[]`.
+
+## Complexity
+
+| Operation | Cost |
+|-----------|------|
+| `select`, `insert`, `cancel` | O(1) |
+| Greedy change | O(D + k) for D denominations and k coins returned |
+| DP change | O(A · C) |
+| Memory | O(products + denominations) |
+
+## What graders look for / common mistakes
+
+- **Look for:** a real State pattern with transitions owned by states; selection, payment and dispensing separated; money conservation; clear rejections.
+- **Mistake:** a State pattern where the *context* still has `switch (state)`. That's two designs at once.
+- **Mistake:** states that hold transaction data, so a shared state object leaks data between customers.
+- **Mistake:** decrementing stock before confirming that change can be made.
+- **Mistake:** floats for money (`0.1 + 0.2`). Use integer rupees or paise.
+- **Mistake:** forgetting to refund on cancel or on a change failure.
+- **Mistake:** State pattern classes with no reason to exist (e.g. a `HasOneCoinState`, `HasTwoCoinsState` explosion). The amount paid is data, not a state.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–10 | Clarify the flow (select or pay first), denominations, change policy, admin ops. |
+| 10–20 | State diagram first, then the class diagram. Agree on the state list. |
+| 20–50 | `Inventory`, `CashBox`, `BaseState` and the concrete states, `VendingMachine`. |
+| 50–65 | Driver: happy path, cancel, sold out, invalid coin, change failure. |
+| 65–80 | Maintenance, exact-payment policy, or the DP follow-up. |
+| 80–90 | UPI and late-callback discussion, edge cases. |
+
+## Interview Q&A
+
+**Q1. Where should state transitions live: in the context or in the states?**
+
+<details>
+<summary>Answer</summary>
+
+Here they live in the states (`m.transition(STATES.idle)`), because each state knows where its actions lead. It's the most common choice in interviews. The alternative is a transition table in the context, which is easier to visualise and validate, but the table must stay in sync with the state classes. For small machines, state-owned transitions are fine. For large workflow engines, prefer an explicit table.
+
+</details>
+
+**Q2. Why is "amount paid" not a state?**
+
+<details>
+<summary>Answer</summary>
+
+States should differ in *behaviour*. Having ₹10 or ₹30 paid behaves the same way ("accept more coins, dispense when enough"), so it's data inside the transaction. Making it a state explodes the number of classes without adding any behaviour.
+
+</details>
+
+**Q3. How do you guarantee the machine never keeps money without dispensing?**
+
+<details>
+<summary>Answer</summary>
+
+Every path out of `ProductSelected` and `Dispensing` ends in exactly one of two outcomes: dispense plus change, or a refund of the exact inserted coins. Stock is taken only after change is secured, and the cash box withdraws the same coins it deposited when change fails. A test can assert `cashBox.total()` before and after each scenario.
+
+</details>
+
+**Q4. How would you add a 60-second inactivity timeout?**
+
+<details>
+<summary>Answer</summary>
+
+Inject a `Clock` and a scheduler. When entering `ProductSelected`, schedule a timeout with the session ID. On firing, if the machine is still in that session, call `cancel()`. The session-ID check stops a stale timer from cancelling a newer customer's transaction. That's the same idea as the UPI callback fix.
+
+</details>
+
+**Q5. Singleton states: any downside?**
+
+<details>
+<summary>Answer</summary>
+
+Only if a state holds per-machine data. Then two machines would share it. Keeping states stateless and storing data on the context avoids that. If a state *needs* data (e.g. a retry counter), create a new state instance on each transition instead.
+
+</details>

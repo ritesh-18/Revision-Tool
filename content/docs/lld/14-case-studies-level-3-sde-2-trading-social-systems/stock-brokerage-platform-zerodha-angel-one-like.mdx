@@ -1,0 +1,1614 @@
+---
+title: "14.2 Stock Brokerage Platform (Zerodha / Angel One-like)"
+---
+
+## Problem & where it's asked
+
+Design the broker side, the app a retail investor actually uses. It covers users and KYC, a funds account, placing and cancelling orders, holdings and positions, watchlists, price alerts and P&L. The exchange is an external system that you reach through a gateway.
+
+**Where it's asked (per research notes):**
+
+- **Zeta** asked for a "Zerodha- or Upstox-like platform" (reported, snippet).
+- **Goldman Sachs (2026)** asked for signup, wallet, buy/sell, portfolio and admin-managed stocks (reported).
+- **Upstox SDE-2** asked a related trailing stop-loss system (reported, snippet). We build it as the extension.
+- "Design Zerodha" is a popular practice prompt, but there are no public Zerodha machine-coding reports.
+- For **Angel One** this exact prompt is *not* confirmed by the notes. It is an inference from the company's business, and the notes list "order book, watchlist, price alerts, portfolio" as likely topics. Prepare for it anyway: it is the problem closest to what Angel One's engineers build every day.
+
+What separates an SDE-2 answer here is not the number of features. It is **money safety**: blocking funds before sending, releasing them on every exit path, making order placement idempotent, and saying clearly what happens when the exchange doesn't answer.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|-----------|
+| Which products? | Delivery (CNC) equity only. Intraday leverage and F&O margin (SPAN/exposure) are out of scope, though an F&O segment exists so we can show the segment check. |
+| Order types? | LIMIT and MARKET. Stop-loss and trailing stop-loss are extensions. |
+| How much to block for a market buy? | LTP × qty plus a 2% buffer. The unused part is released on fill. |
+| Settlement? | Simplified: bought shares show in holdings immediately and sale proceeds are credited immediately. Real T+1 settlement and the "unsettled" balance are mentioned only. |
+| Charges and taxes (brokerage, STT, GST)? | Out of scope. We'd add a `ChargesCalculator` strategy. |
+| Market hours? | 09:15–15:30 IST, checked through an injected clock. The holiday calendar is out of scope. |
+| Is the exchange synchronous? | No. We get an ack, then fills arrive asynchronously. Acks can time out. |
+| Can the app retry? | Yes. Every request carries a `clientOrderId`, and a retry must not create a second order. |
+| Alerts? | One-shot alerts: crosses above, crosses below, and a percentage move from a reference price. |
+
+## Requirements
+
+**Functional**
+
+1. Users with KYC status and enabled segments. Each user has a funds account (available, blocked) and holdings (qty, blocked qty, average price).
+2. Place order → validation chain → reserve funds or shares → send to exchange → handle ack, reject, or timeout.
+3. Order lifecycle `PENDING → OPEN → PARTIALLY_FILLED → FILLED`, with `CANCELLED` and `REJECTED` exits. Illegal transitions throw.
+4. Fills update funds, holdings, average price and realized P&L.
+5. Cancel an open order and release whatever is still reserved.
+6. Watchlists (bounded size), price alerts with pluggable conditions, and portfolio P&L at LTP.
+7. Idempotent placement keyed by `(userId, clientOrderId)`.
+
+**Non-functional**
+
+- No double spending under concurrent requests from one user.
+- No lost or double-applied fills (fills are deduplicated by fill id).
+- The exchange integration can be swapped: a real NSE/BSE adapter or a fake in tests.
+- Deterministic tests: injected clock and ids.
+
+**Out of scope:** authentication, payment gateway top-ups, charting, mutual funds, IPOs, a real RMS (risk management system), and the regulatory specifics of the broker–exchange connection.
+
+## Entities & relationships
+
+| Entity | Key fields | Relationships |
+|--------|-----------|---------------|
+| `User` | id, name, kycVerified, segments | 1 `FundsAccount`, N `Holding`, N `Watchlist`, N `BrokerOrder` |
+| `Instrument` | symbol, exchange, segment, tickSize, lotSize | Referenced by orders, holdings, alerts |
+| `FundsAccount` | available, blocked (paise) | Owned by a user |
+| `Holding` | symbol, qty, blockedQty, totalCost | Average price = totalCost / qty |
+| `BrokerOrder` | id, clientOrderId, side, type, qty, price, state, filledQty, blockedAmount, exchangeOrderId | State machine. Mapped to an exchange order |
+| `ExchangeFill` | fillId, brokerOrderId, qty, price | Applied to exactly one order, once |
+| `PriceAlert` | symbol, `AlertCondition`, active | Observes the `MarketDataFeed` |
+| `ExchangeGateway` | place / cancel / lookup / onFill | Implemented by `FakeExchange` (adapter seam) |
+| `OrderValidator` | validate(ctx) | Chained in `ValidationChain` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class BrokerService {
+        -KeyedMutex userLocks
+        -Map idempotency
+        +placeOrder(userId, req) Promise
+        +cancelOrder(userId, orderId) Promise
+        +reconcile() Promise
+        +portfolio(userId) string[]
+    }
+    class ValidationChain {
+        +validate(ctx)
+    }
+    class OrderValidator {
+        <<interface>>
+        +validate(ctx)
+    }
+    class KycSegmentValidator
+    class MarketHoursValidator
+    class PriceQtyValidator
+    class FundsHoldingsValidator
+    class BrokerOrder {
+        +state
+        +transition(to)
+        +recordFill(qty, price)
+    }
+    class ExchangeGateway {
+        <<interface>>
+        +placeOrder(req) Promise
+        +cancelOrder(id) Promise
+        +lookup(brokerOrderId) Promise
+        +onFill(handler)
+    }
+    class FakeExchange
+    class MarketDataFeed {
+        +subscribe(listener)
+        +publish(symbol, ltp) Promise
+    }
+    class AlertService {
+        +create(userId, symbol, condition)
+    }
+    class AlertCondition {
+        <<interface>>
+        +isMet(prev, curr) bool
+    }
+    class FundsAccount {
+        +block(amount)
+        +release(amount)
+        +settleBlocked(portion, cost)
+    }
+    class Holding {
+        +addBuy(qty, price)
+        +removeSell(qty)
+    }
+    BrokerService --> ValidationChain
+    ValidationChain --> OrderValidator
+    OrderValidator <|.. KycSegmentValidator
+    OrderValidator <|.. MarketHoursValidator
+    OrderValidator <|.. PriceQtyValidator
+    OrderValidator <|.. FundsHoldingsValidator
+    BrokerService --> ExchangeGateway
+    ExchangeGateway <|.. FakeExchange
+    BrokerService --> BrokerOrder
+    BrokerService --> FundsAccount
+    BrokerService --> Holding
+    MarketDataFeed --> AlertService : notifies
+    MarketDataFeed --> FakeExchange : notifies
+    AlertService --> AlertCondition`} />
+
+**Sequence: placing a limit buy and receiving a partial fill**
+
+<Mermaid chart={`sequenceDiagram
+    participant App
+    participant B as BrokerService
+    participant L as UserLock
+    participant V as ValidationChain
+    participant F as FundsAccount
+    participant G as ExchangeGateway
+    App->>B: placeOrder(ritesh, clientOrderId, BUY 40 INFY @ 1500)
+    B->>L: acquire(ritesh)
+    B->>B: idempotency check
+    B->>V: validate(ctx)
+    B->>F: block(60000.00)
+    B->>L: release
+    B->>G: placeOrder(brokerOrderId)
+    G-->>B: ack(exchangeOrderId)
+    B->>B: PENDING to OPEN (under lock)
+    B-->>App: order O1 OPEN
+    G-->>B: fill(25 @ 1498)
+    B->>L: acquire(ritesh)
+    B->>F: settleBlocked(37500.00, 37450.00)
+    B->>B: holding.addBuy, PARTIALLY_FILLED
+    B->>L: release`} />
+
+**Order state machine**
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> PENDING : validated and funds blocked
+    [*] --> REJECTED : validation failed
+    PENDING --> OPEN : exchange ack or first fill
+    PENDING --> REJECTED : exchange reject or not found
+    OPEN --> PARTIALLY_FILLED : fill
+    OPEN --> FILLED : full fill
+    OPEN --> CANCELLED : cancel
+    OPEN --> REJECTED : exchange reject later
+    PARTIALLY_FILLED --> PARTIALLY_FILLED : fill
+    PARTIALLY_FILLED --> FILLED : last fill
+    PARTIALLY_FILLED --> CANCELLED : cancel rest
+    FILLED --> [*]
+    CANCELLED --> [*]
+    REJECTED --> [*]`} />
+
+In our code, a request that fails validation is created and immediately moved `PENDING → REJECTED`, so every rejection is recorded and idempotent retries get the same answer.
+
+## Design decisions & patterns
+
+| Decision | Pattern | Why | Alternative / trade-off |
+|----------|---------|-----|------------------------|
+| Pre-trade checks as independent validators run in sequence | **Chain of Responsibility** (list form) | Each rule (KYC, hours, tick/lot, funds) is testable on its own. Adding "circuit limit" or "ban list" means adding a class, not editing a method. | A classic linked chain (`setNext`) lets a handler stop the chain early. A list is simpler and just as extensible. |
+| Order lifecycle | **State machine** (transition table) | Makes illegal moves (FILLED → CANCELLED) impossible and auditable. | The State pattern with one class per state is overkill when states have no distinct behaviour beyond allowed transitions. |
+| Exchange integration | **Adapter** behind `ExchangeGateway` | NSE/BSE connectivity and message formats stay out of the domain. Tests use `FakeExchange`. | Direct coupling makes testing and switching exchanges painful. |
+| LTP distribution | **Observer** (`MarketDataFeed`) | Alerts, the fake exchange and future features (stop-loss, P&L streaming) subscribe independently. | Polling every alert on a timer wastes work and adds latency. |
+| Alert conditions | **Strategy** | "crosses above", "crosses below", "% move" and future "52-week high" all share `isMet(prev, curr)`. | A switch on an `alertType` enum grows without limit. |
+| Placement API | **Facade** (`BrokerService`) | One entry point that coordinates validation, funds, gateway and repositories. | Controllers calling five services each is duplicated orchestration. |
+| Money | Integer paise; `Holding.totalCost` instead of a stored average | No float drift. The average is derived and always consistent. | Storing `avgPrice` and recomputing on each fill accumulates rounding error. |
+| Concurrency | **Per-user mutex** around reserve and fill application; the network call happens *outside* the lock | Prevents double spending without making one slow exchange call block the user's other operations. | A global lock is simple but doesn't scale. A DB row lock (`SELECT ... FOR UPDATE`) is the persistent equivalent. |
+| Duplicate requests | **Idempotency key** `(userId, clientOrderId)` + request fingerprint | App retries and double taps return the same order. A different payload with the same key is an error. | Deduplicating by "same symbol and qty within 5 s" is guesswork and blocks legitimate repeat orders. |
+
+## Implementation
+
+**Part 1: shared kernel.** Money formatting, typed errors, an IST-aware manual clock, ids, and a keyed async mutex.
+
+```ts
+type Paise = number;
+
+function formatINR(paise: Paise): string {
+  const sign = paise < 0 ? '-' : '';
+  const abs = Math.abs(paise);
+  return `${sign}₹${Math.trunc(abs / 100).toLocaleString('en-IN')}.${String(abs % 100).padStart(2, '0')}`;
+}
+
+class BrokerError extends Error {
+  override name = 'BrokerError';
+}
+class NotFoundError extends BrokerError {
+  override name = 'NotFoundError';
+}
+class OrderRejectedError extends BrokerError {
+  override name = 'OrderRejectedError';
+}
+class InsufficientFundsError extends OrderRejectedError {
+  override name = 'InsufficientFundsError';
+}
+class IllegalTransitionError extends BrokerError {
+  override name = 'IllegalTransitionError';
+}
+class IdempotencyConflictError extends BrokerError {
+  override name = 'IdempotencyConflictError';
+}
+class ExchangeRejectError extends BrokerError {
+  override name = 'ExchangeRejectError';
+}
+class ExchangeTimeoutError extends BrokerError {
+  override name = 'ExchangeTimeoutError';
+}
+
+const errText = (err: unknown): string => (err instanceof Error ? `${err.name}: ${err.message}` : String(err));
+
+interface Clock {
+  now(): number; // epoch millis
+}
+class ManualClock implements Clock {
+  constructor(private ms: number) {}
+  now(): number {
+    return this.ms;
+  }
+  set(ms: number): void {
+    this.ms = ms;
+  }
+}
+
+const IST_OFFSET_MS = 330 * 60_000;
+function istMinuteOfDay(epochMs: number): number {
+  return Math.floor(((epochMs + IST_OFFSET_MS) % 86_400_000) / 60_000);
+}
+function hhmm(minuteOfDay: number): string {
+  return `${String(Math.floor(minuteOfDay / 60)).padStart(2, '0')}:${String(minuteOfDay % 60).padStart(2, '0')}`;
+}
+/** 2026-09-17 at the given IST time, as epoch millis. */
+const istOn17Sep = (h: number, m: number): number => Date.UTC(2026, 8, 17, h, m) - IST_OFFSET_MS;
+
+interface IdGenerator {
+  next(prefix: string): string;
+}
+class SequentialIdGenerator implements IdGenerator {
+  private readonly counters = new Map<string, number>();
+  next(prefix: string): string {
+    const n = (this.counters.get(prefix) ?? 0) + 1;
+    this.counters.set(prefix, n);
+    return `${prefix}${n}`;
+  }
+}
+
+/** One promise chain per key: callers with the same key run one at a time. */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+
+  async runExclusive<T>(key: string, fn: () => Promise<T> | T): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const mine = new Promise<void>((resolve) => (release = resolve));
+    const tail = prev.then(() => mine);
+    this.tails.set(key, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+```
+
+**Part 2: the domain model.** `FundsAccount` and `Holding` guard their own invariants (never negative, never release more than was blocked). `BrokerOrder` refuses illegal transitions.
+
+```ts
+type Side = 'BUY' | 'SELL';
+type OrderType = 'LIMIT' | 'MARKET';
+type Segment = 'EQUITY' | 'FNO';
+type OrderState = 'PENDING' | 'OPEN' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED' | 'REJECTED';
+
+interface Instrument {
+  readonly symbol: string;
+  readonly exchange: 'NSE' | 'BSE';
+  readonly segment: Segment;
+  readonly tickSize: Paise;
+  readonly lotSize: number;
+}
+
+class User {
+  constructor(
+    readonly id: string,
+    readonly name: string,
+    public kycVerified: boolean,
+    readonly segments: ReadonlySet<Segment>,
+  ) {}
+}
+
+class FundsAccount {
+  constructor(
+    private availablePaise: Paise,
+    private blockedPaise: Paise = 0,
+  ) {}
+  get available(): Paise {
+    return this.availablePaise;
+  }
+  get blocked(): Paise {
+    return this.blockedPaise;
+  }
+  block(amount: Paise): void {
+    if (amount > this.availablePaise) {
+      throw new InsufficientFundsError(
+        `Need ${formatINR(amount)} but only ${formatINR(this.availablePaise)} is available`,
+      );
+    }
+    this.availablePaise -= amount;
+    this.blockedPaise += amount;
+  }
+  release(amount: Paise): void {
+    if (amount < 0 || amount > this.blockedPaise) throw new BrokerError(`Cannot release ${formatINR(amount)}`);
+    this.blockedPaise -= amount;
+    this.availablePaise += amount;
+  }
+  /** A fill consumed `portion` of the blocked money and actually cost `cost`. */
+  settleBlocked(portion: Paise, cost: Paise): void {
+    if (portion > this.blockedPaise) throw new BrokerError('Settling more than blocked');
+    this.blockedPaise -= portion;
+    this.availablePaise += portion - cost; // price improvement comes back; slippage is debited
+  }
+  credit(amount: Paise): void {
+    this.availablePaise += amount;
+  }
+}
+
+class Holding {
+  qty = 0;
+  blockedQty = 0;
+  totalCost: Paise = 0;
+  constructor(readonly symbol: string) {}
+
+  get avgPrice(): Paise {
+    return this.qty === 0 ? 0 : Math.round(this.totalCost / this.qty);
+  }
+  get freeQty(): number {
+    return this.qty - this.blockedQty;
+  }
+  addBuy(qty: number, price: Paise): void {
+    this.qty += qty;
+    this.totalCost += qty * price;
+  }
+  /** Removes sold shares and returns their cost basis (for realized P&L). */
+  removeSell(qty: number): Paise {
+    if (qty > this.qty || qty > this.blockedQty) throw new BrokerError(`Selling ${qty} ${this.symbol} but not reserved`);
+    const cost = Math.round((this.totalCost * qty) / this.qty);
+    this.totalCost -= cost;
+    this.qty -= qty;
+    this.blockedQty -= qty;
+    return cost;
+  }
+}
+
+const TRANSITIONS: Record<OrderState, readonly OrderState[]> = {
+  PENDING: ['OPEN', 'REJECTED'],
+  OPEN: ['PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'REJECTED'],
+  PARTIALLY_FILLED: ['PARTIALLY_FILLED', 'FILLED', 'CANCELLED'],
+  FILLED: [],
+  CANCELLED: [],
+  REJECTED: [],
+};
+
+class BrokerOrder {
+  state: OrderState = 'PENDING';
+  filledQty = 0;
+  fillValue: Paise = 0;
+  blockedAmount: Paise = 0;
+  exchangeOrderId: string | undefined;
+  needsReconciliation = false;
+  reason = '';
+  private readonly trail: OrderState[] = ['PENDING'];
+
+  constructor(
+    readonly id: string,
+    readonly userId: string,
+    readonly clientOrderId: string,
+    readonly symbol: string,
+    readonly side: Side,
+    readonly type: OrderType,
+    readonly qty: number,
+    readonly price: Paise | undefined,
+  ) {}
+
+  get remaining(): number {
+    return this.qty - this.filledQty;
+  }
+  get isTerminal(): boolean {
+    return TRANSITIONS[this.state].length === 0;
+  }
+  get avgFillPrice(): Paise {
+    return this.filledQty === 0 ? 0 : Math.round(this.fillValue / this.filledQty);
+  }
+  get history(): string {
+    return this.trail.join(' > ');
+  }
+
+  transition(to: OrderState): void {
+    if (!TRANSITIONS[this.state].includes(to)) {
+      throw new IllegalTransitionError(`${this.id}: ${this.state} -> ${to} is not allowed`);
+    }
+    this.state = to;
+    if (this.trail[this.trail.length - 1] !== to) this.trail.push(to);
+  }
+  recordFill(qty: number, price: Paise): void {
+    if (qty <= 0 || qty > this.remaining) throw new BrokerError(`${this.id}: bad fill qty ${qty}`);
+    this.filledQty += qty;
+    this.fillValue += qty * price;
+    this.transition(this.remaining === 0 ? 'FILLED' : 'PARTIALLY_FILLED');
+  }
+  summary(): string {
+    const px = this.price === undefined ? 'MKT' : formatINR(this.price);
+    return `${this.id} ${this.side} ${this.qty} ${this.symbol} @ ${px} [${this.state}] filled ${this.filledQty}`;
+  }
+}
+```
+
+**Part 3: repositories and the validation chain.** Validators read from an `OrderContext` that the service builds once. None of them mutate anything, so they can run in any order and be unit-tested alone.
+
+```ts
+class InMemoryRepo<T> {
+  private readonly items = new Map<string, T>();
+  constructor(private readonly kind: string) {}
+  save(id: string, item: T): void {
+    this.items.set(id, item);
+  }
+  find(id: string): T | undefined {
+    return this.items.get(id);
+  }
+  get(id: string): T {
+    const item = this.items.get(id);
+    if (item === undefined) throw new NotFoundError(`${this.kind} ${id} not found`);
+    return item;
+  }
+  all(): T[] {
+    return [...this.items.values()];
+  }
+}
+
+class HoldingsRepo {
+  private readonly byUser = new Map<string, Map<string, Holding>>();
+  getOrCreate(userId: string, symbol: string): Holding {
+    let book = this.byUser.get(userId);
+    if (!book) {
+      book = new Map();
+      this.byUser.set(userId, book);
+    }
+    let h = book.get(symbol);
+    if (!h) {
+      h = new Holding(symbol);
+      book.set(symbol, h);
+    }
+    return h;
+  }
+  list(userId: string): Holding[] {
+    return [...(this.byUser.get(userId)?.values() ?? [])].filter((h) => h.qty > 0);
+  }
+}
+
+interface PlaceOrderRequest {
+  clientOrderId: string;
+  symbol: string;
+  side: Side;
+  type: OrderType;
+  qty: number;
+  price?: Paise;
+}
+
+interface OrderContext {
+  readonly user: User;
+  readonly instrument: Instrument;
+  readonly req: PlaceOrderRequest;
+  readonly funds: FundsAccount;
+  readonly holding: Holding;
+  readonly ltp: Paise | undefined;
+}
+
+interface OrderValidator {
+  validate(ctx: OrderContext): void;
+}
+
+class KycSegmentValidator implements OrderValidator {
+  validate({ user, instrument }: OrderContext): void {
+    if (!user.kycVerified) throw new OrderRejectedError(`KYC pending for ${user.name}`);
+    if (!user.segments.has(instrument.segment)) {
+      throw new OrderRejectedError(`${instrument.segment} segment is not enabled for ${user.name}`);
+    }
+  }
+}
+
+class MarketHoursValidator implements OrderValidator {
+  constructor(
+    private readonly clock: Clock,
+    private readonly openMinute = 9 * 60 + 15,
+    private readonly closeMinute = 15 * 60 + 30,
+  ) {}
+  validate(): void {
+    const m = istMinuteOfDay(this.clock.now());
+    if (m < this.openMinute || m >= this.closeMinute) {
+      throw new OrderRejectedError(
+        `Market closed at ${hhmm(m)} IST (open ${hhmm(this.openMinute)}-${hhmm(this.closeMinute)})`,
+      );
+    }
+  }
+}
+
+class PriceQtyValidator implements OrderValidator {
+  validate({ req, instrument, ltp }: OrderContext): void {
+    if (!Number.isInteger(req.qty) || req.qty <= 0) throw new OrderRejectedError(`Invalid quantity ${req.qty}`);
+    if (req.qty % instrument.lotSize !== 0) {
+      throw new OrderRejectedError(`Quantity must be a multiple of lot size ${instrument.lotSize}`);
+    }
+    if (req.type === 'LIMIT') {
+      if (req.price === undefined || !Number.isInteger(req.price) || req.price <= 0) {
+        throw new OrderRejectedError('Limit order needs a positive price in paise');
+      }
+      if (req.price % instrument.tickSize !== 0) {
+        throw new OrderRejectedError(`Price ${formatINR(req.price)} is not in ticks of ${formatINR(instrument.tickSize)}`);
+      }
+    } else {
+      if (req.price !== undefined) throw new OrderRejectedError('Market order must not have a price');
+      if (ltp === undefined) throw new OrderRejectedError(`No LTP yet for ${req.symbol}; cannot size a market order`);
+    }
+  }
+}
+
+const MARKET_BUFFER_BPS = 200; // block 2% extra for market buys
+
+function amountToBlock(req: PlaceOrderRequest, ltp: Paise | undefined): Paise {
+  if (req.type === 'LIMIT' && req.price !== undefined) return req.qty * req.price;
+  const ref = ltp ?? 0;
+  return Math.ceil((req.qty * ref * (10_000 + MARKET_BUFFER_BPS)) / 10_000);
+}
+
+class FundsHoldingsValidator implements OrderValidator {
+  validate({ req, funds, holding, ltp }: OrderContext): void {
+    if (req.side === 'BUY') {
+      const need = amountToBlock(req, ltp);
+      if (need > funds.available) {
+        throw new InsufficientFundsError(`Need ${formatINR(need)}, available ${formatINR(funds.available)}`);
+      }
+    } else if (holding.freeQty < req.qty) {
+      throw new OrderRejectedError(`Only ${holding.freeQty} ${req.symbol} free to sell, asked ${req.qty}`);
+    }
+  }
+}
+
+class ValidationChain {
+  constructor(private readonly validators: readonly OrderValidator[]) {}
+  validate(ctx: OrderContext): void {
+    for (const v of this.validators) v.validate(ctx);
+  }
+}
+```
+
+**Part 4: market data, alerts and watchlists.** The feed is the Observer subject. Alert conditions are strategies that compare the previous and current LTP, which is what makes "crosses above" fire once rather than on every tick above the level.
+
+```ts
+type TickListener = (symbol: string, ltp: Paise) => Promise<void> | void;
+
+class MarketDataFeed {
+  private readonly ltps = new Map<string, Paise>();
+  private readonly listeners: TickListener[] = [];
+  subscribe(listener: TickListener): void {
+    this.listeners.push(listener);
+  }
+  ltp(symbol: string): Paise | undefined {
+    return this.ltps.get(symbol);
+  }
+  async publish(symbol: string, ltp: Paise): Promise<void> {
+    this.ltps.set(symbol, ltp);
+    for (const listener of this.listeners) {
+      try {
+        await listener(symbol, ltp);
+      } catch (err) {
+        console.log(`  [feed] listener error ignored: ${errText(err)}`);
+      }
+    }
+  }
+}
+
+interface AlertCondition {
+  describe(): string;
+  isMet(prev: Paise | undefined, curr: Paise): boolean;
+}
+class CrossesAbove implements AlertCondition {
+  constructor(private readonly level: Paise) {}
+  describe(): string {
+    return `crosses above ${formatINR(this.level)}`;
+  }
+  isMet(prev: Paise | undefined, curr: Paise): boolean {
+    return curr >= this.level && (prev === undefined || prev < this.level);
+  }
+}
+class CrossesBelow implements AlertCondition {
+  constructor(private readonly level: Paise) {}
+  describe(): string {
+    return `crosses below ${formatINR(this.level)}`;
+  }
+  isMet(prev: Paise | undefined, curr: Paise): boolean {
+    return curr <= this.level && (prev === undefined || prev > this.level);
+  }
+}
+class PercentMove implements AlertCondition {
+  constructor(
+    private readonly reference: Paise,
+    private readonly percent: number,
+  ) {}
+  describe(): string {
+    return `moves ${this.percent}% from ${formatINR(this.reference)}`;
+  }
+  isMet(_prev: Paise | undefined, curr: Paise): boolean {
+    return Math.abs(curr - this.reference) * 100 >= this.percent * this.reference;
+  }
+}
+
+interface Notifier {
+  notify(userId: string, message: string): void;
+}
+
+interface PriceAlert {
+  readonly id: string;
+  readonly userId: string;
+  readonly symbol: string;
+  readonly condition: AlertCondition;
+  active: boolean;
+}
+
+class AlertService {
+  private readonly bySymbol = new Map<string, PriceAlert[]>();
+  private readonly lastSeen = new Map<string, Paise>();
+
+  constructor(
+    feed: MarketDataFeed,
+    private readonly notifier: Notifier,
+    private readonly ids: IdGenerator,
+  ) {
+    feed.subscribe((symbol, ltp) => this.onTick(symbol, ltp));
+  }
+
+  create(userId: string, symbol: string, condition: AlertCondition): string {
+    const alert: PriceAlert = { id: this.ids.next('AL'), userId, symbol, condition, active: true };
+    const list = this.bySymbol.get(symbol) ?? [];
+    list.push(alert);
+    this.bySymbol.set(symbol, list);
+    return alert.id;
+  }
+
+  private onTick(symbol: string, ltp: Paise): void {
+    const prev = this.lastSeen.get(symbol);
+    this.lastSeen.set(symbol, ltp);
+    const list = this.bySymbol.get(symbol);
+    if (!list) return;
+    for (const alert of list) {
+      if (alert.active && alert.condition.isMet(prev, ltp)) {
+        alert.active = false; // one-shot
+        this.notifier.notify(alert.userId, `${alert.id}: ${symbol} ${alert.condition.describe()} (LTP ${formatINR(ltp)})`);
+      }
+    }
+    this.bySymbol.set(symbol, list.filter((a) => a.active));
+  }
+}
+
+class WatchlistService {
+  private readonly lists = new Map<string, string[]>();
+  constructor(
+    private readonly instruments: InMemoryRepo<Instrument>,
+    private readonly feed: MarketDataFeed,
+    private readonly maxSize = 50,
+  ) {}
+  add(userId: string, name: string, symbol: string): void {
+    this.instruments.get(symbol); // throws NotFoundError for unknown symbols
+    const key = `${userId}/${name}`;
+    const list = this.lists.get(key) ?? [];
+    if (list.includes(symbol)) return; // idempotent
+    if (list.length >= this.maxSize) throw new BrokerError(`Watchlist ${name} is full (${this.maxSize})`);
+    list.push(symbol);
+    this.lists.set(key, list);
+  }
+  remove(userId: string, name: string, symbol: string): void {
+    const key = `${userId}/${name}`;
+    this.lists.set(key, (this.lists.get(key) ?? []).filter((s) => s !== symbol));
+  }
+  view(userId: string, name: string): string {
+    const rows = (this.lists.get(`${userId}/${name}`) ?? []).map((s) => {
+      const ltp = this.feed.ltp(s);
+      return `${s} ${ltp === undefined ? '-' : formatINR(ltp)}`;
+    });
+    return `${name}: ${rows.join(' | ')}`;
+  }
+}
+```
+
+**Part 5: the exchange gateway and a deterministic fake.** The fake behaves the way a real venue does in the ways that matter: it acks asynchronously, fills on later ticks, rejects oversized orders, can "lose" an ack, and supports lookup by our order id.
+
+```ts
+interface ExchangeOrderRequest {
+  brokerOrderId: string;
+  symbol: string;
+  side: Side;
+  type: OrderType;
+  qty: number;
+  price?: Paise;
+}
+interface ExchangeFill {
+  fillId: string;
+  brokerOrderId: string;
+  exchangeOrderId: string;
+  qty: number;
+  price: Paise;
+}
+type ExchangeLookup =
+  | { found: false }
+  | { found: true; exchangeOrderId: string; state: 'OPEN' | 'FILLED' | 'CANCELLED'; filledQty: number };
+
+interface ExchangeGateway {
+  placeOrder(req: ExchangeOrderRequest): Promise<{ exchangeOrderId: string }>;
+  cancelOrder(exchangeOrderId: string): Promise<void>;
+  lookup(brokerOrderId: string): Promise<ExchangeLookup>;
+  onFill(handler: (fill: ExchangeFill) => Promise<void>): void;
+}
+
+interface FakeOrder extends ExchangeOrderRequest {
+  exchangeOrderId: string;
+  filledQty: number;
+  state: 'OPEN' | 'FILLED' | 'CANCELLED';
+}
+
+class FakeExchange implements ExchangeGateway {
+  private readonly orders = new Map<string, FakeOrder>();
+  private readonly byBrokerId = new Map<string, string>();
+  private handler: ((fill: ExchangeFill) => Promise<void>) | undefined;
+  private dropNextAck = false;
+
+  constructor(
+    private readonly ids: IdGenerator,
+    private readonly liquidityPerTick: number,
+    private readonly freezeQty: number,
+  ) {}
+
+  loseNextAck(): void {
+    this.dropNextAck = true;
+  }
+  onFill(handler: (fill: ExchangeFill) => Promise<void>): void {
+    this.handler = handler;
+  }
+
+  async placeOrder(req: ExchangeOrderRequest): Promise<{ exchangeOrderId: string }> {
+    await Promise.resolve(); // network hop
+    if (req.qty > this.freezeQty) throw new ExchangeRejectError(`qty ${req.qty} exceeds freeze limit ${this.freezeQty}`);
+    const exchangeOrderId = this.ids.next('NSE-');
+    this.orders.set(exchangeOrderId, { ...req, exchangeOrderId, filledQty: 0, state: 'OPEN' });
+    this.byBrokerId.set(req.brokerOrderId, exchangeOrderId);
+    if (this.dropNextAck) {
+      this.dropNextAck = false;
+      throw new ExchangeTimeoutError(`no ack for ${req.brokerOrderId} within 2000 ms`);
+    }
+    return { exchangeOrderId };
+  }
+
+  async cancelOrder(exchangeOrderId: string): Promise<void> {
+    await Promise.resolve();
+    const o = this.orders.get(exchangeOrderId);
+    if (!o || o.state !== 'OPEN') throw new ExchangeRejectError(`${exchangeOrderId} is not open (too late to cancel)`);
+    o.state = 'CANCELLED';
+  }
+
+  async lookup(brokerOrderId: string): Promise<ExchangeLookup> {
+    await Promise.resolve();
+    const exId = this.byBrokerId.get(brokerOrderId);
+    const o = exId === undefined ? undefined : this.orders.get(exId);
+    if (!o) return { found: false };
+    return { found: true, exchangeOrderId: o.exchangeOrderId, state: o.state, filledQty: o.filledQty };
+  }
+
+  /** Subscribed to the market data feed: marketable orders fill at LTP, limited liquidity per tick. */
+  async onTick(symbol: string, ltp: Paise): Promise<void> {
+    for (const o of [...this.orders.values()]) {
+      if (o.symbol !== symbol || o.state !== 'OPEN') continue;
+      const limit = o.price ?? ltp;
+      const marketable = o.type === 'MARKET' || (o.side === 'BUY' ? ltp <= limit : ltp >= limit);
+      if (!marketable) continue;
+      const qty = Math.min(o.qty - o.filledQty, this.liquidityPerTick);
+      o.filledQty += qty;
+      if (o.filledQty === o.qty) o.state = 'FILLED';
+      await this.handler?.({
+        fillId: this.ids.next('F'),
+        brokerOrderId: o.brokerOrderId,
+        exchangeOrderId: o.exchangeOrderId,
+        qty,
+        price: ltp,
+      });
+    }
+  }
+}
+```
+
+**Part 6: `BrokerService`, the facade that keeps money safe.** Read `placeOrder` carefully. Phase 1 runs under the user's lock: idempotency, validation, reservation, and recording the order. Phase 2 talks to the exchange *without* holding the lock. Phase 3 applies the result under the lock again. Fills take the same lock and are deduplicated by `fillId`.
+
+```ts
+interface DayFill {
+  userId: string;
+  symbol: string;
+  side: Side;
+  qty: number;
+  price: Paise;
+}
+
+class BrokerService {
+  private readonly orders = new InMemoryRepo<BrokerOrder>('Order');
+  private readonly idempotency = new Map<string, { orderId: string; fingerprint: string }>();
+  private readonly userLocks = new KeyedMutex();
+  private readonly appliedFills = new Set<string>();
+  private readonly realized = new Map<string, Paise>();
+  private readonly dayFills: DayFill[] = [];
+
+  constructor(
+    private readonly users: InMemoryRepo<User>,
+    private readonly instruments: InMemoryRepo<Instrument>,
+    private readonly funds: InMemoryRepo<FundsAccount>,
+    private readonly holdings: HoldingsRepo,
+    private readonly feed: MarketDataFeed,
+    private readonly gateway: ExchangeGateway,
+    private readonly chain: ValidationChain,
+    private readonly ids: IdGenerator,
+  ) {
+    gateway.onFill((fill) => this.applyFill(fill));
+  }
+
+  async placeOrder(userId: string, req: PlaceOrderRequest): Promise<BrokerOrder> {
+    const { order, fresh } = await this.userLocks.runExclusive(userId, () => this.admit(userId, req));
+    if (fresh && order.state === 'PENDING') await this.send(order);
+    return order;
+  }
+
+  /** Phase 1 (locked): dedupe, validate, reserve, record. */
+  private admit(userId: string, req: PlaceOrderRequest): { order: BrokerOrder; fresh: boolean } {
+    const key = `${userId}:${req.clientOrderId}`;
+    const fingerprint = `${req.side}|${req.symbol}|${req.type}|${req.qty}|${req.price ?? 'MKT'}`;
+    const seen = this.idempotency.get(key);
+    if (seen) {
+      if (seen.fingerprint !== fingerprint) {
+        throw new IdempotencyConflictError(`clientOrderId ${req.clientOrderId} was used for a different order`);
+      }
+      return { order: this.orders.get(seen.orderId), fresh: false };
+    }
+    const user = this.users.get(userId);
+    const order = new BrokerOrder(
+      this.ids.next('O'), userId, req.clientOrderId, req.symbol, req.side, req.type, req.qty, req.price,
+    );
+    this.orders.save(order.id, order);
+    this.idempotency.set(key, { orderId: order.id, fingerprint });
+    try {
+      const instrument = this.instruments.find(req.symbol);
+      if (!instrument) throw new OrderRejectedError(`Unknown instrument ${req.symbol}`);
+      const ctx: OrderContext = {
+        user,
+        instrument,
+        req,
+        funds: this.funds.get(userId),
+        holding: this.holdings.getOrCreate(userId, req.symbol),
+        ltp: this.feed.ltp(req.symbol),
+      };
+      this.chain.validate(ctx);
+      if (req.side === 'BUY') {
+        const amount = amountToBlock(req, ctx.ltp);
+        ctx.funds.block(amount); // re-checks atomically under the lock
+        order.blockedAmount = amount;
+      } else {
+        ctx.holding.blockedQty += req.qty;
+      }
+    } catch (err) {
+      if (!(err instanceof OrderRejectedError)) throw err;
+      order.reason = err.message;
+      order.transition('REJECTED');
+    }
+    return { order, fresh: true };
+  }
+
+  /** Phase 2 (unlocked network call) + phase 3 (locked result handling). */
+  private async send(order: BrokerOrder): Promise<void> {
+    try {
+      const ack = await this.gateway.placeOrder({
+        brokerOrderId: order.id, symbol: order.symbol, side: order.side,
+        type: order.type, qty: order.qty, price: order.price,
+      });
+      await this.userLocks.runExclusive(order.userId, () => {
+        order.exchangeOrderId ??= ack.exchangeOrderId;
+        if (order.state === 'PENDING') order.transition('OPEN');
+      });
+    } catch (err) {
+      await this.userLocks.runExclusive(order.userId, () => {
+        if (err instanceof ExchangeTimeoutError) {
+          order.needsReconciliation = true; // state unknown: do NOT release funds yet
+          order.reason = err.message;
+        } else if (order.state === 'PENDING') {
+          this.rejectAndRelease(order, `exchange: ${errText(err)}`);
+        }
+      });
+    }
+  }
+
+  async cancelOrder(userId: string, orderId: string): Promise<BrokerOrder> {
+    const order = this.orders.get(orderId);
+    if (order.userId !== userId) throw new NotFoundError(`Order ${orderId} not found`);
+    if (order.isTerminal) throw new BrokerError(`${orderId} is already ${order.state}`);
+    if (!order.exchangeOrderId) throw new BrokerError(`${orderId} awaiting exchange ack; retry shortly`);
+    await this.gateway.cancelOrder(order.exchangeOrderId);
+    await this.userLocks.runExclusive(userId, () => {
+      if (order.isTerminal) return;
+      order.transition('CANCELLED');
+      this.releaseReservation(order);
+    });
+    return order;
+  }
+
+  /** Resolves orders whose ack timed out by asking the exchange what it knows. */
+  async reconcile(): Promise<string[]> {
+    const report: string[] = [];
+    for (const order of this.orders.all().filter((o) => o.needsReconciliation)) {
+      const status = await this.gateway.lookup(order.id);
+      await this.userLocks.runExclusive(order.userId, () => {
+        if (!order.needsReconciliation) return;
+        order.needsReconciliation = false;
+        if (!status.found) {
+          this.rejectAndRelease(order, 'not found at exchange after ack timeout');
+        } else {
+          order.exchangeOrderId = status.exchangeOrderId;
+          if (order.state === 'PENDING') order.transition('OPEN');
+        }
+        report.push(`${order.id}: exchange says ${status.found ? status.state : 'NOT_FOUND'} -> ${order.state}`);
+      });
+    }
+    return report;
+  }
+
+  private async applyFill(fill: ExchangeFill): Promise<void> {
+    const order = this.orders.find(fill.brokerOrderId);
+    if (!order) {
+      console.log(`  [fill] ${fill.fillId} for unknown order ${fill.brokerOrderId}: parked for ops`);
+      return;
+    }
+    await this.userLocks.runExclusive(order.userId, () => {
+      if (this.appliedFills.has(fill.fillId)) return; // at-least-once delivery -> apply once
+      this.appliedFills.add(fill.fillId);
+      if (order.state === 'PENDING') {
+        order.exchangeOrderId ??= fill.exchangeOrderId; // fill can beat the ack
+        order.needsReconciliation = false;
+        order.transition('OPEN');
+      }
+      const funds = this.funds.get(order.userId);
+      const holding = this.holdings.getOrCreate(order.userId, order.symbol);
+      const value = fill.qty * fill.price;
+      if (order.side === 'BUY') {
+        const portion = fill.qty === order.remaining
+          ? order.blockedAmount
+          : Math.round((order.blockedAmount * fill.qty) / order.remaining);
+        funds.settleBlocked(portion, value);
+        order.blockedAmount -= portion;
+        holding.addBuy(fill.qty, fill.price);
+      } else {
+        const cost = holding.removeSell(fill.qty);
+        this.realized.set(order.userId, (this.realized.get(order.userId) ?? 0) + value - cost);
+        funds.credit(value);
+      }
+      order.recordFill(fill.qty, fill.price);
+      this.dayFills.push({ userId: order.userId, symbol: order.symbol, side: order.side, qty: fill.qty, price: fill.price });
+      console.log(`  [fill] ${order.id} ${order.side} ${fill.qty} ${order.symbol} @ ${formatINR(fill.price)} -> ${order.state}`);
+    });
+  }
+
+  private rejectAndRelease(order: BrokerOrder, reason: string): void {
+    order.reason = reason;
+    order.transition('REJECTED');
+    this.releaseReservation(order);
+  }
+
+  private releaseReservation(order: BrokerOrder): void {
+    if (order.side === 'BUY') {
+      this.funds.get(order.userId).release(order.blockedAmount);
+      order.blockedAmount = 0;
+    } else {
+      this.holdings.getOrCreate(order.userId, order.symbol).blockedQty -= order.remaining;
+    }
+  }
+
+  fundsLine(userId: string): string {
+    const f = this.funds.get(userId);
+    return `funds: available ${formatINR(f.available)}, blocked ${formatINR(f.blocked)}`;
+  }
+
+  portfolio(userId: string): string[] {
+    let invested = 0;
+    let current = 0;
+    const lines = this.holdings.list(userId).map((h) => {
+      const ltp = this.feed.ltp(h.symbol) ?? h.avgPrice;
+      invested += h.totalCost;
+      current += h.qty * ltp;
+      const pnl = h.qty * ltp - h.totalCost;
+      return `  ${h.symbol.padEnd(5)} qty ${String(h.qty).padStart(3)}  avg ${formatINR(h.avgPrice)}  ltp ${formatINR(ltp)}  P&L ${formatINR(pnl)}`;
+    });
+    lines.push(`  invested ${formatINR(invested)} | current ${formatINR(current)} | unrealized ${formatINR(current - invested)} | realized ${formatINR(this.realized.get(userId) ?? 0)}`);
+    return lines;
+  }
+
+  /** Today's positions: net quantity and average buy/sell per symbol, derived from fills. */
+  positions(userId: string): string[] {
+    const agg = new Map<string, { bq: number; bv: Paise; sq: number; sv: Paise }>();
+    for (const f of this.dayFills.filter((x) => x.userId === userId)) {
+      const a = agg.get(f.symbol) ?? { bq: 0, bv: 0, sq: 0, sv: 0 };
+      if (f.side === 'BUY') {
+        a.bq += f.qty;
+        a.bv += f.qty * f.price;
+      } else {
+        a.sq += f.qty;
+        a.sv += f.qty * f.price;
+      }
+      agg.set(f.symbol, a);
+    }
+    return [...agg].map(([s, a]) => {
+      const avg = (v: Paise, q: number) => (q === 0 ? '-' : formatINR(Math.round(v / q)));
+      return `  ${s.padEnd(5)} net ${String(a.bq - a.sq).padStart(4)}  bought ${a.bq} @ ${avg(a.bv, a.bq)}  sold ${a.sq} @ ${avg(a.sv, a.sq)}`;
+    });
+  }
+
+  orderBook(userId: string): string[] {
+    return this.orders.all()
+      .filter((o) => o.userId === userId)
+      .map((o) => `  ${o.summary()} | ${o.history}${o.reason ? ` | ${o.reason}` : ''}`);
+  }
+}
+```
+
+**Part 7: wiring and the demo.** Everything is wired by hand, which is plain constructor injection. In NestJS these would be providers.
+
+```ts
+const clock = new ManualClock(istOn17Sep(9, 5));
+const ids = new SequentialIdGenerator();
+
+const users = new InMemoryRepo<User>('User');
+users.save('ritesh', new User('ritesh', 'Ritesh', true, new Set<Segment>(['EQUITY'])));
+users.save('asha', new User('asha', 'Asha', false, new Set<Segment>(['EQUITY'])));
+
+const instruments = new InMemoryRepo<Instrument>('Instrument');
+for (const inst of [
+  { symbol: 'INFY', exchange: 'NSE', segment: 'EQUITY', tickSize: 5, lotSize: 1 },
+  { symbol: 'TCS', exchange: 'NSE', segment: 'EQUITY', tickSize: 5, lotSize: 1 },
+  { symbol: 'RELIANCE', exchange: 'NSE', segment: 'EQUITY', tickSize: 5, lotSize: 1 },
+  { symbol: 'IDEA', exchange: 'NSE', segment: 'EQUITY', tickSize: 1, lotSize: 1 },
+  { symbol: 'NIFTY-FUT', exchange: 'NSE', segment: 'FNO', tickSize: 10, lotSize: 50 }, // illustrative lot size
+] satisfies Instrument[]) {
+  instruments.save(inst.symbol, inst);
+}
+
+const funds = new InMemoryRepo<FundsAccount>('Funds');
+funds.save('ritesh', new FundsAccount(100_000_00));
+funds.save('asha', new FundsAccount(50_000_00));
+
+const holdings = new HoldingsRepo();
+holdings.getOrCreate('ritesh', 'TCS').addBuy(20, 3_900_00); // bought on an earlier day
+
+const feed = new MarketDataFeed();
+const exchange = new FakeExchange(ids, 25, 5000);
+feed.subscribe((symbol, ltp) => exchange.onTick(symbol, ltp));
+const alerts = new AlertService(feed, { notify: (u, m) => console.log(`  [alert -> ${u}] ${m}`) }, ids);
+const watchlists = new WatchlistService(instruments, feed);
+
+const broker = new BrokerService(
+  users, instruments, funds, holdings, feed, exchange,
+  new ValidationChain([
+    new KycSegmentValidator(),
+    new MarketHoursValidator(clock),
+    new PriceQtyValidator(),
+    new FundsHoldingsValidator(),
+  ]),
+  ids,
+);
+
+async function place(userId: string, req: PlaceOrderRequest): Promise<BrokerOrder | undefined> {
+  try {
+    const o = await broker.placeOrder(userId, req);
+    console.log(`${userId} ${req.clientOrderId}: ${o.summary()}${o.reason ? ` (${o.reason})` : ''}`);
+    return o;
+  } catch (err) {
+    console.log(`${userId} ${req.clientOrderId}: error ${errText(err)}`);
+    return undefined;
+  }
+}
+
+console.log('== 1. market data, watchlist, alerts ==');
+for (const [s, p] of [['INFY', 1_500_00], ['TCS', 4_000_00], ['RELIANCE', 2_500_00], ['IDEA', 8_00]] as const) {
+  await feed.publish(s, p);
+}
+watchlists.add('ritesh', 'tech', 'INFY');
+watchlists.add('ritesh', 'tech', 'TCS');
+watchlists.add('ritesh', 'tech', 'INFY');
+try {
+  watchlists.add('ritesh', 'tech', 'WIPRO');
+} catch (err) {
+  console.log(`watchlist: ${errText(err)}`);
+}
+console.log(watchlists.view('ritesh', 'tech'));
+alerts.create('ritesh', 'INFY', new CrossesAbove(1_520_00));
+alerts.create('ritesh', 'TCS', new PercentMove(4_000_00, 2));
+alerts.create('ritesh', 'RELIANCE', new CrossesBelow(2_450_00));
+
+console.log('== 2. validation chain ==');
+await place('ritesh', { clientOrderId: 'c1', symbol: 'INFY', side: 'BUY', type: 'LIMIT', qty: 10, price: 1_500_00 });
+clock.set(istOn17Sep(9, 30));
+await place('asha', { clientOrderId: 'c2', symbol: 'INFY', side: 'BUY', type: 'LIMIT', qty: 10, price: 1_500_00 });
+await place('ritesh', { clientOrderId: 'c3', symbol: 'NIFTY-FUT', side: 'BUY', type: 'LIMIT', qty: 50, price: 25_000_00 });
+await place('ritesh', { clientOrderId: 'c4', symbol: 'INFY', side: 'BUY', type: 'LIMIT', qty: 10, price: 1_500_03 });
+await place('ritesh', { clientOrderId: 'c5', symbol: 'TCS', side: 'SELL', type: 'MARKET', qty: 50 });
+await place('ritesh', { clientOrderId: 'c6', symbol: 'RELIANCE', side: 'BUY', type: 'LIMIT', qty: 100, price: 2_500_00 });
+await place('ritesh', { clientOrderId: 'c7', symbol: 'WIPRO', side: 'BUY', type: 'MARKET', qty: 1 });
+
+console.log('== 3. double submit (same clientOrderId, concurrent) ==');
+const buyInfy: PlaceOrderRequest = { clientOrderId: 'app-7f3a', symbol: 'INFY', side: 'BUY', type: 'LIMIT', qty: 40, price: 1_500_00 };
+const [first, second] = await Promise.all([broker.placeOrder('ritesh', buyInfy), broker.placeOrder('ritesh', buyInfy)]);
+console.log(`same order returned: ${first.id === second.id} (${first.id}); ${broker.fundsLine('ritesh')}`);
+await place('ritesh', { ...buyInfy, qty: 400 });
+
+console.log('== 4. fills: partial then full, with price improvement ==');
+await feed.publish('INFY', 1_498_00);
+console.log(`  ${broker.fundsLine('ritesh')}`);
+await feed.publish('INFY', 1_495_00);
+console.log(`  ${broker.fundsLine('ritesh')}`);
+
+console.log('== 5. market sell from holdings ==');
+await place('ritesh', { clientOrderId: 'c8', symbol: 'TCS', side: 'SELL', type: 'MARKET', qty: 10 });
+await feed.publish('TCS', 3_950_00);
+
+console.log('== 6. exchange reject releases funds ==');
+await place('ritesh', { clientOrderId: 'c9', symbol: 'IDEA', side: 'BUY', type: 'LIMIT', qty: 6000, price: 8_00 });
+console.log(`  ${broker.fundsLine('ritesh')}`);
+
+console.log('== 7. lost ack -> reconcile -> cancel ==');
+exchange.loseNextAck();
+const rel = await place('ritesh', { clientOrderId: 'c10', symbol: 'RELIANCE', side: 'BUY', type: 'LIMIT', qty: 5, price: 2_490_00 });
+console.log(`  ${broker.fundsLine('ritesh')}`);
+if (rel) {
+  try {
+    await broker.cancelOrder('ritesh', rel.id);
+  } catch (err) {
+    console.log(`  cancel before reconcile: ${errText(err)}`);
+  }
+  for (const line of await broker.reconcile()) console.log(`  reconcile ${line}`);
+  const cancelled = await broker.cancelOrder('ritesh', rel.id);
+  console.log(`  cancelled: ${cancelled.summary()}; ${broker.fundsLine('ritesh')}`);
+  try {
+    await broker.cancelOrder('ritesh', rel.id);
+  } catch (err) {
+    console.log(`  cancel again: ${errText(err)}`);
+  }
+}
+
+console.log('== 8. alerts fire on ticks ==');
+await feed.publish('INFY', 1_521_00);
+await feed.publish('INFY', 1_525_00);
+await feed.publish('TCS', 3_920_00);
+await feed.publish('RELIANCE', 2_460_00);
+
+console.log('== 9. portfolio, positions, order book ==');
+for (const line of broker.portfolio('ritesh')) console.log(line);
+for (const line of broker.positions('ritesh')) console.log(line);
+for (const line of broker.orderBook('ritesh')) console.log(line);
+console.log(broker.fundsLine('ritesh'));
+```
+
+## Demo output
+
+```text
+== 1. market data, watchlist, alerts ==
+watchlist: NotFoundError: Instrument WIPRO not found
+tech: INFY ₹1,500.00 | TCS ₹4,000.00
+== 2. validation chain ==
+ritesh c1: O1 BUY 10 INFY @ ₹1,500.00 [REJECTED] filled 0 (Market closed at 09:05 IST (open 09:15-15:30))
+asha c2: O2 BUY 10 INFY @ ₹1,500.00 [REJECTED] filled 0 (KYC pending for Asha)
+ritesh c3: O3 BUY 50 NIFTY-FUT @ ₹25,000.00 [REJECTED] filled 0 (FNO segment is not enabled for Ritesh)
+ritesh c4: O4 BUY 10 INFY @ ₹1,500.03 [REJECTED] filled 0 (Price ₹1,500.03 is not in ticks of ₹0.05)
+ritesh c5: O5 SELL 50 TCS @ MKT [REJECTED] filled 0 (Only 20 TCS free to sell, asked 50)
+ritesh c6: O6 BUY 100 RELIANCE @ ₹2,500.00 [REJECTED] filled 0 (Need ₹2,50,000.00, available ₹1,00,000.00)
+ritesh c7: O7 BUY 1 WIPRO @ MKT [REJECTED] filled 0 (Unknown instrument WIPRO)
+== 3. double submit (same clientOrderId, concurrent) ==
+same order returned: true (O8); funds: available ₹40,000.00, blocked ₹60,000.00
+ritesh app-7f3a: error IdempotencyConflictError: clientOrderId app-7f3a was used for a different order
+== 4. fills: partial then full, with price improvement ==
+  [fill] O8 BUY 25 INFY @ ₹1,498.00 -> PARTIALLY_FILLED
+  funds: available ₹40,050.00, blocked ₹22,500.00
+  [fill] O8 BUY 15 INFY @ ₹1,495.00 -> FILLED
+  funds: available ₹40,125.00, blocked ₹0.00
+== 5. market sell from holdings ==
+ritesh c8: O9 SELL 10 TCS @ MKT [OPEN] filled 0
+  [fill] O9 SELL 10 TCS @ ₹3,950.00 -> FILLED
+== 6. exchange reject releases funds ==
+ritesh c9: O10 BUY 6000 IDEA @ ₹8.00 [REJECTED] filled 0 (exchange: ExchangeRejectError: qty 6000 exceeds freeze limit 5000)
+  funds: available ₹79,625.00, blocked ₹0.00
+== 7. lost ack -> reconcile -> cancel ==
+ritesh c10: O11 BUY 5 RELIANCE @ ₹2,490.00 [PENDING] filled 0 (no ack for O11 within 2000 ms)
+  funds: available ₹67,175.00, blocked ₹12,450.00
+  cancel before reconcile: BrokerError: O11 awaiting exchange ack; retry shortly
+  reconcile O11: exchange says OPEN -> OPEN
+  cancelled: O11 BUY 5 RELIANCE @ ₹2,490.00 [CANCELLED] filled 0; funds: available ₹79,625.00, blocked ₹0.00
+  cancel again: BrokerError: O11 is already CANCELLED
+== 8. alerts fire on ticks ==
+  [alert -> ritesh] AL1: INFY crosses above ₹1,520.00 (LTP ₹1,521.00)
+  [alert -> ritesh] AL2: TCS moves 2% from ₹4,000.00 (LTP ₹3,920.00)
+== 9. portfolio, positions, order book ==
+  TCS   qty  10  avg ₹3,900.00  ltp ₹3,920.00  P&L ₹200.00
+  INFY  qty  40  avg ₹1,496.88  ltp ₹1,525.00  P&L ₹1,125.00
+  invested ₹98,875.00 | current ₹1,00,200.00 | unrealized ₹1,325.00 | realized ₹500.00
+  INFY  net   40  bought 40 @ ₹1,496.88  sold 0 @ -
+  TCS   net  -10  bought 0 @ -  sold 10 @ ₹3,950.00
+  O1 BUY 10 INFY @ ₹1,500.00 [REJECTED] filled 0 | PENDING > REJECTED | Market closed at 09:05 IST (open 09:15-15:30)
+  O3 BUY 50 NIFTY-FUT @ ₹25,000.00 [REJECTED] filled 0 | PENDING > REJECTED | FNO segment is not enabled for Ritesh
+  O4 BUY 10 INFY @ ₹1,500.03 [REJECTED] filled 0 | PENDING > REJECTED | Price ₹1,500.03 is not in ticks of ₹0.05
+  O5 SELL 50 TCS @ MKT [REJECTED] filled 0 | PENDING > REJECTED | Only 20 TCS free to sell, asked 50
+  O6 BUY 100 RELIANCE @ ₹2,500.00 [REJECTED] filled 0 | PENDING > REJECTED | Need ₹2,50,000.00, available ₹1,00,000.00
+  O7 BUY 1 WIPRO @ MKT [REJECTED] filled 0 | PENDING > REJECTED | Unknown instrument WIPRO
+  O8 BUY 40 INFY @ ₹1,500.00 [FILLED] filled 40 | PENDING > OPEN > PARTIALLY_FILLED > FILLED
+  O9 SELL 10 TCS @ MKT [FILLED] filled 10 | PENDING > OPEN > FILLED
+  O10 BUY 6000 IDEA @ ₹8.00 [REJECTED] filled 0 | PENDING > REJECTED | exchange: ExchangeRejectError: qty 6000 exceeds freeze limit 5000
+  O11 BUY 5 RELIANCE @ ₹2,490.00 [CANCELLED] filled 0 | PENDING > OPEN > CANCELLED | no ack for O11 within 2000 ms
+funds: available ₹79,625.00, blocked ₹0.00
+```
+
+Things to point out during the walkthrough:
+
+- **Section 3:** two concurrent submits with the same `clientOrderId` produce one order and one ₹60,000 block. Reusing the key with a different quantity is refused, not silently ignored.
+- **Section 4:** the order blocked ₹1,500 per share and filled at ₹1,498 and ₹1,495. The ₹50 + ₹75 of price improvement goes back to `available`, and `blocked` drops to zero once the order is FILLED.
+- **Section 6:** the exchange's freeze-quantity reject arrives *after* ₹48,000 was blocked, and the full amount comes back.
+- **Section 7:** after a lost ack, funds stay blocked (we don't know whether the order is live). Cancel is refused because there is no exchange id yet. Reconciliation finds the order OPEN, and only then does cancel succeed and release the funds.
+- **Section 8:** "crosses above" fires once at ₹1,521.00 and not again at ₹1,525.00. The TCS 2% alert fires at ₹3,920.00, and the RELIANCE alert doesn't fire because ₹2,460.00 is above its ₹2,450.00 level.
+
+## Concurrency deep-dive
+
+The classic broker bug: the app sends two orders a few milliseconds apart (two devices, or an algo). Each one checks funds, then awaits something (an RMS call, an LTP fetch, a DB round trip), then blocks. Both checks pass against the same balance.
+
+```ts
+const formatINR = (p: number): string =>
+  `${p < 0 ? '-' : ''}₹${Math.trunc(Math.abs(p) / 100).toLocaleString('en-IN')}.${String(Math.abs(p) % 100).padStart(2, '0')}`;
+
+class Wallet {
+  available = 100_000_00;
+  blocked = 0;
+}
+const wallet = new Wallet();
+
+async function riskCheck(orderId: string): Promise<void> {
+  await Promise.resolve(`RMS ok for ${orderId}`); // any await opens the window
+}
+
+async function placeNaive(orderId: string, amount: number): Promise<void> {
+  if (wallet.available < amount) {
+    console.log(`${orderId} rejected: insufficient funds`);
+    return;
+  }
+  await riskCheck(orderId);
+  wallet.available -= amount;
+  wallet.blocked += amount;
+  console.log(`${orderId} accepted, blocked ${formatINR(amount)}`);
+}
+
+await Promise.all([placeNaive('O1', 60_000_00), placeNaive('O2', 60_000_00)]);
+console.log(`available ${formatINR(wallet.available)}, blocked ${formatINR(wallet.blocked)}`);
+console.log(wallet.available < 0 ? 'BUG: ₹1,20,000 of orders against ₹1,00,000 of funds' : 'ok');
+```
+
+```text
+O1 accepted, blocked ₹60,000.00
+O2 accepted, blocked ₹60,000.00
+available -₹20,000.00, blocked ₹1,20,000.00
+BUG: ₹1,20,000 of orders against ₹1,00,000 of funds
+```
+
+Fix: take a per-user lock so that *check → await → block* is one critical section, and make `block()` itself re-check. Different users still run in parallel.
+
+```ts
+const formatINR = (p: number): string =>
+  `${p < 0 ? '-' : ''}₹${Math.trunc(Math.abs(p) / 100).toLocaleString('en-IN')}.${String(Math.abs(p) % 100).padStart(2, '0')}`;
+
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const mine = new Promise<void>((r) => (release = r));
+    const tail = prev.then(() => mine);
+    this.tails.set(key, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+
+class Wallet {
+  available = 100_000_00;
+  blocked = 0;
+  block(amount: number): void {
+    if (amount > this.available) throw new Error(`insufficient funds (available ${formatINR(this.available)})`);
+    this.available -= amount;
+    this.blocked += amount;
+  }
+}
+
+const wallets = new Map([['ritesh', new Wallet()], ['asha', new Wallet()]]);
+const locks = new KeyedMutex();
+
+async function placeSafe(userId: string, orderId: string, amount: number): Promise<void> {
+  await locks.runExclusive(userId, async () => {
+    await Promise.resolve(`RMS ok for ${orderId}`);
+    try {
+      wallets.get(userId)?.block(amount);
+      console.log(`${userId}/${orderId} accepted, blocked ${formatINR(amount)}`);
+    } catch (err) {
+      console.log(`${userId}/${orderId} rejected: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+}
+
+await Promise.all([
+  placeSafe('ritesh', 'O1', 60_000_00),
+  placeSafe('ritesh', 'O2', 60_000_00),
+  placeSafe('asha', 'O3', 60_000_00),
+]);
+for (const [user, w] of wallets) {
+  console.log(`${user}: available ${formatINR(w.available)}, blocked ${formatINR(w.blocked)}`);
+}
+```
+
+```text
+ritesh/O1 accepted, blocked ₹60,000.00
+asha/O3 accepted, blocked ₹60,000.00
+ritesh/O2 rejected: insufficient funds (available ₹40,000.00)
+ritesh: available ₹40,000.00, blocked ₹60,000.00
+asha: available ₹40,000.00, blocked ₹60,000.00
+```
+
+Notice that asha's order finishes between ritesh's two orders. The lock is per user, not global.
+
+**Talking points beyond Node**
+
+- **Database (the real source of truth):** make the check and the block one statement: `UPDATE funds SET available = available - :amt, blocked = blocked + :amt WHERE user_id = :u AND available >= :amt`, then check that the affected row count is 1. The alternatives are `SELECT ... FOR UPDATE` inside a transaction, or optimistic locking with a `version` column plus a retry. Add a `UNIQUE(user_id, client_order_id)` constraint so idempotency survives restarts and multiple app instances.
+- **Redis:** a Lua script doing `if available >= amt then DECRBY/INCRBY` is atomic. `SET key NX PX` gives a distributed lock, but locks need fencing tokens, so prefer the atomic script.
+- **Java:** `ConcurrentHashMap<String, ReentrantLock>` (or striped locks) per user, or `AtomicLong.compareAndSet` loops for the balance. Avoid `synchronized` on a global object.
+- **Go:** a `sync.Mutex` per user in a sharded map, or one goroutine per user shard that owns the balances.
+- **Multi-instance deployment:** in-process locks protect only one Node process. Either route each user to a single partition (Kafka key = userId), or rely on the atomic DB statement above. Say this explicitly, because interviewers probe it.
+
+## Failure handling
+
+| Failure | What we do | Why |
+|---------|-----------|-----|
+| Validation fails | Order recorded as REJECTED with a reason. Nothing is reserved. | An auditable record, and idempotent retries get the same answer. |
+| Exchange rejects (freeze qty, price band, etc.) | `PENDING → REJECTED`, release blocked funds or shares | Every exit path must release its reservation. Grep your code for this. |
+| Ack timeout | Keep the order PENDING with `needsReconciliation`, and **keep funds blocked** | The order may be live at the exchange. Releasing the money would allow double spending if it fills. |
+| Reconciliation | Look the order up by *our* id (sent as a tag or client reference). If found, adopt its exchange id and state. If not found after a safe window, reject and release. | Needs a broker-generated id that the exchange echoes back. Never "retry place" blindly: that is how duplicate orders happen. |
+| Fill arrives before ack | The fill handler moves PENDING → OPEN and adopts the exchange id | Networks reorder messages. |
+| Duplicate fill delivery | Deduplicate by `fillId` (a persisted unique key in production) | Message brokers deliver at least once. |
+| Fill for an unknown order | Park it and alert ops. Never drop it silently. | It points to a bug or a data-loss incident. |
+| Cancel races with the final fill | The exchange says "not open". Surface "too late to cancel". The fill updates state. | Both are legitimate outcomes, and the user must see the truth. |
+| Market buy slippage beyond the buffer | `settleBlocked` debits the difference from available (may go negative → margin call / RMS square-off) | Say this out loud: it's why brokers add buffers and use protection-price market orders. |
+| App retries after a 5xx | Same `clientOrderId`, so the same order comes back | That's the reason the idempotency key exists. |
+| End of day | Cancel open DAY orders and release their reservations. A reconciliation job compares our trade book with the exchange's trade file. | Blocked balances must go back to zero once no orders are live. |
+
+## Extensions & follow-ups
+
+Typical follow-ups are stop-loss and trailing stop-loss, GTT (good-till-triggered) orders, basket orders, brokerage and charges, intraday leverage with auto square-off, corporate actions (splits and bonuses adjusting holdings and average price), and streaming order updates over WebSocket.
+
+**Trailing stop-loss (reported at Upstox SDE-2).** The stop price follows the peak LTP by a fixed amount or a percentage and never moves down. When LTP falls to the stop, we fire a market sell. The trailing rule is a Strategy, so "₹15 below peak" and "2% below peak" are just two classes. The percentage stop is rounded *down* to the tick size.
+
+```ts
+type Paise = number;
+const formatINR = (p: Paise): string =>
+  `₹${Math.trunc(p / 100).toLocaleString('en-IN')}.${String(p % 100).padStart(2, '0')}`;
+
+interface TrailRule {
+  describe(): string;
+  stopFor(peak: Paise, tick: Paise): Paise;
+}
+class AbsoluteTrail implements TrailRule {
+  constructor(private readonly by: Paise) {}
+  describe(): string {
+    return `${formatINR(this.by)} below peak`;
+  }
+  stopFor(peak: Paise): Paise {
+    return peak - this.by;
+  }
+}
+class PercentTrail implements TrailRule {
+  constructor(private readonly basisPoints: number) {}
+  describe(): string {
+    return `${this.basisPoints / 100}% below peak`;
+  }
+  stopFor(peak: Paise, tick: Paise): Paise {
+    const raw = Math.floor((peak * (10_000 - this.basisPoints)) / 10_000);
+    return raw - (raw % tick);
+  }
+}
+
+class TrailingStopLoss {
+  private peak: Paise;
+  private triggered = false;
+  constructor(
+    readonly id: string,
+    readonly symbol: string,
+    readonly qty: number,
+    entry: Paise,
+    private readonly tick: Paise,
+    private readonly rule: TrailRule,
+    private readonly onTrigger: (sl: TrailingStopLoss, ltp: Paise) => void,
+  ) {
+    this.peak = entry;
+  }
+  get stop(): Paise {
+    return this.rule.stopFor(this.peak, this.tick);
+  }
+  onTick(ltp: Paise): void {
+    if (this.triggered) return;
+    if (ltp > this.peak) {
+      this.peak = ltp; // the stop only ratchets up
+      return;
+    }
+    if (ltp <= this.stop) {
+      this.triggered = true;
+      this.onTrigger(this, ltp);
+    }
+  }
+  status(): string {
+    return `${this.id} [${this.rule.describe()}] peak ${formatINR(this.peak)} stop ${formatINR(this.stop)}${this.triggered ? ' TRIGGERED' : ''}`;
+  }
+}
+
+const fire = (sl: TrailingStopLoss, ltp: Paise): void =>
+  console.log(`  -> ${sl.id}: MARKET SELL ${sl.qty} ${sl.symbol} (LTP ${formatINR(ltp)} <= stop ${formatINR(sl.stop)})`);
+
+const orders = [
+  new TrailingStopLoss('TSL-abs', 'INFY', 40, 1_500_00, 5, new AbsoluteTrail(15_00), fire),
+  new TrailingStopLoss('TSL-pct', 'INFY', 40, 1_500_00, 5, new PercentTrail(200), fire),
+];
+for (const ltp of [1_510_00, 1_535_00, 1_528_00, 1_521_00, 1_519_00, 1_540_00, 1_504_25]) {
+  console.log(`tick ${formatINR(ltp)}`);
+  for (const o of orders) o.onTick(ltp);
+}
+for (const o of orders) console.log(o.status());
+```
+
+```text
+tick ₹1,510.00
+tick ₹1,535.00
+tick ₹1,528.00
+tick ₹1,521.00
+tick ₹1,519.00
+  -> TSL-abs: MARKET SELL 40 INFY (LTP ₹1,519.00 <= stop ₹1,520.00)
+tick ₹1,540.00
+tick ₹1,504.25
+  -> TSL-pct: MARKET SELL 40 INFY (LTP ₹1,504.25 <= stop ₹1,509.20)
+TSL-abs [₹15.00 below peak] peak ₹1,535.00 stop ₹1,520.00 TRIGGERED
+TSL-pct [2% below peak] peak ₹1,540.00 stop ₹1,509.20 TRIGGERED
+```
+
+The absolute trail triggers at ₹1,519.00 and then ignores later ticks. The percentage trail keeps following the price up to ₹1,540.00, so its stop becomes ₹1,509.20, and the ₹1,504.25 tick triggers it. In the full platform, each `TrailingStopLoss` subscribes to `MarketDataFeed`, and `onTrigger` calls `broker.placeOrder` with a deterministic `clientOrderId` such as `tsl-<id>`. Idempotency then protects us if the trigger fires twice.
+
+Other follow-ups, briefly:
+
+- **GTT:** like an alert whose action is `placeOrder`. Reuse `AlertCondition` and add an `AlertAction` strategy (notify vs place order).
+- **Charges:** a `ChargesCalculator` strategy per segment and product. Block `orderValue + estimatedCharges` for buys.
+- **Streaming order updates:** make `BrokerOrder` transitions publish events (Observer) to a WebSocket gateway, keyed by user.
+- **Corporate actions:** a 1:2 split doubles `qty` and leaves `totalCost` unchanged, which halves the average price automatically. That's another reason to store total cost.
+
+## Edge cases
+
+- Selling shares already reserved by another open sell order: `freeQty` accounts for `blockedQty`.
+- A partial fill followed by cancel releases only the *unfilled* reservation (funds: the remaining `blockedAmount`; shares: `remaining`).
+- The last fill releases the entire remaining `blockedAmount`, including rounding leftovers, so blocked returns exactly to zero.
+- A market order with no LTP (new listing, or feed down) is rejected, because we can't size the block.
+- The market-hours check uses IST, not server time. At exactly 15:30 the market is closed (`>= close`).
+- The same `clientOrderId` from two different users is fine, because the key includes the userId.
+- Adding the same watchlist entry twice is a no-op. The watchlist has a maximum size.
+- "Crosses above" when the first tick seen is already above the level: we fire (prev is undefined). Say this is a product decision.
+- An average price with odd paise, e.g. 3 shares for ₹10.00 total: we keep `totalCost` exact and round only for display.
+- Rejected orders keep a record. Don't count them in the day's positions.
+
+## Complexity
+
+| Operation | Cost |
+|-----------|------|
+| placeOrder (admit) | O(V) validators + O(1) map operations |
+| applyFill | O(1) |
+| cancelOrder | O(1) + one gateway round trip |
+| reconcile | O(P) pending orders × one lookup each |
+| Alert evaluation per tick | O(A_s) alerts for that symbol (a sorted structure or two heaps per symbol makes it O(log A + fired)) |
+| portfolio | O(H) holdings |
+| positions | O(F) fills today (keep running aggregates for O(1)) |
+
+## What graders look for / common mistakes
+
+**They look for:**
+
+- Funds are **blocked** at placement, and every exit path (reject, cancel, fill, timeout-then-not-found) settles or releases them.
+- A state machine with enforced transitions, not a bag of booleans.
+- Validation as separate, composable rules with clear rejection messages.
+- An exchange behind an interface, and a fake that exercises async acks and fills.
+- A good answer to "what if the exchange doesn't respond?" (keep blocked, reconcile, never blind-retry).
+- Idempotency and a per-user concurrency story, including multi-instance.
+
+**Common mistakes:**
+
+- Deducting money only on fill, which allows unlimited orders against the same balance.
+- Releasing funds on timeout.
+- Floats for average price: `(avg * qty + price * q) / (qty + q)` drifts after many fills.
+- Holding the lock across the exchange call (works, but serializes every user action behind network latency) or, worse, no lock at all.
+- A single `status` string mutated from anywhere.
+- Mixing up holdings and positions, or selling shares that aren't free.
+- Forgetting tick and lot validation for F&O.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–10 | Clarify scope (CNC only? market orders? settlement?). Write the order state diagram first. |
+| 10–20 | Entities: User, FundsAccount, Holding, Instrument, Order. Interfaces: ExchangeGateway, OrderValidator, AlertCondition. |
+| 20–45 | `placeOrder` with the validation chain, fund blocking and the fake exchange ack. `applyFill` with average price. Demo one buy. |
+| 45–60 | Cancel, reject paths, and releases. Sell from holdings with realized P&L. |
+| 60–72 | Idempotency key and the per-user lock. Show a double submit. |
+| 72–82 | Market data feed, alerts (Strategy), watchlist, portfolio P&L. |
+| 82–90 | Failure discussion: timeouts, reconciliation, duplicate fills. Extensions. |
+
+If time is short, drop watchlists and alerts before you drop fund blocking or idempotency. Graders care far more about the money path.
+
+## Interview Q&A
+
+**Q1. Why block funds at placement instead of debiting on fill?**
+
+<details>
+<summary>Answer</summary>
+
+Between placement and fill, the order can execute at any moment. If we only debited on fill, a user with ₹1,00,000 could place ten ₹1,00,000 orders, and all of them could fill. Blocking turns "money I have" into "money I can still commit". The fill then *settles* from the blocked amount, and cancel or reject *releases* it. The invariant is `available + blocked + spent = deposits`. It should hold at every point, and a nightly job can assert it.
+
+</details>
+
+**Q2. The exchange call times out. The user taps "retry". What happens?**
+
+<details>
+<summary>Answer</summary>
+
+The retry carries the same `clientOrderId`, so `admit` finds the existing order and returns it (still PENDING, flagged for reconciliation) without sending anything new. The reconciler asks the exchange about our broker order id. If the order exists, we adopt its exchange id and state, and any fills flow through the normal handler. If it doesn't exist after a safe window, we reject and release the funds. A new order is sent only if the user deliberately places a new one with a new key.
+
+</details>
+
+**Q3. Your lock is in-process. We run six Node pods. Is the design still safe?**
+
+<details>
+<summary>Answer</summary>
+
+Not on its own. There are two standard fixes. (1) Make the database the arbiter: a conditional `UPDATE ... WHERE available >= :amt` checked via the affected row count, plus a `UNIQUE(user_id, client_order_id)` constraint for idempotency. (2) Route all commands for a user to a single consumer, e.g. a Kafka topic keyed by userId, so one process owns each user's state. The in-process mutex then becomes an optimisation rather than the guarantee. Distributed locks (Redis/Redlock) are a third option but need fencing tokens. I'd prefer the atomic DB update.
+
+</details>
+
+**Q4. How do you compute average price, and what happens on a partial sell?**
+
+<details>
+<summary>Answer</summary>
+
+Store `qty` and `totalCost` (paise). A buy adds `q × price` to the cost. The average is `round(totalCost / qty)`, computed only when needed. On a sell, remove the proportional cost basis `round(totalCost × q / qty)`: the average of the remaining shares stays the same, and realized P&L is `q × sellPrice − removedCost`. This is the weighted-average method. Tax rules may require FIFO lots, and that would be a different `CostBasisStrategy`.
+
+</details>
+
+**Q5. Why is the network call outside the lock, and what could go wrong because of that?**
+
+<details>
+<summary>Answer</summary>
+
+If the call were inside, a slow exchange would stall every other operation for that user: cancels, other orders and fill application. Outside the lock, the reservation is already done, so the funds are safe. The cost is that events can interleave. A fill might be applied before we record the ack, or a cancel might be requested before we have an exchange id. The code handles both: the fill handler accepts PENDING orders, and cancel refuses politely until the ack arrives. The general lesson: keep critical sections short, and make every handler tolerate messages arriving in any order.
+
+</details>
+
+**Q6. How would you add price alerts for 10 million users efficiently?**
+
+<details>
+<summary>Answer</summary>
+
+Index alerts by symbol, and within a symbol keep two sorted structures: "above" thresholds in a min-heap and "below" thresholds in a max-heap. A tick then only pops alerts that actually fire, so the cost is O(log A + fired) instead of scanning every alert. Shard the alert service by symbol, consume ticks from a partitioned stream, and send notifications asynchronously through a queue. Keep alert definitions in a DB, with the in-memory index rebuilt on startup. One-shot semantics need a persisted "fired" flag, so a restart doesn't re-notify.
+
+</details>

@@ -1,0 +1,148 @@
+---
+title: "7.5 Result types vs exceptions"
+---
+
+## Intuition
+
+In TypeScript, `throw` is invisible in the type system. `withdraw(): Payout` doesn't tell the caller that it can fail in three business-meaningful ways. A **Result** (Either) type makes failure part of the signature, so the compiler forces the caller to handle it.
+
+## The rule of thumb
+
+| Use a `Result` for… | Use exceptions for… |
+|---|---|
+| **Expected business outcomes**: insufficient funds, seat taken, limit exceeded | **Unexpected / infrastructure** failures: DB down, bug, invariant broken |
+| Cases the caller will branch on | Cases that should bubble up to one global handler |
+| Validation with several error kinds | Anything where "crash this request" is the right response |
+
+Many teams mix the two: domain methods return `Result`, infrastructure throws `AppError` subclasses, and a controller or exception filter maps both to HTTP.
+
+```ts
+type Result<T, E> = { ok: true; value: T } | { ok: false; error: E };
+const Ok = <T>(value: T): Result<T, never> => ({ ok: true, value });
+const Err = <E>(error: E): Result<never, E> => ({ ok: false, error });
+
+function andThen<T, U, E1, E2>(r: Result<T, E1>, f: (v: T) => Result<U, E2>): Result<U, E1 | E2> {
+  return r.ok ? f(r.value) : r;
+}
+
+// ---- expected business errors: a discriminated union ----
+type WithdrawError =
+  | { kind: 'INSUFFICIENT_FUNDS'; available: number; requested: number }
+  | { kind: 'ACCOUNT_FROZEN'; reason: string }
+  | { kind: 'BELOW_MINIMUM'; min: number };
+
+interface Account {
+  id: string;
+  balance: number;
+  frozenReason?: string;
+}
+interface Payout {
+  accountId: string;
+  amount: number;
+  newBalance: number;
+}
+
+function validateAmount(amount: number): Result<number, WithdrawError> {
+  return amount < 10_000 ? Err({ kind: 'BELOW_MINIMUM', min: 10_000 }) : Ok(amount);
+}
+
+function withdraw(acc: Account, amount: number): Result<Payout, WithdrawError> {
+  return andThen(validateAmount(amount), (amt): Result<Payout, WithdrawError> => {
+    if (acc.frozenReason) return Err({ kind: 'ACCOUNT_FROZEN', reason: acc.frozenReason });
+    if (acc.balance < amt) return Err({ kind: 'INSUFFICIENT_FUNDS', available: acc.balance, requested: amt });
+    acc.balance -= amt;
+    return Ok({ accountId: acc.id, amount: amt, newBalance: acc.balance });
+  });
+}
+
+function describe(e: WithdrawError): string {
+  switch (e.kind) {
+    case 'INSUFFICIENT_FUNDS':
+      return `need ${e.requested}, have ${e.available}`;
+    case 'ACCOUNT_FROZEN':
+      return `frozen: ${e.reason}`;
+    case 'BELOW_MINIMUM':
+      return `minimum is ${e.min}`;
+    default: {
+      const unreachable: never = e; // adding a new kind breaks compilation here
+      return unreachable;
+    }
+  }
+}
+
+// ---- unexpected / infra errors: a class hierarchy ----
+abstract class AppError extends Error {
+  abstract readonly code: string;
+  abstract readonly httpStatus: number;
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = new.target.name;
+  }
+}
+class NotFoundError extends AppError {
+  override readonly code = 'NOT_FOUND';
+  override readonly httpStatus = 404;
+}
+class UpstreamError extends AppError {
+  override readonly code = 'UPSTREAM_UNAVAILABLE';
+  override readonly httpStatus = 503;
+}
+
+function toHttp(err: unknown): string {
+  if (err instanceof AppError) return `${err.httpStatus} ${err.code} (${err.name}: ${err.message})`;
+  return '500 INTERNAL (unexpected)';
+}
+
+const accounts = new Map<string, Account>([
+  ['A1', { id: 'A1', balance: 50_000 }],
+  ['A2', { id: 'A2', balance: 900_000, frozenReason: 'KYC pending' }],
+]);
+
+function loadAccount(id: string): Account {
+  const acc = accounts.get(id);
+  if (!acc) throw new NotFoundError(`account ${id} does not exist`);
+  return acc;
+}
+
+function withdrawController(id: string, amount: number): string {
+  try {
+    const r = withdraw(loadAccount(id), amount);
+    return r.ok ? `200 paid ${r.value.amount}, balance ${r.value.newBalance}` : `422 ${r.error.kind}: ${describe(r.error)}`;
+  } catch (err) {
+    return toHttp(err);
+  }
+}
+
+console.log(withdrawController('A1', 20_000));
+console.log(withdrawController('A1', 40_000));
+console.log(withdrawController('A1', 500));
+console.log(withdrawController('A2', 20_000));
+console.log(withdrawController('ZZ', 20_000));
+
+const wrapped = new UpstreamError('bank API timed out', { cause: new Error('ETIMEDOUT') });
+console.log(toHttp(wrapped));
+console.log(`cause kept: ${wrapped.cause instanceof Error ? wrapped.cause.message : 'none'}`);
+console.log(`instanceof chain: ${wrapped instanceof UpstreamError} ${wrapped instanceof AppError} ${wrapped instanceof Error}`);
+```
+
+```text
+200 paid 20000, balance 30000
+422 INSUFFICIENT_FUNDS: need 40000, have 30000
+422 BELOW_MINIMUM: minimum is 10000
+422 ACCOUNT_FROZEN: frozen: KYC pending
+404 NOT_FOUND (NotFoundError: account ZZ does not exist)
+503 UPSTREAM_UNAVAILABLE (UpstreamError: bank API timed out)
+cause kept: ETIMEDOUT
+instanceof chain: true true true
+```
+
+## Pitfalls
+
+- **`catch (e)` gives you `unknown`.** Narrow it with `instanceof` before reading `.message`.
+- **Swallowing errors** by returning `Err` for *everything*, including bugs. The Result turns into a silent failure channel.
+- **Losing the root cause.** Wrap with `{ cause }` so logs show the full chain.
+- Set `this.name = new.target.name` so logs say `NotFoundError`, not `Error`.
+
+## How to say it in an interview
+
+> "Business failures like insufficient funds are part of the contract, so I return a discriminated-union `Result`, and the exhaustive `switch` makes the compiler catch unhandled cases. Infrastructure failures throw typed `AppError` subclasses with a code and HTTP status, and one boundary handler maps them."

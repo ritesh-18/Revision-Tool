@@ -1,0 +1,238 @@
+---
+title: "4.7 Object Pool"
+---
+
+## Intent
+
+Keep a bounded set of expensive, reusable objects. Callers **acquire** one, use it, and **release** it back instead of creating and destroying objects each time.
+
+## Problem
+
+Opening a PostgreSQL connection costs a TCP handshake, TLS and auth, often 20–50 ms, and the database allows only a limited number of connections. If every API request opens its own connection, a traffic spike during market open (9:15 AM) exhausts the DB. A pool keeps, say, 10 warm connections; request 11 **waits** until one is released. `pg.Pool`, `mysql2` pools, HTTP keep-alive agents and worker-thread pools all follow this pattern.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class ConnectionPool {
+        -Connection[] idle
+        -Set inUse
+        -Waiter[] waiters
+        -number max
+        +acquire(timeoutMs) Promise~Connection~
+        +release(conn) void
+        +use(fn) Promise~T~
+        +stats() string
+    }
+    class Connection {
+        +number id
+        +query(sql) Promise~string~
+        +reset() void
+    }
+    class ConnectionFactory {
+        <<interface>>
+        +create(id) Promise~Connection~
+    }
+    ConnectionPool o-- Connection
+    ConnectionPool --> ConnectionFactory
+    OrderRepository --> ConnectionPool`} />
+
+## TypeScript implementation
+
+The pool grows lazily up to `max`, queues waiters in FIFO order, supports an acquire timeout, and offers a `use()` helper so callers can't forget to release.
+
+```ts
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+class Connection {
+  private session: string | null = null;
+
+  constructor(readonly id: number) {}
+
+  async query(sql: string): Promise<string> {
+    await sleep(10);
+    this.session = sql; // pretend the connection holds session state
+    return `conn#${this.id} ran "${sql}"`;
+  }
+
+  reset(): void {
+    this.session = null; // clear per-use state before reuse
+  }
+}
+
+interface Waiter {
+  resolve: (c: Connection) => void;
+  reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+class ConnectionPool {
+  private readonly idle: Connection[] = [];
+  private readonly inUse = new Set<Connection>();
+  private waiters: Waiter[] = [];
+  private created = 0;
+
+  constructor(
+    private readonly max: number,
+    private readonly factory: (id: number) => Promise<Connection>,
+  ) {}
+
+  async acquire(timeoutMs = 1_000): Promise<Connection> {
+    const free = this.idle.pop();
+    if (free) return this.checkout(free);
+
+    if (this.created < this.max) {
+      this.created++; // reserve the slot BEFORE awaiting, to avoid over-creating
+      const conn = await this.factory(this.created);
+      return this.checkout(conn);
+    }
+
+    // Pool exhausted: wait in line.
+    return new Promise<Connection>((resolve, reject) => {
+      const waiter: Waiter = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          this.waiters = this.waiters.filter((w) => w !== waiter);
+          reject(new Error(`acquire timed out after ${timeoutMs}ms`));
+        }, timeoutMs),
+      };
+      this.waiters.push(waiter);
+    });
+  }
+
+  release(conn: Connection): void {
+    if (!this.inUse.delete(conn)) throw new Error(`conn#${conn.id} is not checked out`);
+    conn.reset();
+    const next = this.waiters.shift();
+    if (next) {
+      clearTimeout(next.timer);
+      next.resolve(this.checkout(conn)); // hand over directly, FIFO
+    } else {
+      this.idle.push(conn);
+    }
+  }
+
+  async use<T>(fn: (conn: Connection) => Promise<T>): Promise<T> {
+    const conn = await this.acquire();
+    try {
+      return await fn(conn);
+    } finally {
+      this.release(conn); // always returned, even if fn throws
+    }
+  }
+
+  stats(): string {
+    return `created=${this.created} inUse=${this.inUse.size} idle=${this.idle.length} waiting=${this.waiters.length}`;
+  }
+
+  private checkout(conn: Connection): Connection {
+    this.inUse.add(conn);
+    return conn;
+  }
+}
+
+const pool = new ConnectionPool(2, async (id) => {
+  await sleep(5); // expensive handshake
+  console.log(`opened conn#${id}`);
+  return new Connection(id);
+});
+
+// 4 concurrent requests, only 2 connections.
+const results = await Promise.all(
+  ['SELECT holdings', 'SELECT orders', 'SELECT funds', 'SELECT positions'].map((sql) =>
+    pool.use((c) => c.query(sql)),
+  ),
+);
+results.forEach((r) => console.log(r));
+console.log(pool.stats());
+
+// A failing query still returns its connection.
+try {
+  await pool.use(async () => {
+    throw new Error('syntax error at "SELEC"');
+  });
+} catch (err) {
+  console.log(`query failed: ${(err as Error).message}; ${pool.stats()}`);
+}
+
+// Timeout when both connections are held too long.
+const held1 = await pool.acquire();
+const held2 = await pool.acquire();
+try {
+  await pool.acquire(30);
+} catch (err) {
+  console.log(`third caller: ${(err as Error).message}`);
+}
+pool.release(held1);
+pool.release(held2);
+
+// Double release is a bug, and the pool catches it.
+try {
+  pool.release(held1);
+} catch (err) {
+  console.log(`bug caught: ${(err as Error).message}`);
+}
+console.log(pool.stats());
+```
+
+```text
+opened conn#1
+opened conn#2
+conn#1 ran "SELECT holdings"
+conn#2 ran "SELECT orders"
+conn#1 ran "SELECT funds"
+conn#2 ran "SELECT positions"
+created=2 inUse=0 idle=2 waiting=0
+query failed: syntax error at "SELEC"; created=2 inUse=0 idle=2 waiting=0
+third caller: acquire timed out after 30ms
+bug caught: conn#2 is not checked out
+created=2 inUse=0 idle=2 waiting=0
+```
+
+Only two connections were ever opened for four requests; requests 3 and 4 waited and reused them.
+
+## When to use / when NOT to use
+
+- **Use** for objects that are expensive to create *and* limited in number: DB/Redis connections, gRPC channels, worker threads, headless browser pages, large reusable buffers.
+- **Don't use** for cheap objects. Modern JS engines allocate and collect short-lived objects very efficiently; pooling small objects often adds bugs without saving anything. In Node, use the driver's pool (`pg.Pool`, `ioredis`) rather than writing your own in production.
+
+## Pitfalls
+
+- **Leaks**: a caller forgets `release()` and the pool drains. Provide `use(fn)` with `try/finally`.
+- **Dirty objects**: session state (transactions, `SET search_path`, buffers) leaking to the next user. Reset on release.
+- **Double release** puts the same object in the idle list twice, so two callers get it. Track checked-out objects.
+- **Over-creation race**: incrementing `created` *after* `await factory()` lets concurrent callers exceed `max`.
+- **No timeout**: waiters hang forever under load. Always bound the wait and surface a clear error (HTTP 503).
+- **Broken objects**: a connection dropped by the server should be validated/evicted, not handed out again.
+- Pool size too large: 50 pods × 20 connections = 1000 DB connections. Size pools against the DB's limit.
+
+## Related patterns
+
+- **Singleton** gives one shared instance; a pool manages a bounded *set* of instances, each used by one caller at a time.
+- **Flyweight** (Chapter 5) shares immutable objects *simultaneously*; a pool lends mutable objects *exclusively*.
+- **Factory**: the pool uses one to create new members.
+- **Semaphore**: a pool is essentially a semaphore that also hands you the resource.
+
+## Where it shows up in LLD interview problems
+
+- Design a connection pool / thread pool (asked directly at many product companies).
+- Parking Lot: the set of free spots behaves like a pool (acquire a spot, release on exit).
+- Cab booking: a pool of available drivers.
+- Rate limiter / API client with a bounded number of concurrent upstream calls.
+
+Interview line: *"Connections are expensive and capped by the DB, so I'll pool them: lazy creation up to max, FIFO waiters with a timeout, reset on release, and a `use()` helper so release can't be forgotten."*
+
+## Quick check
+
+1. Why does `acquire()` increment `created` before awaiting the factory?
+2. What goes wrong if `release()` doesn't reset the connection?
+3. Pool vs Flyweight in one sentence?
+
+<details>
+<summary>Answers</summary>
+
+1. Otherwise several concurrent callers can all see `created < max` while the first factory call is still pending, and the pool opens more connections than `max`.
+2. Per-use state (an open transaction, session variables, a half-read result) leaks into the next borrower, causing wrong results that are hard to reproduce.
+3. A pool lends a mutable object to one user at a time; a flyweight shares an immutable object with many users at once.
+
+</details>

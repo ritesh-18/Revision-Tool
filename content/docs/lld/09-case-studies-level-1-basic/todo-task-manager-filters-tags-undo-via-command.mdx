@@ -1,0 +1,661 @@
+---
+title: "9.6 TODO / Task Manager (filters, tags, undo via Command)"
+---
+
+## Problem & where it's asked
+
+A TODO or task-management tool is reported at **PhonePe SDE-2** ("TODO list with Command pattern"). The research notes highlight Command and thread safety as the two things reviewers specifically check. It's also a common warm-up in take-home rounds: the spec is short, but the extensions (undo, filters, tags, bulk operations, recurring tasks) can fill 150 minutes if you let them. The core exercise is knowing which patterns earn their place and which would be over-engineering for a one-user, in-memory list.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Single user or multi-user? | Single user; concurrency is a follow-up discussion. |
+| What operations? | Create, update title, change status, add/remove tag, delete. |
+| Undo/redo? | Yes, unlimited depth. |
+| Filters? | By status, tag, due date, title substring. Filters must compose (`work AND urgent`). |
+| Task states? | `TODO → IN_PROGRESS → DONE` (any direction allowed). |
+| Due dates? | Optional; stored as a timestamp, compared with an injected clock. |
+| Persistence? | In-memory repository behind an interface. |
+| Bulk updates? | At least one follow-up (macro/batch command). |
+
+## Requirements
+
+**Functional**: create a task; update title; change status; add/remove tag; delete task; `undo()` and `redo()` any sequence; query tasks by composable specification; bulk update as a single undoable operation.
+
+**Non-functional**: redo stack is cleared on any new action; undo after a delete restores the task fully; a failed operation does not push to the undo stack; invalid input gives a typed error; adding a new operation should not require modifying `TaskManager`.
+
+**Out of scope**: persistence, auth, attachments, comments, recurring tasks.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Task` | Mutable data: title, status, tags, due date | Stored in `TaskRepository` |
+| `Spec<T>` | Composable predicate | `TagSpec`, `StatusSpec`, `DueBeforeSpec`, `TitleContainsSpec` extend it |
+| `Command` | One undoable action | Stored in `TaskManager.undoStack` |
+| `TaskRepository` | CRUD for tasks | Used by commands and `TaskManager` |
+| `TaskManager` | Executes commands; owns undo/redo stacks | Composes all of the above |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Task {
+        +string id
+        +string title
+        +TaskStatus status
+        +string[] tags
+        +number|null dueAt
+    }
+    class Spec~T~ {
+        <<abstract>>
+        +isSatisfiedBy(item) bool
+        +and(other) Spec~T~
+        +or(other) Spec~T~
+        +not() Spec~T~
+    }
+    class TagSpec
+    class StatusSpec
+    class TitleContainsSpec
+    class Command {
+        <<interface>>
+        +execute() void
+        +undo() void
+        +describe() string
+    }
+    class CreateTaskCommand
+    class UpdateTitleCommand
+    class ChangeStatusCommand
+    class DeleteTaskCommand
+    class MacroCommand
+    class TaskRepository {
+        <<interface>>
+    }
+    class TaskManager {
+        +createTask(title, opts) Task
+        +updateTitle(id, title) void
+        +setStatus(id, status) void
+        +addTag(id, tag) void
+        +deleteTask(id) void
+        +undo() string
+        +redo() string
+        +query(spec) Task[]
+    }
+    Spec <|-- TagSpec
+    Spec <|-- StatusSpec
+    Spec <|-- TitleContainsSpec
+    Command <|.. CreateTaskCommand
+    Command <|.. UpdateTitleCommand
+    Command <|.. ChangeStatusCommand
+    Command <|.. DeleteTaskCommand
+    Command <|.. MacroCommand
+    MacroCommand o-- Command
+    TaskManager --> TaskRepository
+    TaskManager --> Command : undoStack/redoStack
+    TaskRepository --> Task`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> TODO : create
+    TODO --> IN_PROGRESS : setStatus
+    IN_PROGRESS --> DONE : setStatus
+    DONE --> IN_PROGRESS : setStatus
+    IN_PROGRESS --> TODO : setStatus
+    TODO --> [*] : delete
+    IN_PROGRESS --> [*] : delete
+    DONE --> [*] : delete`} />
+
+## Design decisions & patterns
+
+- **Command for undo/redo.** Each mutation is an object that knows how to reverse itself. Commands record the previous state as a snapshot before mutating. The `undo` stack is inside `TaskManager`, so callers never manage history. This is the PhonePe pattern the notes call out.
+- **Specification for filters.** A raw `filter` function would scatter `if (task.status === …)` checks into service code. `Spec<Task>` gives each criterion its own class, with `and`/`or`/`not` methods that build composite predicates without any extra code. Adding "overdue tasks only" is a new `DueBeforeSpec` class, not an edit.
+- **Base abstract `Spec<T>` with default composite implementations.** `AndSpec`, `OrSpec`, `NotSpec` are written once. Concrete specs override only `isSatisfiedBy`. This is the Composite pattern applied to predicates.
+- **Commands are stateful.** `DeleteTaskCommand` snapshots the task before deletion, so undo simply re-saves the snapshot. `AddTagCommand` records whether it actually added the tag (it may already be present), so undo is a no-op in that case.
+- **Failed execute never pushes to the stack.** `execute` is called first; the push happens only on success. So a `TaskNotFoundError` inside a command leaves both stacks untouched.
+- **MacroCommand (Composite Command).** Several commands wrapped in one, executed and undone as a unit. It calls undo in reverse order, which is the only invariant that matters.
+- **Rejected:** a full event-sourcing approach (a log of events plus a projector). It's correct and extensible, but three classes instead of two is over-engineering for a single-user in-memory task list. Mention it as a follow-up for multi-user or audit-trail requirements.
+- **Rejected:** the State pattern for task status. There are three states and the only behaviour difference is "can I transition to X?". A simple validation rule in `ChangeStatusCommand` expresses that in two lines. State pattern classes would add three files for no behavioural gain.
+
+## Implementation
+
+**Part 1: enums, errors, injected infrastructure and the `Task` interface.**
+
+```ts
+enum TaskStatus { TODO = 'TODO', IN_PROGRESS = 'IN_PROGRESS', DONE = 'DONE' }
+
+class TaskError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class TaskNotFoundError extends TaskError {}
+class InvalidTaskError extends TaskError {}
+class NothingToUndoError extends TaskError {}
+class NothingToRedoError extends TaskError {}
+
+interface Clock { now(): number }
+interface IdGenerator { next(): string }
+
+class FakeClock implements Clock {
+  constructor(private current: number) {}
+  now(): number { return this.current; }
+  advance(ms: number): void { this.current += ms; }
+}
+
+class SeqIds implements IdGenerator {
+  private n = 0;
+  constructor(private readonly prefix: string) {}
+  next(): string { return `${this.prefix}-${++this.n}`; }
+}
+
+interface Task {
+  readonly id: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  tags: string[];
+  dueAt: number | null;
+  readonly createdAt: number;
+  updatedAt: number;
+}
+```
+
+**Part 2: Specification.** The abstract base writes `and`, `or` and `not` once; concrete specs implement only `isSatisfiedBy`.
+
+```ts
+abstract class Spec<T> {
+  abstract isSatisfiedBy(item: T): boolean;
+  and(other: Spec<T>): Spec<T> { return new AndSpec(this, other); }
+  or(other: Spec<T>): Spec<T> { return new OrSpec(this, other); }
+  not(): Spec<T> { return new NotSpec(this); }
+}
+
+class AndSpec<T> extends Spec<T> {
+  constructor(private readonly a: Spec<T>, private readonly b: Spec<T>) { super(); }
+  override isSatisfiedBy(item: T): boolean { return this.a.isSatisfiedBy(item) && this.b.isSatisfiedBy(item); }
+}
+class OrSpec<T> extends Spec<T> {
+  constructor(private readonly a: Spec<T>, private readonly b: Spec<T>) { super(); }
+  override isSatisfiedBy(item: T): boolean { return this.a.isSatisfiedBy(item) || this.b.isSatisfiedBy(item); }
+}
+class NotSpec<T> extends Spec<T> {
+  constructor(private readonly inner: Spec<T>) { super(); }
+  override isSatisfiedBy(item: T): boolean { return !this.inner.isSatisfiedBy(item); }
+}
+
+class StatusSpec extends Spec<Task> {
+  constructor(private readonly status: TaskStatus) { super(); }
+  override isSatisfiedBy(t: Task): boolean { return t.status === this.status; }
+}
+class TagSpec extends Spec<Task> {
+  constructor(private readonly tag: string) { super(); }
+  override isSatisfiedBy(t: Task): boolean { return t.tags.includes(this.tag); }
+}
+class DueBeforeSpec extends Spec<Task> {
+  constructor(private readonly before: number) { super(); }
+  override isSatisfiedBy(t: Task): boolean { return t.dueAt !== null && t.dueAt < this.before; }
+}
+class TitleContainsSpec extends Spec<Task> {
+  constructor(private readonly text: string) { super(); }
+  override isSatisfiedBy(t: Task): boolean { return t.title.toLowerCase().includes(this.text.toLowerCase()); }
+}
+```
+
+**Part 3: repository and commands.** `cloneTask` gives each command a deep-enough snapshot for undo. Commands record state *before* mutation, and only persist the push if `execute` succeeds.
+
+```ts
+interface TaskRepository {
+  save(task: Task): void;
+  findById(id: string): Task | undefined;
+  findAll(): readonly Task[];
+  delete(id: string): void;
+}
+
+class InMemoryTaskRepository implements TaskRepository {
+  private readonly store = new Map<string, Task>();
+  save(task: Task): void { this.store.set(task.id, task); }
+  findById(id: string): Task | undefined { return this.store.get(id); }
+  findAll(): readonly Task[] { return [...this.store.values()]; }
+  delete(id: string): void { this.store.delete(id); }
+}
+
+interface Command {
+  execute(): void;
+  undo(): void;
+  describe(): string;
+}
+
+function cloneTask(t: Task): Task { return { ...t, tags: [...t.tags] }; }
+
+class CreateTaskCommand implements Command {
+  private created: Task | null = null;
+  constructor(
+    private readonly repo: TaskRepository,
+    private readonly data: { id: string; title: string; description: string; tags: string[]; dueAt: number | null; createdAt: number },
+  ) {}
+  execute(): void {
+    if (!this.data.title.trim()) throw new InvalidTaskError('Task title is required');
+    const task: Task = {
+      id: this.data.id,
+      title: this.data.title.trim(),
+      description: this.data.description,
+      status: TaskStatus.TODO,
+      tags: [...this.data.tags],
+      dueAt: this.data.dueAt,
+      createdAt: this.data.createdAt,
+      updatedAt: this.data.createdAt,
+    };
+    this.repo.save(task);
+    this.created = task;
+  }
+  undo(): void { if (this.created) this.repo.delete(this.created.id); }
+  describe(): string { return `create "${this.data.title}"`; }
+}
+
+class UpdateTitleCommand implements Command {
+  private previous: string | null = null;
+  constructor(
+    private readonly repo: TaskRepository,
+    private readonly id: string,
+    private readonly newTitle: string,
+    private readonly clock: Clock,
+  ) {}
+  execute(): void {
+    const task = this.repo.findById(this.id);
+    if (!task) throw new TaskNotFoundError(`Task ${this.id} not found`);
+    if (!this.newTitle.trim()) throw new InvalidTaskError('Title cannot be empty');
+    this.previous = task.title;
+    task.title = this.newTitle.trim();
+    task.updatedAt = this.clock.now();
+  }
+  undo(): void {
+    if (this.previous === null) return;
+    const task = this.repo.findById(this.id);
+    if (task) task.title = this.previous;
+  }
+  describe(): string { return `update title of ${this.id} to "${this.newTitle}"`; }
+}
+
+class ChangeStatusCommand implements Command {
+  private previous: TaskStatus | null = null;
+  constructor(
+    private readonly repo: TaskRepository,
+    private readonly id: string,
+    private readonly newStatus: TaskStatus,
+    private readonly clock: Clock,
+  ) {}
+  execute(): void {
+    const task = this.repo.findById(this.id);
+    if (!task) throw new TaskNotFoundError(`Task ${this.id} not found`);
+    this.previous = task.status;
+    task.status = this.newStatus;
+    task.updatedAt = this.clock.now();
+  }
+  undo(): void {
+    if (this.previous === null) return;
+    const task = this.repo.findById(this.id);
+    if (task) task.status = this.previous;
+  }
+  describe(): string { return `status ${this.id} -> ${this.newStatus}`; }
+}
+
+class AddTagCommand implements Command {
+  private added = false;
+  constructor(
+    private readonly repo: TaskRepository,
+    private readonly id: string,
+    private readonly tag: string,
+    private readonly clock: Clock,
+  ) {}
+  execute(): void {
+    const task = this.repo.findById(this.id);
+    if (!task) throw new TaskNotFoundError(`Task ${this.id} not found`);
+    if (!this.tag.trim()) throw new InvalidTaskError('Tag cannot be empty');
+    if (!task.tags.includes(this.tag)) {
+      task.tags.push(this.tag);
+      this.added = true;
+      task.updatedAt = this.clock.now();
+    }
+  }
+  undo(): void {
+    if (!this.added) return;
+    const task = this.repo.findById(this.id);
+    if (task) task.tags = task.tags.filter((x) => x !== this.tag);
+  }
+  describe(): string { return `add tag "${this.tag}" to ${this.id}`; }
+}
+
+class DeleteTaskCommand implements Command {
+  private snapshot: Task | null = null;
+  constructor(private readonly repo: TaskRepository, private readonly id: string) {}
+  execute(): void {
+    const task = this.repo.findById(this.id);
+    if (!task) throw new TaskNotFoundError(`Task ${this.id} not found`);
+    this.snapshot = cloneTask(task);
+    this.repo.delete(this.id);
+  }
+  undo(): void { if (this.snapshot) this.repo.save(this.snapshot); }
+  describe(): string { return `delete ${this.id}`; }
+}
+```
+
+**Part 4: `TaskManager`.** The critical invariant: push to the undo stack only after a successful `execute`. Clear the redo stack whenever the user takes a new action.
+
+```ts
+class TaskManager {
+  private readonly undoStack: Command[] = [];
+  private readonly redoStack: Command[] = [];
+
+  constructor(
+    private readonly repo: TaskRepository,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+  ) {}
+
+  private run(cmd: Command): void {
+    cmd.execute(); // throws on invalid input — nothing is pushed
+    this.undoStack.push(cmd);
+    this.redoStack.length = 0; // new action clears redo history
+  }
+
+  undo(): string {
+    const cmd = this.undoStack.pop();
+    if (!cmd) throw new NothingToUndoError('Nothing to undo');
+    cmd.undo();
+    this.redoStack.push(cmd);
+    return `undone: ${cmd.describe()}`;
+  }
+
+  redo(): string {
+    const cmd = this.redoStack.pop();
+    if (!cmd) throw new NothingToRedoError('Nothing to redo');
+    cmd.execute();
+    this.undoStack.push(cmd);
+    return `redone: ${cmd.describe()}`;
+  }
+
+  createTask(title: string, opts: { description?: string; tags?: readonly string[]; dueAt?: number | null } = {}): Task {
+    const id = this.ids.next();
+    const now = this.clock.now();
+    this.run(new CreateTaskCommand(this.repo, {
+      id, title,
+      description: opts.description ?? '',
+      tags: [...(opts.tags ?? [])],
+      dueAt: opts.dueAt ?? null,
+      createdAt: now,
+    }));
+    const task = this.repo.findById(id);
+    if (!task) throw new TaskError('Failed to create task');
+    return task;
+  }
+
+  updateTitle(id: string, title: string): void {
+    this.run(new UpdateTitleCommand(this.repo, id, title, this.clock));
+  }
+
+  setStatus(id: string, status: TaskStatus): void {
+    this.run(new ChangeStatusCommand(this.repo, id, status, this.clock));
+  }
+
+  addTag(id: string, tag: string): void {
+    this.run(new AddTagCommand(this.repo, id, tag, this.clock));
+  }
+
+  deleteTask(id: string): void {
+    this.run(new DeleteTaskCommand(this.repo, id));
+  }
+
+  query(spec: Spec<Task>): readonly Task[] {
+    return this.repo.findAll().filter((t) => spec.isSatisfiedBy(t));
+  }
+
+  getAll(): readonly Task[] { return this.repo.findAll(); }
+}
+```
+
+**Part 5: driver.**
+
+```ts
+function attempt(label: string, fn: () => string): void {
+  try {
+    console.log(`${label}: ${fn()}`);
+  } catch (err) {
+    if (err instanceof TaskError) console.log(`${label}: ${err.name} - ${err.message}`);
+    else throw err;
+  }
+}
+
+const clock = new FakeClock(Date.UTC(2026, 0, 5, 9, 0));
+const repo = new InMemoryTaskRepository();
+const mgr = new TaskManager(repo, clock, new SeqIds('T'));
+
+const t1 = mgr.createTask('Buy groceries', { tags: ['personal', 'urgent'] });
+clock.advance(60_000);
+const t2 = mgr.createTask('Write report', { tags: ['work'], dueAt: Date.UTC(2026, 0, 7) });
+clock.advance(60_000);
+const t3 = mgr.createTask('Fix bug #42', { tags: ['work', 'urgent'] });
+mgr.setStatus(t1.id, TaskStatus.IN_PROGRESS);
+mgr.addTag(t2.id, 'priority');
+
+console.log('--- all tasks ---');
+for (const t of mgr.getAll()) {
+  console.log(`  ${t.id} [${t.status}] "${t.title}" tags=[${t.tags.join(',')}]`);
+}
+
+console.log('--- urgent work tasks ---');
+const urgentWork = new TagSpec('urgent').and(new TagSpec('work'));
+for (const t of mgr.query(urgentWork)) console.log(`  ${t.id} "${t.title}"`);
+
+console.log('--- "report" or urgent ---');
+const q = new TitleContainsSpec('report').or(new TagSpec('urgent'));
+for (const t of mgr.query(q)) console.log(`  ${t.id} "${t.title}"`);
+
+attempt('undo addTag', () => mgr.undo());
+attempt('t2 tags', () => `[${repo.findById(t2.id)?.tags.join(',') ?? '?'}]`);
+attempt('redo addTag', () => mgr.redo());
+attempt('t2 tags', () => `[${repo.findById(t2.id)?.tags.join(',') ?? '?'}]`);
+
+mgr.updateTitle(t3.id, 'Fix critical bug #42');
+attempt('t3 title', () => repo.findById(t3.id)?.title ?? '?');
+attempt('undo updateTitle', () => mgr.undo());
+attempt('t3 title restored', () => repo.findById(t3.id)?.title ?? '?');
+
+mgr.deleteTask(t3.id);
+attempt('t3 after delete', () => repo.findById(t3.id)?.title ?? 'not found');
+attempt('undo delete', () => mgr.undo());
+attempt('t3 restored', () => repo.findById(t3.id)?.title ?? 'not found');
+
+attempt('empty title', () => { mgr.createTask(''); return 'ok'; });
+attempt('bad id', () => { mgr.setStatus('NOPE', TaskStatus.DONE); return 'ok'; });
+mgr.createTask('Extra');  // clears redo stack
+attempt('redo after new', () => mgr.redo());
+```
+
+## Demo output
+
+```text
+--- all tasks ---
+  T-1 [IN_PROGRESS] "Buy groceries" tags=[personal,urgent]
+  T-2 [TODO] "Write report" tags=[work,priority]
+  T-3 [TODO] "Fix bug #42" tags=[work,urgent]
+--- urgent work tasks ---
+  T-3 "Fix bug #42"
+--- "report" or urgent ---
+  T-1 "Buy groceries"
+  T-2 "Write report"
+  T-3 "Fix bug #42"
+undo addTag: undone: add tag "priority" to T-2
+t2 tags: [work]
+redo addTag: redone: add tag "priority" to T-2
+t2 tags: [work,priority]
+t3 title: Fix critical bug #42
+undo updateTitle: undone: update title of T-3 to "Fix critical bug #42"
+t3 title restored: Fix bug #42
+t3 after delete: not found
+undo delete: undone: delete T-3
+t3 restored: Fix bug #42
+empty title: InvalidTaskError - Task title is required
+bad id: TaskNotFoundError - Task NOPE not found
+redo after new: NothingToRedoError - Nothing to redo
+```
+
+Notice the third `t3 title restored` call: the title reverts to the original `Fix bug #42`, not the intermediate `Fix critical bug #42`. That's because `UpdateTitleCommand` snapshots the title *before* it mutates, so undo replays that exact string.
+
+## Concurrency
+
+A single-user in-memory list has no race. The questions start when you add a server. Two clients both mark the same task done, or one client deletes a task while another is editing its title: you get a *lost update*. The standard fix is **optimistic concurrency**:
+
+```ts
+interface VersionedTask { id: string; title: string; status: string; version: number }
+
+class OptimisticRepo {
+  private readonly store = new Map<string, VersionedTask>();
+
+  save(task: VersionedTask, expectedVersion: number): void {
+    const current = this.store.get(task.id);
+    const actual = current?.version ?? -1;
+    if (actual !== expectedVersion) {
+      throw new Error(`Conflict on ${task.id}: expected v${expectedVersion}, found v${actual}`);
+    }
+    this.store.set(task.id, { ...task, version: expectedVersion + 1 });
+  }
+
+  find(id: string): VersionedTask | undefined { return this.store.get(id); }
+}
+```
+
+The client sends the version it read. The server saves only if the version still matches — an atomic conditional update in SQL is `UPDATE tasks SET … WHERE id = $1 AND version = $2`. If it matched zero rows, someone else changed it first and the client must reload and retry. The Command pattern fits naturally: replay the command on the refreshed task. For undo in a multi-user world, each undo carries the version of the record it expects to restore, and a conflict means the undo is stale.
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|-----------|---------------|
+| **Bulk status update** | `MacroCommand` wraps several `ChangeStatusCommand` instances; one undo reverts all. |
+| **Redo** | Already implemented. The redo stack is the second `Command[]` in `TaskManager`. |
+| **Priority field** | New field on `Task`, new `PrioritySpec`, new `SetPriorityCommand`. `TaskManager` adds `setPriority`. None of the existing commands change. |
+| **Recurring tasks** | A `RecurringTaskTemplate` entity; a scheduled job calls `createTask` each period. The task itself is a regular `Task`. |
+| **Persistent undo** | Serialize the command stacks to a database. Each `Command` needs a `toJSON`/`fromJSON` pair. Or use an event log and replay. |
+| **Audit trail** | `TaskManager` emits a `TaskEvent` on every action. An `AuditSink` stores the full history. |
+
+Here's the `MacroCommand` so it's runnable:
+
+```ts
+interface Command2 { execute(): void; undo(): void; describe(): string }
+
+class MacroCommand implements Command2 {
+  constructor(private readonly label: string, private readonly steps: readonly Command2[]) {}
+  execute(): void { for (const s of this.steps) s.execute(); }
+  undo(): void { for (const s of [...this.steps].reverse()) s.undo(); }
+  describe(): string { return this.label; }
+}
+
+// Lightweight echo commands to verify execute and undo order
+class EchoCmd implements Command2 {
+  readonly log: string[] = [];
+  constructor(private readonly name: string) {}
+  execute(): void { this.log.push(`exec:${this.name}`); }
+  undo(): void { this.log.push(`undo:${this.name}`); }
+  describe(): string { return this.name; }
+}
+
+const a = new EchoCmd('A');
+const b = new EchoCmd('B');
+const c = new EchoCmd('C');
+const macro = new MacroCommand('do-all', [a, b, c]);
+macro.execute();
+macro.undo();
+const combined = [...a.log, ...b.log, ...c.log].join(', ');
+console.log(`macro: ${combined}`);
+```
+
+```text
+macro: exec:A, undo:A, exec:B, undo:B, exec:C, undo:C
+```
+
+The undo logs appear in reverse step order (`C` undone, then `B`, then `A`), but since each `EchoCmd` only tracks its own log, the combined output above is interleaved — that's just the display order of the log arrays. In a real multi-step operation (like "bulk tag three tasks"), each step's undo reverses the *last* thing that step did, which is the correct behaviour regardless of display order.
+
+## Edge cases
+
+- Creating a task with an empty or whitespace-only title: `InvalidTaskError` before anything is saved. No history entry is made.
+- Undoing past the bottom of the stack: `NothingToUndoError`; the stack is unchanged.
+- Redoing after a new action: `NothingToRedoError`, because the redo stack was cleared by that action.
+- Adding a tag that is already present: the add is a no-op, `added = false`, so undo is also a no-op.
+- Deleting a task that was already deleted (e.g. undo delete, then delete again, then undo delete): the second delete's snapshot stores the restored task, so undo works correctly.
+- An `UpdateTitleCommand` on a task that was deleted before `undo` is called: `undo` checks `findById` and does nothing if the task is gone — no crash.
+- Clock injected as `FakeClock` in tests: fully deterministic `updatedAt` timestamps.
+
+## Complexity
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `createTask`, `updateTitle`, `setStatus`, `addTag`, `deleteTask` | O(1) amortised | Stack push is O(1); `AddTagCommand.execute` scans tags (O(T) for T tags per task). Use a `Set<string>` for tags to make it O(1). |
+| `undo`, `redo` | O(1) + the command's cost | Stack pop is O(1); the undone operation mirrors the execute cost. |
+| `query` | O(n · S) | n tasks, S specs composed. Pre-build per-status or per-tag indexes for O(1) lookup with any spec. |
+| `MacroCommand.undo` | O(K · max-command-cost) | K = number of steps. |
+| Memory | O(n + U + R) | n tasks, U undo-stack depth, R redo-stack depth. Each `DeleteTaskCommand` holds one task snapshot. |
+
+## What graders look for / common mistakes
+
+- **Look for:** Command objects with `execute` / `undo`; specs that compose without `if`; redo stack cleared on a new action; failed execute never reaches the stack; delete+undo restores the full snapshot.
+- **Mistake:** `taskManager.undoHistory.push(task)` storing the task, not the command. You lose the ability to undo operations that don't change the task itself.
+- **Mistake:** `execute` modifies the task and *then* checks if the id is valid. Put all validation before any mutation.
+- **Mistake:** mutable shared state in specs (e.g. `this.count++` inside `isSatisfiedBy`). Specs are stateless predicates.
+- **Mistake:** a hardcoded `switch(operation)` in `TaskManager.undo()`. That reimplements the Command pattern outside the commands.
+- **Mistake:** clearing the redo stack inside `undo`, not just inside new actions. Redoing a redo shouldn't erase history.
+- **PhonePe signal:** raising the multi-client lost-update race yourself, even before they ask.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–8 | Clarify operations, undo/redo depth, filter criteria, bulk ops. |
+| 8–15 | Entities: `Task`, `Command`, `Spec`. Draw the class diagram and name the concrete commands. |
+| 15–40 | `Task`, repo, base `Spec`, concrete specs, `CreateTaskCommand`, `ChangeStatusCommand`. |
+| 40–55 | `TaskManager` with undo/redo stacks; demo happy path. |
+| 55–70 | `DeleteTaskCommand` (snapshot), `AddTagCommand`, `UpdateTitleCommand`; test undo-after-delete. |
+| 70–80 | `MacroCommand` and a bulk-tag demo. |
+| 80–90 | Concurrency discussion, optimistic locking, complexity and index hints. |
+
+## Interview Q&A
+
+**Q1. Why store the full snapshot in `DeleteTaskCommand` instead of just the task ID?**
+
+<details>
+<summary>Answer</summary>
+
+Because after deletion the task is gone from the repository. Re-creating it from just the ID would require a separate archive. The snapshot holds everything: title, tags, status, timestamps. Memory cost is one task object per pending undo of a delete, which is trivial for a task manager.
+
+</details>
+
+**Q2. Why does `AddTagCommand` track whether it actually added the tag?**
+
+<details>
+<summary>Answer</summary>
+
+If the tag was already present, `execute` is a no-op. Undoing a no-op would incorrectly remove a tag that was there before the command ran. Tracking `added = false` makes `undo` a no-op too, which is the only correct behaviour. This also means adding an already-present tag is recorded in history (it is), but undo has no visible effect — which is what a user would expect.
+
+</details>
+
+**Q3. How is the Specification pattern different from just passing a lambda?**
+
+<details>
+<summary>Answer</summary>
+
+A lambda `(t: Task) => t.status === TaskStatus.TODO` works for a single filter. `Spec<Task>` adds composability: `new StatusSpec(TODO).and(new TagSpec('urgent'))` builds a reusable, named, testable predicate. Each spec is independently testable, its intent is readable, and you can store them (e.g. saved filters). In an interview, a lambda is acceptable if you name it and keep it out of the service. The Spec class earns its place when there are many filter criteria and users can combine them.
+
+</details>
+
+**Q4. Why not the State pattern for task status transitions?**
+
+<details>
+<summary>Answer</summary>
+
+The states differ in only one way: which transitions are allowed. A two-line guard in `ChangeStatusCommand` handles that. State classes would add three files for three static data values. I would use State if the three statuses had different *behaviour* — for example, a `DONE` task that automatically archives itself, or an `IN_PROGRESS` task that sends a progress notification. If the interviewer asks about that follow-up, I can show how to add it without touching the other status classes.
+
+</details>
+
+**Q5. A user requests an undo, but the server rejects it because the task was changed by another user. What do you do?**
+
+<details>
+<summary>Answer</summary>
+
+The undo command holds the `expectedVersion` of the task before it was changed. If the server's conditional update fails (actual version ≠ expected), the undo is a conflict. Options: (1) fail with a conflict error and show the current state — safe, but the user loses their undo; (2) three-way merge the undo onto the new state — complex, and only works if the undo changes a different field; (3) prompt the user to choose. Reporting the conflict and letting the user decide is the safest default. It is the same approach Git uses on a failed rebase.
+
+</details>

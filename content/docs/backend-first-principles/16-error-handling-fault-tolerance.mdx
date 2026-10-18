@@ -1,0 +1,1268 @@
+---
+title: "Error Handling and Building Fault Tolerant Systems"
+description: The fault-tolerant mindset applied to the five kinds of backend errors, proactive detection with health checks and monitoring, recovery and containment strategies, a global error handler, and error messages and logs that don't leak secrets.
+---
+
+<Callout type="info">
+  Notes for [Error Handling and Building Fault Tolerant Systems](https://youtu.be/8NaM_9aKS24) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The lesson is deliberately about a **mindset**, not a tool: errors **will** happen (queries fail, APIs time out, users send bad data, business logic hits edge cases), so the question is never *whether* but *how you handle them*. These notes keep that structure and add the code that turns each idea into something you can ship in Node/NestJS.
+
+<Mermaid chart={`flowchart LR
+  A["Mindset"] --> B["5 error types"]
+  B --> C["Prevention: health checks"]
+  C --> D["Monitoring + observability"]
+  D --> E["Immediate response:<br/>recoverable vs not"]
+  E --> F["Recovery strategies"]
+  F --> G["Propagation + boundaries"]
+  G --> H["Global error handler"]
+  H --> I["Security: messages + logs"]`} />
+
+---
+
+## 1. The five kinds of errors 🎓
+
+<Mermaid chart={`flowchart TD
+  E["Backend errors"] --> L["Logic errors<br/>code runs, result is wrong"]
+  E --> D["Database errors<br/>connection, constraint, query, deadlock"]
+  E --> X["External service errors<br/>network, auth, rate limit, outage"]
+  E --> V["Input validation errors<br/>format, range, required"]
+  E --> C["Configuration errors<br/>missing or wrong settings per environment"]`} />
+
+### 1.1 Logic errors (the sneaky, dangerous ones)
+
+**Problem:** nothing crashes. The code runs and returns a result, but the result is **wrong**. The lesson's example: an e-commerce store applies a discount **twice**, which produces **negative shipping costs**. There is no exception and no alert, and the company **loses money on every order**, possibly for weeks or months until someone notices or a user reports it.
+
+**Why they happen:**
+- **Misunderstood requirements:** something was ambiguous in the discussion with the client or product manager, you wrote down the wrong rule, and without enough testing it went to production.
+- **Incorrectly implemented algorithms:** a complicated discount engine based on user behaviour and purchase history, with one small miscalculation.
+- **Unhandled edge cases:** a user behaviour in the payment or discount flow nobody expected.
+
+When the logic involves **money or security**, these errors can corrupt data and produce wrong business results over a long time.
+
+🔧 **How you actually catch them.** Because there's no exception, you have to **create** the signal:
+
+1. **Encode invariants and fail loudly.** If something must never happen, check it and throw:
+
+```ts title="pricing.ts"
+export function finalizeOrder(o: { subtotal: number; discount: number; shipping: number }) {
+  const total = o.subtotal - o.discount + o.shipping;
+  // invariants: a broken rule should crash this order, not silently cost money
+  if (o.shipping < 0) throw new InvariantError('shipping cannot be negative', o);
+  if (o.discount > o.subtotal) throw new InvariantError('discount exceeds subtotal', o);
+  if (total < 0) throw new InvariantError('order total negative', o);
+  return total;
+}
+```
+
+2. **Make "apply once" structural, not hopeful.** Model applied discounts as a set keyed by discount code (or a DB unique constraint on `(order_id, discount_code)`), so applying the same discount twice is **impossible**, not just unlikely.
+3. **Test properties, not just examples.** Property-based tests (e.g. `fast-check`) generate thousands of random carts and assert "total ≥ 0" and "discount ≤ subtotal" for all of them. They find the edge cases nobody thought of.
+4. **Monitor business metrics** (section 2.2): average discount per order or margin per order jumping overnight is how logic bugs show up in production.
+
+### 1.2 Database errors
+
+Most backends depend heavily on their database, so these can bring the **whole system** down. The lesson lists four kinds.
+
+#### Connection errors
+**Problem:** the app can't talk to the database. The backend throws 500s and the frontend shows empty screens everywhere.
+
+**Causes:** the network is down, the database server is overloaded, or the **connection pool is exhausted**.
+
+**What a pool is (lesson's explanation):** the backend keeps a few **TCP connections to the database open** and reuses them, so each request doesn't pay for a new TCP handshake (plus database authentication). When all of them are busy and more requests arrive, those requests wait, and eventually fail.
+
+🔧 Pool settings that turn "hang forever" into a fast, handleable error:
+
+```ts title="db.ts"
+import { Pool } from 'pg';
+
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,                          // per process; (processes × max) must stay below Postgres max_connections
+  connectionTimeoutMillis: 2_000,   // waiting for a free connection longer than this → error, not a hang
+  idleTimeoutMillis: 30_000,
+  statement_timeout: 5_000,         // server cancels any query over 5 s (SQLSTATE 57014)
+});
+pool.on('error', err => logger.error({ err }, 'idle pg client error')); // otherwise this crashes the process
+```
+
+Edge cases: a **slow query holding connections** is the usual cause of exhaustion, not traffic, so the statement timeout protects the pool. With many replicas or serverless functions, put a pooler (PgBouncer, or your provider's) in front of Postgres.
+
+#### Constraint violations
+**Problem:** the operation breaks a rule the database enforces.
+- **Unique:** creating a user with an email that already exists.
+- **Foreign key:** inserting an `orders` row whose `customer_id` doesn't exist in `customers` (the column is a non-nullable foreign key).
+
+If you don't handle these, the raw database error bubbles up and becomes a **500**, instead of a helpful message.
+
+**Two mechanisms, for two kinds of check:**
+- **Strengthen the validation layer** (frontend and backend) so obviously bad data never reaches the DB.
+- But **some checks only the database can do**. Only the DB knows whether an email is unique *right now*: if you check first in code, two concurrent signups can both pass the check. So for those, **let the constraint fire and translate the error** into a friendly response ("this email is already registered, try another").
+
+🔧 Postgres reports the kind of failure as a stable **SQLSTATE** code. Match on the code, never on the message text:
+
+| SQLSTATE | Name | Typical HTTP response |
+|---|---|---|
+| `23505` | unique_violation | 409 Conflict (the lesson uses 400) |
+| `23503` | foreign_key_violation | 404 or 422 (the referenced thing doesn't exist) |
+| `23502` | not_null_violation | 400 |
+| `40P01` | deadlock_detected | Retry the transaction |
+| `40001` | serialization_failure | Retry the transaction |
+| `57014` | query_canceled (e.g. statement timeout) | 503 / 504 |
+| `42P01` | undefined_table | 500 (a bug: typo or missing migration) |
+| `53300` | too_many_connections | 503 |
+
+#### Query errors
+**Problem:** the SQL itself is wrong (a typo such as `custmers` instead of `customers` gives "relation does not exist"), or a query is **too complex and times out**.
+
+🔧 These are **bugs, not user errors**: return a generic 500, log the details, and alert. Prevention: query builders or ORMs with types, migrations run in CI against a real database, and `EXPLAIN` on queries that touch large tables.
+
+#### Deadlocks
+**Problem:** two transactions each hold a lock the other needs, a **circular wait**, so neither can proceed.
+
+🔧 Why it happens and how to engineer around it:
+
+<Mermaid chart={`sequenceDiagram
+  participant T1 as Transaction 1
+  participant DB as Postgres
+  participant T2 as Transaction 2
+  T1->>DB: UPDATE accounts WHERE id = 1 (locks row 1)
+  T2->>DB: UPDATE accounts WHERE id = 2 (locks row 2)
+  T1->>DB: UPDATE accounts WHERE id = 2 (waits for T2)
+  T2->>DB: UPDATE accounts WHERE id = 1 (waits for T1)
+  Note over DB: cycle detected after deadlock_timeout
+  DB-->>T2: ERROR 40P01 deadlock detected (rolled back)
+  DB-->>T1: proceeds`} />
+
+- **Prevent:** always lock rows **in the same order** (for a transfer between accounts A and B, update the lower ID first). Keep transactions short; never call an external API while holding locks.
+- **Recover:** Postgres detects the cycle and aborts one transaction. That transaction is safe to **retry from the start**:
+
+```ts title="with-tx-retry.ts"
+export async function withTxRetry<T>(fn: (c: PoolClient) => Promise<T>, max = 3): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const out = await fn(client);
+      await client.query('COMMIT');
+      return out;
+    } catch (e: any) {
+      await client.query('ROLLBACK').catch(() => {});
+      const retryable = e.code === '40P01' || e.code === '40001';
+      if (!retryable || attempt >= max) throw e;
+      await sleep(20 * 2 ** attempt + Math.random() * 20);   // small backoff with jitter
+    } finally {
+      client.release();
+    }
+  }
+}
+
+// transfer: lock in a consistent order to avoid deadlocks in the first place
+await withTxRetry(async c => {
+  const [first, second] = [fromId, toId].sort();
+  await c.query('SELECT 1 FROM accounts WHERE id = ANY($1) ORDER BY id FOR UPDATE', [[first, second]]);
+  await c.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [amount, fromId]);
+  await c.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [amount, toId]);
+});
+```
+
+### 1.3 External service errors
+
+Modern apps depend on many outside services: **payment processors**, **email providers**, **object storage** such as S3, **Redis**, and **auth providers** like Auth0 or Clerk. Each is a **point of failure you don't control**. You can't avoid them (rebuilding all of them yourself isn't realistic), so you **expect them to fail and plan for it**. The lesson lists four failure modes.
+
+#### Network failures
+The connection runs over the internet (HTTP, TCP, WebSocket), and the internet isn't perfect: **connection timeouts**, **DNS failures**, **network partitions** (routing problems that split networks apart).
+
+🔧 **The most important mechanism here is a timeout.** Without one, a hung provider holds your request, and your connection, and your memory, for as long as the OS allows. Every outbound call needs a deadline:
+
+```ts
+const res = await fetch(url, { signal: AbortSignal.timeout(3_000) }); // throws a TimeoutError after 3 s
+```
+
+#### Authentication errors with providers
+Providers like Clerk or Auth0 reject requests because of **bad credentials**, **expired tokens** or **insufficient permissions**. And the lesson's warning: **using an external auth provider doesn't make you secure by itself**. Your own backend is still part of the flow, and it can still leak sensitive data, for example by writing tokens or user details into logs.
+
+#### Rate limiting
+Providers (OpenAI, Resend and nearly every other API) limit how many requests a client can make in a time window, to protect themselves from abuse. If something in your platform (a traffic spike, or a **logic error** that loops) makes you call them abnormally often, they respond with **`429 Too Many Requests`**.
+
+**Mechanism: exponential backoff.** On a 429, wait (say 1 minute) and retry; if it's still 429, **double the wait** (2 minutes, then 4…) and keep going until it succeeds.
+
+🔧 A production-grade retry helper. Three details matter: **respect `Retry-After`** when the provider tells you how long to wait, add **jitter** so many clients don't retry in lockstep, and **only retry what can succeed later**:
+
+```ts title="retry.ts"
+export class HttpError extends Error {
+  constructor(public status: number, public retryAfterMs?: number) { super(`HTTP ${status}`); }
+}
+
+const isRetryable = (e: unknown) =>
+  e instanceof HttpError ? e.status === 429 || e.status >= 500
+  : e instanceof Error && (e.name === 'TimeoutError' || 'code' in e);   // timeouts, ECONNRESET, ENOTFOUND...
+
+export async function retry<T>(fn: () => Promise<T>, { attempts = 5, baseMs = 500, capMs = 60_000 } = {}): Promise<T> {
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i + 1 >= attempts || !isRetryable(e)) throw e;
+      const backoff = Math.min(capMs, baseMs * 2 ** i);
+      const wait = e instanceof HttpError && e.retryAfterMs ? e.retryAfterMs : Math.random() * backoff; // "full jitter"
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+}
+
+export async function callProvider(url: string, init: RequestInit) {
+  const res = await fetch(url, { ...init, signal: AbortSignal.timeout(5_000) });
+  if (!res.ok) {
+    const ra = Number(res.headers.get('retry-after'));                // seconds, when present
+    throw new HttpError(res.status, Number.isFinite(ra) && ra > 0 ? ra * 1000 : undefined);
+  }
+  return res.json();
+}
+```
+
+Edge cases:
+- **Retries multiply load.** If each of three layers retries 3 times, one user request can become 27 calls to a struggling service. Retry in **one** layer only.
+- **Only retry idempotent operations**, or send an **idempotency key** so the provider ignores duplicates (critical for payments).
+- **Long backoffs belong in background jobs.** You can't keep an HTTP request open for 4 minutes; inside a request, retry briefly (well under a second), and move anything longer to a queue (see the task queues lesson).
+
+#### Service outages
+Big providers (parts of AWS or GCP) occasionally go down, sometimes from incidents, sometimes for maintenance, and take many of their customers with them. You can't prevent it, so your backend must **degrade gracefully** with **fallbacks**. The lesson's example: if Redis goes down, fall back to an **in-memory cache** or a **second Redis node**, so core flows such as payments and order processing keep working.
+
+🔧 **The mechanism that stops you hammering a dead service: a circuit breaker.** Retries help with short blips; during a real outage they just add load and make every request wait for its timeout. A circuit breaker tracks failures and, past a threshold, **stops calling the service for a while**, failing fast (or using the fallback) instead.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Closed
+  Closed --> Closed: success, or failures below threshold
+  Closed --> Open: failure rate over threshold
+  Open --> Open: calls fail fast and use the fallback
+  Open --> HalfOpen: cool-down elapsed
+  HalfOpen --> Closed: trial call succeeds
+  HalfOpen --> Open: trial call fails`} />
+
+```ts title="circuit-breaker.ts"
+type State = 'closed' | 'open' | 'half-open';
+
+export class CircuitBreaker {
+  private state: State = 'closed';
+  private failures = 0;
+  private openedAt = 0;
+  constructor(private threshold = 5, private coolDownMs = 30_000) {}
+
+  async call<T>(fn: () => Promise<T>, fallback: () => T | Promise<T>): Promise<T> {
+    if (this.state === 'open') {
+      if (Date.now() - this.openedAt < this.coolDownMs) return fallback();  // fail fast
+      this.state = 'half-open';                                            // let one trial through
+    }
+    try {
+      const out = await fn();
+      this.state = 'closed';
+      this.failures = 0;
+      return out;
+    } catch (e) {
+      this.failures++;
+      if (this.state === 'half-open' || this.failures >= this.threshold) {
+        this.state = 'open';
+        this.openedAt = Date.now();
+      }
+      return fallback();
+    }
+  }
+}
+
+// usage: Redis outage → serve from the database instead of failing the request
+const redisBreaker = new CircuitBreaker(5, 15_000);
+const product = await redisBreaker.call(
+  async () => JSON.parse((await redis.get(`product:${id}`)) ?? 'null') ?? (await loadAndCache(id)),
+  () => db.product.findUnique({ where: { id } }),
+);
+```
+
+(In production you'd usually use a library such as `opossum` for Node, which adds rolling windows, metrics and events. In a real half-open state you'd also allow only **one** trial request at a time; this sketch lets any request through once the cool-down passes.)
+
+### 1.4 Input validation errors
+
+**Problem:** consumers of your API send data that doesn't meet your rules. The validation layer at the **entry point** is your **first line of defence** against bad and malicious input.
+
+Kinds of rules:
+- **Format:** is it a valid email, phone number, date? For custom data too, define the exact format you accept and **reject everything else**, for security and robustness.
+- **Range:** numbers too high or too low, strings too long or too short, arrays with fewer than 3 or more than 100 items.
+- **Required fields:** a mandatory field is missing.
+
+These return **400 Bad Request**, and they're the **easiest errors** to handle: you know the requirements in advance, so you enforce them up front. Unlike external failures (out of your control) and logic errors (hard to see), there's no excuse not to have a strong validation layer.
+
+🔧 With zod (NestJS users would typically use a `ValidationPipe` with class-validator DTOs instead; same idea):
+
+```ts title="create-book.schema.ts"
+import { z } from 'zod';
+
+export const CreateBook = z.object({
+  name: z.string().trim().min(1).max(500),          // the lesson's rule: at most 500 characters
+  description: z.string().max(5_000).optional(),
+  authorId: z.string().uuid(),
+}).strict();                                         // unknown fields → rejected, not silently ignored
+
+export const validate = <T>(schema: z.ZodType<T>, input: unknown): T => {
+  const r = schema.safeParse(input);
+  if (!r.success) throw new ValidationError(r.error.issues.map(i => ({ field: i.path.join('.'), message: i.message })));
+  return r.data;
+};
+```
+
+### 1.5 Configuration errors
+
+**Problem:** these appear when moving between **development, staging and production**. The lesson's example: you add `OPENAI_API_KEY` to your local `.env`, your PR is merged, but nobody adds it to production (whether that's set manually or comes from something like AWS Parameter Store). The deploy succeeds. Then:
+
+| Setup | What happens | Verdict |
+|---|---|---|
+| **Config is validated at startup** | The new version **refuses to start**. With **blue-green** deployment (the old version keeps running until the new one is healthy), users never notice; you get a clear "missing OPENAI_API_KEY" error | **Best case** |
+| **No startup validation** | The app starts fine. Later a real user hits the endpoint that needs OpenAI, the key is undefined, and they get a **500 at runtime** | **Worst case** |
+
+**Rule:** validate every **required** configuration value **before the server starts**, and crash immediately if any is missing or malformed. Failing at deploy time beats failing in front of users. (Configuration management gets its own lesson next in the series.)
+
+🔧 Implementation:
+
+```ts title="env.ts (imported first, before anything else)"
+import { z } from 'zod';
+
+const Env = z.object({
+  NODE_ENV: z.enum(['development', 'staging', 'production']),
+  PORT: z.coerce.number().int().default(3000),
+  DATABASE_URL: z.string().url(),
+  REDIS_URL: z.string().url(),
+  OPENAI_API_KEY: z.string().startsWith('sk-'),
+});
+
+const parsed = Env.safeParse(process.env);
+if (!parsed.success) {
+  // print names only, never values: the values may be secrets
+  console.error('Invalid configuration:', parsed.error.issues.map(i => `${i.path.join('.')}: ${i.message}`));
+  process.exit(1);
+}
+export const env = parsed.data;   // typed; use env.OPENAI_API_KEY everywhere instead of process.env
+```
+
+(In NestJS, `ConfigModule.forRoot({ validate })` or a `validationSchema` gives you the same fail-at-boot behaviour.)
+
+---
+
+## 2. Prevention: the best error handling starts before the error 🎓
+
+The lesson's central idea: **find errors before they spread.** Detecting a problem the moment it appears, before it causes real damage, is the best error handling any system can have, whether frontend, backend or infrastructure.
+
+### 2.1 Health checks
+**Basic:** expose an endpoint such as `/health` or `/status`. The body doesn't matter; the **status code** does: 200 means running, 4xx/5xx means something is wrong. External tools keep calling it to confirm the service is alive.
+
+**But "running" isn't "working".** Check that the service can **actually do its job**:
+
+| What | Check | Example |
+|---|---|---|
+| **Database** | Connectivity, **query performance**, data integrity | Run a **representative query**; if one that took 500 ms now takes 4–5 s, something is wrong |
+| **External services** | Can you reach them, and do they work? | **Payments:** periodic test transactions (if the last one 5 minutes ago succeeded, real ones probably will too). **Email:** send test messages to an internal inbox. **Auth:** generate test tokens and validate them against the provider |
+| **Core functionality** | Is the app correctly set up? | Configuration loaded, **required caches populated**, internal data structures consistent |
+
+Together these are **proactive error detection**: being ready for the worst case ahead of time.
+
+🔧 **Liveness vs readiness.** Orchestrators like Kubernetes distinguish two questions, and mixing them up causes outages:
+- **Liveness** ("is the process stuck?"): failing it makes the platform **restart** the container. Keep it trivial. If it checks the database, a DB outage restarts **every** replica in a loop, which makes things worse.
+- **Readiness** ("can I take traffic now?"): failing it only **removes** the instance from the load balancer until it recovers. This is where dependency checks belong.
+- Deep checks (test payments, test emails) run on a **schedule** as synthetic monitoring, not on every probe, or you'll hammer providers and pay for it.
+
+```ts title="health.controller.ts"
+app.get('/health/live', (_req, res) => res.status(200).send('ok'));     // process is alive
+
+app.get('/health/ready', async (_req, res) => {
+  const check = async (name: string, fn: () => Promise<unknown>, slowMs: number) => {
+    const t0 = performance.now();
+    try {
+      await Promise.race([fn(), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2_000))]);
+      const ms = Math.round(performance.now() - t0);
+      return { name, ok: true, ms, degraded: ms > slowMs };
+    } catch (e) {
+      return { name, ok: false, error: (e as Error).message };
+    }
+  };
+  const results = await Promise.all([
+    check('postgres', () => pool.query('SELECT 1 FROM books LIMIT 1'), 200),   // representative, cheap
+    check('redis', () => redis.ping(), 50),
+  ]);
+  const ok = results.every(r => r.ok);
+  res.status(ok ? 200 : 503).json({ status: ok ? 'ready' : 'not-ready', results });
+});
+```
+
+### 2.2 Monitoring and observability
+(A full lesson on logging, monitoring and observability comes later in the series; here it's about the mindset.)
+
+**Goal:** detect errors **quickly, while they happen**, with **enough context to debug** them.
+
+- **Don't only track error rates; track performance.** Degrading performance is one of the **earliest signs** that something is about to fail, so watching it lets you act before the failure.
+- **Cover every error source:** HTTP errors, database errors, external-service failures, business-logic errors.
+- **Performance metrics:** response times, resource usage, throughput.
+- **Business metrics:** for an e-commerce backend, a sudden **drop in successful transactions** points to a technical problem **even when error rates look normal**. Track successful transactions, successful logins and so on.
+- **Logging:** use **structured logs** (JSON) that are easy to parse and enrich with metadata; aggregate them with tools like **Grafana Loki** to search, visualise and store them.
+
+🔧 Why business metrics catch what error rates miss: a broken "Pay" button that does nothing produces **zero errors**. Only "orders per minute fell 80% compared with the same time last week" reveals it.
+
+```ts title="logger.ts"
+import pino from 'pino';
+export const logger = pino({
+  redact: { paths: ['req.headers.authorization', 'req.headers.cookie', '*.password', '*.cardNumber', '*.email'],
+            censor: '[redacted]' },
+});
+// every log line is JSON: {"level":30,"time":...,"requestId":"9f2c...","userId":"u_123","msg":"order created"}
+```
+
+### 2.3 Classifying errors so alerts mean something ➕
+
+Monitoring every error source produces a flood; the step that turns it into action is deciding, per error, **whether anyone needs to know** and **which errors are really the same one**. (Alerting on SLO burn rates is covered in the DevOps lesson; this is about the errors that feed it.)
+
+#### Expected outcomes vs incidents
+**Problem:** the dashboard shows "4,000 errors in the last hour" and someone gets paged. 3,950 were users typing a wrong password or requesting a deleted book.
+
+**Why it happens:** "error" means two different things. A **validation failure, a 404 or a 409** is the API correctly telling a client "no"; nothing is broken. An **unknown exception, a pool timeout, an unhandled database error** means your system failed to do its job. Counting both in one number hides the second in the noise of the first.
+
+**Mechanism:** classify at the one place that sees every error, the global handler (section 4), and emit a metric with a small fixed set of classes:
+
+| Class | Examples | Who hears about it |
+|---|---|---|
+| `client` | 400 validation, 401, 404, 409 | Nobody, unless the **rate** jumps (a broken frontend deploy) |
+| `dependency` | Provider 5xx or timeout, circuit open, 429 from a provider | Ticket or page depending on duration and user impact |
+| `internal` | Unknown error → 500, invariant violation, DB `42P01` | Page: it's a bug or a broken deploy |
+
+```ts title="error-metrics.ts"
+import { Counter } from 'prom-client';
+export const appErrors = new Counter({ name: 'app_errors_total', help: 'errors by class', labelNames: ['class', 'code', 'route'] });
+
+export function classify(err: unknown, status: number): 'client' | 'dependency' | 'internal' {
+  if (err instanceof ExternalServiceError || (err as Error)?.name === 'TimeoutError') return 'dependency';
+  if (status < 500) return 'client';
+  return 'internal';
+}
+
+// inside errorMiddleware, after choosing the status:
+appErrors.inc({ class: classify(err, status), code: known?.code ?? 'INTERNAL', route: req.route?.path ?? 'unknown' });
+```
+
+**Edge cases:**
+- **A spike of 4xx can be your bug.** A frontend release that sends a renamed field turns every request into a 400. Alert on a sudden **change** in the client-error rate per route, not on its absolute level.
+- **Use the route template** (`/books/:id`), never the raw path, as a label; raw paths create one series per ID.
+
+#### Grouping errors by fingerprint
+**Problem:** one broken query produces 50,000 log lines a minute with different IDs in each message, while a brand-new error that appeared after the last deploy shows up 12 times and nobody notices.
+
+**Why it happens:** humans and alerting rules look at **counts of messages**, but the meaningful unit is **distinct causes**. Messages that differ only in an ID look different to a naive grouping.
+
+**Mechanism:** compute a **fingerprint** per error: the error type, the message with variable parts removed, and the top frames of the stack. Count by fingerprint, and alert when a **new** fingerprint appears shortly after a deploy. Error-tracking tools (Sentry and similar) do exactly this; the sketch shows the idea.
+
+```ts title="fingerprint.ts"
+import { createHash } from 'node:crypto';
+
+export function fingerprint(err: Error) {
+  const msg = err.message
+    .replace(/[0-9a-f]{8}-[0-9a-f-]{27}/gi, ':uuid')     // UUIDs
+    .replace(/\d+/g, ':n')                               // numbers and IDs
+    .replace(/'[^']*'/g, ':s');                          // quoted values
+  const frames = (err.stack ?? '').split('\n').slice(1, 4).map(l => l.replace(/:\d+:\d+\)?$/, '')).join('|');
+  return createHash('sha1').update(`${err.name}|${msg}|${frames}`).digest('hex').slice(0, 12);
+}
+// log { fingerprint, ... } on every error; alert on fingerprints first seen in the last hour with count > N
+```
+
+**Edge cases:** wrapped errors (section 3.6) should be fingerprinted by their **root cause** as well, or every wrapper hides the real source. Minified or bundled code needs source maps for stack frames to be stable and readable.
+
+---
+
+## 3. Philosophies for handling errors 🎓
+
+### 3.1 Immediate error response
+When an error happens, **your first reaction decides whether it stays minor or becomes a major failure**, and the right reaction depends on the error's type and context.
+
+<Mermaid chart={`flowchart TD
+  E["Error occurs"] --> Q{"Recoverable?<br/>will trying again later work?"}
+  Q -->|"yes: network blip, provider 5xx,<br/>pool momentarily exhausted"| R["Retry with exponential backoff<br/>without adding load to a stressed system"]
+  Q -->|"no: dependency down for long,<br/>bug, bad data"| C["Contain + degrade gracefully"]
+  C --> C1["Serve cached data"]
+  C --> C2["Disable non-essential features"]
+  C --> C3["Offer an alternative path"]
+  R --> F{"Still failing?"}
+  F -->|"yes"| C
+  F -->|"no"| OK["Recovered"]`} />
+
+- **Recoverable errors** (a failed email send, which can wait; network errors; running out of DB connections in the pool): **retries with exponential backoff** work well. The lesson's caution: **don't overwhelm a system that is already stressed**. Your recovery logic must not add load to the very thing that's struggling.
+- **Non-recoverable errors:** **containment and graceful degradation**. Switch to **cached data**, **turn off non-essential features**, offer **alternative functionality**, and **limit the blast radius**.
+
+🔧 Graceful degradation in practice: if the recommendation service is down, the product page still renders, just without "you may also like". That requires deciding **in advance** which features are essential (checkout) and which are optional (recommendations, reviews widget), and wrapping the optional ones so their failure returns an empty result instead of throwing.
+
+### 3.2 Retry budgets: retrying without causing a retry storm ➕
+
+The lesson's caution, "don't overwhelm a system that is already stressed", needs a mechanism: per-call backoff (section 1.3) limits how fast **one** request retries, but nothing limits how many requests are retrying **at once**. (Making the retried operation itself safe, with idempotency keys, is covered in the REST API design lesson.)
+
+#### Why per-request backoff isn't enough
+**Problem:** a dependency slows down and 5% of calls time out. Every failed call retries up to 3 times. The extra load pushes failures to 30%, which produces more retries, which pushes failures to 80%. The dependency now receives several times its normal traffic, almost all of it retries, and it can't recover even after the original cause is gone.
+
+**Why it happens:** retries are **positive feedback**. The more the dependency fails, the more load it gets. Backoff with jitter spreads retries over time but doesn't reduce their **total**, and a retry from a request whose user has already given up is pure waste.
+
+**Mechanism:** cap retries as a **fraction of normal traffic**, per client and per dependency. Google's SRE book describes exactly this: a per-request limit (fail after 3 attempts) plus a **per-client retry budget**: retry only while retries are below about **10%** of requests. When a dependency fails broadly, the budget runs out and the client fails fast instead of tripling the load.
+
+#### Implementing a retry budget
+A token bucket that earns a fraction of a token for each normal request and spends a whole token per retry:
+
+```ts title="retry-budget.ts"
+export class RetryBudget {
+  private tokens: number;
+  constructor(private ratio = 0.1, private max = 100) { this.tokens = max; }
+
+  onRequest() { this.tokens = Math.min(this.max, this.tokens + this.ratio); }   // every first attempt earns 0.1
+  tryRetry(): boolean {                                                           // every retry costs 1
+    if (this.tokens < 1) return false;
+    this.tokens -= 1;
+    return true;
+  }
+}
+
+const budgets = new Map<string, RetryBudget>();                                  // one per dependency
+const budgetFor = (dep: string) => budgets.get(dep) ?? budgets.set(dep, new RetryBudget()).get(dep)!;
+
+export async function callWithBudget<T>(dep: string, fn: () => Promise<T>, attempts = 3): Promise<T> {
+  const budget = budgetFor(dep);
+  budget.onRequest();
+  for (let i = 0; ; i++) {
+    try { return await fn(); }
+    catch (e) {
+      if (i + 1 >= attempts || !isRetryable(e)) throw e;
+      if (!budget.tryRetry()) { retryBudgetExhausted.inc({ dep }); throw e; }    // fail fast: dependency is broadly sick
+      await new Promise(r => setTimeout(r, Math.random() * Math.min(2_000, 100 * 2 ** i)));
+    }
+  }
+}
+```
+
+**Edge cases:**
+- **The budget is per process.** With 50 instances, each has its own bucket, which is fine: the ratio still holds overall.
+- **Export "budget exhausted" as a metric.** It's an early, precise signal that a dependency is failing broadly, often before error-rate alerts fire.
+- **Combine with the circuit breaker** (section 1.3): the budget limits extra load while the breaker is still closed; the breaker stops calls entirely once failure is near-total.
+
+#### Client-side adaptive throttling
+**Problem:** even first attempts can overload a backend that is rejecting most of them; each rejection still costs it a connection and some work.
+
+**Mechanism:** the SRE book's client-side throttling: each client tracks, over a recent window, **requests** it attempted and **accepts** the backend actually handled. When requests exceed `K × accepts` (K is typically 2), the client rejects new calls **locally** with probability `(requests − K × accepts) / requests`, before they reach the backend.
+
+```ts title="adaptive-throttle.ts"
+export class AdaptiveThrottle {
+  private requests = 0; private accepts = 0;
+  constructor(private k = 2) { setInterval(() => { this.requests *= 0.5; this.accepts *= 0.5; }, 30_000).unref(); } // decay = rolling window
+
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    const pReject = Math.max(0, (this.requests - this.k * this.accepts) / (this.requests + 1));
+    this.requests++;
+    if (Math.random() < pReject) throw new AppError(503, 'THROTTLED_LOCALLY', 'Dependency overloaded');
+    const out = await fn();            // a thrown "overloaded" error means not accepted
+    this.accepts++;
+    return out;
+  }
+}
+```
+
+**Edge cases:** count only **overload** rejections (429, 503, timeouts) as not accepted; a 404 is an accepted request. K controls how much wasted traffic you tolerate: lower K sheds earlier but may reject requests the backend could have served.
+
+#### Telling callers not to retry
+**Problem:** your API is overloaded and returns 500. The gateway in front retries, the mobile app retries, the partner's SDK retries. Three layers of retries hit you at once.
+
+**Mechanism:** make overload **explicit** and **non-retryable** for the layers that would amplify it. Return `503` (or `429` for per-client limits) with `Retry-After`, and an error code that internal callers treat as "do not retry at this layer". The SRE book's rule: only the layer directly above the overloaded one retries; layers further up see the failure and stop.
+
+```ts title="overloaded-response.ts"
+export class OverloadedError extends AppError {
+  constructor(public retryAfterSec = 5) { super(503, 'OVERLOADED', 'Service is busy, please retry shortly'); }
+}
+// in errorMiddleware:
+if (known instanceof OverloadedError) res.setHeader('Retry-After', String(known.retryAfterSec));
+// in internal clients: isRetryable(e) returns false when the response code is OVERLOADED
+```
+
+**Edge cases:** clients you don't control (browsers, third-party SDKs) may ignore `Retry-After`. Make sure your own frontend honours it and uses jittered backoff, and protect the API with load shedding (next section) regardless.
+
+### 3.3 Load shedding and admission control ➕
+
+Graceful degradation (section 3.1) turns **features** off when a dependency fails; when the problem is **too much traffic for your own server**, the right response is to refuse some requests quickly so the rest still succeed.
+
+#### Why overload collapses throughput
+**Problem:** at 120% of capacity, you'd expect to serve 100% and fail 20%. Instead, almost every request fails.
+
+**Why it happens:** excess requests don't disappear; they **queue** (in the event loop, the DB pool, the OS accept queue). Every queued request makes later ones wait longer. Once the wait exceeds the client's timeout, your server is doing complete work for requests whose clients have already left, and those clients retry. **Useful throughput (goodput) collapses** even though the CPU is at 100%. The SRE book's guidance is to reject early instead of queuing deeply: a queue many times the size of your worker pool only adds latency. (Why latency explodes near 100% utilisation is covered in scaling part 1.)
+
+**Mechanism:** **admission control**: decide at the door whether a request can be served in time, and reject it immediately with `503` and `Retry-After` if not. A rejection costs microseconds; a request that times out after queueing costs the full work plus a retry.
+
+#### A concurrency limit with a bounded wait
+Limit in-flight requests, allow a **small** queue, and drop requests that wait too long:
+
+```ts title="admission.middleware.ts"
+import type { Request, Response, NextFunction } from 'express';
+
+const MAX_IN_FLIGHT = 200, MAX_QUEUE = 100, MAX_WAIT_MS = 500;
+let inFlight = 0;
+type Waiter = { start: () => void; res: Response; timer: NodeJS.Timeout };
+const queue: Waiter[] = [];
+
+const release = () => {
+  inFlight--;
+  const w = queue.shift();
+  if (w) { clearTimeout(w.timer); inFlight++; w.start(); }        // hand the free slot to the oldest waiter
+};
+
+export function admission(req: Request, res: Response, next: NextFunction) {
+  const start = () => { res.once('close', release); next(); };   // 'close' fires on finish and on client abort
+
+  if (inFlight < MAX_IN_FLIGHT) { inFlight++; return start(); }
+  if (queue.length >= MAX_QUEUE) return reject(res);              // queue full: refuse immediately
+
+  const w: Waiter = {
+    start, res,
+    timer: setTimeout(() => {                                     // waited too long: shed it
+      const i = queue.indexOf(w);
+      if (i !== -1) { queue.splice(i, 1); reject(res); }
+    }, MAX_WAIT_MS),
+  };
+  queue.push(w);
+}
+
+const reject = (res: Response) => {
+  shedRequests.inc();
+  res.setHeader('Retry-After', '2');
+  res.status(503).json({ code: 'OVERLOADED', message: 'Service is busy, please retry shortly' });
+};
+```
+
+**Edge cases:**
+- **Exempt health and readiness probes** from shedding, or the orchestrator restarts a server that is merely busy, which removes capacity exactly when it's needed.
+- **Pick `MAX_IN_FLIGHT` from measurement**: load-test to find the concurrency where latency starts to climb, and set the limit just below it. Libraries such as `@fastify/under-pressure` package this behaviour for Fastify.
+
+#### Event-loop lag as the overload signal in Node
+**Problem:** a fixed in-flight limit is wrong when request cost varies: 200 cheap requests are fine, 200 report exports freeze the process.
+
+**Why it happens:** in Node, all JavaScript runs on one thread. When it's saturated, every timer and every I/O callback runs late; that delay, **event-loop lag**, directly measures "this process has more work than it can do".
+
+**Mechanism:** sample the lag with `perf_hooks.monitorEventLoopDelay` (a histogram in nanoseconds) and shed new requests while a high percentile is above a threshold.
+
+```ts title="loop-lag.ts"
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+
+const h = monitorEventLoopDelay({ resolution: 10 });
+h.enable();
+let lagMs = 0;
+setInterval(() => { lagMs = h.percentile(99) / 1e6; h.reset(); }, 1_000).unref();
+
+export const shedOnLag = (thresholdMs = 100) => (req: Request, res: Response, next: NextFunction) =>
+  lagMs > thresholdMs && !req.path.startsWith('/health') ? reject(res) : next();
+```
+
+**Edge cases:** lag rises **after** the overload starts (it's measured over the last second), so keep the in-flight limit as the fast guard and lag as the adaptive one. A single CPU-heavy request (a huge `JSON.parse`) causes lag spikes too; the fix there is moving that work off the event loop, not shedding.
+
+#### Shedding by priority
+**Problem:** under overload you reject randomly, so checkout requests fail as often as "you may also like" requests.
+
+**Mechanism:** classify requests by **criticality** and shed the least critical first, with lower thresholds for best-effort traffic. Also drop work whose deadline has already passed (section 3.9): if a request has waited longer than its client will wait, finishing it helps nobody.
+
+```ts title="priority-shedding.ts"
+const CRITICAL = [/^\/checkout/, /^\/payments/, /^\/auth/];
+const priorityOf = (path: string) => (CRITICAL.some(r => r.test(path)) ? 'critical' : 'best-effort');
+
+export const shedByPriority = (req: Request, res: Response, next: NextFunction) => {
+  const limit = priorityOf(req.path) === 'critical' ? 150 : 60;     // best-effort is refused much earlier
+  return lagMs > limit ? reject(res) : next();
+};
+```
+
+**Edge cases:** keep the critical list short and reviewed; if everything is critical, nothing is. Rejected best-effort calls should degrade in the UI (hide the widget), which ties back to the graceful degradation in section 3.1.
+
+### 3.4 Error recovery strategies
+How you recover depends on the error and on how **critical** the feature is.
+
+- **Automatic recovery** handles many errors without humans: **restarting** a service that has stopped responding (this works most of the time), **cleaning up corrupted caches**, **switching to backup systems**. Design these carefully, because automation can make a problem **worse**. Test them deliberately: push the system to its failure thresholds ahead of time and see which recovery works for which service.
+- **Manual recovery** is needed where **human judgement** is required. **Document the procedures** (runbooks) so every team member and new hire knows what to do during an incident, and **test them** so they work quickly under stress.
+- **Data integrity comes first.** Code and services can be redeployed; **data is the only irreplaceable thing** (users, transactions, orders). So: **back up at key moments**, know how to **restore**, be able to **replay transaction logs**, and have the right recovery tools.
+
+🔧 Two things make that real for Postgres: **point-in-time recovery** (base backups + continuous WAL archiving, so you can restore to the second before a bad migration), and **regular restore drills**. A backup that has never been restored is a hope, not a backup.
+
+### 3.5 Failures that span services: sagas and compensation ➕
+
+"Data integrity first" is easy inside one database, where a transaction rolls everything back; a checkout that reserves stock in one service, charges a card at Stripe and books a courier elsewhere has no transaction spanning all three, so a failure halfway leaves real-world side effects behind. (Publishing each step's event reliably is the transactional outbox from the task queues lesson.)
+
+#### Why a distributed transaction doesn't save you
+**Problem:** the card is charged, then the shipment service is down. The customer has paid for an order that will never ship, and nothing automatically undoes the charge.
+
+**Why it happens:** atomicity across systems needs every participant to take part in a protocol such as two-phase commit, holding locks until a coordinator says "commit". Third-party APIs (payment providers, couriers) don't offer that, and even internally 2PC blocks every participant while the coordinator is unreachable.
+
+**Mechanism:** a **saga**: a sequence of **local** steps, each committed on its own, where every step that can be undone has a **compensating action** (a business-level undo: refund, release, cancel). If step N fails, run the compensations for steps N−1 … 1 in reverse order. The system is eventually consistent instead of atomic.
+
+<Mermaid chart={`flowchart LR
+  A["1. Reserve stock"] --> B["2. Charge card"]
+  B --> C["3. Book courier"]
+  C --> D["Order confirmed"]
+  C -.->|"fails"| CB["undo 2: refund card"]
+  CB -.-> CA["undo 1: release stock"]
+  CA -.-> F["Order failed,<br/>customer notified"]`} />
+
+#### An orchestrated saga that survives crashes
+**Problem:** if the process running the saga crashes between "charge" and "book courier", an in-memory saga is forgotten: nothing finishes it and nothing compensates.
+
+**Mechanism:** an **orchestrator** stores the saga's progress in the database after every step, and a background job resumes any saga that isn't finished. Each step and each compensation is idempotent (keyed by saga ID), so resuming may safely repeat the last one.
+
+```ts title="checkout-saga.ts"
+type Step = { name: string; run: (s: Saga) => Promise<void>; undo?: (s: Saga) => Promise<void> };
+
+const steps: Step[] = [
+  { name: 'reserve', run: s => inventory.reserve(s.orderId, s.items, { idempotencyKey: `${s.id}:reserve` }),
+                     undo: s => inventory.release(s.orderId, { idempotencyKey: `${s.id}:release` }) },
+  { name: 'charge',  run: s => payments.charge(s.orderId, s.amount, { idempotencyKey: `${s.id}:charge` }),
+                     undo: s => payments.refund(s.orderId, { idempotencyKey: `${s.id}:refund` }) },
+  { name: 'ship',    run: s => courier.book(s.orderId, s.address, { idempotencyKey: `${s.id}:ship` }) },   // pivot: no undo after this
+];
+
+export async function runSaga(sagaId: string) {
+  const s = await db.saga.findUniqueOrThrow({ where: { id: sagaId } });
+  if (s.status === 'running') {
+    for (let i = s.completedSteps; i < steps.length; i++) {
+      try {
+        await steps[i].run(s);
+        await db.saga.update({ where: { id: sagaId }, data: { completedSteps: i + 1 } });   // checkpoint
+      } catch (err) {
+        if (isRetryable(err)) throw err;                         // the job queue retries the same step later
+        await db.saga.update({ where: { id: sagaId }, data: { status: 'compensating', error: String(err) } });
+        break;
+      }
+    }
+  }
+  const latest = await db.saga.findUniqueOrThrow({ where: { id: sagaId } });
+  if (latest.status === 'compensating') {
+    for (let i = latest.completedSteps - 1; i >= 0; i--) {
+      await steps[i].undo?.(latest);                             // throws → job retries; undo is idempotent
+      await db.saga.update({ where: { id: sagaId }, data: { completedSteps: i } });
+    }
+    await db.saga.update({ where: { id: sagaId }, data: { status: 'failed' } });
+  } else if (latest.completedSteps === steps.length) {
+    await db.saga.update({ where: { id: sagaId }, data: { status: 'done' } });
+  }
+}
+// a recurring job calls runSaga for every saga stuck in 'running' or 'compensating' for more than a minute
+```
+
+**Edge cases:**
+- **Orchestration vs choreography:** in choreography, services react to each other's events with no central coordinator. It avoids a central component but makes the flow hard to see and debug; for flows with compensations, an explicit orchestrator is usually easier to reason about.
+- **The pivot step:** after the courier is booked, the saga can only move **forward** (retry until it succeeds). Order steps so the hardest-to-undo one comes last.
+
+#### Compensations are business actions, and they can fail too
+**Problem:** "undo the charge" sounds like a rollback, but the customer may already have seen the charge on their statement, and the refund call itself can fail.
+
+**Why it happens:** compensation doesn't erase history; it adds a new fact (a refund) that cancels an old one. And it calls the same unreliable services that caused the failure.
+
+**Mechanism:**
+- **Retry compensations until they succeed** (through the job queue, with backoff), and alert if one stays stuck: a failed compensation is a case for a human with a runbook (section 3.4).
+- **Make intermediate states visible and safe.** Between "stock reserved" and "order confirmed", other requests can see the reservation (sagas have no isolation). Model it explicitly as a `PENDING` state that other flows respect, rather than pretending the order already exists.
+- **Tell the customer what happened**: "payment refunded, order cancelled" is part of the compensation.
+
+**Edge cases:** some actions can't be compensated at all (an email that was sent). Do them **after** the pivot, or phrase them so a follow-up can correct them.
+
+### 3.6 Propagation control
+Not every error should be handled where it occurs. Often it should **propagate upward** to a level with **more context** about what the operation meant.
+
+- In exception-based languages (JavaScript, Python), **catch a low-level exception, wrap it with context, and rethrow** a higher-level one. At the top you then have enough information to **log properly**, return a **meaningful response**, or **trigger recovery**.
+- This must be **deliberate**: uncontrolled propagation can spread to other services or crash your main process.
+
+```ts title="error-wrapping.ts"
+try {
+  await s3.send(new PutObjectCommand({ Bucket, Key, Body }));
+} catch (cause) {
+  // keep the original as `cause` (ES2022), add the business meaning
+  throw new ExternalServiceError('avatar upload failed', { cause, context: { userId, key: Key } });
+}
+```
+
+🔧 In Node, uncontrolled propagation has a concrete failure mode: an **unhandled promise rejection** or an exception thrown in a callback **terminates the process** (and every in-flight request with it). Always `await` or `.catch()` promises, and register `process.on('unhandledRejection')` to **log and exit cleanly**, letting the platform restart you, rather than continuing in an unknown state.
+
+### 3.7 Process-level crash policy in Node ➕
+
+"Log and exit cleanly" is the right instinct; doing it well means knowing what Node does by default, what a crash handler may and may not do, and which errors never reach any handler at all. (Draining in-flight requests on shutdown is the graceful shutdown lesson's topic.)
+
+#### What Node does by default, and why you shouldn't fight it
+**Problem:** a team adds `process.on('uncaughtException', err => logger.error(err))` so "the server never crashes". Weeks later it's serving wrong data: a request crashed halfway through updating an in-memory cache, and the process kept going with it half-updated.
+
+**Why it happens:** an exception that unwinds to the top has skipped every `finally` and cleanup in between. Locks may be held, connections half-used, in-memory state half-mutated. The Node docs are explicit: an uncaught exception means the application is in an **undefined state**, and **it is not safe to resume normal operation** after `'uncaughtException'`; the correct use is synchronous cleanup before shutting down. For promises, the default mode `--unhandled-rejections=throw` (the default since Node 15) raises an unhandled rejection as an uncaught exception, so it also crashes the process unless you intercept it.
+
+**Mechanism:** treat both events as **fatal**: record what happened, stop taking traffic, give in-flight work a short, bounded chance to finish, and exit non-zero so the orchestrator starts a clean process. Several replicas behind a load balancer make one crash invisible to users; continuing in a corrupt state is visible to all of them.
+
+#### A crash handler that exits well
+```ts title="crash-handler.ts"
+import pino from 'pino';
+
+// a synchronous destination so the last log line is written even if we exit right after
+const fatalLog = pino(pino.destination({ dest: 1, sync: true }));
+let shuttingDown = false;
+
+function onFatal(kind: string, err: unknown) {
+  fatalLog.fatal({ err, kind }, 'fatal error, shutting down');
+  if (shuttingDown) return;                     // a second fatal during shutdown: already on our way out
+  shuttingDown = true;
+  process.exitCode = 1;
+
+  const hardKill = setTimeout(() => process.exit(1), 10_000);   // never hang: 10 s maximum
+  hardKill.unref();
+
+  server.close(() => process.exit(1));          // stop accepting, let in-flight requests finish
+  setReadiness(false);                          // readiness probe now fails → no new traffic
+}
+
+process.on('uncaughtException', err => onFatal('uncaughtException', err));
+process.on('unhandledRejection', reason => onFatal('unhandledRejection', reason));
+```
+
+**Edge cases:**
+- **Keep the handler tiny and defensive.** Code that throws inside the handler, or awaits a slow network call (sending to an error tracker without a timeout), can hang the exit. The hard-kill timer is the backstop.
+- **Monitoring without changing behaviour:** `process.on('uncaughtExceptionMonitor', ...)` lets telemetry see the error while leaving Node's default crash in place.
+- **Exit codes matter:** a non-zero code lets the platform count crash loops and alert on them; exiting with 0 after a fatal error hides it.
+
+#### Errors that never reach a handler
+**Problem:** a background task fails, nothing is logged, and the work is silently skipped, or it crashes the process from a place no try/catch could reach.
+
+**Why it happens:** the global error handler (section 4) only sees errors thrown **inside a request's call chain**. Three common paths bypass it:
+- **Floating promises:** `sendAnalytics(event)` without `await` or `.catch`. If it rejects, it's an unhandled rejection: with the default mode, the whole process crashes.
+- **`EventEmitter` `'error'` events with no listener** are thrown, crashing the process: streams, sockets, and the `pg` pool's idle-client error (handled in section 1.2's `db.ts`).
+- **Work outside a request**: timers, queue consumers, cron handlers and message listeners. NestJS exception filters, for example, apply to the request pipeline, not to arbitrary callbacks.
+
+**Mechanism:** make "fire and forget" explicit with a helper that always attaches a handler, and let the linter forbid the accidental kind (`@typescript-eslint/no-floating-promises`).
+
+```ts title="background.ts"
+export function runInBackground(name: string, task: () => Promise<unknown>) {
+  task().catch(err => {
+    logger.error({ err, task: name }, 'background task failed');
+    appErrors.inc({ class: 'internal', code: 'BACKGROUND_TASK', route: name });
+  });
+}
+
+// instead of:  sendAnalytics(event)            ← floating; a rejection crashes the process
+runInBackground('analytics', () => sendAnalytics(event));
+
+stream.on('error', err => logger.warn({ err }, 'upload stream failed'));   // every emitter you create
+```
+
+**Edge cases:** anything important enough to need a retry belongs in a job queue, not in `runInBackground`; the helper is for work you're genuinely willing to lose.
+
+### 3.8 Error boundaries
+**Error boundaries** are where errors are **stopped**, so a failure in one service **doesn't take down others**. Mechanisms the lesson names:
+- **Separate processes**, so one crash doesn't kill everything.
+- **Timeouts** at service boundaries.
+- **Message queues** (such as RabbitMQ) for **asynchronous** communication, so a bug in one service doesn't directly break another.
+
+<Mermaid chart={`flowchart LR
+  subgraph Sync["Synchronous coupling"]
+    A1["Order API"] -->|"HTTP, waits"| B1["Email service down"]
+    B1 -.->|"timeout spreads"| A1
+  end
+  subgraph Async["Queue as a boundary"]
+    A2["Order API"] -->|"enqueue, returns"| Q[["Queue"]]
+    Q --> B2["Email service down:<br/>jobs wait, retried later"]
+  end`} />
+
+🔧 A related mechanism is the **bulkhead**: give each dependency its **own limited pool** (connections, concurrency slots), so a slow dependency can only exhaust its own share instead of every worker in the process.
+
+### 3.9 Timeout budgets and deadline propagation ➕
+
+"Timeouts at service boundaries" works only if the timeouts **fit together**: each one chosen in isolation either fires too late to matter or lets work continue long after the user has given up.
+
+#### The timeout budget across hops
+**Problem:** the load balancer gives up after 30 s. Your API calls an inventory service with a 10 s timeout and retries twice, then a pricing service with another 10 s. Worst case: 40 s of work for a request the load balancer abandoned at 30 s. The user saw an error, and your servers kept working for nobody.
+
+**Why it happens:** each timeout was set for its own call, not as a share of the **whole request's** time. Retries multiply each share.
+
+**Mechanism:** treat the request's total time as a **budget**: set it at the edge, below the outermost timeout (load balancer, client), and give each downstream call **the smaller of its own limit and what's left**. The outer layer must always time out **after** the inner ones, never before.
+
+| Layer | Timeout |
+|---|---|
+| Client / load balancer | 30 s |
+| API request budget | 10 s |
+| Each downstream call (incl. retries) | `min(3 s, remaining budget)` |
+| Database statement | `min(2 s, remaining budget)` |
+
+**Edge cases:** leave a margin (100–200 ms) for the work **after** the last call, such as serialising the response; a budget spent to zero leaves no time to send even an error.
+
+#### Propagating a deadline inside the process
+**Mechanism:** create one **deadline** per request, as an `AbortSignal` that fires when the budget runs out **or** the client disconnects, and pass it to every call. `AbortSignal.any` (Node 20.3+) combines several signals into one.
+
+```ts title="deadline.ts"
+import type { Request, Response, NextFunction } from 'express';
+
+export function deadline(budgetMs = 10_000) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const clientGone = new AbortController();
+    res.on('close', () => { if (!res.writableFinished) clientGone.abort(new Error('client disconnected')); });
+    req.deadlineAt = Date.now() + budgetMs;
+    req.signal = AbortSignal.any([AbortSignal.timeout(budgetMs), clientGone.signal]);
+    next();
+  };
+}
+
+export const remaining = (req: Request) => Math.max(0, req.deadlineAt - Date.now());
+
+// in a service: each call gets min(own limit, what's left), and stops if the request is already dead
+export async function getPrice(req: Request, sku: string) {
+  if (remaining(req) < 50) throw new AppError(504, 'DEADLINE_EXCEEDED', 'Request took too long');
+  return fetch(`${PRICING_URL}/prices/${sku}`, {
+    signal: AbortSignal.any([req.signal, AbortSignal.timeout(Math.min(3_000, remaining(req)))]),
+  });
+}
+```
+
+**Edge cases:** a signal only stops code that **checks** it. Long loops in your own code should check `req.signal.aborted` between steps; otherwise the request "times out" while the CPU keeps working on it.
+
+#### Across services and into the database
+**Problem:** the API stops waiting after 10 s, but the inventory service it called doesn't know that and finishes a 25 s query anyway.
+
+**Mechanism:** send the **remaining budget** downstream with every call, and have each service use it as its own deadline (the SRE book's example: a 30 s deadline with 7 s already spent gives the next hop 23 s). gRPC does this natively with deadlines; over HTTP, use a header. Send **relative** milliseconds rather than an absolute timestamp, so clock differences between machines don't matter. In Postgres, apply it to the transaction with `SET LOCAL statement_timeout`.
+
+```ts title="propagate.ts"
+// caller
+await fetch(`${INVENTORY_URL}/reserve`, {
+  method: 'POST', body, signal: req.signal,
+  headers: { 'x-request-timeout-ms': String(remaining(req) - 100) },     // keep a margin for our own work
+});
+
+// callee middleware: never trust more than our own maximum (the header could come from anywhere)
+const fromHeader = Number(req.get('x-request-timeout-ms'));
+const budget = Number.isFinite(fromHeader) && fromHeader > 0 ? Math.min(fromHeader, 10_000) : 10_000;
+
+// database: bound the statement by what's left of the request
+await withTx(async c => {
+  await c.query(`SET LOCAL statement_timeout = ${Math.max(100, Math.min(2_000, remaining(req)))}`);
+  await c.query('UPDATE stock SET reserved = reserved + $1 WHERE sku = $2', [qty, sku]);
+});
+```
+
+**Edge cases:**
+- **Accept the header only from internal callers** and cap it, as above; a public client could otherwise ask for a 10-minute budget.
+- **`SET LOCAL` lasts only for the transaction**, which is what you want with a connection pool: a plain `SET` would leak the timeout to the next request that reuses the connection.
+
+### 3.10 Bulkheads in practice ➕
+
+The bulkhead idea above is one sentence; making it real means deciding **what** gets its own compartment, **how big** each is, and what happens when one is full.
+
+#### A concurrency limit per dependency
+**Problem:** the recommendations service slows from 50 ms to 5 s. Each of its calls now holds a request open 100 times longer; within a minute every in-flight slot in your API is waiting on recommendations, and checkout, which never calls recommendations, stops responding too.
+
+**Why it happens:** all requests share the same pools (event loop capacity, sockets, memory, the admission limit from section 3.3). Without a boundary, the slowest dependency decides how many of them are tied up.
+
+**Mechanism:** wrap each dependency in its own **semaphore**: a maximum number of concurrent calls, a small waiting line, and a maximum wait. When it's full, fail **immediately** (and use the fallback), so the slow dependency can only ever occupy its own slots.
+
+```ts title="bulkhead.ts"
+export class Bulkhead {
+  private active = 0;
+  private waiting: (() => void)[] = [];
+  constructor(private name: string, private maxConcurrent: number, private maxWaiting: number, private maxWaitMs: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.active >= this.maxConcurrent) {
+      if (this.waiting.length >= this.maxWaiting) throw new BulkheadFullError(this.name);
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => { this.waiting = this.waiting.filter(w => w !== go); reject(new BulkheadFullError(this.name)); }, this.maxWaitMs);
+        const go = () => { clearTimeout(t); resolve(); };
+        this.waiting.push(go);
+      });
+    } else {
+      this.active++;
+    }
+    try { return await fn(); }
+    finally {
+      const next = this.waiting.shift();
+      if (next) next();            // pass our slot straight to the next waiter
+      else this.active--;
+    }
+  }
+}
+
+const recsBulkhead = new Bulkhead('recommendations', 20, 10, 100);
+const recs = await recsBulkhead.run(() => fetchRecs(userId)).catch(() => []);   // full or failing → empty widget
+```
+
+**Edge cases:** the bulkhead limits **concurrency**, not duration; pair it with a timeout (section 3.9) so slots are released, and a circuit breaker (section 1.3) so a dead dependency isn't tried at all.
+
+#### Separate pools for separate workloads
+**Problem:** a monthly report runs ten heavy queries at once on the same `pg` pool as the API. All 20 connections are busy for a minute, and every API request waits for a connection.
+
+**Mechanism:** give different **workloads** different pools with their own limits and timeouts, so the expensive one can't drain the shared one. The same applies to outbound HTTP: a dedicated keep-alive agent per provider with its own socket limit.
+
+```ts title="pools.ts"
+import { Pool } from 'pg';
+import { Agent } from 'undici';
+
+export const oltpPool    = new Pool({ connectionString: DATABASE_URL, max: 20, statement_timeout: 2_000 });
+export const reportsPool = new Pool({ connectionString: REPLICA_URL,  max: 3,  statement_timeout: 60_000 }); // small, slow, isolated
+
+export const paymentsAgent = new Agent({ connections: 50 });   // per-origin connection cap for the payment provider
+export const emailAgent    = new Agent({ connections: 10 });
+// fetch(url, { dispatcher: paymentsAgent })
+```
+
+**Edge cases:** the sum of all pools across all replicas must still fit Postgres `max_connections` (section 1.2). Point heavy read workloads at a read replica when you can, which also isolates the primary.
+
+#### Sizing compartments
+**Problem:** a bulkhead that's too small rejects healthy traffic; one that's too big doesn't protect anything.
+
+**Mechanism:** size from normal behaviour with Little's law: `concurrent calls ≈ calls per second × typical latency`. 200 calls/s × 50 ms ≈ 10 concurrent; allow 2–3× that for bursts (20–30). If the dependency slows to 5 s, the bulkhead caps it at 30 slots instead of the 1,000 it would otherwise take. Export `active`, `waiting` and rejections per bulkhead and revisit the numbers after load tests.
+
+**Edge cases:** compartments per **dependency** are the usual starting point; split further (per tenant, per endpoint) only when one caller of a shared dependency has repeatedly starved the others.
+
+---
+
+## 4. The final safety net: a global error handler 🎓
+
+The lesson author's favourite mechanism, and in their view **the most important** error-handling piece in a backend: most of the effort goes in once, at the start, and after that you only add conditions now and then.
+
+### The architecture it sits in
+
+<Mermaid chart={`flowchart TD
+  REQ["HTTP request"] --> RT["Routing layer<br/>picks the handler"]
+  RT --> H["Handler<br/>deserialize, validate, bind"]
+  H --> S["Service<br/>orchestrates repositories"]
+  S --> R1["Repository: getUserById"]
+  S --> R2["Repository: getPostsByUser"]
+  R1 --> DB[(Database)]
+  R2 --> DB
+  H -. "ValidationError" .-> G["Global error middleware"]
+  S -. "business errors" .-> G
+  R1 -. "DB errors" .-> G
+  G --> RES["Consistent HTTP error response"]`} />
+
+- **Handler:** extracts data from the request, **deserialises**, **validates**, **binds**, then calls a service.
+- **Service:** an **orchestrator** that can call several repository methods (e.g. get a user, then get that user's posts).
+- **Repository:** **leaf functions** that do one thing, usually one database query (`getUserById`).
+
+**The pattern:** wherever an error occurs, **let it bubble up** to one **middleware** that sees every request and response. In JavaScript or Python you **throw** and the middleware catches; in **Go** you **return** the error from repository → service → handler until it reaches the middleware. Every language lets you define **custom error types**, and the middleware **inspects the type** and decides the response.
+
+### The lesson's examples (a book-management API, like Goodreads)
+
+| Where | What happens | Error the middleware sees | Response |
+|---|---|---|---|
+| Handler | `POST /books` with a 700-character name; the rule is ≤ 500 | Validation error | **400**, with the field errors so the user can fix them |
+| Repository | `INSERT` fails: a book with that name already exists | Unique-constraint violation | **400** "Book already exists" (🔧 **409 Conflict** is the more specific code many APIs use) |
+| Repository | `GET /books/123`: `SELECT ... WHERE id = 123` finds nothing (a malformed link, or a scam link someone sent) | "No rows" error from the driver | **404** "Book with id 123 does not exist" |
+| Repository | `POST /books` with an `authorId` that doesn't exist | Foreign-key violation | **404** "Author does not exist" (🔧 some APIs prefer **422**, since the URL itself was found) |
+| Anywhere | Anything not recognised | Unknown | **500** with a **generic** message (section 5) |
+
+An error response usually has a structure like: `code` (the HTTP status), `message`, and an array of field-level errors.
+
+### Why it's worth it
+1. **More robust:** no matter which layer fails, the error goes through one gateway. Without it, each repository has to remember to translate its own errors; forget once and a "book already exists" becomes a confusing **500 "something went wrong"**.
+2. **Less redundancy:** without a central handler, every repository method needs the same "is it a unique violation? a foreign-key violation?" checks copied in. More copies mean more bugs.
+
+### 🔧 Implementation: error types + one middleware (Express)
+
+```ts title="errors.ts"
+export class AppError extends Error {
+  constructor(public status: number, public code: string, message: string,
+              public details?: unknown, options?: { cause?: unknown }) {
+    super(message, options);
+  }
+}
+export class ValidationError extends AppError {
+  constructor(details: { field: string; message: string }[]) { super(400, 'VALIDATION_FAILED', 'Invalid input', details); }
+}
+export class NotFoundError extends AppError {
+  constructor(what: string) { super(404, 'NOT_FOUND', `${what} does not exist`); }
+}
+export class ConflictError extends AppError {
+  constructor(message: string) { super(409, 'CONFLICT', message); }
+}
+```
+
+```ts title="books.repository.ts"
+export async function getBookById(id: string) {
+  const { rows } = await pool.query('SELECT * FROM books WHERE id = $1', [id]);
+  if (rows.length === 0) throw new NotFoundError(`Book with id ${id}`);   // node-pg returns [], so we raise it
+  return rows[0];
+}
+// note: no try/catch for 23505 or 23503 here. They bubble up untouched.
+```
+
+```ts title="error-middleware.ts"
+import type { ErrorRequestHandler } from 'express';
+
+// translate driver errors into domain errors in ONE place
+const PG_MAP: Record<string, (e: any) => AppError> = {
+  '23505': () => new ConflictError('A record with these details already exists'),
+  '23503': () => new NotFoundError('A referenced record'),
+  '23502': e => new ValidationError([{ field: e.column ?? 'unknown', message: 'is required' }]),
+};
+
+export const errorMiddleware: ErrorRequestHandler = (err, req, res, _next) => {
+  const known = err instanceof AppError ? err : PG_MAP[err?.code]?.(err);
+
+  if (known) {
+    if (known.status >= 500) req.log.error({ err }, known.message);
+    else req.log.warn({ code: known.code, path: req.path }, known.message);
+    return res.status(known.status).json({ code: known.code, message: known.message, errors: known.details ?? [] });
+  }
+
+  // unknown → full detail in the logs, nothing internal in the response
+  req.log.error({ err, requestId: req.id }, 'unhandled error');
+  res.status(500).json({ code: 'INTERNAL', message: 'Something went wrong', requestId: req.id });
+};
+
+// app.ts: register LAST, after all routes
+app.use(errorMiddleware);
+```
+
+Edge cases:
+- **The constraint name tells you which rule fired.** If a table has two unique constraints (email and username), use `err.constraint` (e.g. `users_email_key`) to choose the message, and map it to a **user-facing** field name; don't echo the constraint name itself.
+- **Express 4 doesn't catch rejected promises** from async handlers; wrap handlers (or use Express 5, which forwards them to the error middleware).
+- **Headers already sent:** if streaming has started, you can't send a JSON error; check `res.headersSent` and just end the response.
+
+🔧 **The NestJS version** is an exception filter, registered globally:
+
+```ts title="all-exceptions.filter.ts"
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, Logger } from '@nestjs/common';
+
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly log = new Logger('Errors');
+
+  catch(err: unknown, host: ArgumentsHost) {
+    const res = host.switchToHttp().getResponse();
+    const req = host.switchToHttp().getRequest();
+
+    if (err instanceof HttpException) {                    // includes ValidationPipe's BadRequestException
+      return res.status(err.getStatus()).json(err.getResponse());
+    }
+    const mapped = err instanceof AppError ? err : PG_MAP[(err as any)?.code]?.(err);
+    if (mapped) return res.status(mapped.status).json({ code: mapped.code, message: mapped.message, errors: mapped.details ?? [] });
+
+    this.log.error({ err, path: req.url });
+    return res.status(500).json({ code: 'INTERNAL', message: 'Something went wrong' });
+  }
+}
+// main.ts: app.useGlobalFilters(new AllExceptionsFilter());
+```
+
+---
+
+## 5. Security in error handling 🎓
+
+### 5.1 Don't leak internals in error messages
+**Problem:** a raw database error contains **table names, index names, constraint names** and other internals. If the global handler copies `err.message` into the response, a malicious user learns your schema and can craft more advanced attacks (more targeted SQL injection, for one), and your platform becomes a target. Leaking **users'** data is even worse than leaking yours, because it destroys trust.
+
+**Mechanism:** control every message. By the time an error reaches the **default 500 branch**, you've already ruled out validation, constraint and business errors, so you **don't know** what it is, and it may contain internals. Return only **"Something went wrong"** (or the library default, "Internal Server Error"). Full detail goes to the **logs**, linked by a request ID.
+
+### 5.2 Don't help attackers enumerate accounts
+**Problem:** a login endpoint that says "**no user with this email**" for one input and "**incorrect password**" for another leaks which emails are registered.
+
+**The attack, step by step:**
+1. Try many emails with one password. Most get "user does not exist".
+2. One gets "**password incorrect**", so that email **definitely has an account**.
+3. Now try **common passwords** against just that email, with much better odds.
+
+The error messages alone made the attack possible.
+
+**Mechanism:** return **one generic message** for every failure: "**Invalid email or password**". The lesson points to the **OWASP Cheat Sheet Series** for authentication best practices (it gives the same advice, and similar wording for password reset: "If that email address is in our database, we will send you an email").
+
+🔧 **Same message isn't enough if timing differs.** If "user not found" returns in 2 ms but "wrong password" takes 80 ms (because bcrypt or argon2 ran), the attacker can tell them apart by timing. Run the hash comparison **either way**:
+
+```ts title="login.service.ts"
+const DUMMY_HASH = await argon2.hash('not-a-real-password');   // computed once at startup
+
+export async function login(email: string, password: string) {
+  const user = await users.findByEmail(email.toLowerCase());
+  const ok = await argon2.verify(user?.passwordHash ?? DUMMY_HASH, password); // same work for both cases
+  if (!user || !ok) throw new AppError(401, 'INVALID_CREDENTIALS', 'Invalid email or password');
+  return createSession(user.id);
+}
+```
+
+Pair this with **rate limiting** per account and per IP on the login route (see the caching lesson's Redis rate limiter).
+
+### 5.3 Don't put sensitive data in logs
+**Problem:** logs feel internal, but companies with real traffic produce **hundreds of GB of logs a day** and ship them to **several external services** (storage, analytics, observability). In many big **data breaches**, it was the **logs** that leaked, and with them any emails, passwords, API keys or card numbers written into them.
+
+**Mechanism:** never log passwords, API keys, tokens, card numbers or emails. **Log the user's ID and a correlation (request) ID** instead: enough context to trace a problem without exposing anyone.
+
+🔧 Make it automatic rather than relying on discipline: a request-ID middleware plus a redacting logger (the `pino` `redact` config in section 2.2), so that even an accidental `logger.info({ body: req.body })` comes out with the secrets censored.
+
+```ts title="request-id.ts"
+import { randomUUID } from 'node:crypto';
+app.use((req, res, next) => {
+  req.id = req.get('x-request-id') ?? randomUUID();    // accept the gateway's ID or create one
+  res.setHeader('x-request-id', req.id);               // the user can quote it to support
+  req.log = logger.child({ requestId: req.id, userId: req.user?.id });  // ID, never the email
+  next();
+});
+```
+
+---
+
+## 6. Recap 🎓
+
+- Errors are **normal**. A backend engineer needs a **fault-tolerant mindset**: expect them, detect them, handle them.
+- **Five types:** logic (silent and dangerous), database (connection, constraint, query, deadlock), external services (network, auth, rate limit, outage), input validation (easiest, so be thorough), configuration (validate at startup).
+- **The best error handling starts before the error:** health checks for the server, the database, external services and core functionality, plus monitoring of errors, **performance** and **business metrics**, and structured logs.
+- **Respond by type:** recoverable → retry with backoff, gently; non-recoverable → contain and degrade gracefully.
+- **Recover:** automate what's safe, document and rehearse the manual parts, and **protect data above everything**.
+- **Control propagation** and build **boundaries** (processes, timeouts, queues).
+- **A global error handler** is the final safety net: one place that maps every error to the right response.
+- **Security:** generic messages for unknown errors, no account enumeration, no sensitive data in logs.
+- ➕ **Classify errors:** client vs dependency vs internal, so only real failures page someone; group by fingerprint and alert on new ones after a deploy.
+- ➕ **Retry budgets:** cap retries at a fraction of traffic (about 10%), throttle adaptively on the client, and signal "overloaded, don't retry" upstream.
+- ➕ **Load shedding:** reject early with 503 + Retry-After using a concurrency limit with a bounded wait, event-loop lag, and priorities.
+- ➕ **Sagas:** cross-service operations become local steps with idempotent compensations, checkpointed so a crash resumes; irreversible steps go last.
+- ➕ **Node crash policy:** uncaught exceptions and unhandled rejections are fatal; log synchronously, drain briefly, exit non-zero; catch floating promises and emitter errors explicitly.
+- ➕ **Deadlines:** one request budget, shrinking at each hop, propagated as an AbortSignal, a relative-timeout header and `SET LOCAL statement_timeout`.
+- ➕ **Bulkheads:** a semaphore per dependency, separate pools per workload, sized with Little's law.
+
+---
+
+## Interview questions
+
+1. **Why are logic errors the most dangerous kind?** **Nothing crashes and nothing alerts; the system quietly does the wrong thing (like a double discount) until someone notices the damage.**
+2. **How do you detect logic errors in production?** **Invariant checks that throw, structural guarantees (e.g. a unique constraint per order and discount), property-based tests, and monitoring business metrics.**
+3. **Why can't validation alone prevent unique-email errors?** **Two concurrent requests can both pass an "email not taken" check; only the database constraint is authoritative, so catch 23505 and translate it.**
+4. **What causes a deadlock and how do you handle it?** **Two transactions waiting on locks the other holds; lock rows in a consistent order, keep transactions short, and retry the transaction on 40P01.**
+5. **What's the single most important protection when calling an external API?** **A timeout, so a hung dependency can't hold your requests, connections and memory indefinitely.**
+6. **How should you handle a 429?** **Back off exponentially with jitter, honour Retry-After, retry in only one layer, and move long waits into background jobs.**
+7. **What is a circuit breaker?** **A wrapper that stops calling a failing dependency after a threshold, fails fast or uses a fallback while open, then lets a trial call through to test recovery.**
+8. **Why validate configuration at startup?** **So a missing setting stops the new deploy (and blue-green keeps the old version serving) instead of causing 500s for real users later.**
+9. **Liveness vs readiness checks?** **Liveness says whether to restart the process (keep it trivial); readiness says whether to send it traffic (include dependency checks).**
+10. **Recoverable vs non-recoverable errors: what's the response to each?** **Recoverable: retry with backoff without overloading the stressed system. Non-recoverable: contain and degrade gracefully with cached data or disabled features.**
+11. **What are the benefits of a global error handler?** **Every error is mapped consistently in one place, so no layer can forget a case, and the mapping logic isn't duplicated across repositories.**
+12. **Why must a login endpoint return the same error for unknown email and wrong password?** **Different messages (or timings) let attackers enumerate registered emails and then focus password guessing on real accounts.**
+13. **What should and shouldn't go into logs?** **User IDs and correlation IDs, yes; passwords, tokens, API keys, card numbers and emails, no, because logs flow through many third-party systems and are a common breach source.**
+14. ➕ **Why shouldn't 404s and validation errors page anyone?** **They're the API correctly refusing a request; count them separately from dependency and internal failures, and alert only on sudden changes in their rate.**
+15. ➕ **What is a retry storm and how does a retry budget prevent it?** **Failures cause retries, retries add load, load causes more failures; a budget allows retries only while they're a small fraction (about 10%) of normal requests, so broad failure makes clients fail fast.**
+16. ➕ **Why does a server at 120% load often serve almost nothing?** **Excess requests queue, wait past client timeouts, get retried, and the server spends its capacity on abandoned work; rejecting early with 503 keeps goodput up.**
+17. ➕ **How do you detect overload in a Node process?** **Event-loop delay (monitorEventLoopDelay) plus an in-flight request limit; shed best-effort traffic first and exempt health checks.**
+18. ➕ **What is a saga and what is a compensating action?** **A sequence of local transactions across services; each undoable step has a business-level undo (refund, release) run in reverse order when a later step fails.**
+19. ➕ **Is it safe to keep running after uncaughtException?** **No; the Node docs say the process is in an undefined state, so only do synchronous cleanup, then exit and let the platform restart a clean process.**
+20. ➕ **What is deadline propagation?** **Setting one time budget for a request and passing the remaining time to every downstream call and query, so no layer keeps working after the caller has given up.**
+21. ➕ **How does a bulkhead differ from a circuit breaker?** **A bulkhead caps how many concurrent calls a dependency may occupy; a circuit breaker stops calling it after repeated failures. They're used together with timeouts.**
+
+## Sources
+
+- [Lesson video: Error Handling and Building Fault Tolerant Systems (Sriniously)](https://youtu.be/8NaM_9aKS24)
+- [PostgreSQL: Error codes (SQLSTATE)](https://www.postgresql.org/docs/current/errcodes-appendix.html)
+- [PostgreSQL: Explicit locking and deadlocks](https://www.postgresql.org/docs/current/explicit-locking.html)
+- [node-postgres: Pool options](https://node-postgres.com/apis/pool)
+- [OWASP: Authentication Cheat Sheet (generic error messages)](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP: Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [AWS Builders' Library: Timeouts, retries and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)
+- [Martin Fowler: Circuit Breaker](https://martinfowler.com/bliki/CircuitBreaker.html)
+- [MDN: Retry-After header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After)
+- [Kubernetes: Liveness, readiness and startup probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
+- [Express: Error handling](https://expressjs.com/en/guide/error-handling.html)
+- [NestJS: Exception filters](https://docs.nestjs.com/exception-filters)
+- [pino: Redaction](https://getpino.io/#/docs/redaction)
+- [Google SRE book: Handling overload (retry budgets, adaptive throttling)](https://sre.google/sre-book/handling-overload/)
+- [Google SRE book: Addressing cascading failures (deadlines, load shedding)](https://sre.google/sre-book/addressing-cascading-failures/)
+- [microservices.io: Saga pattern](https://microservices.io/patterns/data/saga.html)
+- [Node.js: process events (uncaughtException, unhandledRejection)](https://nodejs.org/api/process.html)
+- [Node.js: perf_hooks.monitorEventLoopDelay](https://nodejs.org/api/perf_hooks.html)
+- [MDN: AbortSignal.any()](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/any_static)
+- [PostgreSQL: SET (SET LOCAL scope)](https://www.postgresql.org/docs/current/sql-set.html)
+- [typescript-eslint: no-floating-promises](https://typescript-eslint.io/rules/no-floating-promises/)
+- [@fastify/under-pressure](https://github.com/fastify/under-pressure)

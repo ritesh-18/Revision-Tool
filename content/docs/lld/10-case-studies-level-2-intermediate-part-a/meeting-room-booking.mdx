@@ -1,0 +1,790 @@
+---
+title: "10.5 Meeting Room Booking"
+---
+
+## Problem & where it's asked
+
+Build a meeting-room booking system for an office: rooms have capacities and amenities, employees book a room for a time slot, bookings can be cancelled, and the system can list a room's bookings and find free rooms. Optionally, support recurring meetings.
+
+**Reported** at **Flipkart** (SDE-2 machine coding, July 2025: full running code with edge cases), **Amazon** (SDE-2, meeting room reservation), **Salesforce** (2026: recurring meetings capped at 20 instances), and **Uber** (a "My Calendar"-style variant: can this interval be booked?). It's a close cousin of LeetCode 729/731 (My Calendar) and 253 (Meeting Rooms II), so the interval logic must be airtight.
+
+Graded on: **interval logic**, correct classes, readable code, and edge cases.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Is `[10:00, 11:00)` in conflict with `[11:00, 12:00)`? | No. Intervals are **half-open** `[start, end)`, so back-to-back meetings are fine. |
+| Time granularity and zone? | Millisecond timestamps in UTC. Display as `YYYY-MM-DD HH:MM`. |
+| Can the user pick a room, or does the system choose? | Both. Without a room id, the system chooses via a strategy (smallest room that fits). |
+| Capacity rules? | Attendees must be ≤ room capacity. Amenities (projector, VC) are optional filters. |
+| Booking in the past? Maximum length? | Rejected in the past (via injected clock). Max 8 hours. |
+| Who can cancel? | Only the organizer. Cancelling twice is an error. |
+| Recurring? | DAILY or WEEKLY, up to 20 occurrences, **all-or-nothing**: if any occurrence conflicts, nothing is booked and the conflicts are reported. |
+| Concurrent bookings? | Must never double-book (discussed in the concurrency section). |
+
+## Requirements
+
+**Functional**
+
+1. Add rooms (id, name, capacity, amenities).
+2. Book a slot in a specific room, or let the system choose a room.
+3. Cancel a booking (organizer only).
+4. List bookings for a room on a given day, in time order.
+5. Find available rooms for a slot and attendee count.
+6. Recurring bookings (DAILY/WEEKLY, ≤ 20 occurrences, atomic).
+
+**Non-functional**
+
+- Conflict check in O(log n) per room.
+- Never double-book.
+- Room-selection rule is pluggable.
+- Deterministic ids and time for tests.
+
+**Out of scope**
+
+Invitations/notifications, time zones per user, buildings/floors hierarchy (extension), waitlists, room check-in/auto-release.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `TimeRange` | Value object `[start, end)` with validation and `overlaps` | Used by bookings and queries |
+| `Room` | id, name, capacity, amenities | Has one `RoomCalendar` |
+| `Booking` | id, room, organizer, range, attendees, status, optional series id | Belongs to one room |
+| `RoomCalendar` | Sorted, non-overlapping confirmed bookings; conflict search | One per room |
+| `RoomSelectionStrategy` | Picks one room among free candidates | `SmallestFitStrategy`, `PreferredFloorStrategy` |
+| `RecurrenceRule` | frequency + count | Expanded into many `TimeRange`s |
+| `BookingService` | Validation, selection, booking, cancellation, queries | Uses repositories, calendars, strategy, clock, ids |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class TimeRange {
+      +number start
+      +number end
+      +overlaps(other) boolean
+      +shift(ms) TimeRange
+    }
+    class Room {
+      +string id
+      +string name
+      +number capacity
+      +number floor
+      +Set amenities
+    }
+    class Booking {
+      +string id
+      +string roomId
+      +string organizer
+      +TimeRange range
+      +number attendees
+      +BookingStatus status
+      +string seriesId
+    }
+    class RoomCalendar {
+      +findConflict(range) Booking
+      +add(booking)
+      +remove(bookingId)
+      +between(range) Booking[]
+    }
+    class RoomSelectionStrategy {
+      <<interface>>
+      +choose(rooms, request) Room
+    }
+    class SmallestFitStrategy
+    class PreferredFloorStrategy
+    class BookingService {
+      +addRoom(room)
+      +book(request) Booking
+      +bookRecurring(request, rule) Booking[]
+      +cancel(bookingId, userId)
+      +availableRooms(range, attendees) Room[]
+      +bookingsFor(roomId, day) Booking[]
+    }
+    Room "1" -- "1" RoomCalendar
+    RoomCalendar o-- Booking
+    Booking --> TimeRange
+    BookingService --> RoomSelectionStrategy
+    BookingService --> RoomCalendar
+    RoomSelectionStrategy <|.. SmallestFitStrategy
+    RoomSelectionStrategy <|.. PreferredFloorStrategy`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> CONFIRMED: book
+    CONFIRMED --> CANCELLED: cancel by organizer
+    CANCELLED --> [*]`} />
+
+## Design decisions & patterns
+
+- **`TimeRange` value object.** All interval rules (validation, half-open overlap) live in one immutable class. The classic bug `a.start <= b.end` (which makes back-to-back meetings conflict) can only happen in one place.
+- **Per-room sorted calendar with binary search.** Confirmed bookings of one room never overlap, so when sorted by start their ends are sorted too. A new range can only collide with its immediate predecessor or successor in that order. That makes the conflict check O(log n). Insertion is O(n) because of `splice`, which is fine for a room's bookings. A balanced tree (Java's `TreeMap.floorEntry` / `ceilingEntry`) makes it O(log n).
+- **Strategy for room selection.** "Smallest room that fits" (don't waste the 20-seater on a 1:1) is one policy. "Prefer my floor" is another. The service asks the strategy and doesn't care which.
+- **All-or-nothing recurrence.** Expand the rule into ranges, check all of them, and only then write. That's a mini transaction and avoids half-booked series that users hate.
+- **Cancelled bookings stay in the repository** (status `CANCELLED`) but leave the calendar. That gives an audit trail without slowing conflict checks.
+- **Injected `Clock` and `IdGenerator`**, so "can't book in the past" is testable.
+- **Rejected:** a global list of all bookings scanned on every request (O(N) across all rooms); a boolean slot grid per 15 minutes (simple, but memory-heavy and breaks with arbitrary times); storing `Date` objects (mutable; compare by value is error-prone).
+
+## Implementation
+
+**Part 1: errors, time helpers, value objects.**
+
+```ts
+class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+class ConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictError';
+  }
+}
+class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NotFoundError';
+  }
+}
+class PermissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PermissionError';
+  }
+}
+
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+
+/** "2025-07-01 10:30" (UTC) -> epoch ms */
+function at(text: string): number {
+  const ms = Date.parse(`${text.replace(' ', 'T')}:00Z`);
+  if (Number.isNaN(ms)) throw new ValidationError(`Bad time "${text}"`);
+  return ms;
+}
+function fmt(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
+}
+
+class TimeRange {
+  constructor(readonly start: number, readonly end: number) {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) throw new ValidationError('Time must be finite');
+    if (start >= end) throw new ValidationError(`Start ${fmt(start)} must be before end ${fmt(end)}`);
+  }
+  /** Half-open: [10:00, 11:00) and [11:00, 12:00) do NOT overlap. */
+  overlaps(other: TimeRange): boolean {
+    return this.start < other.end && other.start < this.end;
+  }
+  get durationMs(): number {
+    return this.end - this.start;
+  }
+  shift(ms: number): TimeRange {
+    return new TimeRange(this.start + ms, this.end + ms);
+  }
+  toString(): string {
+    return `${fmt(this.start)}-${fmt(this.end).slice(11)}`;
+  }
+}
+
+interface Clock {
+  now(): number;
+}
+interface IdGenerator {
+  next(prefix: string): string;
+}
+class SequentialIds implements IdGenerator {
+  private readonly counters = new Map<string, number>();
+  next(prefix: string): string {
+    const n = (this.counters.get(prefix) ?? 0) + 1;
+    this.counters.set(prefix, n);
+    return `${prefix}${n}`;
+  }
+}
+
+type Amenity = 'PROJECTOR' | 'VC' | 'WHITEBOARD';
+type BookingStatus = 'CONFIRMED' | 'CANCELLED';
+
+interface Room {
+  readonly id: string;
+  readonly name: string;
+  readonly capacity: number;
+  readonly floor: number;
+  readonly amenities: ReadonlySet<Amenity>;
+}
+
+interface Booking {
+  readonly id: string;
+  readonly roomId: string;
+  readonly title: string;
+  readonly organizer: string;
+  readonly range: TimeRange;
+  readonly attendees: number;
+  status: BookingStatus;
+  readonly seriesId?: string;
+}
+```
+
+**Part 2: the room calendar.** This is the class to get right. The binary search finds where the new range would be inserted, and only the two neighbours need checking.
+
+```ts
+class RoomCalendar {
+  private readonly bookings: Booking[] = []; // confirmed, sorted by start, non-overlapping
+
+  /** Index of the first booking whose start is >= t. */
+  private lowerBound(t: number): number {
+    let lo = 0;
+    let hi = this.bookings.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.bookings[mid].range.start < t) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  findConflict(range: TimeRange): Booking | undefined {
+    const i = this.lowerBound(range.start);
+    const before = this.bookings[i - 1];
+    if (before && before.range.overlaps(range)) return before;
+    const after = this.bookings[i];
+    if (after && after.range.overlaps(range)) return after;
+    return undefined;
+  }
+
+  add(booking: Booking): void {
+    const conflict = this.findConflict(booking.range);
+    if (conflict) throw new ConflictError(`Overlaps "${conflict.title}" ${conflict.range}`);
+    this.bookings.splice(this.lowerBound(booking.range.start), 0, booking);
+  }
+
+  remove(bookingId: string): void {
+    const i = this.bookings.findIndex((b) => b.id === bookingId);
+    if (i >= 0) this.bookings.splice(i, 1);
+  }
+
+  between(range: TimeRange): Booking[] {
+    // Start one earlier: the previous booking may still be running at range.start.
+    const from = Math.max(0, this.lowerBound(range.start) - 1);
+    const out: Booking[] = [];
+    for (let i = from; i < this.bookings.length && this.bookings[i].range.start < range.end; i++) {
+      if (this.bookings[i].range.overlaps(range)) out.push(this.bookings[i]);
+    }
+    return out;
+  }
+}
+```
+
+**Part 3: repositories and room-selection strategies.**
+
+```ts
+class RoomRepository {
+  private readonly rooms = new Map<string, { room: Room; calendar: RoomCalendar }>();
+  add(room: Room): void {
+    if (this.rooms.has(room.id)) throw new ValidationError(`Room ${room.id} already exists`);
+    this.rooms.set(room.id, { room, calendar: new RoomCalendar() });
+  }
+  get(id: string): { room: Room; calendar: RoomCalendar } {
+    const entry = this.rooms.get(id);
+    if (!entry) throw new NotFoundError(`Unknown room ${id}`);
+    return entry;
+  }
+  all(): { room: Room; calendar: RoomCalendar }[] {
+    return [...this.rooms.values()];
+  }
+}
+
+class BookingRepository {
+  private readonly bookings = new Map<string, Booking>();
+  save(b: Booking): void {
+    this.bookings.set(b.id, b);
+  }
+  get(id: string): Booking {
+    const b = this.bookings.get(id);
+    if (!b) throw new NotFoundError(`Unknown booking ${id}`);
+    return b;
+  }
+  bySeries(seriesId: string): Booking[] {
+    return [...this.bookings.values()].filter((b) => b.seriesId === seriesId);
+  }
+}
+
+interface BookingRequest {
+  title: string;
+  organizer: string;
+  start: number;
+  end: number;
+  attendees: number;
+  roomId?: string;
+  amenities?: Amenity[];
+  preferredFloor?: number;
+}
+
+interface RoomSelectionStrategy {
+  choose(candidates: readonly Room[], request: BookingRequest): Room | undefined;
+}
+
+/** Best fit: the smallest room that holds everyone, ties by id. */
+class SmallestFitStrategy implements RoomSelectionStrategy {
+  choose(candidates: readonly Room[]): Room | undefined {
+    return [...candidates].sort((a, b) => a.capacity - b.capacity || a.id.localeCompare(b.id))[0];
+  }
+}
+
+/** Closest floor to the organizer first, then best fit. */
+class PreferredFloorStrategy implements RoomSelectionStrategy {
+  choose(candidates: readonly Room[], request: BookingRequest): Room | undefined {
+    const floor = request.preferredFloor ?? 0;
+    return [...candidates].sort(
+      (a, b) => Math.abs(a.floor - floor) - Math.abs(b.floor - floor) || a.capacity - b.capacity,
+    )[0];
+  }
+}
+```
+
+**Part 4: the service.** Validation first, then selection, then the write. `bookRecurring` checks every occurrence before writing any.
+
+```ts
+interface RecurrenceRule {
+  frequency: 'DAILY' | 'WEEKLY';
+  count: number;
+}
+
+const MAX_DURATION = 8 * HOUR;
+const MAX_OCCURRENCES = 20;
+
+class BookingService {
+  constructor(
+    private readonly rooms: RoomRepository,
+    private readonly bookings: BookingRepository,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+    private strategy: RoomSelectionStrategy = new SmallestFitStrategy(),
+  ) {}
+
+  setStrategy(strategy: RoomSelectionStrategy): void {
+    this.strategy = strategy;
+  }
+
+  addRoom(id: string, name: string, capacity: number, floor: number, amenities: Amenity[] = []): Room {
+    if (!Number.isInteger(capacity) || capacity <= 0) throw new ValidationError('Capacity must be a positive integer');
+    const room: Room = { id, name, capacity, floor, amenities: new Set(amenities) };
+    this.rooms.add(room);
+    return room;
+  }
+
+  book(req: BookingRequest): Booking {
+    const range = this.validate(req);
+    const room = this.pickRoom(req, [range]);
+    return this.commit(req, room, range);
+  }
+
+  bookRecurring(req: BookingRequest, rule: RecurrenceRule): Booking[] {
+    if (!Number.isInteger(rule.count) || rule.count < 1 || rule.count > MAX_OCCURRENCES) {
+      throw new ValidationError(`Recurring count must be 1..${MAX_OCCURRENCES}`);
+    }
+    const first = this.validate(req);
+    const step = rule.frequency === 'DAILY' ? DAY : 7 * DAY;
+    const ranges = Array.from({ length: rule.count }, (_, i) => first.shift(i * step));
+    const room = this.pickRoom(req, ranges); // checks ALL occurrences before writing
+    const seriesId = this.ids.next('S');
+    return ranges.map((r) => this.commit(req, room, r, seriesId));
+  }
+
+  cancel(bookingId: string, userId: string): void {
+    const booking = this.bookings.get(bookingId);
+    if (booking.organizer !== userId) throw new PermissionError(`Only ${booking.organizer} can cancel ${bookingId}`);
+    if (booking.status === 'CANCELLED') throw new ValidationError(`${bookingId} is already cancelled`);
+    booking.status = 'CANCELLED';
+    this.rooms.get(booking.roomId).calendar.remove(booking.id);
+  }
+
+  availableRooms(range: TimeRange, attendees: number, amenities: Amenity[] = []): Room[] {
+    return this.rooms
+      .all()
+      .filter(({ room, calendar }) =>
+        room.capacity >= attendees &&
+        amenities.every((a) => room.amenities.has(a)) &&
+        !calendar.findConflict(range),
+      )
+      .map(({ room }) => room);
+  }
+
+  bookingsFor(roomId: string, day: string): Booking[] {
+    const start = at(`${day} 00:00`);
+    return this.rooms.get(roomId).calendar.between(new TimeRange(start, start + DAY));
+  }
+
+  private validate(req: BookingRequest): TimeRange {
+    if (!req.title.trim() || !req.organizer.trim()) throw new ValidationError('Title and organizer are required');
+    if (!Number.isInteger(req.attendees) || req.attendees <= 0) throw new ValidationError('Attendees must be >= 1');
+    const range = new TimeRange(req.start, req.end);
+    if (range.start < this.clock.now()) throw new ValidationError(`Cannot book in the past (${range})`);
+    if (range.durationMs > MAX_DURATION) throw new ValidationError('A booking can be at most 8 hours');
+    return range;
+  }
+
+  private pickRoom(req: BookingRequest, ranges: TimeRange[]): Room {
+    const freeForAll = (calendar: RoomCalendar) => ranges.every((r) => !calendar.findConflict(r));
+    if (req.roomId) {
+      const { room, calendar } = this.rooms.get(req.roomId);
+      if (room.capacity < req.attendees) {
+        throw new ValidationError(`${room.name} holds ${room.capacity}, requested ${req.attendees}`);
+      }
+      const clashes = ranges.filter((r) => calendar.findConflict(r));
+      if (clashes.length > 0) {
+        throw new ConflictError(`${room.name} is busy at ${clashes.map(String).join(', ')}`);
+      }
+      return room;
+    }
+    const candidates = this.rooms
+      .all()
+      .filter(({ room, calendar }) =>
+        room.capacity >= req.attendees &&
+        (req.amenities ?? []).every((a) => room.amenities.has(a)) &&
+        freeForAll(calendar),
+      )
+      .map(({ room }) => room);
+    const chosen = this.strategy.choose(candidates, req);
+    if (!chosen) throw new ConflictError(`No room for ${req.attendees} people at ${ranges[0]}`);
+    return chosen;
+  }
+
+  private commit(req: BookingRequest, room: Room, range: TimeRange, seriesId?: string): Booking {
+    const booking: Booking = {
+      id: this.ids.next('B'),
+      roomId: room.id,
+      title: req.title,
+      organizer: req.organizer,
+      range,
+      attendees: req.attendees,
+      status: 'CONFIRMED',
+      seriesId,
+    };
+    this.rooms.get(room.id).calendar.add(booking); // re-checks the conflict: last line of defence
+    this.bookings.save(booking);
+    return booking;
+  }
+}
+```
+
+**Part 5: demo.**
+
+```ts
+const clock: Clock = { now: () => at('2025-07-01 08:00') };
+const service = new BookingService(new RoomRepository(), new BookingRepository(), clock, new SequentialIds());
+service.addRoom('R1', 'Nifty', 4, 1, ['WHITEBOARD']);
+service.addRoom('R2', 'Sensex', 8, 2, ['PROJECTOR', 'VC']);
+service.addRoom('R3', 'Bull Pen', 20, 1, ['PROJECTOR', 'VC', 'WHITEBOARD']);
+
+const show = (b: Booking) => `${b.id} ${b.roomId} "${b.title}" ${b.range} (${b.attendees})`;
+const attempt = (label: string, action: () => void) => {
+  try {
+    action();
+  } catch (err) {
+    if (err instanceof Error) console.log(`${label}: ${err.name}: ${err.message}`);
+  }
+};
+
+const standup = service.book({ title: 'Standup', organizer: 'ritesh', start: at('2025-07-01 10:00'), end: at('2025-07-01 10:30'), attendees: 3 });
+console.log(`auto-picked: ${show(standup)}`);
+const review = service.book({ title: 'Design review', organizer: 'asha', start: at('2025-07-01 10:00'), end: at('2025-07-01 11:00'), attendees: 3 });
+console.log(`auto-picked: ${show(review)}`);
+const backToBack = service.book({ title: '1:1', organizer: 'asha', start: at('2025-07-01 10:30'), end: at('2025-07-01 11:00'), attendees: 2, roomId: 'R1' });
+console.log(`back-to-back ok: ${show(backToBack)}`);
+
+attempt('overlap', () =>
+  service.book({ title: 'Sync', organizer: 'ravi', start: at('2025-07-01 10:15'), end: at('2025-07-01 10:45'), attendees: 2, roomId: 'R1' }),
+);
+attempt('too big', () =>
+  service.book({ title: 'Town hall', organizer: 'ravi', start: at('2025-07-01 12:00'), end: at('2025-07-01 13:00'), attendees: 9, roomId: 'R2' }),
+);
+attempt('past', () =>
+  service.book({ title: 'Old', organizer: 'ravi', start: at('2025-07-01 07:00'), end: at('2025-07-01 07:30'), attendees: 2 }),
+);
+attempt('reversed', () =>
+  service.book({ title: 'Oops', organizer: 'ravi', start: at('2025-07-01 12:00'), end: at('2025-07-01 11:00'), attendees: 2 }),
+);
+
+const free = service.availableRooms(new TimeRange(at('2025-07-01 10:00'), at('2025-07-01 10:30')), 2, ['PROJECTOR']);
+console.log(`free with projector 10:00-10:30: ${free.map((r) => r.name).join(', ') || 'none'}`);
+
+service.setStrategy(new PreferredFloorStrategy());
+const vc = service.book({ title: 'Client call', organizer: 'ravi', start: at('2025-07-01 14:00'), end: at('2025-07-01 15:00'), attendees: 2, amenities: ['VC'], preferredFloor: 1 });
+console.log(`floor-1 preference with VC: ${show(vc)}`);
+
+console.log('--- recurring ---');
+const series = service.bookRecurring(
+  { title: 'Weekly planning', organizer: 'ritesh', start: at('2025-07-01 14:00'), end: at('2025-07-01 15:00'), attendees: 6, roomId: 'R2' },
+  { frequency: 'WEEKLY', count: 3 },
+);
+for (const b of series) console.log(`series ${b.seriesId}: ${show(b)}`);
+attempt('single clash', () => service.book({ title: 'x', organizer: 'x', start: at('2025-07-08 14:30'), end: at('2025-07-08 15:00'), attendees: 1, roomId: 'R2' }));
+attempt('daily clash', () =>
+  service.bookRecurring(
+    { title: 'Daily sync', organizer: 'asha', start: at('2025-07-07 14:00'), end: at('2025-07-07 14:30'), attendees: 4, roomId: 'R2' },
+    { frequency: 'DAILY', count: 10 },
+  ),
+);
+attempt('too many', () => service.bookRecurring({ title: 'Forever', organizer: 'asha', start: at('2025-07-02 09:00'), end: at('2025-07-02 09:30'), attendees: 2 }, { frequency: 'DAILY', count: 21 }));
+
+console.log('--- cancel ---');
+attempt('not organizer', () => service.cancel(standup.id, 'asha'));
+service.cancel(standup.id, 'ritesh');
+attempt('twice', () => service.cancel(standup.id, 'ritesh'));
+console.log(`R1 on 2025-07-01: ${service.bookingsFor('R1', '2025-07-01').map(show).join(' | ')}`);
+const reuse = service.book({ title: 'Standup v2', organizer: 'ravi', start: at('2025-07-01 10:00'), end: at('2025-07-01 10:30'), attendees: 2, roomId: 'R1' });
+console.log(`slot reusable after cancel: ${show(reuse)}`);
+```
+
+## Demo output
+
+```text
+auto-picked: B1 R1 "Standup" 2025-07-01 10:00-10:30 (3)
+auto-picked: B2 R2 "Design review" 2025-07-01 10:00-11:00 (3)
+back-to-back ok: B3 R1 "1:1" 2025-07-01 10:30-11:00 (2)
+overlap: ConflictError: Nifty is busy at 2025-07-01 10:15-10:45
+too big: ValidationError: Sensex holds 8, requested 9
+past: ValidationError: Cannot book in the past (2025-07-01 07:00-07:30)
+reversed: ValidationError: Start 2025-07-01 12:00 must be before end 2025-07-01 11:00
+free with projector 10:00-10:30: Bull Pen
+floor-1 preference with VC: B4 R3 "Client call" 2025-07-01 14:00-15:00 (2)
+--- recurring ---
+series S1: B5 R2 "Weekly planning" 2025-07-01 14:00-15:00 (6)
+series S1: B6 R2 "Weekly planning" 2025-07-08 14:00-15:00 (6)
+series S1: B7 R2 "Weekly planning" 2025-07-15 14:00-15:00 (6)
+single clash: ConflictError: Sensex is busy at 2025-07-08 14:30-15:00
+daily clash: ConflictError: Sensex is busy at 2025-07-08 14:00-14:30, 2025-07-15 14:00-14:30
+too many: ValidationError: Recurring count must be 1..20
+--- cancel ---
+not organizer: PermissionError: Only ritesh can cancel B1
+twice: ValidationError: B1 is already cancelled
+R1 on 2025-07-01: B3 R1 "1:1" 2025-07-01 10:30-11:00 (2)
+slot reusable after cancel: B8 R1 "Standup v2" 2025-07-01 10:00-10:30 (2)
+```
+
+The first two bookings show best fit: the standup gets `Nifty` (4 seats), and the design review, which overlaps it, gets the next-smallest free room. The `1:1` starts exactly when the standup ends and is accepted: that's the half-open interval rule. The daily series is rejected as a whole because two of its ten days (8 and 15 July) collide with the weekly planning meeting, and the error names both dates so the user can fix them in one go.
+
+## Concurrency
+
+Two people click "Book" for the same room and slot at the same moment. If there's any `await` between "check for conflict" and "save" (a DB read, a call to a calendar API), both checks pass and the room is double-booked. This is a textbook **check-then-act** race.
+
+Fixes, strongest first:
+
+1. **Let the database enforce it.** Postgres has exclusion constraints: `EXCLUDE USING gist (room_id WITH =, tstzrange(start, end) WITH &&)`. Even buggy app code can't double-book.
+2. **Pessimistic lock per room:** `SELECT ... FROM rooms WHERE id = $1 FOR UPDATE` inside the transaction, then check and insert.
+3. **In-process per-room mutex** (single instance), with the check repeated *inside* the lock.
+
+```ts
+interface Slot {
+  roomId: string;
+  start: number;
+  end: number;
+  who: string;
+}
+const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 1));
+
+class SlotStore {
+  readonly slots: Slot[] = [];
+  async conflicts(s: Slot): Promise<boolean> {
+    await pause(); // DB round-trip
+    return this.slots.some((x) => x.roomId === s.roomId && x.start < s.end && s.start < x.end);
+  }
+  async insert(s: Slot): Promise<void> {
+    await pause();
+    this.slots.push(s);
+  }
+}
+
+class RoomLocks {
+  private readonly tails = new Map<string, Promise<void>>();
+  async withRoom<T>(roomId: string, work: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(roomId) ?? Promise.resolve();
+    let done!: () => void;
+    const mine = new Promise<void>((resolve) => (done = resolve));
+    const tail = prev.then(() => mine);
+    this.tails.set(roomId, tail);
+    await prev;
+    try {
+      return await work();
+    } finally {
+      done();
+      if (this.tails.get(roomId) === tail) this.tails.delete(roomId);
+    }
+  }
+}
+
+async function book(store: SlotStore, s: Slot): Promise<string> {
+  if (await store.conflicts(s)) return `${s.who}: rejected`;
+  await store.insert(s);
+  return `${s.who}: booked`;
+}
+
+const requests: Slot[] = [
+  { roomId: 'R1', start: 10, end: 11, who: 'asha' },
+  { roomId: 'R1', start: 10, end: 11, who: 'ravi' },
+  { roomId: 'R2', start: 10, end: 11, who: 'meera' },
+];
+
+const racyStore = new SlotStore();
+const racy = await Promise.all(requests.map((r) => book(racyStore, r)));
+console.log(`no lock:  ${racy.join(', ')} -> R1 bookings: ${racyStore.slots.filter((s) => s.roomId === 'R1').length}`);
+
+const safeStore = new SlotStore();
+const locks = new RoomLocks();
+const safe = await Promise.all(requests.map((r) => locks.withRoom(r.roomId, () => book(safeStore, r))));
+console.log(`per-room: ${safe.join(', ')} -> R1 bookings: ${safeStore.slots.filter((s) => s.roomId === 'R1').length}`);
+```
+
+```text
+no lock:  asha: booked, ravi: booked, meera: booked -> R1 bookings: 2
+per-room: asha: booked, ravi: rejected, meera: booked -> R1 bookings: 1
+```
+
+The lock is **per room**, so Meera's booking of R2 doesn't wait for R1. For a recurring booking or a multi-room booking, acquire the locks in a fixed order (sorted room ids) to avoid deadlock.
+
+## Extensions & follow-ups
+
+| Follow-up (source) | Design change |
+|--------------------|---------------|
+| Recurring meetings, max 20 (Salesforce 2026, reported) | Implemented: `RecurrenceRule` expanded to ranges, all-or-nothing. Add "skip conflicting occurrences" as an option if product wants it. |
+| Room capacity and amenities (reported) | Implemented as filters before the strategy. |
+| Concurrent booking (reported) | Per-room lock or a DB exclusion constraint (above). |
+| Buildings and floors (inferred) | `Building → Floor → Room` hierarchy. Search is scoped by building, and `PreferredFloorStrategy` already uses the floor. |
+| "My Calendar": can this interval be booked? (Uber, reported) | That's `RoomCalendar.findConflict`. A double-booking-allowed variant (My Calendar II) needs a sweep line or a segment tree. |
+| Suggest the next free slot | Merge busy intervals and scan the gaps. Shown below. |
+| Cancel one occurrence vs the whole series | `seriesId` already groups them: `cancelSeries(seriesId)` loops over `bySeries`. |
+
+"No room at 10:00? Suggest the earliest slot where *all* attendees and the room are free." This is the most common follow-up once booking works:
+
+```ts
+type Interval = readonly [start: number, end: number];
+
+/** Merges overlapping or touching intervals. O(n log n). */
+function mergeBusy(intervals: Interval[]): Interval[] {
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+  const merged: [number, number][] = [];
+  for (const [s, e] of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  return merged;
+}
+
+/** Earliest [t, t + duration) inside the window that avoids every busy interval. */
+function earliestFreeSlot(busyCalendars: Interval[][], window: Interval, duration: number): Interval | undefined {
+  if (duration <= 0) throw new Error('duration must be positive');
+  let cursor = window[0];
+  for (const [s, e] of mergeBusy(busyCalendars.flat())) {
+    if (e <= cursor) continue;
+    if (s - cursor >= duration) break; // the gap before this busy block is big enough
+    cursor = Math.max(cursor, e);
+  }
+  return cursor + duration <= window[1] ? [cursor, cursor + duration] : undefined;
+}
+
+// Minutes since 09:00 to keep the example readable.
+const hhmm = (m: number) => `${String(9 + Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+const room: Interval[] = [[60, 120], [150, 180]]; // 10:00-11:00, 11:30-12:00
+const asha: Interval[] = [[0, 30], [120, 150]]; // 09:00-09:30, 11:00-11:30
+const ravi: Interval[] = [[180, 240]]; // 12:00-13:00
+
+for (const duration of [30, 45, 90, 600]) {
+  const slot = earliestFreeSlot([room, asha, ravi], [0, 480], duration);
+  console.log(`${duration} min -> ${slot ? `${hhmm(slot[0])}-${hhmm(slot[1])}` : 'no slot today'}`);
+}
+```
+
+```text
+30 min -> 09:30-10:00
+45 min -> 13:00-13:45
+90 min -> 13:00-14:30
+600 min -> no slot today
+```
+
+## Edge cases
+
+- Back-to-back meetings (`end === start`): allowed. Identical ranges: conflict. A range that fully contains another: conflict (the binary search still catches it through the neighbour check).
+- `start >= end`, non-finite times, zero attendees, empty title: rejected.
+- Booking in the past or longer than 8 hours: rejected.
+- Specific room too small: a clear capacity error rather than a generic "not available".
+- No room satisfies capacity + amenities + time: a `ConflictError` naming the slot.
+- Cancelling: only the organizer, only once. After cancelling, the slot is bookable again.
+- Recurring: count 0 or > 20 rejected; one conflicting occurrence rejects the whole series and names the clashing dates.
+- Meetings spanning midnight: `bookingsFor(day)` uses overlap, so a 23:30–00:30 meeting shows on both days.
+- Daylight saving time: avoided by storing UTC. Recurrence "every Monday 10:00 local" would need a time-zone library.
+
+## Complexity
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `findConflict` (one room) | O(log n) | n = bookings in that room |
+| `book` with room id | O(log n + n) | search + array insert (O(log n) with a balanced tree) |
+| `book` auto-select | O(R log n + R log R) | R rooms, then sort candidates |
+| `bookRecurring` (k occurrences) | O(k · R log n) | k ≤ 20 |
+| `cancel` | O(n) | find in array (O(log n) with a tree keyed by start) |
+| `bookingsFor(day)` | O(log n + m) | m = results |
+| `earliestFreeSlot` | O(B log B) | B = busy intervals across calendars |
+
+## What graders look for / common mistakes
+
+- ✅ A `TimeRange` with a correct half-open overlap check. ❌ `<=` comparisons that reject back-to-back meetings, or checks that miss "new range contains existing range".
+- ✅ Per-room data structure; binary search or tree for conflicts. ❌ Scanning every booking in the building.
+- ✅ Validation with specific error types and messages.
+- ✅ All-or-nothing recurring bookings.
+- ❌ Deleting cancelled bookings (no audit) or leaving them in the calendar (slot never frees up).
+- ❌ Using `new Date()` inside the service (untestable "not in the past" rule).
+- ❌ No discussion of double-booking under concurrency.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–8 | Clarify interval semantics, capacity, who cancels, recurring? Write the assumptions. |
+| 8–18 | `TimeRange`, `Room`, `Booking`, errors. |
+| 18–35 | `RoomCalendar` with binary search. Test overlaps in the driver right away. |
+| 35–55 | `BookingService.book`, `cancel`, `availableRooms`, `bookingsFor`. |
+| 55–65 | `RoomSelectionStrategy` (best fit). |
+| 65–80 | Recurring bookings (all-or-nothing) + edge cases in the driver. |
+| 80–90 | Concurrency discussion, cleanup, walkthrough. |
+
+## Interview Q&A
+
+**Q1. Why is checking only the two neighbours enough?**
+
+<details>
+<summary>Answer</summary>
+
+Confirmed bookings in a room never overlap, so when they're sorted by start, they're also sorted by end. Let `i` be the first booking that starts at or after the new start. Every booking before `i-1` ends no later than booking `i-1` ends, so if `i-1` finishes before the new range starts, all earlier bookings do too. Every booking after `i` starts no earlier than booking `i` starts, so if `i` starts at or after the new end, all later bookings do too. Only `i-1` and `i` can overlap.
+
+</details>
+
+**Q2. How would you store this in a relational database?**
+
+<details>
+<summary>Answer</summary>
+
+Tables `rooms(id, name, capacity, floor)`, `room_amenities(room_id, amenity)`, `bookings(id, room_id, organizer_id, starts_at, ends_at, status, series_id)`, plus `booking_series(id, rule)`. Index `(room_id, starts_at)`. For integrity, use a Postgres exclusion constraint on `(room_id, tstzrange(starts_at, ends_at))` filtered to `status = 'CONFIRMED'`. Availability becomes a `NOT EXISTS` query with the overlap condition.
+
+</details>
+
+**Q3. How do you find the minimum number of rooms needed for a list of meetings?**
+
+<details>
+<summary>Answer</summary>
+
+That's LeetCode 253. Sort the start times and end times separately and sweep: each start increments the count, each end at or before the current start decrements it, and the answer is the maximum count. O(n log n). Equivalently, use a min-heap of end times. It's a good capacity-planning report on top of this system.
+
+</details>
+
+**Q4. The product wants "book it anyway and skip the conflicting weeks" for recurring meetings. What changes?**
+
+<details>
+<summary>Answer</summary>
+
+Add a `conflictPolicy: 'ALL_OR_NOTHING' | 'SKIP_CONFLICTS'` to the request (or make it a strategy). With `SKIP_CONFLICTS`, `pickRoom` must choose a room first (for example, the room free for the most occurrences), then commit only the free occurrences and return the skipped dates to the user. The rest of the service is unchanged.
+
+</details>

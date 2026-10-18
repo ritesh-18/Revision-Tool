@@ -1,0 +1,262 @@
+---
+title: "4.1 Singleton"
+---
+
+## Intent
+
+Make sure a class has exactly one instance, and give everyone one well-known way to reach it.
+
+## Problem
+
+Your trading backend has a `MarketDataFeed` that holds one WebSocket connection to the exchange. If three services each call `new MarketDataFeed()`, you open three sockets, get three copies of every tick, and may hit the exchange's connection limit. Config, a metrics registry and an in-memory rate-limiter have the same need: **one shared instance per process**.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class AppConfig {
+        -AppConfig instance$
+        -Map values
+        -AppConfig()
+        +getInstance()$ AppConfig
+        +get(key) string
+        +set(key, value) void
+    }
+    class OrderService
+    class RiskService
+    OrderService --> AppConfig : getInstance()
+    RiskService --> AppConfig : getInstance()`} />
+
+## TypeScript implementation
+
+**Classic lazy singleton.** The constructor is `private`, so `new AppConfig()` fails to compile outside the class. The only way in is `getInstance()`.
+
+```ts
+class AppConfig {
+  private static instance: AppConfig | undefined;
+  private readonly values = new Map<string, string>();
+
+  private constructor() {
+    console.log('AppConfig created');
+    this.values.set('env', 'prod');
+  }
+
+  static getInstance(): AppConfig {
+    if (!AppConfig.instance) {
+      AppConfig.instance = new AppConfig();
+    }
+    return AppConfig.instance;
+  }
+
+  get(key: string): string | undefined {
+    return this.values.get(key);
+  }
+
+  set(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+}
+
+// const bad = new AppConfig(); // compile error: constructor is private
+
+const a = AppConfig.getInstance();
+const b = AppConfig.getInstance();
+console.log(`same instance: ${a === b}`);
+a.set('featureX', 'on');
+console.log(`b sees featureX = ${b.get('featureX')}`);
+```
+
+```text
+AppConfig created
+same instance: true
+b sees featureX = on
+```
+
+**Async-safe singleton.** Node runs your JavaScript on one thread, so the classic version has no thread-safety problem like Java does. But there is an *async* race: if creating the instance involves `await` (opening a connection, say), two callers can both see "no instance yet" and both start connecting. The fix is to cache the **promise**, not the finished instance.
+
+```ts
+class DbClient {
+  static #pending: Promise<DbClient> | undefined;
+  static connectCount = 0;
+
+  private constructor(readonly url: string) {}
+
+  static get(): Promise<DbClient> {
+    // Store the promise synchronously, before any await happens.
+    DbClient.#pending ??= DbClient.connect();
+    return DbClient.#pending;
+  }
+
+  private static async connect(): Promise<DbClient> {
+    DbClient.connectCount++;
+    await new Promise((resolve) => setTimeout(resolve, 20)); // fake network handshake
+    return new DbClient('postgres://orders-db');
+  }
+}
+
+const [c1, c2, c3] = await Promise.all([DbClient.get(), DbClient.get(), DbClient.get()]);
+console.log(`connections opened: ${DbClient.connectCount}`);
+console.log(`all same: ${c1 === c2 && c2 === c3} (${c1.url})`);
+```
+
+```text
+connections opened: 1
+all same: true (postgres://orders-db)
+```
+
+A naive version (`if (!this.instance) this.instance = await connect()`) would report `connections opened: 3`. That is a real bug people ship.
+
+**The idiomatic TypeScript singleton: a module-level instance.** ES modules are evaluated once and cached, so an exported `const` already *is* a singleton for the whole process. No private constructor, no `getInstance()`.
+
+```ts
+// metrics.ts (imagine this is its own file)
+class MetricsRegistry {
+  private readonly counters = new Map<string, number>();
+
+  inc(name: string, by = 1): void {
+    this.counters.set(name, (this.counters.get(name) ?? 0) + by);
+  }
+
+  snapshot(): string {
+    return [...this.counters].map(([k, v]) => `${k}=${v}`).join(', ');
+  }
+}
+
+export const metrics = new MetricsRegistry(); // evaluated once per process
+
+// order-service.ts would do: import { metrics } from './metrics';
+function placeOrder(): void {
+  metrics.inc('orders.placed');
+}
+
+// payment-service.ts would do the same import and get the SAME object
+function capturePayment(amount: number): void {
+  metrics.inc('payments.captured');
+  metrics.inc('payments.amount', amount);
+}
+
+placeOrder();
+placeOrder();
+capturePayment(500);
+console.log(metrics.snapshot());
+```
+
+```text
+orders.placed=2, payments.captured=1, payments.amount=500
+```
+
+Two caveats with module singletons: the "one per process" guarantee breaks if the same package is installed twice in `node_modules` (two copies, two instances), and it is still global state, which brings us to testing.
+
+**Why singletons hurt testability.** Look at this service:
+
+```ts
+// ❌ Hidden dependency: the signature says nothing about config or clock
+class TradingWindowService {
+  canTrade(): boolean {
+    const cfg = AppConfig.getInstance();          // global reach-out
+    const now = SystemClock.getInstance().now();  // global reach-out
+    return now >= cfg.marketOpen && now <= cfg.marketClose;
+  }
+}
+```
+
+To test "orders are rejected after 15:30" you must mutate a global object and remember to reset it, otherwise one test's state leaks into the next. Tests stop being runnable in parallel or in random order. The dependency is also invisible: nothing in the constructor tells a reader that this class needs a clock.
+
+**The DI alternative.** Keep "one instance" as a *wiring decision* made in one place (the composition root, or Nest's container, where providers are singleton-scoped by default), and let classes receive their dependencies.
+
+```ts
+interface Clock {
+  nowMinutes(): number; // minutes since midnight, IST
+}
+
+interface MarketHours {
+  open: number;
+  close: number;
+}
+
+class TradingWindowService {
+  constructor(
+    private readonly clock: Clock,
+    private readonly hours: MarketHours,
+  ) {}
+
+  canTrade(): boolean {
+    const now = this.clock.nowMinutes();
+    return now >= this.hours.open && now <= this.hours.close;
+  }
+}
+
+// Composition root: the ONLY place that decides "one instance of each".
+const nseHours: MarketHours = { open: 9 * 60 + 15, close: 15 * 60 + 30 };
+
+// In tests: a fake clock, no global state, no reset needed.
+class FixedClock implements Clock {
+  constructor(private readonly minutes: number) {}
+  nowMinutes(): number {
+    return this.minutes;
+  }
+}
+
+const cases: Array<[string, number]> = [
+  ['09:00', 9 * 60],
+  ['10:30', 10 * 60 + 30],
+  ['15:31', 15 * 60 + 31],
+];
+for (const [label, minutes] of cases) {
+  const svc = new TradingWindowService(new FixedClock(minutes), nseHours);
+  console.log(`${label} -> canTrade=${svc.canTrade()}`);
+}
+```
+
+```text
+09:00 -> canTrade=false
+10:30 -> canTrade=true
+15:31 -> canTrade=false
+```
+
+In NestJS this is simply `@Injectable()` with the default scope: one instance per app, but injected, so tests use `Test.createTestingModule(...).overrideProvider(...)`.
+
+## When to use / when NOT to use
+
+| Use it when | Avoid it when |
+| --- | --- |
+| There is truly one physical resource per process (a socket, a logger sink, a metrics registry) | You just want "convenient global access": that is a global variable wearing a suit |
+| Creation is expensive and the object is stateless or safely shared | The object holds per-request or per-user state |
+| You have no DI container (small scripts, libraries) | You have a DI container: register it as a singleton-scoped provider instead |
+
+## Pitfalls
+
+- **Hidden coupling**: `X.getInstance()` calls buried in methods make dependencies invisible and tests order-dependent.
+- **Async init race**: cache the promise, not the resolved value.
+- **"One per process" is not "one per system"**: with 4 pods behind a load balancer you have 4 singletons. A singleton rate-limiter does not limit cluster-wide; you need Redis for that.
+- **Duplicate module copies**: two versions of a package in `node_modules` give two instances.
+- **Mutable shared state** across concurrent requests leads to data bleeding between users.
+
+## Related patterns
+
+- **Monostate**: many instances sharing static state; same problems, less honest.
+- **Factory / Abstract Factory**: a factory itself is often a singleton.
+- **Flyweight** (Chapter 5): also shares objects, but *many* shared instances keyed by intrinsic state, not exactly one.
+- **Object Pool**: a fixed *set* of reusable instances instead of one.
+
+## Where it shows up in LLD interview problems
+
+- Parking Lot: `ParkingLot.getInstance()` is the textbook answer; say "I'd make it a singleton-scoped provider rather than a static accessor, so tests can create fresh lots".
+- Logger / Rate limiter / ID generator / Order book registry in a trading platform.
+- Cache manager in an LRU-cache problem.
+
+Interview line: *"I'll keep a single instance, but I'll inject it instead of calling a static getter. That keeps the lifetime decision in one place and keeps the class testable."*
+
+## Quick check
+
+1. Node is single-threaded. Can a singleton still be created twice?
+2. Why is a module-level `export const x = new X()` usually preferred in TypeScript?
+3. Your singleton rate-limiter lets 4x the allowed traffic through in production. Why?
+
+<details>
+<summary>Answers</summary>
+
+1. Yes, if initialisation is async. Two callers can both pass the `if (!instance)` check before the first `await` finishes. Cache the promise synchronously.
+2. ES modules are evaluated once and cached, so you get one instance with no ceremony, and you can still swap it via DI or module mocking in tests.
+3. You run 4 instances of the service. A singleton is per process, so each pod has its own counter. Use a shared store (Redis) for cluster-wide limits.
+
+</details>

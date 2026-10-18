@@ -1,0 +1,146 @@
+---
+title: "7.2 Repository pattern and Specifications"
+---
+
+## Intuition
+
+A repository makes storage look like an **in-memory collection of domain objects**. Services say `orders.save(order)` and `orders.find(openOrdersFor(user))`. They never see SQL, Redis keys, or Maps. In a machine-coding round the implementation *is* a Map, but the interface is what you're being graded on.
+
+A **Specification** is a query written as an object: a named predicate you can combine with `and` / `or` / `not`. Filtering rules stop being scattered `filter(o => ...)` lambdas and become reusable, testable business vocabulary ("open orders", "large orders"). A real SQL repository would translate them into `WHERE` clauses.
+
+## The rule
+
+- One repository per **aggregate root** (Order, Account, Show). Don't make one per table.
+- The interface lives next to the domain; the implementation lives in infra.
+- Return copies (or immutable objects) so nobody can mutate storage without calling `save`.
+
+```ts
+interface Entity {
+  id: string;
+}
+
+interface Specification<T> {
+  isSatisfiedBy(item: T): boolean;
+  describe(): string;
+}
+
+const spec = <T>(description: string, predicate: (item: T) => boolean): Specification<T> => ({
+  isSatisfiedBy: predicate,
+  describe: () => description,
+});
+const and = <T>(...specs: Specification<T>[]): Specification<T> =>
+  spec(`(${specs.map(s => s.describe()).join(' AND ')})`, item => specs.every(s => s.isSatisfiedBy(item)));
+const or = <T>(...specs: Specification<T>[]): Specification<T> =>
+  spec(`(${specs.map(s => s.describe()).join(' OR ')})`, item => specs.some(s => s.isSatisfiedBy(item)));
+const not = <T>(s: Specification<T>): Specification<T> =>
+  spec(`NOT ${s.describe()}`, item => !s.isSatisfiedBy(item));
+
+type SortableKey<T> = { [K in keyof T]: T[K] extends number | string ? K : never }[keyof T];
+
+interface FindOptions<T> {
+  sortBy?: SortableKey<T>;
+  order?: 'asc' | 'desc';
+  limit?: number;
+}
+
+interface Repository<T extends Entity> {
+  save(entity: T): void;
+  findById(id: string): T | undefined;
+  find(where?: Specification<T>, options?: FindOptions<T>): T[];
+  count(where?: Specification<T>): number;
+  delete(id: string): boolean;
+}
+
+class InMemoryRepository<T extends Entity> implements Repository<T> {
+  private readonly store = new Map<string, T>();
+
+  save(entity: T): void {
+    this.store.set(entity.id, structuredClone(entity));
+  }
+
+  findById(id: string): T | undefined {
+    const found = this.store.get(id);
+    return found === undefined ? undefined : structuredClone(found);
+  }
+
+  find(where?: Specification<T>, options: FindOptions<T> = {}): T[] {
+    let rows = [...this.store.values()];
+    if (where) rows = rows.filter(r => where.isSatisfiedBy(r));
+    const { sortBy, order = 'asc', limit } = options;
+    if (sortBy !== undefined) {
+      const dir = order === 'asc' ? 1 : -1;
+      const valueOf = (row: T): number | string => row[sortBy] as number | string;
+      rows.sort((x, y) => (valueOf(x) < valueOf(y) ? -dir : valueOf(x) > valueOf(y) ? dir : 0));
+    }
+    if (limit !== undefined) rows = rows.slice(0, limit);
+    return rows.map(r => structuredClone(r));
+  }
+
+  count(where?: Specification<T>): number {
+    return where ? this.find(where).length : this.store.size;
+  }
+
+  delete(id: string): boolean {
+    return this.store.delete(id);
+  }
+}
+
+// ---- domain ----
+interface Order extends Entity {
+  userId: string;
+  symbol: string;
+  qty: number;
+  pricePaise: number;
+  status: 'OPEN' | 'FILLED' | 'CANCELLED';
+}
+
+// Specifications = business vocabulary
+const ofUser = (userId: string) => spec<Order>(`user=${userId}`, o => o.userId === userId);
+const isOpen = spec<Order>('status=OPEN', o => o.status === 'OPEN');
+const forSymbol = (symbol: string) => spec<Order>(`symbol=${symbol}`, o => o.symbol === symbol);
+const notionalAtLeast = (paise: number) =>
+  spec<Order>(`notional>=${paise}`, o => o.qty * o.pricePaise >= paise);
+
+const orders: Repository<Order> = new InMemoryRepository<Order>();
+const seed: Order[] = [
+  { id: 'o1', userId: 'u1', symbol: 'INFY', qty: 10, pricePaise: 150_000, status: 'OPEN' },
+  { id: 'o2', userId: 'u1', symbol: 'TCS', qty: 50, pricePaise: 400_000, status: 'OPEN' },
+  { id: 'o3', userId: 'u1', symbol: 'INFY', qty: 5, pricePaise: 151_000, status: 'FILLED' },
+  { id: 'o4', userId: 'u2', symbol: 'SBIN', qty: 500, pricePaise: 80_000, status: 'OPEN' },
+];
+seed.forEach(o => orders.save(o));
+
+const bigOpen = and(isOpen, notionalAtLeast(10_000_000));
+console.log(`${bigOpen.describe()} -> ${orders.find(bigOpen).map(o => o.id).join(',')}`);
+
+const u1NotInfy = and(ofUser('u1'), not(forSymbol('INFY')));
+console.log(`${u1NotInfy.describe()} -> ${orders.find(u1NotInfy).map(o => o.id).join(',')}`);
+
+const infyOrSbin = or(forSymbol('INFY'), forSymbol('SBIN'));
+const sorted = orders.find(infyOrSbin, { sortBy: 'pricePaise', order: 'desc', limit: 2 });
+console.log(`top-2 by price among ${infyOrSbin.describe()} -> ${sorted.map(o => `${o.id}@${o.pricePaise}`).join(',')}`);
+
+// Copies protect the store
+const leaked = orders.findById('o1');
+if (leaked) leaked.status = 'CANCELLED'; // mutating the copy only
+console.log(`o1 in store is still ${orders.findById('o1')?.status}; open count=${orders.count(isOpen)}`);
+console.log(`deleted o4: ${orders.delete('o4')}, total=${orders.count()}`);
+```
+
+```text
+(status=OPEN AND notional>=10000000) -> o2,o4
+(user=u1 AND NOT symbol=INFY) -> o2
+top-2 by price among (symbol=INFY OR symbol=SBIN) -> o3@151000,o1@150000
+o1 in store is still OPEN; open count=3
+deleted o4: true, total=3
+```
+
+## Pitfalls
+
+- **A "generic repository" with 40 methods.** Add query methods only as the use cases need them.
+- **`findAll()` followed by filtering in the service.** That's fine for an in-memory round. Still say out loud that in production the Specification becomes a `WHERE` clause plus an index, so the database does the filtering.
+- **`structuredClone` on class instances** loses the prototype, so methods vanish. Clone plain-data entities, or give your classes an explicit `clone()`.
+
+## How to say it in an interview
+
+> "Services depend on a `Repository<Order>` interface. For this round it's a Map, but it could be Postgres without the service changing. Queries are Specification objects, so rules like 'open orders above ₹1 lakh' have a name, can be combined, and can be tested on their own."

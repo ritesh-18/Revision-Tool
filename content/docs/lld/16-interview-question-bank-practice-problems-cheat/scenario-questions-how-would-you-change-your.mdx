@@ -1,0 +1,227 @@
+---
+title: "16.5 Scenario questions: \"how would you change your design if…\""
+---
+
+Follow-ups are where SDE-2 candidates stand out. The interviewer is checking whether your design **absorbs** a change or **fights** it. Answer in this order: (1) where the change lands, (2) what stays untouched, (3) the one risk.
+
+**S1. …we add a new vehicle type (e.g. EV cars that need charging spots)?**
+
+<details>
+<summary>Answer</summary>
+
+- **Where it lands:** a new `VehicleType` value, a new `SpotType.EV_CHARGING`, and one new entry in the compatibility map (`EV_CAR → [EV_CHARGING, LARGE]`). If fees differ, a new pricing Strategy or a charging-fee Decorator.
+- **Untouched:** `ParkingService`, the allocation strategies (they query "compatible free spots"), the ticket flow.
+- **Risk:** if the code has `if (vehicle instanceof Car)` checks in the allocator, you have to edit them. That is the design smell the question is designed to expose.
+- **Extra:** charging sessions have their own lifecycle (plugged in → charging → complete), so model a `ChargingSession` linked to the ticket rather than stuffing it into `Ticket`.
+
+</details>
+
+**S2. …we need to support multiple currencies?**
+
+<details>
+<summary>Answer</summary>
+
+- Replace raw numbers with a `Money` value object `{ amountMinor: bigint | number; currency: 'INR' | 'USD' | … }`. Arithmetic across different currencies must **throw**.
+- Add an `FxRateProvider` interface. Convert only at defined boundaries (checkout or settlement), and record the rate used on the transaction for audit.
+- Store amounts in minor units, and note that different currencies have different numbers of decimal places (JPY has 0).
+- Balances: a wallet becomes a map `currency → balance`, or one wallet per currency.
+- Rounding: pick a rule (banker's rounding or half-up) and apply it in one place.
+
+```ts
+class CurrencyMismatch extends Error { override name = 'CurrencyMismatch'; }
+
+class Money {
+  private constructor(readonly minor: bigint, readonly currency: string) {}
+  static of(minor: bigint, currency: string): Money { return new Money(minor, currency); }
+  add(other: Money): Money {
+    if (other.currency !== this.currency) throw new CurrencyMismatch(`${this.currency} + ${other.currency}`);
+    return new Money(this.minor + other.minor, this.currency);
+  }
+  toString(): string { return `${this.minor} ${this.currency} (minor units)`; }
+}
+
+console.log(Money.of(1050n, 'INR').add(Money.of(250n, 'INR')).toString());
+try {
+  Money.of(100n, 'INR').add(Money.of(100n, 'USD'));
+} catch (e) {
+  if (e instanceof CurrencyMismatch) console.log(`${e.name}: ${e.message}`);
+}
+```
+
+```text
+1300 INR (minor units)
+CurrencyMismatch: INR + USD
+```
+
+</details>
+
+**S3. …this must be thread-safe (or handle concurrent requests)?**
+
+<details>
+<summary>Answer</summary>
+
+1. **Name the shared mutable state**: seat map, balances, counters, queues.
+2. **Name the invariants at risk**: no double booking, no negative balance, exact limits.
+3. **Choose the granularity**: per-key locks (per seat/show, per user) rather than one global lock.
+4. **In Node**: keep each check-and-update synchronous (no `await` in between). Where an `await` is unavoidable, use a keyed async mutex (Q42).
+5. **In Java/Go**: `ConcurrentHashMap.compute`, `ReentrantLock` per key, atomics, or `sync.Mutex` / channels.
+6. **Multi-resource operations**: lock in a fixed order to avoid deadlock.
+7. **Prove it**: a test that fires 100 concurrent requests and asserts the invariant.
+
+</details>
+
+**S4. …we need to persist to a database instead of memory?**
+
+<details>
+<summary>Answer</summary>
+
+- Services depend on repository **interfaces**, so add `PostgresBookingRepository implements BookingRepository`. Service code doesn't change.
+- Repository methods become `async`. If you designed them sync, every caller changes. That is a good argument for making repository interfaces return Promises from day one when persistence is likely.
+- Move invariants that need atomicity into the DB: unique constraints, conditional updates, transactions. A **unit of work** or a transaction callback lets a service run several repository calls atomically.
+- Add `version` columns for optimistic locking, and indexes that match your query methods (`findByCityAndMovie`).
+- Map domain objects to rows in the repository, not in the entities.
+
+</details>
+
+**S5. …we need audit logs for every state change?**
+
+<details>
+<summary>Answer</summary>
+
+- Emit **domain events** (`BookingConfirmed`, `BalanceDebited`) from services or entities, and have an `AuditLogSubscriber` append them to an append-only store. Business code only publishes.
+- Each audit record holds who (actor), what (event type + before/after or a diff), when (injected clock), why (request ID / correlation ID).
+- Make records immutable, and don't let application code delete them.
+- To guarantee audit and state never diverge, write both in the same transaction, or use the **transactional outbox** (§7.4).
+- For money, the ledger itself *is* the audit trail (double-entry, append-only).
+
+</details>
+
+**S6. …we need to add a new notification channel (WhatsApp)?**
+
+<details>
+<summary>Answer</summary>
+
+Add `WhatsAppChannel implements NotificationChannel` and register it in the channel factory or registry. Extend user preferences with the new channel value.
+
+Untouched: the event subscription logic, templates (unless the channel needs its own format, in which case use a per-channel template Strategy), and retry/dedup.
+
+Mention rate limits per channel and a fallback order (WhatsApp → SMS) as a Chain of Responsibility.
+
+</details>
+
+**S7. …a user can cancel, and we need refunds with a cancellation policy?**
+
+<details>
+<summary>Answer</summary>
+
+- Add `CANCELLED` (and maybe `REFUND_PENDING`, `REFUNDED`) to the booking **state machine**, with legal transitions only from `CONFIRMED`.
+- The refund amount is a `CancellationPolicy` Strategy (full refund up to 24 h before, 50 % up to 2 h before, none after), driven by an injected clock.
+- The refund is a separate idempotent payment operation linked to the original transaction.
+- Release the resource (seat, slot, room) **and** promote the waitlist in the same critical section, then notify through Observer.
+
+</details>
+
+**S8. …the number of items grows to millions — which data structures change?**
+
+<details>
+<summary>Answer</summary>
+
+Go through your hot paths:
+
+- Linear scans of a list → maps / indexes keyed by query fields.
+- "Top K" by sorting on every call → a heap, a sorted structure (skip list, balanced BST), or a maintained index.
+- Time-window counts → ring buffers / buckets instead of storing every timestamp.
+- Interval overlap checks → an interval tree or a sorted map per resource.
+- Prefix search → a trie with top-K cached per node.
+
+Also estimate memory (items × bytes) and say when it no longer fits in one process (shard it or move it to Redis).
+
+</details>
+
+**S9. …we need to support recurring meetings / bookings?**
+
+<details>
+<summary>Answer</summary>
+
+- Store a **recurrence rule** (`{ freq: 'WEEKLY', interval: 1, byDay: ['MO','WE'], count?: n, until?: date }`), not just expanded rows.
+- Expand the occurrences inside a query window when checking conflicts. Cap the expansion, as Salesforce's spec did with a maximum of 20 instances.
+- Conflict check: every generated occurrence must be free, or the whole series is rejected (atomic), or you return the list of conflicting dates.
+- Exceptions: "cancel just this occurrence" is stored as an override record keyed by `(seriesId, occurrenceDate)`.
+- Time zones: store the rule in the organiser's zone, so DST changes don't shift the meeting.
+
+</details>
+
+**S10. …the product wants a different strategy per city (pricing, matching)?**
+
+<details>
+<summary>Answer</summary>
+
+Keep Strategies as they are and add a **strategy resolver**: `StrategyResolver.pricingFor(cityId)` backed by configuration (a map or DB table) with a default fallback.
+
+Services ask the resolver instead of holding a single strategy. Configuration can be hot-reloaded, so swap an immutable snapshot atomically. Use Feature flags (§15) for gradual rollout.
+
+The risk is combinatorial explosion. If the variations multiply (city × vehicle × time), switch to a rules table or a Specification-based rule engine.
+
+</details>
+
+**S11. …we need rate limiting on this API?**
+
+<details>
+<summary>Answer</summary>
+
+Add it as a **Decorator / Proxy** or a middleware in front of the service, not inside the business logic. The limiter key (user, IP, API key) and the algorithm (token bucket for bursts, sliding window for precision) are configuration. Return a structured "rate limited" result with a retry-after hint.
+
+For many servers, use a shared store (Redis with atomic scripts), or accept approximate per-node limits (limit ÷ number of nodes). See §7.9 and the Rate Limiter case in §10.
+
+</details>
+
+**S12. …an external dependency (payment, SMS) becomes slow or flaky?**
+
+<details>
+<summary>Answer</summary>
+
+- Set **timeouts** on every call.
+- **Retry with exponential backoff and jitter**, only for retryable errors, and only with idempotency keys.
+- Put a **circuit breaker** per dependency (closed → open → half-open), and fall back to a second provider or queue the work.
+- Use **bulkheads**: a separate concurrency limit per dependency, so one slow provider can't exhaust all workers.
+- Make work **asynchronous** where the user doesn't need an immediate answer (notifications) using a queue + worker.
+- Add metrics for latency, error rate and breaker state. See §7.10.
+
+</details>
+
+**S13. …we need undo for admin actions / a history of changes?**
+
+<details>
+<summary>Answer</summary>
+
+Turn admin operations into **Command** objects with `execute` / `undo` and a history stack per admin session. When the inverse is not obvious, store a **Memento** (a before-image).
+
+For a persistent history across sessions, store the commands or events (event sourcing lite) and build "undo" as a *compensating* command, not a deletion. That keeps the audit trail intact.
+
+</details>
+
+**S14. …orders must be processed in sequence per user, but in parallel across users?**
+
+<details>
+<summary>Answer</summary>
+
+Use **per-key serial queues**: a map `userId → promise chain` (a keyed mutex), or a set of partitioned worker queues where `hash(userId) % N` picks the queue.
+
+Each queue has one consumer, so the order holds within a key. Different keys run in parallel. This is exactly Kafka's partition-key model, and how an exchange runs one matching thread per symbol.
+
+Clean up idle keys to avoid leaking memory. With a fixed N partitions, a hot key can overload one partition, so mention that trade-off.
+
+</details>
+
+**S15. …we must support partial failures in a multi-step workflow (reserve inventory → charge → create shipment)?**
+
+<details>
+<summary>Answer</summary>
+
+Use a **saga**: each step has a compensating action (release inventory, refund charge, cancel shipment). An orchestrator (a small state machine) records each step's status, so that after a crash it can resume or compensate.
+
+Every step and compensation must be idempotent. Timeouts move the saga to a compensation path. Persist the saga state (outbox or workflow table).
+
+In an LLD round, show the `WorkflowStep` interface with `execute()` and `compensate()` and the orchestrator loop. That is the same skeleton as the DAG engine in §13.
+
+</details>

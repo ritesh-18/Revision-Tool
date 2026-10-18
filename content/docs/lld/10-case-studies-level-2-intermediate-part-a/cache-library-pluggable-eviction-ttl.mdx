@@ -1,0 +1,701 @@
+---
+title: "10.3 Cache Library — Pluggable Eviction + TTL"
+---
+
+## Problem & where it's asked
+
+Build an in-memory key-value cache library with a fixed capacity, a **pluggable eviction policy** (LRU, LFU, FIFO, and custom ones later), optional **time-to-live** per entry, and **statistics** (hits, misses, evictions). `get` and `put` must be O(1).
+
+**Reported** at **Groww** (SDE-2: "scalable cache", built end to end), **Upstox** (SDE-2: distributed cache using a LinkedHashMap-style design), **Goldman Sachs** (2026, TTL variant), **Amazon** (LRU cache), **Microsoft** and **Walmart**. It's also the natural follow-up to LeetCode 146 (LRU) and 460 (LFU), so expect the interviewer to know the data structures well.
+
+Graded on: **data-structure choice** (hash map + doubly linked list), an **eviction-policy interface**, and **locking / concurrency** discussion.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Capacity in entries or bytes? | Entries. Byte-weighted capacity is an extension. |
+| Which policies? | LRU, LFU (ties broken by least recently used), FIFO. Chosen per cache instance. |
+| TTL? | Optional default TTL plus an optional per-entry override. Expired entries are never returned. |
+| When are expired entries removed? | Lazily on access, plus an explicit `purgeExpired()` a timer can call. |
+| Does `put` on an existing key count as "use"? | Yes for LRU/LFU (it's an access). For FIFO, updating does not change position. |
+| What is returned on miss? | `undefined`. There's also `getOrLoad` for read-through. |
+| Eviction notifications? | Optional `onEvict(key, value, reason)` callback (Observer). |
+| Thread safety? | Node is single-threaded; async loaders need de-duplication (covered in concurrency). |
+
+## Requirements
+
+**Functional**
+
+1. `get(key)`, `put(key, value, ttlMs?)`, `delete(key)`, `has(key)`, `size`.
+2. When full, `put` of a new key evicts exactly one entry chosen by the policy.
+3. TTL: an entry older than its TTL behaves as absent and is counted as an expiration.
+4. Stats: hits, misses, evictions, expirations, hit rate.
+5. Policies are swappable without touching `Cache`.
+6. Eviction listener.
+
+**Non-functional**
+
+- O(1) `get`/`put`/`delete` for LRU and FIFO. LFU is O(1) amortised.
+- Generic over key and value types.
+- Deterministic tests via injected clock.
+
+**Out of scope**
+
+Distribution/sharding (discussed), persistence, byte-size accounting, background threads.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Cache<K, V>` | Public API; storage map, TTL, stats, listener | Has one `EvictionPolicy<K>` and a `Clock` |
+| `Entry<V>` | value + `expiresAt` | Stored in the cache's `Map<K, Entry<V>>` |
+| `EvictionPolicy<K>` | Tracks usage order of keys and picks a victim | Implemented by LRU, LFU, FIFO |
+| `LruPolicy<K>` | Doubly linked list + node map | Uses `ListNode<K>` |
+| `LfuPolicy<K>` | key→frequency, frequency→ordered key set, `minFreq` | |
+| `FifoPolicy<K>` | Insertion-ordered set | |
+| `CacheStats` | Counters snapshot | Returned by `stats()` |
+| `PolicyRegistry` | Name → policy constructor | Used by `createCache` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Cache~K,V~ {
+      -Map store
+      -EvictionPolicy policy
+      +get(key) V
+      +put(key, value, ttlMs)
+      +delete(key) boolean
+      +purgeExpired() number
+      +stats() CacheStats
+    }
+    class EvictionPolicy~K~ {
+      <<interface>>
+      +onInsert(key)
+      +onAccess(key)
+      +onRemove(key)
+      +victim() K
+    }
+    class LruPolicy~K~ {
+      -Map nodes
+      -ListNode head
+      -ListNode tail
+    }
+    class LfuPolicy~K~ {
+      -Map freqOf
+      -Map buckets
+      -number minFreq
+    }
+    class FifoPolicy~K~ {
+      -Set order
+    }
+    class Clock {
+      <<interface>>
+      +now() number
+    }
+    EvictionPolicy <|.. LruPolicy
+    EvictionPolicy <|.. LfuPolicy
+    EvictionPolicy <|.. FifoPolicy
+    Cache --> EvictionPolicy
+    Cache --> Clock`} />
+
+## Design decisions & patterns
+
+- **Strategy for eviction.** The cache owns *storage, TTL and stats*. The policy owns only *ordering of keys*. The policy never sees values, which keeps it tiny and reusable (the same `LruPolicy` could order rate-limiter state keys from 10.2).
+- **Event-style policy interface** (`onInsert`, `onAccess`, `onRemove`, `victim`). The cache tells the policy what happened. The policy doesn't need to know about TTL or values. This is the seam that makes "add an ARC/2Q policy" a new class only.
+- **LRU with an explicit doubly linked list with sentinel nodes.** Sentinels remove all `null` checks at the ends. (A JavaScript `Map` also preserves insertion order and can implement LRU with `delete` + `set`, shown in the extensions. Interviewers usually want to see the list, though.)
+- **LFU with frequency buckets.** `Map<freq, Set<K>>` where each `Set` keeps insertion order, so ties are broken by least recent use. `minFreq` resets to 1 on every insert.
+- **Lazy TTL + optional sweep.** Checking expiry on `get` is O(1) and needs no timers. A sweep (`purgeExpired`) reclaims memory for keys nobody reads again. We don't start timers inside the library; the host decides (a `setInterval` in the app, or a cron).
+- **Observer for eviction.** `onEvict` lets callers log, emit metrics, or write-behind to a DB.
+- **Registry for policy names**, so config (`"policy": "LFU"`) maps to a class without a `switch`.
+- **Rejected:** subclassing `LruCache extends Cache` (combining TTL × policy × stats explodes into many subclasses; composition doesn't); `setTimeout` per entry (thousands of timers, hard to test); storing timestamps in the policy (mixes concerns).
+
+## Implementation
+
+**Part 1: shared types, errors, clock.**
+
+```ts
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  private t = 0;
+  now(): number {
+    return this.t;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+  }
+}
+
+class CacheConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CacheConfigError';
+  }
+}
+
+type EvictionReason = 'CAPACITY' | 'EXPIRED' | 'DELETED';
+
+interface Entry<V> {
+  value: V;
+  expiresAt: number; // Infinity when there is no TTL
+}
+
+interface CacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+  expirations: number;
+  hitRatePercent: number;
+}
+```
+
+**Part 2: the policy interface and the three policies.**
+
+```ts
+interface EvictionPolicy<K> {
+  readonly name: string;
+  onInsert(key: K): void;
+  onAccess(key: K): void;
+  onRemove(key: K): void;
+  victim(): K | undefined;
+}
+
+class ListNode<K> {
+  prev: ListNode<K> | null = null;
+  next: ListNode<K> | null = null;
+  constructor(readonly key: K | undefined) {}
+}
+
+class LruPolicy<K> implements EvictionPolicy<K> {
+  readonly name = 'LRU';
+  private readonly nodes = new Map<K, ListNode<K>>();
+  private readonly head = new ListNode<K>(undefined); // most recent side
+  private readonly tail = new ListNode<K>(undefined); // least recent side
+  constructor() {
+    this.head.next = this.tail;
+    this.tail.prev = this.head;
+  }
+  onInsert(key: K): void {
+    const node = new ListNode(key);
+    this.nodes.set(key, node);
+    this.addFront(node);
+  }
+  onAccess(key: K): void {
+    const node = this.nodes.get(key);
+    if (!node) return;
+    this.unlink(node);
+    this.addFront(node);
+  }
+  onRemove(key: K): void {
+    const node = this.nodes.get(key);
+    if (!node) return;
+    this.unlink(node);
+    this.nodes.delete(key);
+  }
+  victim(): K | undefined {
+    const last = this.tail.prev;
+    return last && last !== this.head ? last.key : undefined;
+  }
+  private addFront(node: ListNode<K>): void {
+    const first = this.head.next;
+    node.prev = this.head;
+    node.next = first;
+    this.head.next = node;
+    if (first) first.prev = node;
+  }
+  private unlink(node: ListNode<K>): void {
+    if (node.prev) node.prev.next = node.next;
+    if (node.next) node.next.prev = node.prev;
+    node.prev = null;
+    node.next = null;
+  }
+}
+
+class LfuPolicy<K> implements EvictionPolicy<K> {
+  readonly name = 'LFU';
+  private readonly freqOf = new Map<K, number>();
+  private readonly buckets = new Map<number, Set<K>>(); // each Set is ordered oldest-first
+  private minFreq = 0;
+  onInsert(key: K): void {
+    this.freqOf.set(key, 1);
+    this.bucket(1).add(key);
+    this.minFreq = 1;
+  }
+  onAccess(key: K): void {
+    const freq = this.freqOf.get(key);
+    if (freq === undefined) return;
+    this.detach(key, freq);
+    if (this.minFreq === freq && !this.buckets.has(freq)) this.minFreq = freq + 1;
+    this.freqOf.set(key, freq + 1);
+    this.bucket(freq + 1).add(key);
+  }
+  onRemove(key: K): void {
+    const freq = this.freqOf.get(key);
+    if (freq === undefined) return;
+    this.detach(key, freq);
+    this.freqOf.delete(key);
+    // minFreq may now point at an empty bucket; victim() skips forward lazily.
+  }
+  victim(): K | undefined {
+    if (this.freqOf.size === 0) return undefined;
+    while (!this.buckets.has(this.minFreq)) this.minFreq++;
+    const oldest = this.buckets.get(this.minFreq)?.values().next();
+    return oldest && !oldest.done ? oldest.value : undefined;
+  }
+  private bucket(freq: number): Set<K> {
+    let set = this.buckets.get(freq);
+    if (!set) {
+      set = new Set<K>();
+      this.buckets.set(freq, set);
+    }
+    return set;
+  }
+  private detach(key: K, freq: number): void {
+    const set = this.buckets.get(freq);
+    set?.delete(key);
+    if (set && set.size === 0) this.buckets.delete(freq);
+  }
+}
+
+class FifoPolicy<K> implements EvictionPolicy<K> {
+  readonly name = 'FIFO';
+  private readonly order = new Set<K>();
+  onInsert(key: K): void {
+    this.order.add(key);
+  }
+  onAccess(): void {
+    // FIFO ignores reads and updates
+  }
+  onRemove(key: K): void {
+    this.order.delete(key);
+  }
+  victim(): K | undefined {
+    const first = this.order.values().next();
+    return first.done ? undefined : first.value;
+  }
+}
+```
+
+**Part 3: the cache.** Every path that removes an entry goes through one private `remove` method, so the policy, the stats and the listener can never drift apart.
+
+```ts
+interface CacheOptions<K, V> {
+  capacity: number;
+  policy: EvictionPolicy<K>;
+  clock: Clock;
+  defaultTtlMs?: number;
+  onEvict?: (key: K, value: V, reason: EvictionReason) => void;
+}
+
+class Cache<K, V> {
+  private readonly store = new Map<K, Entry<V>>();
+  private hits = 0;
+  private misses = 0;
+  private evictions = 0;
+  private expirations = 0;
+
+  constructor(private readonly opts: CacheOptions<K, V>) {
+    if (!Number.isInteger(opts.capacity) || opts.capacity <= 0) {
+      throw new CacheConfigError(`capacity must be a positive integer, got ${opts.capacity}`);
+    }
+    if (opts.defaultTtlMs !== undefined) Cache.checkTtl(opts.defaultTtlMs);
+  }
+
+  get size(): number {
+    return this.store.size;
+  }
+
+  get(key: K): V | undefined {
+    const entry = this.liveEntry(key);
+    if (!entry) {
+      this.misses++;
+      return undefined;
+    }
+    this.hits++;
+    this.opts.policy.onAccess(key);
+    return entry.value;
+  }
+
+  has(key: K): boolean {
+    return this.liveEntry(key) !== undefined; // does not count as a use
+  }
+
+  put(key: K, value: V, ttlMs?: number): void {
+    if (ttlMs !== undefined) Cache.checkTtl(ttlMs);
+    const ttl = ttlMs ?? this.opts.defaultTtlMs;
+    const expiresAt = ttl === undefined ? Number.POSITIVE_INFINITY : this.opts.clock.now() + ttl;
+    if (this.liveEntry(key)) {
+      this.store.set(key, { value, expiresAt });
+      this.opts.policy.onAccess(key);
+      return;
+    }
+    if (this.store.size >= this.opts.capacity) {
+      const victim = this.opts.policy.victim();
+      if (victim !== undefined) this.remove(victim, 'CAPACITY');
+    }
+    this.store.set(key, { value, expiresAt });
+    this.opts.policy.onInsert(key);
+  }
+
+  delete(key: K): boolean {
+    if (!this.store.has(key)) return false;
+    this.remove(key, 'DELETED');
+    return true;
+  }
+
+  /** O(n) sweep: call it from a timer in the host app. */
+  purgeExpired(): number {
+    const now = this.opts.clock.now();
+    let purged = 0;
+    for (const [key, entry] of this.store) {
+      if (entry.expiresAt <= now) {
+        this.remove(key, 'EXPIRED');
+        purged++;
+      }
+    }
+    return purged;
+  }
+
+  keys(): K[] {
+    return [...this.store.keys()];
+  }
+
+  stats(): CacheStats {
+    const lookups = this.hits + this.misses;
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      evictions: this.evictions,
+      expirations: this.expirations,
+      hitRatePercent: lookups === 0 ? 0 : Math.round((this.hits * 100) / lookups),
+    };
+  }
+
+  private liveEntry(key: K): Entry<V> | undefined {
+    const entry = this.store.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.opts.clock.now()) {
+      this.remove(key, 'EXPIRED');
+      return undefined;
+    }
+    return entry;
+  }
+
+  private remove(key: K, reason: EvictionReason): void {
+    const entry = this.store.get(key);
+    if (!entry) return;
+    this.store.delete(key);
+    this.opts.policy.onRemove(key);
+    if (reason === 'CAPACITY') this.evictions++;
+    if (reason === 'EXPIRED') this.expirations++;
+    this.opts.onEvict?.(key, entry.value, reason);
+  }
+
+  private static checkTtl(ttl: number): void {
+    if (!Number.isFinite(ttl) || ttl <= 0) throw new CacheConfigError(`ttl must be > 0 ms, got ${ttl}`);
+  }
+}
+```
+
+**Part 4: policy registry and a factory function.** Configuration arrives as a string; the registry turns it into an object.
+
+```ts
+type PolicyName = 'LRU' | 'LFU' | 'FIFO';
+
+const policyRegistry = new Map<string, <K>() => EvictionPolicy<K>>([
+  ['LRU', <K>() => new LruPolicy<K>()],
+  ['LFU', <K>() => new LfuPolicy<K>()],
+  ['FIFO', <K>() => new FifoPolicy<K>()],
+]);
+
+function createCache<K, V>(
+  policy: PolicyName | string,
+  options: Omit<CacheOptions<K, V>, 'policy'>,
+): Cache<K, V> {
+  const make = policyRegistry.get(policy);
+  if (!make) throw new CacheConfigError(`Unknown eviction policy ${policy}`);
+  return new Cache<K, V>({ ...options, policy: make<K>() });
+}
+```
+
+**Part 5: demo.** The same access pattern runs against all three policies so the difference is visible.
+
+```ts
+const clock = new FakeClock();
+const evictedLog: string[] = [];
+
+for (const name of ['LRU', 'LFU', 'FIFO'] as const) {
+  evictedLog.length = 0;
+  const cache = createCache<string, number>(name, {
+    capacity: 3,
+    clock,
+    onEvict: (k, _v, reason) => evictedLog.push(`${k}(${reason})`),
+  });
+  cache.put('A', 1);
+  cache.put('B', 2);
+  cache.put('C', 3);
+  cache.get('A');
+  cache.get('A');
+  cache.get('B');
+  cache.put('D', 4); // full: someone must go
+  cache.get('C');
+  cache.put('E', 5); // full again
+  console.log(`${name}: keys=[${cache.keys().join(',')}] evicted=[${evictedLog.join(',')}]`);
+}
+
+console.log('--- TTL ---');
+const quotes = createCache<string, number>('LRU', { capacity: 10, clock, defaultTtlMs: 1000 });
+quotes.put('RELIANCE', 2890_50);
+quotes.put('TCS', 4120_00, 5000); // per-entry override
+clock.advance(999);
+console.log(`t+999ms RELIANCE paise=${quotes.get('RELIANCE')}`);
+clock.advance(1);
+console.log(`t+1000ms RELIANCE paise=${quotes.get('RELIANCE')} TCS paise=${quotes.get('TCS')}`);
+quotes.put('INFY', 1500_00);
+clock.advance(5000);
+console.log(`purged after 6s: ${quotes.purgeExpired()}, size=${quotes.size}`);
+console.log(`stats: ${JSON.stringify(quotes.stats())}`);
+
+console.log('--- validation ---');
+for (const make of [
+  () => createCache<string, number>('LRU', { capacity: 0, clock }),
+  () => createCache<string, number>('ARC', { capacity: 2, clock }),
+  () => createCache<string, number>('FIFO', { capacity: 2, clock }).put('x', 1, -5),
+]) {
+  try {
+    make();
+  } catch (err) {
+    if (err instanceof Error) console.log(`${err.name}: ${err.message}`);
+  }
+}
+```
+
+## Demo output
+
+```text
+LRU: keys=[B,D,E] evicted=[C(CAPACITY),A(CAPACITY)]
+LFU: keys=[A,B,E] evicted=[C(CAPACITY),D(CAPACITY)]
+FIFO: keys=[C,D,E] evicted=[A(CAPACITY),B(CAPACITY)]
+--- TTL ---
+t+999ms RELIANCE paise=289050
+t+1000ms RELIANCE paise=undefined TCS paise=412000
+purged after 6s: 2, size=0
+stats: {"hits":2,"misses":1,"evictions":0,"expirations":3,"hitRatePercent":67}
+--- validation ---
+CacheConfigError: capacity must be a positive integer, got 0
+CacheConfigError: Unknown eviction policy ARC
+CacheConfigError: ttl must be > 0 ms, got -5
+```
+
+Trace the first three lines by hand, because that's exactly what an interviewer will ask you to do. After the reads, `A` has been used 3 times, `B` twice and `C` once.
+
+- **LRU:** recency order is `B, A, C`, so `D` pushes out `C`. The later `get('C')` is a miss. When `E` arrives, the order is `D, B, A`, so `A` goes, even though it was the most *frequently* used key.
+- **LFU:** `C` (frequency 1) goes first. When `E` arrives, `D` is the only key with frequency 1, so it goes. The popular `A` and `B` survive.
+- **FIFO:** reads are ignored, so the first two arrivals, `A` and `B`, are evicted in order.
+
+The TTL block stores prices in paise. The stats show three expirations: one found lazily by `get`, two by the sweep.
+
+## Concurrency
+
+JavaScript won't interleave inside `get` or `put`, so the data structures are safe in a single Node process. (In Java, you'd need a lock around `get` too, because LRU's `get` *mutates* the list, which is a classic interview trap. A `ReadWriteLock` doesn't help for LRU gets, so use a plain lock or segment the cache.)
+
+The real async problem is the **cache stampede**: a hot key expires, 500 requests miss at once, and all 500 hit the database. The fix is **single-flight**: keep a map of in-flight load promises, and let every concurrent caller await the same one.
+
+```ts
+class SingleFlightCache<V> {
+  private readonly values = new Map<string, V>();
+  private readonly inFlight = new Map<string, Promise<V>>();
+
+  async getOrLoad(key: string, loader: (key: string) => Promise<V>): Promise<V> {
+    const cached = this.values.get(key);
+    if (cached !== undefined) return cached;
+    const pending = this.inFlight.get(key);
+    if (pending) return pending;
+    const promise = loader(key)
+      .then((value) => {
+        this.values.set(key, value);
+        return value;
+      })
+      .finally(() => this.inFlight.delete(key)); // failures are not cached; the next caller retries
+    this.inFlight.set(key, promise);
+    return promise;
+  }
+}
+
+let dbCalls = 0;
+const slowDb = async (key: string): Promise<string> => {
+  dbCalls++;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  if (key === 'bad') throw new Error(`db timeout for ${key}`);
+  return `profile:${key}`;
+};
+
+const cache = new SingleFlightCache<string>();
+const results = await Promise.all(Array.from({ length: 5 }, () => cache.getOrLoad('u42', slowDb)));
+console.log(`5 concurrent callers -> db calls: ${dbCalls}, values: ${[...new Set(results)].join(',')}`);
+
+const settled = await Promise.allSettled([cache.getOrLoad('bad', slowDb), cache.getOrLoad('bad', slowDb)]);
+console.log(`failed load shared by callers: ${settled.map((r) => r.status).join(',')}, db calls: ${dbCalls}`);
+await cache.getOrLoad('bad', slowDb).catch((err: unknown) => {
+  console.log(`retry hits db again: ${err instanceof Error ? err.message : String(err)}, db calls: ${dbCalls}`);
+});
+```
+
+```text
+5 concurrent callers -> db calls: 1, values: profile:u42
+failed load shared by callers: rejected,rejected, db calls: 2
+retry hits db again: db timeout for bad, db calls: 3
+```
+
+For multi-threaded runtimes (or Node worker threads sharing a structure through a server), use **lock striping**: N segments, each with its own lock and its own LRU, and route by `hash(key) % N`. That's roughly how Java's `ConcurrentHashMap` and Caffeine scale.
+
+## Extensions & follow-ups
+
+| Follow-up (source) | Design change |
+|--------------------|---------------|
+| Thread-safe cache (reported, general) | Lock striping / segmented caches, or an actor that owns the cache. In Node: single-flight for loads. |
+| "Scalable cache" end to end (Groww SDE-2, reported) | Shard by consistent hashing across nodes, replicate hot shards, add a read-through `getOrLoad`, and export stats as metrics. |
+| LinkedHashMap-style implementation (Upstox SDE-2, reported) | JS `Map` keeps insertion order, so `delete` + `set` moves a key to the end. Shown below. |
+| TTL variant (Goldman 2026, reported) | Already supported. For eager expiry at scale, add a min-heap (or timing wheel) keyed by `expiresAt`. |
+| Byte-size capacity | Add `weigh(value)`, track total weight, and evict in a loop until it fits. |
+| Write-through / write-behind | Use the `onEvict` hook or a decorator around `put`. |
+| New policy (e.g. "evict the largest entry") | A new `EvictionPolicy` + registry entry; `Cache` is unchanged. |
+
+A compact LinkedHashMap-style LRU with a TTL (the version you can type in 10 minutes when the interviewer says "now do it without writing a linked list"):
+
+```ts
+class MapLruCache<K, V> {
+  private readonly map = new Map<K, { value: V; expiresAt: number }>();
+  constructor(
+    private readonly capacity: number,
+    private readonly now: () => number,
+  ) {
+    if (capacity <= 0) throw new Error('capacity must be positive');
+  }
+  get(key: K): V | undefined {
+    const entry = this.map.get(key);
+    if (!entry) return undefined;
+    this.map.delete(key);
+    if (entry.expiresAt <= this.now()) return undefined; // expired: already removed
+    this.map.set(key, entry); // re-insert = move to "most recent" end
+    return entry.value;
+  }
+  put(key: K, value: V, ttlMs = Number.POSITIVE_INFINITY): void {
+    this.map.delete(key);
+    if (this.map.size >= this.capacity) {
+      const oldest = this.map.keys().next();
+      if (!oldest.done) this.map.delete(oldest.value); // first key = least recent
+    }
+    this.map.set(key, { value, expiresAt: this.now() + ttlMs });
+  }
+  keys(): K[] {
+    return [...this.map.keys()];
+  }
+}
+
+let t = 0;
+const lru = new MapLruCache<string, string>(2, () => t);
+lru.put('a', 'A');
+lru.put('b', 'B', 100);
+lru.get('a');
+lru.put('c', 'C'); // evicts b (least recently used)
+console.log(`after put c: [${lru.keys().join(',')}]`);
+t = 50;
+lru.put('d', 'D', 10); // evicts a
+t = 60;
+console.log(`d at t=60: ${lru.get('d')}, c: ${lru.get('c')}, keys: [${lru.keys().join(',')}]`);
+```
+
+```text
+after put c: [a,c]
+d at t=60: undefined, c: C, keys: [c]
+```
+
+Both `Map` operations used here are O(1) on average in V8, so this is a legitimate O(1) LRU. Mention that it relies on a language guarantee (insertion order), which Java gives you through `LinkedHashMap(accessOrder = true)` and `removeEldestEntry`.
+
+## Edge cases
+
+- Capacity 1: every new key evicts the previous one. Make sure `victim()` is not the key being inserted.
+- `put` on an existing key must not evict anything, even when the cache is full.
+- `put` on a key that exists but has **expired** is treated as a fresh insert (counted as an expiration first).
+- `has()` should not change recency (a common hidden-test difference).
+- `get` of an expired key: miss + expiration, and the entry is removed immediately.
+- Storing `undefined` as a value is ambiguous with "miss". Either forbid it or return `{ found, value }`.
+- LFU tie-break: by least recent use within the same frequency, so say it explicitly.
+- LFU after explicit deletes: `minFreq` can point at an empty bucket, and `victim()` skips forward.
+- TTL of 0 or negative: rejected. Infinite TTL: allowed by omitting it.
+
+## Complexity
+
+| Operation | LRU | LFU | FIFO |
+|-----------|-----|-----|------|
+| `get` | O(1) | O(1) | O(1) |
+| `put` (incl. eviction) | O(1) | O(1) amortised* | O(1) |
+| `delete` | O(1) | O(1) | O(1) |
+| `purgeExpired` | O(n) | O(n) | O(n) |
+| Extra memory | 1 list node per key | freq entry + set slot per key | set slot per key |
+
+\* After explicit deletes, `victim()` may skip a few empty frequency levels. For strictly O(1) worst case, keep the frequency buckets themselves in a doubly linked list (the "O(1) LFU" paper design).
+
+## What graders look for / common mistakes
+
+- ✅ Hash map + doubly linked list, and you can explain *why* each is needed (lookup vs order).
+- ✅ Policy as an interface; the cache doesn't `switch` on policy names.
+- ✅ One removal path (`remove`) that updates storage, policy, stats and listeners together.
+- ❌ Using an array for LRU order (`indexOf` + `splice` is O(n)).
+- ❌ Forgetting to update the policy on `put` of an existing key.
+- ❌ Evicting when updating an existing key in a full cache.
+- ❌ `setTimeout` per entry for TTL (untestable, leaks timers).
+- ❌ LFU without a tie-breaker, or with an O(n) scan for the minimum frequency.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–7 | Clarify capacity unit, policies, TTL semantics, `has` vs `get`, stats. |
+| 7–15 | `EvictionPolicy` interface, `Cache` skeleton, `Entry`. |
+| 15–35 | LRU with DLL + sentinels. Test it through the driver immediately. |
+| 35–50 | `Cache` with TTL, stats and the single `remove` path. |
+| 50–65 | LFU (buckets + `minFreq`), FIFO. |
+| 65–78 | Registry, validation, listener, driver comparing policies. |
+| 78–90 | Concurrency talk (stampede, striping), and scaling talk (sharding). |
+
+## Interview Q&A
+
+**Q1. Why do you need both a hash map and a linked list for LRU?**
+
+<details>
+<summary>Answer</summary>
+
+The map gives O(1) lookup from key to node. The doubly linked list gives O(1) "move to front" and "remove from back" once you hold the node. A list alone needs O(n) to find a node, and a map alone has no cheap way to find the least recently used key. The list must be *doubly* linked so you can unlink a node without walking to find its predecessor.
+
+</details>
+
+**Q2. How would you make this cache safe under multiple threads (for example, in Java)?**
+
+<details>
+<summary>Answer</summary>
+
+Even `get` mutates the LRU order, so a read-write lock doesn't allow concurrent gets. Options: one lock (simple, but it becomes a bottleneck); lock striping, with N independent segments each holding its own lock and LRU, trading global LRU accuracy for throughput; or Caffeine's approach of recording reads in a lock-free buffer and replaying them onto the policy in batches. In Node, the equivalent concern is async: single-flight loading to prevent stampedes.
+
+</details>
+
+**Q3. Lazy expiry means dead entries use memory. How do you fix that at scale?**
+
+<details>
+<summary>Answer</summary>
+
+Add a periodic `purgeExpired` sweep (what the demo does). With millions of entries, keep a min-heap or a hierarchical timing wheel ordered by `expiresAt`, so the sweeper only touches entries that actually expired. Redis combines lazy expiry with sampling: it tests random keys that have a TTL and repeats if many were expired.
+
+</details>
+
+**Q4. When would you choose LFU over LRU?**
+
+<details>
+<summary>Answer</summary>
+
+When popularity is stable over time: reference data, stock master data, popular product pages. LRU handles shifting access patterns better (news, a stock that is trending today). Plain LFU suffers from "old popular" keys that never leave, so real systems use aging or windowed variants (W-TinyLFU in Caffeine).
+
+</details>

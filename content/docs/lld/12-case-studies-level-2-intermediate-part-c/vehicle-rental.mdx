@@ -1,0 +1,481 @@
+---
+title: "12.6 Vehicle Rental"
+---
+
+## Problem & where it's asked
+
+Design a vehicle rental platform. Branches hold a fleet of vehicles. Customers search for available vehicles by branch and type for a time range, place a short-lived hold, confirm a booking, and can cancel before pickup. The platform computes the price using a pluggable pricing strategy and prevents overlapping reservations.
+
+- **PhonePe (reported, snippet-level):** "Design a vehicle rental system." The snippet mentions availability search, booking by time range and a pricing module. Treat the details as indicative.
+- **Common LLD prep question (company association uncertain):** frequently appears in aggregated lists alongside FlipMed, Library Management and Parking Lot.
+- **Graded on:** correct interval-overlap detection, a **Strategy** for pricing, a hold mechanism with a TTL, and clean validation before any mutation.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Vehicle types? | Car, SUV, Bike, Truck. |
+| One branch or many? | Many branches; search is per branch. |
+| How is availability checked? | No confirmed booking overlaps the requested window. |
+| What stops two customers booking the same car simultaneously? | A short **hold** (default TTL 15 minutes) claimed synchronously before any async payment step. |
+| Pricing unit? | Per hour for Cars/SUVs/Bikes; per day for Trucks. Rates are injected; a Surge decorator multiplies the base rate. |
+| Can a booking be modified? | Cancel and re-book. Modification is an extension. |
+| Return at a different branch? | Out of scope; noted as extension. |
+
+## Requirements
+
+**Functional:** `addVehicle(type, branchId, model)`, `search(branchId, type, start, end)`, `placeHold(vehicleId, customerId, start, end)`, `confirmBooking(vehicleId, customerId)`, `cancelBooking(bookingId)`.
+
+**Non-functional:** holds expire automatically; expired holds are cleaned up lazily (on every search and hold attempt); overlap check is O(bookings per vehicle), which is small in practice; money in paise; injected clock and ID generator for determinism; typed errors.
+
+**Out of scope:** payments, driver assignment, vehicle tracking, multi-branch return.
+
+## Entities & relationships
+
+| Entity | Key fields | Relationship |
+|---|---|---|
+| `Vehicle` | id, type, branchId, model, status | Has many `Booking`s |
+| `Booking` | id, vehicleId, customerId, startMin, endMin, pricePaise, status | Belongs to one `Vehicle` |
+| `Hold` | vehicleId, customerId, startMin, endMin, expiresAt | Temporary; one per vehicle |
+| `PricingStrategy` | `calculate(start, end)` → paise | `HourlyRate`, `DailyRate`, `SurgePricing` |
+| `RentalService` | search, hold, confirm, cancel | Owns `VehicleRepository`, `BookingRepository`, holds map and pricing map |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class RentalService {
+        +addVehicle(type, branch, model) Vehicle
+        +search(branch, type, start, end) Vehicle[]
+        +placeHold(vehicleId, customerId, start, end) string
+        +confirmBooking(vehicleId, customerId) Booking
+        +cancelBooking(bookingId) Booking
+    }
+    class PricingStrategy {
+        <<interface>>
+        +name string
+        +calculate(start, end) number
+    }
+    class HourlyRate
+    class DailyRate
+    class SurgePricing
+    class Vehicle {
+        +id string
+        +type VehicleType
+        +branchId string
+        +status VehicleStatus
+    }
+    class Booking {
+        +id string
+        +vehicleId string
+        +startMin number
+        +endMin number
+        +pricePaise number
+        +status string
+    }
+    RentalService --> Vehicle
+    RentalService --> Booking
+    RentalService --> PricingStrategy
+    PricingStrategy <|.. HourlyRate
+    PricingStrategy <|.. DailyRate
+    PricingStrategy <|.. SurgePricing`} />
+
+## Design decisions & patterns
+
+**1. Strategy for pricing.** `HourlyRate` and `DailyRate` are concrete strategies; `SurgePricing` is a **Decorator** over any base strategy. Adding a weekend rate or a member discount is one new class. The service never has `if (type === Truck)` conditionals — it looks up the strategy by type in a map.
+
+**2. Interval overlap.** Two half-open intervals `[a, b)` and `[c, d)` overlap when `a < d && c < b`. Using half-open intervals means `[0, 540)` and `[540, 1080)` do **not** overlap, so back-to-back bookings are allowed. This is the simplest semantically correct definition; confirm it with the interviewer.
+
+**3. Hold with TTL.** A hold is claimed synchronously before any payment step (the pattern from the FlipMed concurrency section). The hold map is keyed by `vehicleId` and has exactly one entry per vehicle. Expired holds are lazily removed on the next `search` or `placeHold` call, avoiding a background timer. A real system would also have a background reaper to free holds after the TTL without waiting for the next search.
+
+**4. Validate-then-mutate.** `confirmBooking` checks that the hold exists and belongs to the right customer before inserting the booking. `cancelBooking` checks that the rental has not started. All validation happens before any state change.
+
+**5. Maintenance state.** Vehicles in `MAINTENANCE` status are excluded from search results. This is a simple `status` field check, not a state machine, because the ATM-style lifecycle is not needed here — the only meaningful lifecycle is "can I rent it now?".
+
+## Implementation
+
+**Part 1: errors, enums and helpers.**
+
+```ts
+class RentalError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class NotFoundError extends RentalError {}
+class ConflictError extends RentalError {}
+class ValidationError extends RentalError {}
+class HoldExpiredError extends RentalError {}
+
+enum VehicleType { Car = 'CAR', Suv = 'SUV', Bike = 'BIKE', Truck = 'TRUCK' }
+enum VehicleStatus { Available = 'AVAILABLE', OnHold = 'ON_HOLD', Rented = 'RENTED', Maintenance = 'MAINTENANCE' }
+
+interface Clock { now(): number; }
+class ManualClock implements Clock {
+  constructor(private t: number) {}
+  now(): number { return this.t; }
+  advance(minutes: number): void { this.t += minutes; }
+}
+
+interface IdGenerator { next(prefix: string): string; }
+class SequentialIds implements IdGenerator {
+  private readonly counters = new Map<string, number>();
+  next(prefix: string): string {
+    const n = (this.counters.get(prefix) ?? 0) + 1;
+    this.counters.set(prefix, n);
+    return `${prefix}${n}`;
+  }
+}
+
+const formatPaise = (p: number): string =>
+  `₹${Math.floor(p / 100)}.${String(p % 100).padStart(2, '0')}`;
+
+/** Half-open interval overlap: [aStart, aEnd) overlaps [bStart, bEnd). */
+const overlaps = (aS: number, aE: number, bS: number, bE: number): boolean =>
+  aS < bE && bS < aE;
+```
+
+**Part 2: pricing strategies.**
+
+```ts
+interface PricingStrategy {
+  readonly name: string;
+  calculate(startMin: number, endMin: number): number; // returns paise
+}
+
+/** Rounds partial hours up. */
+class HourlyRate implements PricingStrategy {
+  constructor(readonly name: string, private readonly paisePerHour: number) {}
+  calculate(startMin: number, endMin: number): number {
+    return Math.ceil((endMin - startMin) / 60) * this.paisePerHour;
+  }
+}
+
+/** Rounds partial days up. */
+class DailyRate implements PricingStrategy {
+  constructor(readonly name: string, private readonly paisePerDay: number) {}
+  calculate(startMin: number, endMin: number): number {
+    return Math.ceil((endMin - startMin) / (60 * 24)) * this.paisePerDay;
+  }
+}
+
+/** Decorator: multiplies any base strategy by a surge factor. */
+class SurgePricing implements PricingStrategy {
+  get name(): string { return `${this.base.name} ×${this.factor}`; }
+  constructor(private readonly base: PricingStrategy, private readonly factor: number) {}
+  calculate(startMin: number, endMin: number): number {
+    return Math.round(this.base.calculate(startMin, endMin) * this.factor);
+  }
+}
+```
+
+**Part 3: domain models and repositories.**
+
+```ts
+interface Vehicle {
+  readonly id: string;
+  readonly type: VehicleType;
+  readonly branchId: string;
+  readonly model: string;
+  status: VehicleStatus;
+}
+
+interface Booking {
+  readonly id: string;
+  readonly vehicleId: string;
+  readonly customerId: string;
+  readonly startMin: number;
+  readonly endMin: number;
+  readonly pricePaise: number;
+  status: 'CONFIRMED' | 'CANCELLED';
+}
+
+interface Hold {
+  readonly vehicleId: string;
+  readonly customerId: string;
+  readonly startMin: number;
+  readonly endMin: number;
+  readonly expiresAt: number;
+}
+
+class VehicleRepository {
+  private readonly vehicles = new Map<string, Vehicle>();
+  save(v: Vehicle): void { this.vehicles.set(v.id, v); }
+  get(id: string): Vehicle {
+    const v = this.vehicles.get(id);
+    if (!v) throw new NotFoundError(`Vehicle ${id} not found`);
+    return v;
+  }
+  findByBranchAndType(branchId: string, type: VehicleType): Vehicle[] {
+    return [...this.vehicles.values()].filter(v => v.branchId === branchId && v.type === type);
+  }
+}
+
+class BookingRepository {
+  private readonly bookings = new Map<string, Booking>();
+  save(b: Booking): void { this.bookings.set(b.id, b); }
+  get(id: string): Booking {
+    const b = this.bookings.get(id);
+    if (!b) throw new NotFoundError(`Booking ${id} not found`);
+    return b;
+  }
+  confirmedFor(vehicleId: string): Booking[] {
+    return [...this.bookings.values()].filter(b => b.vehicleId === vehicleId && b.status === 'CONFIRMED');
+  }
+}
+```
+
+**Part 4: the rental service.**
+
+```ts
+class RentalService {
+  private readonly vehicleRepo = new VehicleRepository();
+  private readonly bookingRepo = new BookingRepository();
+  private readonly holds = new Map<string, Hold>();
+  private readonly pricing = new Map<VehicleType, PricingStrategy>();
+
+  constructor(
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+    private readonly holdTtlMinutes = 15,
+  ) {
+    this.pricing.set(VehicleType.Car,   new HourlyRate('Car hourly',   10000));  // ₹100/hr
+    this.pricing.set(VehicleType.Suv,   new HourlyRate('SUV hourly',   15000));  // ₹150/hr
+    this.pricing.set(VehicleType.Bike,  new HourlyRate('Bike hourly',  3000));   // ₹30/hr
+    this.pricing.set(VehicleType.Truck, new DailyRate('Truck daily',   500000)); // ₹5000/day
+  }
+
+  setPricing(type: VehicleType, strategy: PricingStrategy): void {
+    this.pricing.set(type, strategy);
+  }
+
+  addVehicle(type: VehicleType, branchId: string, model: string): Vehicle {
+    const v: Vehicle = { id: this.ids.next('V'), type, branchId, model, status: VehicleStatus.Available };
+    this.vehicleRepo.save(v);
+    return v;
+  }
+
+  /** Available = no overlapping confirmed booking, no active hold, not in maintenance. */
+  search(branchId: string, type: VehicleType, startMin: number, endMin: number): Vehicle[] {
+    if (startMin >= endMin) throw new ValidationError('start must be before end');
+    this.cleanExpiredHolds();
+    return this.vehicleRepo.findByBranchAndType(branchId, type).filter(v => {
+      if (v.status === VehicleStatus.Maintenance) return false;
+      if (this.holds.has(v.id)) return false;
+      return !this.bookingRepo.confirmedFor(v.id).some(b => overlaps(b.startMin, b.endMin, startMin, endMin));
+    });
+  }
+
+  placeHold(vehicleId: string, customerId: string, startMin: number, endMin: number): string {
+    const v = this.vehicleRepo.get(vehicleId);
+    if (v.status === VehicleStatus.Maintenance) throw new ValidationError(`${vehicleId} is under maintenance`);
+    this.cleanExpiredHolds();
+    if (this.holds.has(vehicleId)) throw new ConflictError(`${vehicleId} is already held`);
+    const clash = this.bookingRepo.confirmedFor(vehicleId).find(b => overlaps(b.startMin, b.endMin, startMin, endMin));
+    if (clash) throw new ConflictError(`${vehicleId} is already booked for that period`);
+    this.holds.set(vehicleId, { vehicleId, customerId, startMin, endMin, expiresAt: this.clock.now() + this.holdTtlMinutes });
+    return vehicleId;
+  }
+
+  confirmBooking(vehicleId: string, customerId: string): Booking {
+    this.cleanExpiredHolds();
+    const hold = this.holds.get(vehicleId);
+    if (!hold) throw new HoldExpiredError(`Hold for ${vehicleId} has expired or was never placed`);
+    if (hold.customerId !== customerId) throw new ConflictError('Hold belongs to a different customer');
+    const strategy = this.pricing.get(this.vehicleRepo.get(vehicleId).type)!;
+    const pricePaise = strategy.calculate(hold.startMin, hold.endMin);
+    const booking: Booking = {
+      id: this.ids.next('B'), vehicleId, customerId,
+      startMin: hold.startMin, endMin: hold.endMin, pricePaise, status: 'CONFIRMED',
+    };
+    this.bookingRepo.save(booking);
+    this.holds.delete(vehicleId);
+    return booking;
+  }
+
+  cancelBooking(bookingId: string): Booking {
+    const b = this.bookingRepo.get(bookingId);
+    if (b.status !== 'CONFIRMED') throw new ConflictError(`Booking ${bookingId} is already cancelled`);
+    if (this.clock.now() >= b.startMin) throw new ValidationError('Cannot cancel a rental that has already started');
+    b.status = 'CANCELLED';
+    this.bookingRepo.save(b);
+    return b;
+  }
+
+  getBooking(id: string): Booking { return this.bookingRepo.get(id); }
+
+  private cleanExpiredHolds(): void {
+    const now = this.clock.now();
+    for (const [key, hold] of this.holds)
+      if (hold.expiresAt <= now) this.holds.delete(key);
+  }
+}
+```
+
+**Part 5: driver.**
+
+```ts
+const clock = new ManualClock(0);
+const ids = new SequentialIds();
+const svc = new RentalService(clock, ids);
+
+const HOUR = 60;
+
+const c1 = svc.addVehicle(VehicleType.Car,  'MUM', 'Swift');
+const c2 = svc.addVehicle(VehicleType.Car,  'MUM', 'Baleno');
+const b1 = svc.addVehicle(VehicleType.Bike, 'MUM', 'Activa');
+svc.addVehicle(VehicleType.Car, 'DEL', 'Swift'); // separate branch
+
+function act(label: string, fn: () => unknown): void {
+  try {
+    const r = fn();
+    if (r && typeof r === 'object' && 'pricePaise' in (r as object)) {
+      const bk = r as Booking;
+      console.log(`${label} -> ${bk.id} price=${formatPaise(bk.pricePaise)}`);
+    } else if (Array.isArray(r)) {
+      console.log(`${label} -> [${(r as Vehicle[]).map(v => `${v.id}:${v.model}`).join(', ')}]`);
+    } else {
+      console.log(`${label} -> ok`);
+    }
+  } catch (err) { console.log(`${label} -> ${(err as Error).name}: ${(err as Error).message}`); }
+}
+
+act('search MUM CAR 9h-18h',   () => svc.search('MUM', VehicleType.Car, 9*HOUR, 18*HOUR));
+act('hold V1',                  () => svc.placeHold(c1.id, 'cust-A', 9*HOUR, 18*HOUR));
+act('confirm V1',               () => svc.confirmBooking(c1.id, 'cust-A'));
+act('search after book',        () => svc.search('MUM', VehicleType.Car, 9*HOUR, 18*HOUR));
+act('hold V1 overlap',          () => svc.placeHold(c1.id, 'cust-B', 12*HOUR, 20*HOUR));
+act('hold V1 next day',         () => svc.placeHold(c1.id, 'cust-B', 18*HOUR, 27*HOUR));
+act('confirm V1 next day',      () => svc.confirmBooking(c1.id, 'cust-B'));
+act('hold V2 (15 min TTL)',     () => svc.placeHold(c2.id, 'cust-C', 9*HOUR, 12*HOUR));
+clock.advance(20);
+act('confirm expired hold',     () => svc.confirmBooking(c2.id, 'cust-C'));
+svc.setPricing(VehicleType.Bike, new SurgePricing(new HourlyRate('Bike hourly', 3000), 1.5));
+act('hold bike surge',          () => svc.placeHold(b1.id, 'cust-D', 9*HOUR, 11*HOUR));
+act('confirm bike surge 2h',    () => svc.confirmBooking(b1.id, 'cust-D'));
+const bk2 = svc.getBooking('B2');
+act('cancel B2',                () => svc.cancelBooking(bk2.id));
+clock.advance(18*HOUR);
+act('cancel started B1',        () => svc.cancelBooking('B1'));
+act('search DEL CAR',           () => svc.search('DEL', VehicleType.Car, 9*HOUR, 18*HOUR));
+```
+
+## Demo output
+
+```text
+search MUM CAR 9h-18h -> [V1:Swift, V2:Baleno]
+hold V1 -> ok
+confirm V1 -> B1 price=₹900.00
+search after book -> [V2:Baleno]
+hold V1 overlap -> ConflictError: V1 is already booked for that period
+hold V1 next day -> ok
+confirm V1 next day -> B2 price=₹900.00
+hold V2 (15 min TTL) -> ok
+confirm expired hold -> HoldExpiredError: Hold for V2 has expired or was never placed
+hold bike surge -> ok
+confirm bike surge 2h -> B3 price=₹90.00
+cancel B2 -> B2 price=₹900.00
+cancel started B1 -> ValidationError: Cannot cancel a rental that has already started
+search DEL CAR -> [V4:Swift]
+```
+
+B1's booking is 9h–18h = 9 hours × ₹100 = ₹900.00. B2 is 18h–27h = also 9 hours. The bike surge: 2 hours × ₹30 × 1.5 = ₹90. V4 is on the DEL branch and was never touched, so it shows as available.
+
+## Concurrency
+
+In a single-threaded Node process, `placeHold` + `confirmBooking` are effectively atomic across two calls because nothing can interleave between synchronous operations. The race emerges with multiple server instances (or a cluster):
+
+1. Server A: `search(MUM, CAR, 9h, 18h)` returns `[V1, V2]`.
+2. Server B receives a concurrent request for the same slot.
+3. Both servers call `placeHold(V1, …)`. Neither sees a hold yet because holds live in in-process memory.
+4. Both succeed; V1 is double-held.
+
+**Fix:** store holds in a shared, atomic store (Redis, PostgreSQL) and use a conditional write (`SET hold:V1 customer EXAT <ttl> NX` — set if not exists). The `NX` flag makes the hold claim atomic. Confirmation then checks the shared store, not an in-process map.
+
+A second race: two customers hold *different* vehicles, then one cancels and frees a vehicle that the other needs. This is not a problem — cancelling releases a confirmed booking and another customer can hold it.
+
+## Extensions & follow-ups
+
+| Extension | Design change |
+|---|---|
+| **Multi-city availability** | Add a `cityId` above `branchId`; search fans out to multiple branches and ranks by distance. |
+| **One-way rental** | `Booking` gains a `returnBranchId`. The service needs a rebalancing module to move vehicles. |
+| **Coupon / discount** | A `DiscountStrategy` wraps `PricingStrategy`; a coupon code resolves to a percentage off. |
+| **Driver assignment** | A `Driver` entity with a schedule; the service must also check driver availability in the same time window. |
+| **Dynamic pricing (supply/demand)** | Inject a `DemandSensor` into `SurgePricing`; the factor is computed at hold time, not compile time. |
+| **Cancellation refund policy** | Inject a `RefundPolicy`; the amount returned depends on how far in advance the cancellation happens. |
+
+## Edge cases
+
+- `search` with `start >= end` throws `ValidationError` before any repository call.
+- `placeHold` on a vehicle already held by another customer throws `ConflictError` (with the vehicle ID, not the customer ID — never leak other customers' data).
+- `placeHold` on a vehicle in `MAINTENANCE` is rejected.
+- Holding a vehicle for a window that abuts (not overlaps) an existing booking is allowed: `[0, 540)` and `[540, 1080)` do not overlap.
+- Expired holds are cleaned up lazily; `confirmBooking` after TTL throws `HoldExpiredError`, and the vehicle is back in the search results on the next call.
+- Cancellation after the rental has started is rejected (clock >= startMin).
+- `cancelBooking` of an already-cancelled booking throws `ConflictError`.
+- Branch isolation: `search('DEL', …)` never returns MUM vehicles.
+
+## Complexity
+
+With V vehicles per branch type and B bookings per vehicle:
+
+| Operation | Cost | Note |
+|---|---|---|
+| `search` | O(V × B) | Per vehicle, scan confirmed bookings for overlap |
+| `placeHold` | O(B) for one vehicle + O(active holds) for cleanup | |
+| `confirmBooking` | O(1) | Hold lookup + one insert |
+| `cancelBooking` | O(1) | Booking lookup + status update |
+| `cleanExpiredHolds` | O(active holds) | Called lazily on search and hold |
+
+For large V, index bookings by `(vehicleId, endMin)` using a sorted structure so overlap queries are O(log B + overlap count) instead of O(B).
+
+## What graders look for / common mistakes
+
+- ✅ Half-open interval overlap formula: `a < d && c < b` (not `<=`).
+- ✅ Hold expiry checked at `confirmBooking` time, not only at hold time.
+- ✅ `PricingStrategy` interface; adding surge or member-discount requires no service change.
+- ✅ Validation before mutation: `placeHold` checks maintenance status and existing bookings before writing.
+- ❌ Checking overlap as `a <= d && c <= b` — this rejects back-to-back bookings that should be allowed.
+- ❌ Storing availability as a boolean on the vehicle — this is one global boolean and cannot represent future bookings.
+- ❌ No hold mechanism: two concurrent searches both see the vehicle available and both book it.
+- ❌ Pricing logic inside the service with `if (type === 'TRUCK')` — violates Open/Closed.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---|---|
+| 0–8 | Clarify: branches, types, hold TTL, pricing unit, cancellation rules. |
+| 8–18 | Entities and class diagram on paper; state the Strategy and Decorator for pricing. |
+| 18–40 | `Vehicle`, `Booking`, `Hold` interfaces + both repositories; overlap helper. |
+| 40–55 | `RentalService`: `addVehicle`, `search` (with hold exclusion), `placeHold`. |
+| 55–70 | `confirmBooking` + `cancelBooking`; inject `Clock` for deterministic TTL. |
+| 70–80 | Driver with happy path, overlap conflict, hold expiry, surge. |
+| 80–90 | Concurrency (Redis NX), multi-branch return, dynamic pricing; tidy names. |
+
+## Interview Q&A
+
+<details>
+<summary>Q1. Two customers call `search` at the same time and both see V1 available. How do you prevent a double booking?</summary>
+
+With a single server instance and synchronous operations, `placeHold` runs atomically and the second caller will find the hold already present. With multiple instances, holds must live in a shared store, and the write must be atomic — for example `SET hold:V1 … NX` in Redis or `INSERT INTO holds … ON CONFLICT DO NOTHING` in PostgreSQL. The second caller's insert fails, and they get a `ConflictError` and must retry with a different vehicle.
+
+</details>
+
+<details>
+<summary>Q2. The interviewer asks: "What if the hold TTL passes and the customer is still on the payment page?" </summary>
+
+The hold is released, and the vehicle becomes bookable again. If the customer finishes payment after the TTL, `confirmBooking` throws `HoldExpiredError`. The UI should proactively warn the customer when the hold is about to expire (say, with a countdown) and let them re-hold if the vehicle is still free. This mirrors how flight booking sites show a "your fare is held for 10 minutes" timer.
+
+</details>
+
+<details>
+<summary>Q3. How would you find the cheapest available vehicle of any type at a branch for a given window?</summary>
+
+Compute the price for each available vehicle using its type's strategy and return the list sorted by price. If there are many vehicles, you can prune: compute an estimated price per type (since all vehicles of the same type share a strategy), run availability queries for the cheapest type first, and stop as soon as you find one. This avoids scanning all types when a cheap one is available.
+
+</details>
+
+<details>
+<summary>Q4. How does the overlap formula handle the edge case where the requested window exactly matches an existing booking?</summary>
+
+`overlaps(9h, 18h, 9h, 18h)` = `9 < 18 && 9 < 18` = `true`. An exact match overlaps, as expected. The edge case that surprises many candidates is the *abutting* case: `overlaps(9h, 18h, 18h, 27h)` = `9 < 27 && 18 < 18` = `true && false` = `false`. Back-to-back bookings do not overlap.
+
+</details>

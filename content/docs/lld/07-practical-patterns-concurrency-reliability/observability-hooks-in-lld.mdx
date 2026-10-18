@@ -1,0 +1,144 @@
+---
+title: "7.13 Observability hooks in LLD"
+---
+
+You won't wire up Prometheus in a machine-coding round. But **leaving seams for it** is a cheap SDE-2 signal: a `Logger` port and a `Metrics` port, injected like everything else, and a **decorator** that adds timing and counters around a dependency without touching business code.
+
+- Logs are **structured** (JSON key/values, not string soup) and carry correlation ids (`requestId`, `orderId`) through **child loggers**.
+- Metrics: **counters** (orders placed, failures by reason), **histograms** (latency), **gauges** (queue depth, breaker state). Keep **tag cardinality low**: never use `userId` as a metric tag.
+- Never log secrets or PII: card numbers, PAN, OTPs, tokens.
+
+```ts
+type Fields = Record<string, string | number | boolean>;
+
+interface Logger {
+  info(msg: string, fields?: Fields): void;
+  error(msg: string, fields?: Fields): void;
+  child(bindings: Fields): Logger;
+}
+
+interface Metrics {
+  increment(name: string, tags?: Record<string, string>): void;
+  observe(name: string, value: number, tags?: Record<string, string>): void;
+}
+
+interface Clock {
+  now(): number;
+}
+
+class JsonLogger implements Logger {
+  constructor(private readonly clock: Clock, private readonly bindings: Fields = {}) {}
+  private write(level: string, msg: string, fields: Fields = {}): void {
+    console.log(JSON.stringify({ ts: this.clock.now(), level, msg, ...this.bindings, ...fields }));
+  }
+  info(msg: string, fields?: Fields): void {
+    this.write('info', msg, fields);
+  }
+  error(msg: string, fields?: Fields): void {
+    this.write('error', msg, fields);
+  }
+  child(bindings: Fields): Logger {
+    return new JsonLogger(this.clock, { ...this.bindings, ...bindings });
+  }
+}
+
+class InMemoryMetrics implements Metrics {
+  private readonly counters = new Map<string, number>();
+  private readonly samples = new Map<string, number[]>();
+  private key(name: string, tags: Record<string, string> = {}): string {
+    const t = Object.keys(tags)
+      .sort()
+      .map(k => `${k}=${tags[k]}`)
+      .join(',');
+    return t ? `${name}{${t}}` : name;
+  }
+  increment(name: string, tags?: Record<string, string>): void {
+    const k = this.key(name, tags);
+    this.counters.set(k, (this.counters.get(k) ?? 0) + 1);
+  }
+  observe(name: string, value: number, tags?: Record<string, string>): void {
+    const k = this.key(name, tags);
+    this.samples.set(k, [...(this.samples.get(k) ?? []), value]);
+  }
+  report(): string {
+    const counters = [...this.counters].sort().map(([k, v]) => `${k}=${v}`);
+    const hists = [...this.samples].sort().map(([k, v]) => `${k} n=${v.length} max=${Math.max(...v)}`);
+    return [...counters, ...hists].join('\n');
+  }
+}
+
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number {
+    return this.t;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+  }
+}
+
+// ---- a port and a decorator that instruments any implementation ----
+interface PaymentGateway {
+  charge(orderId: string, amountPaise: number): Promise<string>;
+}
+
+class InstrumentedGateway implements PaymentGateway {
+  constructor(
+    private readonly inner: PaymentGateway,
+    private readonly metrics: Metrics,
+    private readonly log: Logger,
+    private readonly clock: Clock,
+  ) {}
+
+  async charge(orderId: string, amountPaise: number): Promise<string> {
+    const start = this.clock.now();
+    const log = this.log.child({ orderId });
+    try {
+      const txn = await this.inner.charge(orderId, amountPaise);
+      this.metrics.increment('payment_charge_total', { outcome: 'success' });
+      log.info('charge ok', { txn, amountPaise, ms: this.clock.now() - start });
+      return txn;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : 'unknown';
+      this.metrics.increment('payment_charge_total', { outcome: 'failure', reason });
+      log.error('charge failed', { reason, ms: this.clock.now() - start });
+      throw err;
+    } finally {
+      this.metrics.observe('payment_charge_ms', this.clock.now() - start);
+    }
+  }
+}
+
+const clock = new FakeClock(1_000);
+const slowGateway: PaymentGateway = {
+  async charge(orderId, amountPaise) {
+    clock.advance(amountPaise > 100_000 ? 900 : 120); // simulated latency
+    if (amountPaise > 100_000) throw new Error('limit_exceeded');
+    return `txn-${orderId}`;
+  },
+};
+
+const metrics = new InMemoryMetrics();
+const rootLogger = new JsonLogger(clock, { service: 'payments' });
+const gateway = new InstrumentedGateway(slowGateway, metrics, rootLogger.child({ requestId: 'req-42' }), clock);
+
+for (const [orderId, amount] of [['o1', 50_000], ['o2', 250_000], ['o3', 75_000]] as const) {
+  try {
+    await gateway.charge(orderId, amount);
+  } catch {
+    // already logged and counted by the decorator
+  }
+}
+console.log(metrics.report());
+```
+
+```text
+{"ts":1120,"level":"info","msg":"charge ok","service":"payments","requestId":"req-42","orderId":"o1","txn":"txn-o1","amountPaise":50000,"ms":120}
+{"ts":2020,"level":"error","msg":"charge failed","service":"payments","requestId":"req-42","orderId":"o2","reason":"limit_exceeded","ms":900}
+{"ts":2140,"level":"info","msg":"charge ok","service":"payments","requestId":"req-42","orderId":"o3","txn":"txn-o3","amountPaise":75000,"ms":120}
+payment_charge_total{outcome=failure,reason=limit_exceeded}=1
+payment_charge_total{outcome=success}=2
+payment_charge_ms n=3 max=900
+```
+
+**How to say it:** "Logger and Metrics are ports. I instrument dependencies with decorators, so business code stays clean, and in production those ports map to pino and Prometheus/OpenTelemetry, with the request id propagated through child loggers."

@@ -1,0 +1,196 @@
+---
+title: "6.2 Observer"
+---
+
+## Intent
+
+Let one object (the **subject**) notify many dependents (**observers**) when something happens, without knowing who they are. Observers can subscribe and unsubscribe at runtime.
+
+## Problem
+
+Your market-data service receives price ticks. Many parts of the app care about them:
+
+- **Price alerts:** "tell me when INFY crosses ₹1,500".
+- A **P&L widget** that recalculates on every tick.
+- An **audit logger**.
+- Next quarter: a **stop-loss engine**.
+
+If the feed calls `alertService.check()`, `pnl.update()`, and `logger.log()` directly, the feed depends on all of them, and adding a consumer means editing the feed. You want the feed to just say "a tick happened" and let interested parties react.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class TypedEmitter {
+        -listeners map
+        +on(event, fn) unsubscribe
+        +emit(event, payload)
+        +count(event) number
+    }
+    class Listener {
+        <<interface>>
+        +call(payload)
+    }
+    class PriceAlert {
+        -off unsubscribe
+        -onTick(tick)
+    }
+    class AuditLogger
+    TypedEmitter o-- Listener : notifies
+    PriceAlert ..> TypedEmitter : subscribes
+    AuditLogger ..> TypedEmitter : subscribes`} />
+
+## TypeScript implementation
+
+The important TypeScript idea is an **event map**: a type that maps each event name to its payload type. `on('tick', fn)` then knows that `fn` receives a `Tick`. A typo in the event name or payload becomes a compile error.
+
+```ts
+type Listener<T> = (payload: T) => void;
+
+class TypedEmitter<E extends Record<string, unknown>> {
+  private listeners: { [K in keyof E]?: Set<Listener<E[K]>> } = {};
+
+  /** Subscribe and get back an unsubscribe function. */
+  on<K extends keyof E>(event: K, fn: Listener<E[K]>): () => void {
+    const set = this.listeners[event] ?? new Set<Listener<E[K]>>();
+    this.listeners[event] = set;
+    set.add(fn);
+    return () => {
+      set.delete(fn);
+    };
+  }
+
+  emit<K extends keyof E>(event: K, payload: E[K]): void {
+    // Copy first: a listener may unsubscribe while we are iterating.
+    for (const fn of [...(this.listeners[event] ?? [])]) {
+      try {
+        fn(payload);
+      } catch (err) {
+        // One broken observer must not stop the others.
+        console.log(`  listener error: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  count<K extends keyof E>(event: K): number {
+    return this.listeners[event]?.size ?? 0;
+  }
+}
+
+interface Tick {
+  symbol: string;
+  price: number;
+}
+
+type MarketEvents = {
+  tick: Tick;
+  marketStatus: { open: boolean };
+};
+
+class PriceAlert {
+  private readonly off: () => void;
+
+  constructor(
+    feed: TypedEmitter<MarketEvents>,
+    private readonly user: string,
+    private readonly symbol: string,
+    private readonly target: number,
+  ) {
+    this.off = feed.on('tick', (t) => this.onTick(t));
+  }
+
+  private onTick(t: Tick): void {
+    if (t.symbol !== this.symbol || t.price < this.target) return;
+    console.log(`  [ALERT] ${this.user}: ${t.symbol} hit ${t.price} (target ${this.target})`);
+    this.off(); // one-shot alert: unsubscribe after firing
+  }
+}
+
+const feed = new TypedEmitter<MarketEvents>();
+
+const offLog = feed.on('tick', (t) => console.log(`tick ${t.symbol} ${t.price}`));
+const offBuggy = feed.on('tick', () => {
+  throw new Error('widget crashed');
+});
+new PriceAlert(feed, 'ritesh', 'INFY', 1500);
+new PriceAlert(feed, 'asha', 'TCS', 4000);
+
+feed.emit('tick', { symbol: 'INFY', price: 1490 });
+feed.emit('tick', { symbol: 'TCS', price: 3900 });
+feed.emit('tick', { symbol: 'INFY', price: 1510 });
+
+offLog();
+offBuggy();
+console.log('-- logger and widget unsubscribed --');
+
+feed.emit('tick', { symbol: 'INFY', price: 1520 }); // ritesh's alert already fired
+feed.emit('tick', { symbol: 'TCS', price: 4010 });
+console.log(`tick listeners left: ${feed.count('tick')}`);
+
+// feed.emit('tick', { symbol: 'INFY' });      // compile error: price missing
+// feed.on('tik', () => {});                    // compile error: unknown event
+```
+
+```text
+tick INFY 1490
+  listener error: widget crashed
+tick TCS 3900
+  listener error: widget crashed
+tick INFY 1510
+  listener error: widget crashed
+  [ALERT] ritesh: INFY hit 1510 (target 1500)
+-- logger and widget unsubscribed --
+  [ALERT] asha: TCS hit 4010 (target 4000)
+tick listeners left: 0
+```
+
+Returning an **unsubscribe function** from `on()` is the modern style. You'll recognize it from React's `useEffect` cleanup, RxJS `subscription.unsubscribe()`, and Redux `store.subscribe()`.
+
+## When to use / when NOT to use
+
+**Use it when**
+- One change must fan out to a set of consumers that is open-ended or changes at runtime.
+- The producer shouldn't depend on its consumers (market data → alerts, order filled → notifications, P&L, audit).
+
+**Don't use it when**
+- There is exactly one consumer and the order of steps matters. A direct call is clearer.
+- You need guaranteed delivery, retries, or delivery across processes. That calls for a message broker (Kafka, RabbitMQ, SQS), which is Pub/Sub infrastructure rather than an in-memory observer.
+
+## Pitfalls
+
+- **Memory leaks.** A long-lived subject holds references to short-lived observers, such as a React component that never unsubscribes. Always return and call an unsubscribe function.
+- **Mutating the listener list while iterating.** Iterate over a copy, as shown above.
+- **A throwing listener breaks the chain.** Wrap each call in try/catch.
+- **Hidden control flow.** "Who reacts to `orderFilled`?" becomes hard to answer. Keep event names meaningful and documented.
+- **Cascades.** Observer A emits an event that triggers B, which emits an event that triggers A again. Watch for loops.
+- **Sync vs async.** Synchronous observers block the emitter. A slow SMS sender should be queued, not called inline.
+
+## Related patterns
+
+- **Observer vs Pub/Sub.** In Observer, subscribers register *directly on the subject*, so they know about it. In Pub/Sub, a **broker/topic** sits in between and neither side knows the other. It is usually async and often distributed.
+- **Observer vs Mediator.** Observer broadcasts to whoever is listening, with one-to-many communication going one way. A Mediator *coordinates* many-to-many interactions and holds the rules about who talks to whom.
+- The **Event Emitter** in Node, **RxJS Observables**, and **NestJS `@OnEvent`** are all variants of Observer.
+
+## Where it shows up in LLD interview problems
+
+- **Stock price alerts / watchlists** (a classic in broker interviews).
+- **Notification service:** order status changes notify email, SMS, and push channels.
+- **Auction system:** bidders are notified when they are outbid.
+- **Elevator:** floor displays observe elevator position.
+- **Cricket scoreboard / live score app.**
+
+*How to say it:* "The price feed is the subject. Alerts, the P&L view, and the audit log subscribe to typed `tick` events. `on()` returns an unsubscribe function so one-shot alerts can remove themselves, and each listener is isolated with try/catch."
+
+## Quick check
+
+1. Why does `emit` iterate over a copy of the listener set?
+2. How is Observer different from Pub/Sub?
+3. What is the most common production bug with observers?
+
+<details>
+<summary>Answer</summary>
+
+1. A listener may unsubscribe itself, or add another listener, during the notification. Iterating over a copy keeps the loop predictable.
+2. With Observer, subscribers attach directly to the subject. With Pub/Sub, a broker/topic decouples publishers from subscribers, usually asynchronously and often across processes.
+3. Leaks from observers that never unsubscribe, which keeps them alive and makes them fire after they should be gone.
+
+</details>

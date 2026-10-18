@@ -1,0 +1,720 @@
+---
+title: "10.2 Rate Limiter Service"
+---
+
+## Problem & where it's asked
+
+Design an in-process rate-limiting *service* (think of a library used by an API gateway or a NestJS guard). Different APIs and different users get different limits, and each limit can use a different algorithm. Chapter 7 covered how the algorithms work internally. Here the focus is the **LLD around them**: how rules are configured and resolved, how algorithms are plugged in, where per-user state lives, and how time is injected so the whole thing is testable.
+
+**Reported** at **Atlassian** (a strategy per resource: `isAllowed(resourceId)`), **Razorpay** (N requests per second per user), **PhonePe** (thousands of concurrent users with low memory; UPI throttling), **Walmart** 2026 ("add token bucket without editing existing code"), **Goldman Sachs** 2026, **Microsoft**, **Uber**, **Zeta**, and **Flipkart** (rate limiter / token bucket in its machine-coding list). For Angel One, order-placement throttling (the exchange imposes per-client order-rate limits) makes this a very plausible ask, but that's **uncertain**, not reported.
+
+Graded on: **OCP through Strategy**, correct window arithmetic, and a thread-safety discussion (per-key rather than global locks).
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| What's the key being limited? | A `(userId, apiId)` pair. Rules can also be shared across all users of an API (global scope). |
+| How are limits configured? | Rules: a matcher (`apiId`, `userId`, `tier`, any may be absent) + algorithm config + scope. |
+| If several rules match? | The **most specific** wins: user+API > tier+API > API > default. |
+| Which algorithms? | Token bucket, sliding-window log, fixed window. New ones must plug in without edits. |
+| What does the caller get back? | `allowed`, `remaining`, `retryAfterMs` and the rule id (to set `X-RateLimit-*` and `Retry-After` headers). |
+| Can rules change at runtime? | Yes. Updating a rule resets state for that rule (new version). |
+| Single process or distributed? | Single process for the design. Distributed (Redis) is covered in the concurrency section. |
+| Time source? | An injected `Clock`, so tests use a fake clock and no real waiting. |
+
+## Requirements
+
+**Functional**
+
+1. `isAllowed({ userId, apiId, tier })` returns a decision.
+2. Add or update rules at runtime, and validate them (positive limits, known algorithm, unique matcher).
+3. Resolve the most specific rule. A default rule must always exist.
+4. Support `PER_USER` and `GLOBAL` scopes.
+5. Support token bucket, sliding-window log and fixed window, pluggable via a registry.
+
+**Non-functional**
+
+- `isAllowed` is O(1) amortised (sliding log: amortised over evictions).
+- Memory proportional to *active* keys. Idle state should be evictable.
+- Deterministic tests: no `Date.now()` inside the logic.
+- Adding an algorithm = one new class + one registration.
+
+**Out of scope**
+
+Distributed consistency across nodes (discussed only), quotas per day/month billing, request queuing (we reject, not delay), IP reputation.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Clock` | Provides current time in ms | Injected into the service |
+| `AlgorithmConfig` | Discriminated union of algorithm parameters | Part of a `RateLimitRule` |
+| `RateLimitRule` | id, version, matcher, scope, config | Stored in `RuleStore` |
+| `RuleStore` | Validates, stores and resolves rules by specificity | Used by the service |
+| `RateLimiter` | State + algorithm for **one** key | Created by `LimiterFactory` |
+| `LimiterFactory` | Registry `algorithm → creator` | Knows all algorithm classes |
+| `RateLimiterService` | Facade: resolve rule, find/create state, decide | Owns `Map<stateKey, RateLimiter>` |
+| `Decision` | Result returned to the caller | Created per call |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Clock {
+      <<interface>>
+      +now() number
+    }
+    class RateLimiter {
+      <<interface>>
+      +tryAcquire(now) Verdict
+    }
+    class TokenBucketLimiter
+    class SlidingWindowLogLimiter
+    class FixedWindowLimiter
+    class LimiterFactory {
+      +register(algorithm, creator)
+      +create(config) RateLimiter
+    }
+    class RuleStore {
+      +upsert(rule)
+      +resolve(request) RateLimitRule
+    }
+    class RateLimitRule {
+      +string id
+      +number version
+      +RuleMatcher match
+      +Scope scope
+      +AlgorithmConfig config
+    }
+    class RateLimiterService {
+      +isAllowed(request) Decision
+    }
+    RateLimiter <|.. TokenBucketLimiter
+    RateLimiter <|.. SlidingWindowLogLimiter
+    RateLimiter <|.. FixedWindowLimiter
+    LimiterFactory ..> RateLimiter : creates
+    RuleStore o-- RateLimitRule
+    RateLimiterService --> RuleStore
+    RateLimiterService --> LimiterFactory
+    RateLimiterService --> Clock
+    RateLimiterService o-- RateLimiter : per key state`} />
+
+## Design decisions & patterns
+
+- **Strategy: one `RateLimiter` object per key.** Each instance owns both the algorithm and its state (tokens, timestamps). The alternative, a stateless strategy plus a separate state map, is also valid and is what you'd use with Redis. For in-memory code, keeping state and behaviour together is simpler.
+- **Factory with a registry (OCP).** `LimiterFactory.register('TOKEN_BUCKET', cfg => new TokenBucketLimiter(cfg))`. Walmart's follow-up ("add token bucket without editing existing code") becomes a single `register` call.
+- **Rule resolution by specificity**, like CSS selectors or NestJS guards with metadata. Specificity = number of defined matcher fields, with `userId` weighted highest. This avoids a hand-written `if` ladder that breaks when a new matcher field is added.
+- **State key = `ruleId@version|scopeKey`.** When a rule is updated, its version bumps, so old state is simply never read again (and can be evicted). No need to walk the map and reset.
+- **Injected `Clock`.** The single most important testability decision. The demo advances a `FakeClock` by exact milliseconds.
+- **Facade.** Callers see one method, `isAllowed`. Rule resolution, the factory and the state map are hidden.
+- **Rejected:** a Singleton `RateLimiter` (hidden global state, painful to test; use DI instead); one global lock (serialises every request in the system); a `switch(algorithm)` inside the service (violates OCP).
+
+## Implementation
+
+**Part 1: time, config types, errors.**
+
+```ts
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  constructor(private current = 0) {}
+  now(): number {
+    return this.current;
+  }
+  advance(ms: number): void {
+    this.current += ms;
+  }
+}
+
+class ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConfigError';
+  }
+}
+
+type Tier = 'FREE' | 'PRO';
+type Scope = 'PER_USER' | 'GLOBAL';
+
+type AlgorithmConfig =
+  | { algorithm: 'TOKEN_BUCKET'; capacity: number; refillPerSecond: number }
+  | { algorithm: 'SLIDING_WINDOW_LOG'; limit: number; windowMs: number }
+  | { algorithm: 'FIXED_WINDOW'; limit: number; windowMs: number };
+type Algorithm = AlgorithmConfig['algorithm'];
+
+interface RuleMatcher {
+  apiId?: string;
+  userId?: string;
+  tier?: Tier;
+}
+
+interface RateLimitRule {
+  readonly id: string;
+  readonly version: number;
+  readonly match: RuleMatcher;
+  readonly scope: Scope;
+  readonly config: AlgorithmConfig;
+}
+
+interface RequestContext {
+  userId: string;
+  apiId: string;
+  tier: Tier;
+}
+
+/** What an algorithm returns. */
+interface Verdict {
+  allowed: boolean;
+  remaining: number;
+  retryAfterMs: number;
+}
+/** What the service returns to the caller. */
+interface Decision extends Verdict {
+  ruleId: string;
+}
+```
+
+**Part 2: the algorithms (strategies).** Each is deliberately short; Chapter 7 explains the maths. Each receives `now` as an argument rather than reading a clock, which makes them pure functions of (state, time).
+
+```ts
+interface RateLimiter {
+  tryAcquire(now: number): Verdict;
+}
+
+function requirePositive(value: number, label: string): void {
+  if (!Number.isFinite(value) || value <= 0) throw new ConfigError(`${label} must be > 0, got ${value}`);
+}
+
+class TokenBucketLimiter implements RateLimiter {
+  private tokens: number;
+  private lastRefill: number | undefined;
+  constructor(private readonly capacity: number, private readonly refillPerSecond: number) {
+    requirePositive(capacity, 'capacity');
+    requirePositive(refillPerSecond, 'refillPerSecond');
+    this.tokens = capacity;
+  }
+  tryAcquire(now: number): Verdict {
+    if (this.lastRefill !== undefined) {
+      const elapsed = Math.max(0, now - this.lastRefill);
+      this.tokens = Math.min(this.capacity, this.tokens + (elapsed * this.refillPerSecond) / 1000);
+    }
+    this.lastRefill = now;
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return { allowed: true, remaining: Math.floor(this.tokens), retryAfterMs: 0 };
+    }
+    const retryAfterMs = Math.ceil(((1 - this.tokens) * 1000) / this.refillPerSecond);
+    return { allowed: false, remaining: 0, retryAfterMs };
+  }
+}
+
+class SlidingWindowLogLimiter implements RateLimiter {
+  private readonly log: number[] = [];
+  private head = 0; // index of the oldest live timestamp (avoids O(n) shift)
+  constructor(private readonly limit: number, private readonly windowMs: number) {
+    requirePositive(limit, 'limit');
+    requirePositive(windowMs, 'windowMs');
+  }
+  tryAcquire(now: number): Verdict {
+    while (this.head < this.log.length && this.log[this.head] <= now - this.windowMs) this.head++;
+    if (this.head > 64 && this.head * 2 > this.log.length) {
+      this.log.splice(0, this.head); // compact occasionally
+      this.head = 0;
+    }
+    const used = this.log.length - this.head;
+    if (used < this.limit) {
+      this.log.push(now);
+      return { allowed: true, remaining: this.limit - used - 1, retryAfterMs: 0 };
+    }
+    return { allowed: false, remaining: 0, retryAfterMs: this.log[this.head] + this.windowMs - now };
+  }
+}
+
+class FixedWindowLimiter implements RateLimiter {
+  private windowStart = Number.NEGATIVE_INFINITY;
+  private count = 0;
+  constructor(private readonly limit: number, private readonly windowMs: number) {
+    requirePositive(limit, 'limit');
+    requirePositive(windowMs, 'windowMs');
+  }
+  tryAcquire(now: number): Verdict {
+    const start = Math.floor(now / this.windowMs) * this.windowMs;
+    if (start !== this.windowStart) {
+      this.windowStart = start;
+      this.count = 0;
+    }
+    if (this.count < this.limit) {
+      this.count++;
+      return { allowed: true, remaining: this.limit - this.count, retryAfterMs: 0 };
+    }
+    return { allowed: false, remaining: 0, retryAfterMs: start + this.windowMs - now };
+  }
+}
+```
+
+**Part 3: the factory registry and the rule store.** The factory narrows the union once per creator. The rule store validates eagerly, so a bad config fails at startup, not on the first request at 9:15 a.m. market open.
+
+```ts
+type LimiterCreator = (config: AlgorithmConfig) => RateLimiter;
+
+class LimiterFactory {
+  private readonly creators = new Map<Algorithm, LimiterCreator>();
+  register(algorithm: Algorithm, creator: LimiterCreator): this {
+    this.creators.set(algorithm, creator);
+    return this;
+  }
+  create(config: AlgorithmConfig): RateLimiter {
+    const creator = this.creators.get(config.algorithm);
+    if (!creator) throw new ConfigError(`No limiter registered for ${config.algorithm}`);
+    return creator(config);
+  }
+  supports(algorithm: Algorithm): boolean {
+    return this.creators.has(algorithm);
+  }
+}
+
+function defaultFactory(): LimiterFactory {
+  return new LimiterFactory()
+    .register('TOKEN_BUCKET', (c) => {
+      if (c.algorithm !== 'TOKEN_BUCKET') throw new ConfigError('expected TOKEN_BUCKET config');
+      return new TokenBucketLimiter(c.capacity, c.refillPerSecond);
+    })
+    .register('SLIDING_WINDOW_LOG', (c) => {
+      if (c.algorithm !== 'SLIDING_WINDOW_LOG') throw new ConfigError('expected SLIDING_WINDOW_LOG config');
+      return new SlidingWindowLogLimiter(c.limit, c.windowMs);
+    })
+    .register('FIXED_WINDOW', (c) => {
+      if (c.algorithm !== 'FIXED_WINDOW') throw new ConfigError('expected FIXED_WINDOW config');
+      return new FixedWindowLimiter(c.limit, c.windowMs);
+    });
+}
+
+type RuleInput = Omit<RateLimitRule, 'version'>;
+
+class RuleStore {
+  private readonly rules = new Map<string, RateLimitRule>();
+  constructor(private readonly factory: LimiterFactory) {}
+
+  upsert(input: RuleInput): RateLimitRule {
+    if (!this.factory.supports(input.config.algorithm)) {
+      throw new ConfigError(`Unknown algorithm ${input.config.algorithm}`);
+    }
+    this.factory.create(input.config); // dry run: validates the numbers
+    const signature = RuleStore.signature(input.match);
+    for (const r of this.rules.values()) {
+      if (r.id !== input.id && RuleStore.signature(r.match) === signature) {
+        throw new ConfigError(`Rule ${r.id} already covers ${signature}`);
+      }
+    }
+    const version = (this.rules.get(input.id)?.version ?? 0) + 1;
+    const rule: RateLimitRule = { ...input, version };
+    this.rules.set(rule.id, rule);
+    return rule;
+  }
+
+  resolve(req: RequestContext): RateLimitRule {
+    let best: RateLimitRule | undefined;
+    let bestScore = -1;
+    for (const rule of this.rules.values()) {
+      const { apiId, userId, tier } = rule.match;
+      if (apiId !== undefined && apiId !== req.apiId) continue;
+      if (userId !== undefined && userId !== req.userId) continue;
+      if (tier !== undefined && tier !== req.tier) continue;
+      const score = (userId ? 4 : 0) + (apiId ? 2 : 0) + (tier ? 1 : 0);
+      if (score > bestScore) {
+        best = rule;
+        bestScore = score;
+      }
+    }
+    if (!best) throw new ConfigError('No default rule configured');
+    return best;
+  }
+
+  private static signature(m: RuleMatcher): string {
+    return `api=${m.apiId ?? '*'} user=${m.userId ?? '*'} tier=${m.tier ?? '*'}`;
+  }
+}
+```
+
+**Part 4: the service facade.** It resolves the rule, builds the state key from the scope, lazily creates state, and asks the limiter.
+
+```ts
+class RateLimiterService {
+  private readonly state = new Map<string, RateLimiter>();
+  constructor(
+    private readonly rules: RuleStore,
+    private readonly factory: LimiterFactory,
+    private readonly clock: Clock,
+  ) {}
+
+  isAllowed(req: RequestContext): Decision {
+    if (!req.userId || !req.apiId) throw new ConfigError('userId and apiId are required');
+    const rule = this.rules.resolve(req);
+    const scopeKey = rule.scope === 'GLOBAL' ? '*' : req.userId;
+    const key = `${rule.id}@${rule.version}|${scopeKey}`;
+    let limiter = this.state.get(key);
+    if (!limiter) {
+      limiter = this.factory.create(rule.config);
+      this.state.set(key, limiter);
+    }
+    return { ...limiter.tryAcquire(this.clock.now()), ruleId: rule.id };
+  }
+
+  activeKeys(): number {
+    return this.state.size;
+  }
+}
+```
+
+**Part 5: demo.** The rules model a broker-like API: a default, a tighter tier-specific limit on order placement, a special case for one algo-trading client, and a global cap on an expensive endpoint.
+
+```ts
+const clock = new FakeClock(0);
+const factory = defaultFactory();
+const rules = new RuleStore(factory);
+const limiter = new RateLimiterService(rules, factory, clock);
+
+rules.upsert({ id: 'default', match: {}, scope: 'PER_USER', config: { algorithm: 'FIXED_WINDOW', limit: 5, windowMs: 60_000 } });
+rules.upsert({ id: 'orders-free', match: { apiId: 'POST /orders', tier: 'FREE' }, scope: 'PER_USER', config: { algorithm: 'TOKEN_BUCKET', capacity: 2, refillPerSecond: 1 } });
+rules.upsert({ id: 'orders-bot', match: { apiId: 'POST /orders', userId: 'algo-7' }, scope: 'PER_USER', config: { algorithm: 'SLIDING_WINDOW_LOG', limit: 3, windowMs: 1000 } });
+rules.upsert({ id: 'reports-global', match: { apiId: 'GET /reports' }, scope: 'GLOBAL', config: { algorithm: 'FIXED_WINDOW', limit: 2, windowMs: 10_000 } });
+
+function hit(userId: string, apiId: string, tier: Tier = 'FREE'): void {
+  const d = limiter.isAllowed({ userId, apiId, tier });
+  const verdict = d.allowed ? `ALLOW remaining=${d.remaining}` : `DENY retryAfter=${d.retryAfterMs}ms`;
+  console.log(`t=${clock.now()} ${userId} ${apiId} [${d.ruleId}] ${verdict}`);
+}
+
+console.log('--- token bucket (FREE tier orders) ---');
+hit('ritu', 'POST /orders');
+hit('ritu', 'POST /orders');
+hit('ritu', 'POST /orders');
+clock.advance(500);
+hit('ritu', 'POST /orders');
+clock.advance(500);
+hit('ritu', 'POST /orders');
+hit('ravi', 'POST /orders'); // separate bucket per user
+
+console.log('--- sliding window (algo client override) ---');
+hit('algo-7', 'POST /orders', 'PRO');
+clock.advance(300);
+hit('algo-7', 'POST /orders', 'PRO');
+hit('algo-7', 'POST /orders', 'PRO');
+hit('algo-7', 'POST /orders', 'PRO');
+clock.advance(700);
+hit('algo-7', 'POST /orders', 'PRO');
+
+console.log('--- global scope + default rule ---');
+hit('ritu', 'GET /reports');
+hit('ravi', 'GET /reports');
+hit('asha', 'GET /reports');
+hit('asha', 'GET /holdings', 'PRO');
+
+console.log('--- hot reload: raise the FREE order limit ---');
+rules.upsert({ id: 'orders-free', match: { apiId: 'POST /orders', tier: 'FREE' }, scope: 'PER_USER', config: { algorithm: 'TOKEN_BUCKET', capacity: 5, refillPerSecond: 1 } });
+hit('ritu', 'POST /orders');
+console.log(`active state entries: ${limiter.activeKeys()}`);
+
+console.log('--- invalid config ---');
+const badRules: RuleInput[] = [
+  { id: 'bad-1', match: { apiId: 'GET /x' }, scope: 'PER_USER', config: { algorithm: 'FIXED_WINDOW', limit: 0, windowMs: 1000 } },
+  { id: 'bad-2', match: { apiId: 'GET /reports' }, scope: 'PER_USER', config: { algorithm: 'FIXED_WINDOW', limit: 1, windowMs: 1000 } },
+];
+for (const r of badRules) {
+  try {
+    rules.upsert(r);
+  } catch (err) {
+    if (err instanceof Error) console.log(`${err.name}: ${err.message}`);
+  }
+}
+```
+
+## Demo output
+
+```text
+--- token bucket (FREE tier orders) ---
+t=0 ritu POST /orders [orders-free] ALLOW remaining=1
+t=0 ritu POST /orders [orders-free] ALLOW remaining=0
+t=0 ritu POST /orders [orders-free] DENY retryAfter=1000ms
+t=500 ritu POST /orders [orders-free] DENY retryAfter=500ms
+t=1000 ritu POST /orders [orders-free] ALLOW remaining=0
+t=1000 ravi POST /orders [orders-free] ALLOW remaining=1
+--- sliding window (algo client override) ---
+t=1000 algo-7 POST /orders [orders-bot] ALLOW remaining=2
+t=1300 algo-7 POST /orders [orders-bot] ALLOW remaining=1
+t=1300 algo-7 POST /orders [orders-bot] ALLOW remaining=0
+t=1300 algo-7 POST /orders [orders-bot] DENY retryAfter=700ms
+t=2000 algo-7 POST /orders [orders-bot] ALLOW remaining=0
+--- global scope + default rule ---
+t=2000 ritu GET /reports [reports-global] ALLOW remaining=1
+t=2000 ravi GET /reports [reports-global] ALLOW remaining=0
+t=2000 asha GET /reports [reports-global] DENY retryAfter=8000ms
+t=2000 asha GET /holdings [default] ALLOW remaining=4
+--- hot reload: raise the FREE order limit ---
+t=2000 ritu POST /orders [orders-free] ALLOW remaining=4
+active state entries: 6
+--- invalid config ---
+ConfigError: limit must be > 0, got 0
+ConfigError: Rule reports-global already covers api=GET /reports user=* tier=*
+```
+
+Read the trace carefully. `ritu` gets two instant orders (bucket capacity 2), is rejected with a precise `Retry-After`, and gets a token back after one second. `algo-7` resolves to the user-specific rule even though it also matches the API. The third `GET /reports` is rejected for `asha` even though she never called it before, because the scope is `GLOBAL`. After the hot reload, `ritu` gets a fresh bucket (new version), and the stale entry is now garbage that an idle sweeper can remove.
+
+## Concurrency
+
+Inside one Node process, `isAllowed` is synchronous: read-check-write can't interleave, so no lock is needed. That's a nice point to make explicitly, because candidates coming from Java often add locks that do nothing in Node.
+
+Things change once there are **several instances** behind a load balancer and the counter lives in **Redis**. Now "GET count → check → SET count+1" is a network round-trip, and two instances can both read `limit - 1` and both allow the request. The fix is **not** a lock around it (a distributed lock on every request is too slow). Instead, make the operation atomic *inside the store*: `INCR` + `PEXPIRE` (fixed window), or a Lua script for token bucket / sliding window. In Java terms that's `ConcurrentHashMap.compute` or an `AtomicLong`, i.e. per-key atomicity instead of a global lock.
+
+```ts
+const hop = () => new Promise<void>((resolve) => setTimeout(resolve, 1));
+
+/** Simulates Redis: every call is a network hop, but `incr` itself is atomic on the server. */
+class FakeRedis {
+  private readonly data = new Map<string, number>();
+  async get(key: string): Promise<number> {
+    await hop();
+    return this.data.get(key) ?? 0;
+  }
+  async set(key: string, value: number): Promise<void> {
+    await hop();
+    this.data.set(key, value);
+  }
+  async incr(key: string): Promise<number> {
+    await hop();
+    const next = (this.data.get(key) ?? 0) + 1; // runs as one step on the server
+    this.data.set(key, next);
+    return next;
+  }
+}
+
+const LIMIT = 3;
+
+async function allowRacy(redis: FakeRedis, key: string): Promise<boolean> {
+  const count = await redis.get(key);
+  if (count >= LIMIT) return false;
+  await redis.set(key, count + 1);
+  return true;
+}
+
+async function allowAtomic(redis: FakeRedis, key: string): Promise<boolean> {
+  const count = await redis.incr(key); // increment first, then decide
+  return count <= LIMIT;
+}
+
+const tenRequests = Array.from({ length: 10 }, (_, i) => i);
+
+// Ten requests arriving at ten app instances that share one Redis.
+const racyStore = new FakeRedis();
+const racyResults = await Promise.all(tenRequests.map(() => allowRacy(racyStore, 'u1:0')));
+console.log(`racy GET/SET: allowed ${racyResults.filter(Boolean).length} of 10, limit ${LIMIT}`);
+
+const atomicStore = new FakeRedis();
+const atomicResults = await Promise.all(tenRequests.map(() => allowAtomic(atomicStore, 'u1:0')));
+console.log(`atomic INCR: allowed ${atomicResults.filter(Boolean).length} of 10, limit ${LIMIT}`);
+```
+
+```text
+racy GET/SET: allowed 10 of 10, limit 3
+atomic INCR: allowed 3 of 10, limit 3
+```
+
+Two notes for the interviewer. First, "increment then decide" means rejected requests still consume a count. That's usually acceptable (and it even penalises hammering), or you can `DECR` on reject. Second, for per-user token buckets on one machine with worker threads, lock **per key** (striped locks), never globally. PhonePe-style scale also means state has to be small: a token bucket is two numbers, while a sliding-window *log* grows with the limit, so prefer a sliding-window *counter* for big limits.
+
+## Extensions & follow-ups
+
+| Follow-up (source) | Design change |
+|--------------------|---------------|
+| Add a new algorithm without edits (Walmart 2026, reported) | Extend the `AlgorithmConfig` union, write the class, `factory.register(...)`. Shown below with a leaky bucket. |
+| Thousands of users, low memory (PhonePe, reported) | Evict idle state: track `lastSeen` per key and sweep, or cap the map with LRU (10.3). Use compact algorithms (token bucket, sliding counter). Shown below. |
+| Per-user locks instead of one global lock (reported) | Striped/keyed locks, or atomic store operations (see concurrency). |
+| Several limits at once (per-user AND global) | `resolve` returns a list. Check all, and only consume if all allow (or accept slight over-consumption). |
+| Distributed limiter | Stateless strategy + Redis state + Lua scripts; the `RateLimiter` interface becomes async. |
+| Queue instead of reject | Return `retryAfterMs` and let a scheduler delay the call (leaky bucket as a queue). |
+
+Below: a leaky-bucket algorithm registered from outside, and an idle-state sweeper. The code is self-contained, so the interfaces are re-declared compactly.
+
+```ts
+interface Verdict { allowed: boolean; retryAfterMs: number }
+interface RateLimiter { tryAcquire(now: number): Verdict }
+type Config =
+  | { algorithm: 'FIXED_WINDOW'; limit: number; windowMs: number }
+  | { algorithm: 'LEAKY_BUCKET'; capacity: number; leakPerSecond: number };
+
+class Factory {
+  private readonly creators = new Map<Config['algorithm'], (c: Config) => RateLimiter>();
+  register(name: Config['algorithm'], create: (c: Config) => RateLimiter): this {
+    this.creators.set(name, create);
+    return this;
+  }
+  create(c: Config): RateLimiter {
+    const create = this.creators.get(c.algorithm);
+    if (!create) throw new Error(`No limiter for ${c.algorithm}`);
+    return create(c);
+  }
+}
+
+/** New algorithm: requests fill a bucket that drains at a constant rate (smooths bursts). */
+class LeakyBucketLimiter implements RateLimiter {
+  private level = 0;
+  private last = 0;
+  constructor(private readonly capacity: number, private readonly leakPerSecond: number) {}
+  tryAcquire(now: number): Verdict {
+    this.level = Math.max(0, this.level - ((now - this.last) * this.leakPerSecond) / 1000);
+    this.last = now;
+    if (this.level + 1 <= this.capacity) {
+      this.level += 1;
+      return { allowed: true, retryAfterMs: 0 };
+    }
+    return { allowed: false, retryAfterMs: Math.ceil(((this.level + 1 - this.capacity) * 1000) / this.leakPerSecond) };
+  }
+}
+
+/** Keeps per-key state but forgets keys that have been idle longer than `idleMs`. */
+class IdleEvictingStateMap {
+  private readonly entries = new Map<string, { limiter: RateLimiter; lastSeen: number }>();
+  constructor(private readonly idleMs: number) {}
+  getOrCreate(key: string, now: number, create: () => RateLimiter): RateLimiter {
+    const found = this.entries.get(key);
+    if (found) {
+      // delete + set moves the key to the end: the Map stays ordered by lastSeen
+      this.entries.delete(key);
+      found.lastSeen = now;
+      this.entries.set(key, found);
+      return found.limiter;
+    }
+    const entry = { limiter: create(), lastSeen: now };
+    this.entries.set(key, entry);
+    return entry.limiter;
+  }
+  /** Oldest entries come first, so we stop at the first fresh one: O(evicted). */
+  sweep(now: number): number {
+    let evicted = 0;
+    for (const [key, entry] of this.entries) {
+      if (now - entry.lastSeen < this.idleMs) break;
+      this.entries.delete(key);
+      evicted++;
+    }
+    return evicted;
+  }
+  get size(): number {
+    return this.entries.size;
+  }
+}
+
+const factory = new Factory().register('LEAKY_BUCKET', (c) => {
+  if (c.algorithm !== 'LEAKY_BUCKET') throw new Error('expected LEAKY_BUCKET');
+  return new LeakyBucketLimiter(c.capacity, c.leakPerSecond);
+});
+const config: Config = { algorithm: 'LEAKY_BUCKET', capacity: 2, leakPerSecond: 2 };
+const state = new IdleEvictingStateMap(5_000);
+
+const calls: [number, string][] = [[0, 'u1'], [0, 'u1'], [0, 'u1'], [250, 'u1'], [500, 'u2'], [4000, 'u3']];
+for (const [t, user] of calls) {
+  const v = state.getOrCreate(user, t, () => factory.create(config)).tryAcquire(t);
+  console.log(`t=${t} ${user}: ${v.allowed ? 'ALLOW' : `DENY retry ${v.retryAfterMs}ms`}`);
+}
+console.log(`keys before sweep: ${state.size}`);
+console.log(`swept at t=6000: ${state.sweep(6000)} keys, remaining ${state.size}`);
+try {
+  factory.create({ algorithm: 'FIXED_WINDOW', limit: 1, windowMs: 1000 });
+} catch (err) {
+  console.log(err instanceof Error ? err.message : String(err));
+}
+```
+
+```text
+t=0 u1: ALLOW
+t=0 u1: ALLOW
+t=0 u1: DENY retry 500ms
+t=250 u1: DENY retry 250ms
+t=500 u2: ALLOW
+t=4000 u3: ALLOW
+keys before sweep: 3
+swept at t=6000: 2 keys, remaining 1
+No limiter for FIXED_WINDOW
+```
+
+## Edge cases
+
+- No default rule: fail at startup (`resolve` throws a `ConfigError` so it's never silently "allow all").
+- Two rules with the same matcher: rejected at `upsert`. Otherwise resolution would depend on insertion order.
+- Clock going backwards (NTP adjustment): the token bucket clamps `elapsed` to ≥ 0.
+- Burst at a fixed-window boundary: up to 2× the limit across two adjacent windows. Mention it and offer a sliding window.
+- `limit = 0` or negative values: rejected (use an explicit "blocked" rule if you want to block).
+- Very large windows with a sliding log: memory grows with the limit. Switch to a sliding-window counter.
+- Rule updated mid-burst: a new version means fresh state. Say whether that's acceptable (usually it is).
+- Missing `userId` (anonymous): fall back to an IP or API-key identifier. Never share one bucket for all anonymous users by accident.
+
+## Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `isAllowed` (token bucket, fixed window) | O(R) rule resolution + O(1) | O(1) per key |
+| `isAllowed` (sliding log) | O(R) + amortised O(1) | O(limit) per key |
+| `resolve` | O(R) for R rules | — |
+| `upsert` | O(R) duplicate check | O(1) |
+| Idle sweep | O(evicted) | — |
+
+With many rules, index them in a `Map<apiId, Rule[]>` so resolution is O(rules for that API), which is effectively O(1).
+
+## What graders look for / common mistakes
+
+- ✅ Algorithms behind an interface, created via a registry/factory. ❌ A `switch` inside `isAllowed`.
+- ✅ Injected clock and deterministic tests. ❌ `Date.now()` and `setTimeout` in tests ("wait 1 second and check").
+- ✅ Explicit rule-resolution rule (most specific wins). ❌ "First matching rule" without saying so.
+- ✅ Correct `retryAfterMs` and `remaining`. ❌ Off-by-one windows (`<` vs `<=` on the window edge).
+- ✅ Separate state per key. ❌ One limiter instance shared by every user.
+- ❌ Adding `synchronized`-style locks in single-threaded Node, or ignoring concurrency entirely for the distributed version.
+- ❌ Unbounded maps (a memory leak per unique user id).
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–8 | Clarify keys, scopes, algorithms, precedence, response shape. |
+| 8–15 | Interfaces: `Clock`, `RateLimiter`, `AlgorithmConfig`, `RateLimitRule`. |
+| 15–40 | Two algorithms first (fixed window, token bucket), then sliding log. |
+| 40–55 | `LimiterFactory` + `RuleStore` with validation and resolution. |
+| 55–70 | `RateLimiterService` + driver with a `FakeClock`. Get output. |
+| 70–80 | Global scope, hot reload, error cases. |
+| 80–90 | Talk through concurrency (Redis atomicity) and memory eviction. |
+
+## Interview Q&A
+
+**Q1. How do you add "sliding window counter" without touching existing code?**
+
+<details>
+<summary>Answer</summary>
+
+Add a variant to the `AlgorithmConfig` union, write `SlidingWindowCounterLimiter implements RateLimiter`, and register it in the composition root: `factory.register('SLIDING_WINDOW_COUNTER', ...)`. `RuleStore` and `RateLimiterService` don't change, because they only depend on the `RateLimiter` interface and the factory. That's OCP in practice.
+
+</details>
+
+**Q2. Why pass `now` into `tryAcquire` instead of injecting the clock into each limiter?**
+
+<details>
+<summary>Answer</summary>
+
+It keeps each algorithm a pure function of (state, time), which makes unit tests trivial (`tryAcquire(0)`, `tryAcquire(999)`). It also guarantees that all checks in one request see the same timestamp. The service holds the single `Clock`. Injecting into each limiter would also work, but then every limiter creation needs the clock passed through the factory.
+
+</details>
+
+**Q3. Your service keeps a map entry per user. What happens with 10 million users?**
+
+<details>
+<summary>Answer</summary>
+
+Memory grows without bound. Options: evict idle keys (sweep by last-seen, or an LRU cap), pick compact algorithms (two numbers for a token bucket instead of a log), and at that scale move state to Redis with TTLs, so expiry is handled by the store. The design already isolates state creation in one place, so swapping the `Map` for an evicting map is a local change.
+
+</details>
+
+**Q4. Fixed window vs sliding log vs token bucket: which would you choose for order placement at a broker?**
+
+<details>
+<summary>Answer</summary>
+
+A token bucket: it allows a small burst (a trader placing a basket of orders) while enforcing a sustained rate, and its state is O(1). Fixed window is too bursty at boundaries, which matters if the exchange enforces a strict per-second cap. A sliding log is exact but costs memory per request. If the downstream limit is a hard "N per second", a sliding window counter or a token bucket with `capacity = N` is the safe choice.
+
+</details>

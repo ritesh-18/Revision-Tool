@@ -1,0 +1,708 @@
+---
+title: "9. Vector Databases"
+description: "A vector database stores high-dimensional vectors (typically embeddings, see Chapter 8) and answers a single question fast: given this query vector, what..."
+---
+
+<Callout type="info">
+  How to read this chapter:
+  - 📘 **Handbook**: the original chapter text, unchanged apart from diagrams redrawn as Mermaid.
+  - 🔧 **Going deeper**: code and extra depth on topics the handbook already covers.
+  - ➕ **Beyond the handbook**: topics the original chapter does not cover at all.
+</Callout>
+
+## 9.1 Concept Explanation
+
+A vector database stores high-dimensional vectors (typically embeddings, see Chapter 8) and answers a single question fast: *given this query vector, what are the most similar vectors I have?* At small scale, you could iterate over every vector and compute similarity. At a billion vectors, that is impossible in interactive time. Vector databases use approximate nearest neighbor (ANN) algorithms to find near-best matches in milliseconds.
+
+A vector DB is not a general database with vectors added on. It is a specialized index optimized for nearest-neighbor search, often paired with conventional fields (filters, metadata) so you can scope results ("documents from this user, in this language, embedded within the last 30 days, semantically similar to this question").
+
+## 9.2 ANN — Why We Cannot Search Exactly
+
+Exact nearest-neighbor search requires comparing the query against every vector in the dataset — O(n) per query. At a million vectors, this is a few seconds; at a billion, it is minutes. Unacceptable for online use.
+
+ANN trades exactness for speed. The algorithm returns the *approximate* nearest neighbors, typically with 95–99% recall (the fraction of true top-k that appear in the returned top-k). For semantic search, this is plenty — the user does not care whether you returned the absolute best match or one of the top three.
+
+## 9.3 HNSW — The Dominant Index
+
+Hierarchical Navigable Small World (HNSW) is the most widely used ANN algorithm in production. The intuition: build a multi-layer graph where each node connects to a small set of nearby neighbors and a few far-away "shortcut" neighbors. To search, start at the top layer (sparse, fast traversal across the dataset), descend layer by layer, refining at each level until you reach the target neighborhood.
+
+Strengths: very fast queries, high recall, supports updates. Weaknesses: high memory usage (the graph structure plus the vectors themselves all in RAM is expensive at billion-scale), slower build times than some alternatives.
+
+HNSW is what powers Qdrant, Weaviate's default index, pgvector's `hnsw` index, Milvus's HNSW backend, and Pinecone's serverless offering's primary algorithm.
+
+## 9.3a HNSW parameters: M, efConstruction, efSearch 🔧
+
+Every HNSW implementation exposes the same three knobs, and knowing what each one does to memory, build time, recall and latency is what turns "HNSW is fast" into a capacity plan.
+
+### The problem
+
+Defaults work for a demo. At production scale, teams either over-provision (huge `M`, slow builds, double the RAM) or under-provision (recall quietly at 85% and nobody measured it).
+
+### Why the knobs exist (first principles)
+
+HNSW search is a greedy walk on a graph: from the current node, move to whichever neighbor is closest to the query, and stop when no neighbor is closer. A pure greedy walk gets stuck in local minima. HNSW fixes this in two ways: upper layers with long-range links get you close fast, and at the bottom layer the search keeps a candidate list of the best `ef` nodes seen so far instead of a single current node, so it can back out of dead ends. The three parameters control how well connected the graph is and how wide that candidate list is.
+
+### Mechanism: what each parameter costs
+
+| Parameter | What it controls | Raises | Costs |
+|---|---|---|---|
+| `M` | Links per node (bottom layer usually allows `2M`) | Recall ceiling, robustness on hard data | Memory per vector, build time, slightly slower queries |
+| `efConstruction` | Candidate list width while inserting | Graph quality, so recall at a given `efSearch` | Build time (roughly linear) |
+| `efSearch` | Candidate list width while querying | Recall | Query latency (roughly linear) |
+
+pgvector names them `m` (default 16), `ef_construction` (default 64) and the session setting `hnsw.ef_search` (default 40).
+
+**Memory maths.** Per vector, the graph needs the vector itself plus its bottom-layer links (upper layers add little, since each layer holds about `1/M` of the nodes below it):
+
+```text
+bytes per vector  ≈  dim × bytes_per_value  +  2M × 4      (4-byte neighbor ids)
+
+1536-dim float32, M = 16:   6144 + 128  ≈ 6.3 KB   -> 10M vectors ≈ 63 GB
+1536-dim float32, M = 64:   6144 + 512  ≈ 6.7 KB   -> link overhead now 8%
+ 384-dim float32, M = 64:   1536 + 512  ≈ 2.0 KB   -> link overhead now 33%
+```
+
+The vector dominates for large dimensions, so raising `M` is cheaper than it looks there. For small vectors, the links dominate. In pgvector the HNSW index stores its own copy of each vector, separate from the table row, so plan for both.
+
+**Latency maths.** At the bottom layer, the search pops up to about `efSearch` candidates and checks up to `2M` neighbors of each, many already visited:
+
+```text
+distance computations  ≲  efSearch × 2M     (plus a few hops per upper layer)
+
+efSearch = 40, M = 16   ->  at most ~1,280 distances
+brute force over 10M    ->  10,000,000 distances
+```
+
+Each distance is `dim` multiply-adds, so 1,280 of them at 1,536 dims is about 2 million operations, well under a millisecond on one core. The real latency driver is memory access: each candidate is a random read. If the index does not fit in RAM (or in Postgres `shared_buffers` plus the OS page cache), every hop becomes a disk read and p99 latency jumps by orders of magnitude.
+
+**Recall has no closed form.** It depends on the data's intrinsic dimensionality. It rises steeply with `efSearch` and then flattens, so measure the curve and pick the knee.
+
+### Implementation: measure the recall/latency curve
+
+```python
+import time, numpy as np, faiss
+
+d, n, nq, k = 768, 200_000, 500, 10
+rng = np.random.default_rng(0)
+xb = rng.normal(size=(n, d)).astype("float32"); faiss.normalize_L2(xb)
+xq = rng.normal(size=(nq, d)).astype("float32"); faiss.normalize_L2(xq)
+# Use your real embeddings and real queries; random data is much harder than text.
+
+flat = faiss.IndexFlatIP(d); flat.add(xb)
+_, truth = flat.search(xq, k)                       # exact top-k as ground truth
+
+index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)  # M = 32
+index.hnsw.efConstruction = 128                     # must be set before add()
+index.add(xb)
+
+for ef in (16, 32, 64, 128, 256):
+    index.hnsw.efSearch = ef
+    t = time.perf_counter(); _, got = index.search(xq, k); dt = time.perf_counter() - t
+    recall = np.mean([len(set(g) & set(t_)) / k for g, t_ in zip(got, truth)])
+    print(f"efSearch={ef:4d}  recall@{k}={recall:.3f}  {1000*dt/nq:.3f} ms/query")
+```
+
+The same tuning in pgvector:
+
+```sql
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 128);
+
+BEGIN;
+SET LOCAL hnsw.ef_search = 100;    -- per transaction, safe with connection poolers
+SELECT id FROM chunks ORDER BY embedding <=> $1 LIMIT 10;
+COMMIT;
+```
+
+### Edge cases and failure modes
+
+- **`efSearch` below `k`.** The search cannot return more than `efSearch` results. In pgvector, `LIMIT 100` with the default `ef_search = 40` returns at most 40 rows from the index scan. Set `ef_search` to at least the `LIMIT`.
+- **Changing `M` or `efConstruction` needs a rebuild.** They are baked into the graph. Only `efSearch` is free to change at query time.
+- **Build memory.** pgvector builds fastest when the graph fits in `maintenance_work_mem`. When it does not, the build continues on disk and slows down a lot (Postgres prints a notice). See 9.7a.
+- **Recall measured on random data misleads.** Real embeddings cluster, which usually makes ANN easier, but your queries may concentrate in dense regions where it is harder. Use a sample of real queries.
+- **Filtered queries change the picture.** With a restrictive filter, the effective recall drops far below the unfiltered curve. See 9.10a.
+
+## 9.4 IVF — Inverted File Index
+
+IVF partitions the vector space into clusters using a clustering algorithm (typically k-means). At query time, you find the closest few clusters and search only within them.
+
+Strengths: lower memory, faster builds, good for batch workloads. Weaknesses: lower recall than HNSW at equivalent speed, recall drops on edge-case queries (when the relevant vector happens to be in a cluster you did not search).
+
+IVF is often combined with **PQ (Product Quantization)** — compressing each vector by splitting it into sub-vectors and encoding each with a small codebook. IVF-PQ enables billion-scale indices that fit in modest memory.
+
+## 9.5 PQ and Quantization
+
+Product Quantization compresses vectors massively. A 768-dim float32 vector (3 KB) becomes a few dozen bytes. At a billion vectors, this is the difference between 3 TB of RAM and 30 GB.
+
+The cost is quality loss. PQ is lossy. Recall drops, especially for nuanced queries. The mitigation is *re-ranking*: retrieve more candidates than you need using the compressed index, then re-score the top candidates with the full-precision vectors.
+
+Scalar quantization (8-bit per dimension) and binary quantization (1-bit per dimension, with bit-level Hamming distance) are simpler alternatives gaining traction. Modern embedding models like cohere-binary and OpenAI text-embedding-3 with binary support enable order-of-magnitude storage reductions.
+
+## 9.6 Memory Layout and Internals
+
+A vector index must store:
+- The vector data (full precision, quantized, or both).
+- The index structure (graph nodes, cluster centroids, posting lists).
+- Metadata (per-vector fields, ACL tags, timestamps).
+- Indexes on metadata for filtering.
+
+Memory-resident indices are fastest. Disk-resident indices (DiskANN, Vamana) trade query latency for capacity. SSD-resident with intelligent caching is the modern compromise.
+
+Per-vector metadata is usually stored alongside or in a paired relational table. The vector DB joins or filters by metadata at query time. Filter-first vs vector-first ordering depends on filter selectivity — covered below.
+
+## 9.7 Major Vector Databases
+
+**Pinecone** — managed-only, serverless and pod-based offerings. Strong ergonomics, mature filtering, fast. Cost can climb at large scale.
+
+**Weaviate** — open-source and managed cloud. Schema-aware (objects, not just vectors). Built-in hybrid search.
+
+**Milvus** — open-source, built for billion-scale. Multiple index backends. Zilliz is the managed offering.
+
+**Qdrant** — open-source and managed cloud. Rust-based, high performance, strong filtering, payload-rich.
+
+**Chroma** — developer-friendly, embedded or hosted. Great for prototypes and small to medium scale.
+
+**pgvector** — Postgres extension. Vectors as a column. Excellent when you already have Postgres and want vector search alongside relational data. HNSW and IVF indexes supported.
+
+**Elasticsearch / OpenSearch** — keyword search engines that now support vectors. Strong hybrid search, mature ops, but vector performance trails specialized DBs at extreme scale.
+
+**Redis Vector Search** — Redis with vector capabilities. Fast for small in-memory indices. Limited at large scale.
+
+**Vespa** — Yahoo's heavyweight search engine, now open-source. Strong for combined ranking workloads. Steeper learning curve.
+
+**LanceDB, Marqo, Vald, Turbopuffer** — newer entrants with various specializations.
+
+## 9.7a pgvector in production 🔧
+
+The list above describes pgvector in one line, and since Postgres plus pgvector is a very common production choice for teams already on Postgres, this section covers the decisions that line hides. (General Postgres indexing, `EXPLAIN` and vacuum are covered in [Databases: Postgres](/docs/backend-first-principles/12-databases-postgres).) Facts below are from the pgvector README for the 0.8.x series, checked October 2026.
+
+### Schema and column types
+
+**Problem.** The obvious schema (`embedding vector(3072)`) cannot be indexed, and the error only appears when you try to create the index.
+
+**Why.** pgvector index pages have a size limit, so it caps indexable dimensions per type: `vector` up to 2,000, `halfvec` (16-bit floats) up to 4,000, `bit` up to 64,000, and `sparsevec` up to 1,000 non-zero elements.
+
+**Mechanism and implementation.** Store full precision if you want it, and index a half-precision (or truncated, see [8.11a](/docs/genai-handbook/08-embeddings)) expression:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE chunks (
+  id               text PRIMARY KEY,
+  tenant_id        uuid NOT NULL,
+  doc_id           text NOT NULL,
+  text             text NOT NULL,
+  content_hash     text NOT NULL,
+  embedding_model  text NOT NULL,
+  embedding        vector(3072) NOT NULL
+);
+
+-- 3072 dims is over the 2000 limit for vector, so index a halfvec expression.
+CREATE INDEX chunks_embedding_hnsw ON chunks
+  USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops);
+
+-- The query must use the SAME expression, or the index is ignored.
+SELECT id FROM chunks
+ORDER BY embedding::halfvec(3072) <=> $1::halfvec(3072)
+LIMIT 10;
+```
+
+**Edge cases.** Half precision halves index memory with a negligible effect on ranking for typical embeddings. The expression in `ORDER BY` must match the index expression exactly, including the cast and dimension. Check with `EXPLAIN`.
+
+### HNSW or IVFFlat
+
+**Problem.** pgvector offers two ANN indexes with different operational behavior, and the wrong choice shows up months later.
+
+**Why they differ.** IVFFlat (9.4) runs k-means on the rows that exist when you create the index, then assigns each row to its nearest centroid. HNSW (9.3) builds a graph incrementally and has no training step.
+
+**Mechanism.**
+- **HNSW**: better speed/recall trade-off, can be created on an empty table, handles inserts well. Slower to build and uses more memory.
+- **IVFFlat**: faster build, less memory. The README suggests `lists = rows / 1000` up to a million rows and `sqrt(rows)` above, and `ivfflat.probes = sqrt(lists)` as a starting point (default 1). Because the centroids come from the data at build time, create the index after loading data, and rebuild it when the data distribution changes a lot.
+
+```sql
+-- IVFFlat for a 4M-row table: sqrt(4,000,000) = 2000 lists
+CREATE INDEX ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 2000);
+SET ivfflat.probes = 45;   -- about sqrt(2000)
+```
+
+**Edge cases.** An IVFFlat index created on an empty or tiny table has meaningless centroids, and recall is poor. With `probes = 1` and a restrictive filter, IVFFlat often returns fewer rows than `LIMIT`. Default to HNSW unless build time or memory rules it out.
+
+### Building indexes without hurting production
+
+**Problem.** An HNSW build over tens of millions of rows takes hours, holds locks, and competes with live traffic.
+
+**Mechanism and implementation.**
+
+```sql
+SET maintenance_work_mem = '8GB';            -- let the graph fit in memory during the build
+SET max_parallel_maintenance_workers = 7;    -- default is 2 (plus the leader)
+CREATE INDEX CONCURRENTLY chunks_embedding_hnsw ON chunks
+  USING hnsw ((embedding::halfvec(3072)) halfvec_cosine_ops);
+```
+
+Load data first and create the index afterwards; inserting into an existing HNSW index row by row is much slower than one bulk build.
+
+**Edge cases.** `CONCURRENTLY` cannot run inside a transaction block, and if it fails it leaves an `INVALID` index that you must drop. Do not set `maintenance_work_mem` so high that the server runs out of memory. Managed Postgres services may cap these settings.
+
+### Binary quantization with re-ranking in SQL
+
+This is the pgvector version of [8.12a](/docs/genai-handbook/08-embeddings): index the sign bits, over-fetch with Hamming distance, re-rank with the full vectors.
+
+```sql
+CREATE INDEX ON chunks
+  USING hnsw ((binary_quantize(embedding)::bit(3072)) bit_hamming_ops);
+
+SELECT id FROM (
+  SELECT id, embedding
+  FROM chunks
+  ORDER BY binary_quantize(embedding)::bit(3072) <~> binary_quantize($1::vector(3072))
+  LIMIT 80                                   -- 8x over-fetch
+) candidates
+ORDER BY embedding <=> $1::vector(3072)      -- exact re-rank on 80 rows
+LIMIT 10;
+```
+
+**Edge cases.** The inner `LIMIT` is your recall dial. The re-rank reads full vectors from the table, which is fast for 80 rows but not for 8,000.
+
+### Querying from Node
+
+```ts
+import pg from 'pg';
+import pgvector from 'pgvector/pg';
+
+const pool = new pg.Pool();
+
+export async function nearest(tenantId: string, qv: number[], k = 10) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL hnsw.ef_search = 100');
+    const { rows } = await client.query(
+      `SELECT id, doc_id, text, embedding::halfvec(3072) <=> $1::halfvec(3072) AS distance
+         FROM chunks
+        WHERE tenant_id = $2
+        ORDER BY embedding::halfvec(3072) <=> $1::halfvec(3072)
+        LIMIT $3`,
+      [pgvector.toSql(qv), tenantId, k],
+    );
+    await client.query('COMMIT');
+    return rows;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+```
+
+`pgvector.toSql` serializes the array to the `[x,y,...]` text format. You only need `pgvector.registerTypes` if you read vector columns back as arrays. The `WHERE tenant_id = $2` clause turns this into a filtered search, whose pitfalls are in 9.10a.
+
+## 9.8 Comparison Table
+
+| DB | Hosting | Index | Hybrid | Filtering | Scale Sweet Spot |
+|---|---|---|---|---|---|
+| Pinecone | Managed | HNSW + proprietary | Yes (sparse-dense) | Strong | Production, hands-off |
+| Weaviate | OSS + managed | HNSW | Yes | Strong | Medium to large |
+| Milvus / Zilliz | OSS + managed | Many | Yes | Strong | Billion-scale |
+| Qdrant | OSS + managed | HNSW | Yes | Very strong | Medium to large |
+| Chroma | OSS + managed | HNSW | Limited | Basic | Prototype to medium |
+| pgvector | Postgres | HNSW + IVF | Via FTS | Excellent (SQL) | Small to medium |
+| OpenSearch | OSS + managed | HNSW | Yes | Excellent | Medium to large |
+| Redis | OSS + managed | Flat + HNSW | Yes | Decent | Small in-memory |
+| Vespa | OSS + managed | Many | Yes | Excellent | Large with ranking |
+
+There is no universal best. Pick by what you already operate, what scale you target, and how rich your filtering needs are.
+
+## 9.9 Hybrid Search
+
+Pure vector search misses exact matches. If the user asks for "ERROR-4521" (an error code), embedding might not retrieve the exact document. Hybrid search combines vector (semantic) and BM25 (keyword) scores, ranked together.
+
+Two approaches:
+- **Score fusion** — run both searches, combine scores with weights or Reciprocal Rank Fusion (RRF).
+- **Sparse-dense hybrid** — store both a sparse vector (BM25-like) and a dense vector per document; the index handles both.
+
+Hybrid search routinely outperforms pure vector or pure keyword on real-world retrieval benchmarks. Most production RAG systems use it.
+
+## 9.9a Reciprocal Rank Fusion in code 🔧
+
+The handbook names RRF as a fusion method, and since it is the default fusion in most hybrid systems, here is why it works and how to implement it. (How BM25 itself scores documents is covered in [Full-text search and Elasticsearch](/docs/backend-first-principles/15-full-text-search-elasticsearch).)
+
+### The problem: scores from different retrievers are not comparable
+
+A cosine similarity lives roughly in 0.2 to 0.9 and bunches tightly. A BM25 score is unbounded and depends on term statistics, so it can be 3 for one query and 40 for the next. Adding them, even with weights, lets whichever scale is larger dominate, and the right weight changes per query.
+
+### Why ranks fix it (first principles)
+
+Ranks are on the same scale for every retriever: first is first. RRF (Cormack, Clarke and Buettcher, 2009) throws away scores and sums a decreasing function of rank:
+
+```text
+RRF(d) = sum over retrievers r of   1 / (k + rank_r(d))        rank starts at 1, k = 60 by convention
+```
+
+The constant `k` flattens the curve. With `k = 60`, rank 1 contributes `1/61 ≈ 0.0164` and rank 10 contributes `1/70 ≈ 0.0143`, so being near the top of *both* lists beats being first in one and absent from the other. That rewards agreement, which is what you want from two retrievers with different blind spots.
+
+### Implementation in TypeScript
+
+```ts
+type Ranked = { id: string }[];   // each list already sorted best-first
+
+export function rrf(lists: Ranked[], k = 60, weights?: number[]): { id: string; score: number }[] {
+  const scores = new Map<string, number>();
+  lists.forEach((list, li) => {
+    const w = weights?.[li] ?? 1;
+    const seen = new Set<string>();
+    list.forEach((item, i) => {
+      if (seen.has(item.id)) return;   // duplicates inside one list count once
+      seen.add(item.id);
+      scores.set(item.id, (scores.get(item.id) ?? 0) + w / (k + i + 1));
+    });
+  });
+  return [...scores.entries()]
+    .map(([id, score]) => ({ id, score }))
+    .sort((a, b) => b.score - a.score);
+}
+
+// const fused = rrf([vectorHits, keywordHits]).slice(0, 20);
+```
+
+### Implementation inside Postgres
+
+With pgvector and Postgres full-text search, you can fuse in one query. This follows the pattern from the pgvector examples repository:
+
+```sql
+WITH semantic AS (
+  SELECT id, RANK() OVER (ORDER BY embedding <=> $1) AS rank
+  FROM chunks
+  WHERE tenant_id = $3
+  ORDER BY embedding <=> $1
+  LIMIT 50
+),
+keyword AS (
+  SELECT id, RANK() OVER (ORDER BY ts_rank_cd(tsv, q) DESC) AS rank
+  FROM chunks, websearch_to_tsquery('english', $2) AS q
+  WHERE tsv @@ q AND tenant_id = $3
+  ORDER BY ts_rank_cd(tsv, q) DESC
+  LIMIT 50
+)
+SELECT COALESCE(s.id, kw.id) AS id,
+       COALESCE(1.0 / (60 + s.rank), 0) + COALESCE(1.0 / (60 + kw.rank), 0) AS score
+FROM semantic s
+FULL OUTER JOIN keyword kw ON s.id = kw.id
+ORDER BY score DESC
+LIMIT 20;
+```
+
+Here `tsv` is a stored `tsvector` column with a GIN index, for example `tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED`.
+
+### Edge cases and failure modes
+
+- **`ts_rank_cd` is not BM25.** Postgres ranking ignores corpus-wide term rarity in the way BM25 uses it. For true BM25 inside Postgres you need an extension or a separate search engine. RRF only uses the order, which softens the difference, but the keyword list itself is weaker.
+- **One list is empty.** A query with no keyword matches (or one that `websearch_to_tsquery` turns into nothing) silently becomes pure vector search. That is usually the right behavior, but log it.
+- **Depth of each list.** Fusing the top 50 of each list is typical. A document ranked 51st in one list contributes nothing from that list, so very short lists reduce the benefit.
+- **Weights.** Weighted RRF (the `weights` argument) lets you favor one retriever, for example keyword for queries that look like error codes. Tune weights on a golden set, not by intuition.
+- **RRF scores are not probabilities.** Do not threshold them across queries. Use a reranker (10.9) if you need a relevance cutoff.
+
+## 9.10 Filtering Strategies
+
+Real queries are scoped: "documents I have access to, in English, modified this year, semantically similar to my question." How filters compose with vector search materially affects performance.
+
+- **Pre-filter (filter then search).** Restrict candidate set first, search vectors among those. Best when filter is highly selective (returns 0.1% of corpus). Worst when filter is barely selective (returns 90%) — you have done a lot of metadata work for nothing.
+- **Post-filter (search then filter).** Search vectors first, drop non-matching results. Best when filter is loose. Risk: if filter is restrictive, your top-k may return zero matches.
+- **Integrated filtering.** Modern vector DBs (Qdrant, Weaviate, Milvus) build the filter into the index traversal, achieving both correctness and performance.
+
+This is one of the hard problems in vector DB design. Different DBs handle it differently; benchmark on your filter distribution.
+
+## 9.10a Why post-filtering starves, and pgvector's iterative scans 🔧
+
+The three strategies above are easiest to choose between once you can predict how many results a filtered query actually returns, so this section adds the arithmetic and the pgvector settings.
+
+### The problem
+
+A query like "top 10 chunks for this tenant" returns 3 rows, or 0, even though the tenant has thousands of matching chunks. Nothing errors.
+
+### Why it happens (first principles)
+
+An ANN index finds the nearest vectors in the *whole* collection. If the filter is applied afterwards, the number of survivors is roughly:
+
+```text
+expected rows  ≈  candidates returned by the index  ×  selectivity of the filter
+
+pgvector default: ef_search = 40 candidates
+tenant holds 1% of rows    ->  40 × 0.01  = 0.4 rows expected
+tenant holds 20% of rows   ->  40 × 0.20  = 8 rows   (still short of LIMIT 10)
+```
+
+The nearest neighbors of the query, globally, mostly belong to other tenants. Raising `ef_search` helps linearly, but for a 0.1% filter you would need `ef_search` in the tens of thousands, at which point the index is no faster than a scan.
+
+### Mechanism: the options in pgvector
+
+1. **Iterative index scans (pgvector 0.8.0 and later).** When the filtered result is short, the index scan keeps going and fetches more candidates, until it has enough rows or hits a limit. `hnsw.iterative_scan` takes `strict_order` (results stay exactly ordered by distance) or `relaxed_order` (slightly out of order, better recall and speed). `hnsw.max_scan_tuples` (default 20,000) caps the work. IVFFlat has `ivfflat.iterative_scan = relaxed_order` and `ivfflat.max_probes`.
+2. **Let the planner pre-filter.** With a B-tree index on the filter column, Postgres can choose to fetch the matching rows first and compute exact distances for them. For a very selective filter (a few thousand rows), this exact scan is fast and has perfect recall.
+3. **Partial indexes** for a small set of common filter values, and **partitioning** when there are many values (for example one partition per tenant, see 9.14a). Each partition gets its own small HNSW index, so the filter is applied structurally before the vector search.
+
+### Implementation
+
+```sql
+-- Option 1: iterative scan, relaxed order, then re-sort the small result set.
+BEGIN;
+SET LOCAL hnsw.iterative_scan = relaxed_order;
+SET LOCAL hnsw.max_scan_tuples = 40000;
+WITH hits AS MATERIALIZED (
+  SELECT id, embedding <=> $1 AS distance
+  FROM chunks
+  WHERE tenant_id = $2 AND lang = 'en'
+  ORDER BY distance
+  LIMIT 10
+)
+SELECT * FROM hits ORDER BY distance;    -- restore strict order
+COMMIT;
+
+-- Option 2: give the planner a pre-filter path.
+CREATE INDEX ON chunks (tenant_id);
+
+-- Option 3: a partial HNSW index for one hot filter value.
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops) WHERE lang = 'en';
+```
+
+### Edge cases and failure modes
+
+- **`max_scan_tuples` still caps recall.** With a 0.01% filter, 20,000 scanned tuples may still yield too few rows. For filters that tight, the exact pre-filter path (option 2) is better. Check what the planner chose with `EXPLAIN ANALYZE`.
+- **Plan flips.** The planner picks between index scan and pre-filter using row estimates. Stale statistics (`ANALYZE` not run after a big load) can make it pick the wrong path for some tenants and not others, which looks like random latency spikes.
+- **`SET` vs `SET LOCAL`.** Behind a transaction-mode connection pooler (PgBouncer and similar), a plain `SET` can leak to another client's session or be lost. Use `SET LOCAL` inside a transaction.
+- **Row-level security is a post-filter too.** RLS policies are applied as filters on the index scan's output, so they have exactly this starvation behavior. Enable iterative scans for RLS-protected vector tables.
+- **Other engines.** Qdrant, Weaviate and Milvus apply filters during graph traversal, which avoids most of this, but very selective filters can still disconnect the graph. They typically switch to exact search below a threshold. Read how your engine decides.
+
+## 9.11 Production Architecture
+
+<Mermaid chart={`flowchart TD
+  A["Application"] --> B["Vector DB client"]
+  B -- "ANN query" --> C["Vector index<br/>(HNSW/IVF/etc.)"]
+  B -- "BM25 query" --> D["Sparse index (optional)"]
+  B -- "Metadata filter" --> E["Filter index"]
+  C --> F["Result fusion / re-ranking"]
+  D --> F
+  E --> F
+  F --> G["Cross-encoder reranker (optional)"]
+  G --> H["Top-k results back to application"]`} />
+
+Sharding and replication are standard at scale. Shard by document ID or by tenant. Replicate for read throughput and availability.
+
+## 9.12 Scaling Challenges
+
+- **Index build time** at billion-scale can take days. Plan incremental updates and periodic reindex windows.
+- **Memory blowup** — HNSW indices are memory-hungry. Switch to disk-resident (DiskANN) when RAM cost dominates.
+- **Hot keys** — when one tenant dominates traffic, sharding by tenant produces hot shards. Hash-shard or rebalance.
+- **Refresh latency** — newly ingested documents may not appear in search for seconds to minutes. Document the SLA.
+
+## 9.12a Deletes, updates and index health ➕
+
+The scaling list covers growth, but not what happens when vectors are removed or changed, which every real corpus does constantly.
+
+### The problem
+
+After months of edits and deletions, search gets slower and recall drops, even though the row count is flat. Or a deleted document keeps showing up in answers.
+
+### Why it happens (first principles)
+
+A graph index cannot simply drop a node. Other nodes link to it, and those links are part of the paths searches follow. Removing it outright would cut paths and strand parts of the graph. So most engines **tombstone** the node: mark it deleted, skip it in results, but keep walking through it. An update is a delete plus an insert, since a changed vector belongs in a different place in the graph. Over time:
+- Tombstoned nodes still cost traversal time but never produce results. A collection that is 30% tombstones behaves like a post-filter with 70% selectivity (see 9.10a).
+- New nodes are linked into a graph shaped by old data, so graph quality slowly decays.
+
+Postgres adds its own layer: MVCC. `DELETE` and `UPDATE` leave dead row versions, and the HNSW index keeps pointing at them until `VACUUM` removes the entries and repairs the neighbors' links.
+
+### Mechanism: how engines clean up
+
+- **Postgres + pgvector**: autovacuum removes dead index entries and reconnects neighbors. The README notes that vacuuming HNSW indexes can be slow and suggests `REINDEX INDEX CONCURRENTLY` first to speed it up.
+- **Dedicated engines** (Qdrant, Milvus, Weaviate, and others) store data in segments and run background optimizers or compaction that rewrite segments without the deleted points. Check how your engine schedules this and whether you can trigger it.
+- **Periodic rebuild**: the blunt but reliable option. 9.21's "reindex as a quarterly drill" covers this.
+
+### Implementation: replace a document's chunks atomically, then watch health
+
+```sql
+-- Re-ingesting a document: delete old chunks and insert new ones in ONE transaction,
+-- so readers see either the old version or the new one, never a mix or nothing.
+BEGIN;
+DELETE FROM chunks WHERE doc_id = $1;
+INSERT INTO chunks (id, tenant_id, doc_id, text, content_hash, embedding_model, embedding)
+SELECT * FROM unnest($2::text[], $3::uuid[], $4::text[], $5::text[], $6::text[], $7::text[], $8::vector[]);
+COMMIT;
+
+-- Health check: dead tuples and last vacuum per table
+SELECT relname, n_live_tup, n_dead_tup, last_autovacuum
+FROM pg_stat_user_tables WHERE relname = 'chunks';
+
+-- Rebuild a degraded index without blocking reads or writes
+REINDEX INDEX CONCURRENTLY chunks_embedding_hnsw;
+```
+
+For a hot table, tune autovacuum per table so it runs before dead tuples pile up:
+
+```sql
+ALTER TABLE chunks SET (autovacuum_vacuum_scale_factor = 0.02);
+```
+
+### Edge cases and failure modes
+
+- **Delete-and-reinsert of unchanged chunks.** Re-ingesting a whole document when one paragraph changed churns the index for nothing. Compare content hashes per chunk and only touch changed ones (see [freshness and incremental ingestion](/docs/genai-handbook/10-rag)).
+- **Soft deletes.** An `is_deleted` flag avoids index churn but turns every query into a filtered query, with the starvation risk from 9.10a. Hard-delete in the background.
+- **"Deleted" is not gone.** Backups, replicas, caches of retrieved chunks and cached LLM answers all still hold the content. A right-to-erasure request must cover every copy, including vectors, since embeddings can leak information about their source text (8.13).
+- **Eventual consistency.** In engines with asynchronous indexing, a delete may take seconds to stop appearing in results. If a deletion must be immediate (a revoked document), also filter it out at the application layer until the engine confirms.
+
+## 9.13 Replication and Sharding
+
+- **Sharding** distributes vectors across nodes. Each query fans out to all shards, gathers candidates, and merges. More shards = more parallelism but more network coordination.
+- **Replication** copies shards to multiple nodes. More replicas = more read throughput, higher availability, higher cost.
+- **Consistency** — most vector DBs offer eventual consistency for new inserts. If you need read-after-write, check carefully.
+
+## 9.14 Security Concerns
+
+- Multi-tenant isolation: separate collections per tenant for hard isolation, or shared collection with per-document tenant_id and mandatory filter at the application boundary.
+- Encryption at rest and in transit — table stakes; verify your provider supports it.
+- Backup and restore — operational discipline; vector DBs are databases.
+- Audit logging — track who queried what, especially in regulated industries.
+
+## 9.14a Multi-tenant isolation patterns 🔧
+
+The first bullet above names the two ends of the isolation spectrum, and this section works through the options in between with Postgres code, since "Design a multi-tenant retrieval system" is also an interview question in 9.18.
+
+### The problem
+
+One shared index is cheap and simple, but a single missing `WHERE tenant_id = ...` leaks one customer's documents into another customer's answers. One index per tenant is safe but expensive, and with 10,000 tenants it becomes an operations problem.
+
+### Why it is harder for vectors than for normal tables
+
+In a relational table, a tenant filter on an indexed column is cheap and exact. In a vector index, as 9.10a shows, a tenant filter on a shared HNSW graph is a selective filter on an approximate search, so small tenants get poor recall or empty results. Isolation therefore affects quality as well as security.
+
+### Mechanism: three levels
+
+| Level | How | Isolation | Cost and limits |
+|---|---|---|---|
+| Shared table, tenant column | `tenant_id` on every row, enforced filter | Logical only | Cheapest; filtered-search recall issues for small tenants |
+| Partition or namespace per tenant | Postgres list partitions, Pinecone namespaces, Milvus partitions | Structural; each tenant has its own small index | Thousands of partitions add planner and memory overhead |
+| Database or collection per tenant | Separate DB, cluster or collection | Strongest; separate keys, backups, regions | Highest cost; needed for strict contracts or data residency |
+
+A common hybrid: big or regulated tenants get their own partition or database, the long tail shares a table.
+
+### Implementation 1: shared table with row-level security
+
+RLS makes the database enforce the tenant filter, so a forgotten `WHERE` in application code cannot leak data.
+
+```sql
+ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chunks FORCE ROW LEVEL SECURITY;   -- apply to the table owner too
+
+CREATE POLICY tenant_isolation ON chunks
+  USING (tenant_id = current_setting('app.tenant_id')::uuid);
+```
+
+```ts
+// Every request runs in a transaction that pins the tenant first.
+export async function withTenant<T>(tenantId: string, fn: (c: pg.PoolClient) => Promise<T>) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // set_config(..., true) is the function form of SET LOCAL and accepts a bind parameter
+    await client.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId]);
+    await client.query("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"); // RLS is a post-filter (9.10a)
+    const out = await fn(client);
+    await client.query('COMMIT');
+    return out;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+```
+
+### Implementation 2: a partition per large tenant
+
+```sql
+CREATE TABLE chunks_p (
+  id text, tenant_id uuid NOT NULL, text text, embedding vector(1024),
+  PRIMARY KEY (tenant_id, id)
+) PARTITION BY LIST (tenant_id);
+
+CREATE TABLE chunks_acme   PARTITION OF chunks_p FOR VALUES IN ('7f9c0d3e-1111-4a2b-9c3d-000000000001');
+CREATE TABLE chunks_shared PARTITION OF chunks_p DEFAULT;          -- long-tail tenants
+
+-- Created on the parent, this builds one HNSW index per partition.
+CREATE INDEX ON chunks_p USING hnsw (embedding vector_cosine_ops);
+
+-- Offboarding a big tenant is a metadata operation, not a giant DELETE:
+-- ALTER TABLE chunks_p DETACH PARTITION chunks_acme;  DROP TABLE chunks_acme;
+```
+
+A query with `WHERE tenant_id = $1` is pruned to one partition, so a large tenant searches only its own graph.
+
+### Edge cases and failure modes
+
+- **Superusers and `BYPASSRLS` roles skip policies.** The application must connect as an ordinary role. Test that a query without the setting returns nothing (with the policy above, `current_setting` raises an error when the setting is missing, which is the safe failure).
+- **Pooled connections.** A session-level `SET app.tenant_id` on a pooled connection leaks to the next request that reuses it. Use the transaction-scoped form shown above.
+- **Caches cross tenants.** Query-embedding caches are safe to share, but caches of retrieved chunks or generated answers must be keyed by tenant (and by user, if permissions differ within a tenant, see [10.20a](/docs/genai-handbook/10-rag)).
+- **Noisy neighbors.** A big tenant's bulk ingestion triggers index builds and vacuum that slow everyone on the same instance. Separate ingestion capacity, or move that tenant to its own partition or database.
+- **Too many partitions.** Postgres handles hundreds to low thousands of partitions well. Tens of thousands slow planning and use memory. Group the long tail in the shared partition.
+
+## 9.15 Deployment Guide
+
+For managed: pick by feature fit, sign up, allocate the right tier. For self-hosted: containerize, deploy on Kubernetes with persistent storage, expose via internal service, autoscale read replicas. Monitor disk, memory, p99 query latency, and replication lag.
+
+## 9.16 Monitoring Strategy
+
+- p50, p95, p99 query latency.
+- Indexing throughput.
+- Recall on a golden set (run nightly).
+- Memory and disk usage trends.
+- Per-tenant or per-namespace query volume.
+- Error rate by query type.
+
+## 9.17 Cost Optimization
+
+- Quantization (PQ, scalar, binary).
+- Lower-dim embeddings if quality allows.
+- Tier old data to disk-resident indices.
+- Right-size the managed tier — many teams over-provision.
+- For Pinecone-class managed services, watch the storage/query split in pricing and optimize for whichever dominates.
+
+## 9.18 Interview Questions
+
+- Walk through HNSW vs IVF.
+- How do filters interact with ANN search?
+- Compare three vector databases.
+- Design a multi-tenant retrieval system.
+- How do you handle re-embedding at scale?
+- ➕ What do `M`, `efConstruction` and `efSearch` trade off? **`M` is links per node (memory and recall ceiling), `efConstruction` is build-time candidate width (graph quality vs build time), `efSearch` is query-time candidate width (recall vs latency). Only `efSearch` can change without a rebuild.**
+- ➕ A tenant-filtered pgvector query returns 2 rows for `LIMIT 10`. Why, and what fixes it? **The HNSW scan returns about `ef_search` global candidates and the filter removes most of them. Enable `hnsw.iterative_scan`, let the planner pre-filter with a B-tree index, or partition by tenant.**
+- ➕ Why does RRF use ranks instead of scores? **Cosine and BM25 scores are on unrelated scales that vary per query. Ranks are comparable, and `1 / (60 + rank)` rewards documents that both retrievers place high.**
+- ➕ Why do HNSW indexes degrade with deletes? **Deleted nodes are tombstoned and still traversed, so they cost time and act like a filter. Vacuum, compaction or a periodic rebuild restores health.**
+- ➕ How do you index 3,072-dim vectors in pgvector? **The `vector` type indexes only up to 2,000 dims. Index a `halfvec` expression (up to 4,000) or a Matryoshka-truncated copy, and query with the same expression.**
+
+## 9.19 Hands-on Exercises
+
+1. Sketch the index structure of HNSW on paper.
+2. For a 100M-vector corpus with 1024-dim embeddings, plan a storage and memory budget.
+3. Design a hybrid search ranker combining BM25 and cosine.
+4. Plan a zero-downtime migration from one vector DB to another.
+
+## 9.20 Common Mistakes
+
+- Picking a vector DB before measuring traffic and filter patterns.
+- Ignoring filter selectivity in performance planning.
+- Skipping re-ranking when pure vector recall is mediocre.
+- Treating the vector DB as a stable long-term contract — formats and APIs evolve fast.
+
+## 9.21 Enterprise Best Practices
+
+Encapsulate vector DB access behind an internal service so you can swap providers. Maintain a golden retrieval evaluation set and run it nightly. Plan capacity in tenants and growth rate, not in raw vectors. Document the recall and latency SLA per index. Treat reindex as a quarterly drill, not an emergency.
+
+## Sources
+
+- [pgvector README](https://github.com/pgvector/pgvector) (0.8.x: HNSW and IVFFlat options and defaults, iterative index scans, dimension limits, `halfvec`, binary quantization, filtering, build settings, vacuum). Checked October 2026.
+- [pgvector-node](https://github.com/pgvector/pgvector-node) (`pgvector/pg`, `toSql`, `registerTypes`).
+- [pgvector-python hybrid search RRF example](https://github.com/pgvector/pgvector-python/blob/master/examples/hybrid_search/rrf.py) (SQL fusion pattern).
+- Malkov and Yashunin, [Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs](https://arxiv.org/abs/1603.09320), IEEE TPAMI 2018.
+- Cormack, Clarke and Buettcher, [Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf), SIGIR 2009.
+- [Faiss wiki: HNSW and index parameters](https://github.com/facebookresearch/faiss/wiki).
+- PostgreSQL documentation: [Row Security Policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html), [Table Partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html), [Text Search ranking](https://www.postgresql.org/docs/current/textsearch-controls.html).

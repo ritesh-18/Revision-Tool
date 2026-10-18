@@ -1,0 +1,1070 @@
+---
+title: "Caching, the Secret Behind It All"
+description: What caching is, where it lives (CDN, DNS, CPU, RAM), how in-memory stores like Redis work, cache-aside vs write-through, eviction policies, and the four everyday backend use cases, solved at the engineering level.
+---
+
+<Callout type="info">
+  Notes for [Caching, the secret behind it all](https://youtu.be/estH64OkwxU) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The lesson builds caching from one sentence ("do less work, less often") up to the concrete Redis patterns a backend engineer uses every day. **It starts with why big platforms can't live without it, walks down the layers where caches exist, and ends with database, session, API and rate-limit caching.**
+
+<Mermaid chart={`flowchart LR
+  A["Definition"] --> B["3 real-world examples"]
+  B --> C["3 levels: network, hardware, software"]
+  C --> D["CDN"]
+  D --> E["DNS"]
+  E --> F["CPU caches + RAM"]
+  F --> G["In-memory KV stores"]
+  G --> H["Cache-aside vs write-through"]
+  H --> I["Eviction policies"]
+  I --> J["4 backend use cases"]`} />
+
+---
+
+## 1. What caching actually is 🎓
+
+**The one-line version:** caching is a way to cut the **time and effort** needed to do some piece of work.
+
+**The technical version:** you keep a **subset** of some primary data in a place that is **faster and cheaper to read from**. Which subset you keep depends on how often each piece is used, how likely it is to be used next, and similar signals.
+
+Two words in that definition carry the whole topic:
+
+- **Subset.** You never cache everything. Fast storage (RAM, edge servers) is **more expensive and smaller** than disk-based storage. Caching all of it would cost a fortune and defeat the purpose.
+- **Faster location.** The cache only helps if reading from it is much cheaper than recomputing or refetching the original.
+
+Vocabulary you will use constantly:
+
+| Term | Meaning |
+|---|---|
+| **Cache hit** | The data you asked for is in the cache, so you return it immediately |
+| **Cache miss** | It isn't, so you do the slow path (compute or fetch from the source) and usually store the result for next time |
+| **TTL (time to live)** | How long an entry is allowed to stay before it is considered stale |
+
+### 🔧 Why a cache pays off: the hit-ratio math
+The average cost of a read with a cache in front is:
+
+> `average latency = hitRatio × cacheLatency + (1 − hitRatio) × originLatency`
+
+Say Redis answers in 1 ms and a heavy Postgres query takes 200 ms.
+
+| Hit ratio | Average latency | Origin load |
+|---|---|---|
+| 0% | 200 ms | 100% of requests |
+| 80% | 0.8 × 1 + 0.2 × 200 = **40.8 ms** | 20% |
+| 95% | 0.95 × 1 + 0.05 × 200 = **10.95 ms** | 5% |
+| 99% | **2.99 ms** | 1% |
+
+Two lessons from the numbers: **the miss path dominates** (going from 95% to 99% cuts latency almost 4×), and a cache is also a **load shield**, because the origin only sees the misses.
+
+---
+
+## 2. Three examples that show the pattern 🎓
+
+### Google search: cache expensive computation
+- **Problem:** answering a query means running crawling, indexing and ranking pipelines over billions of pages. That is CPU- and memory-heavy. A query like "what is the weather today" is typed **millions of times a day**; recomputing it every time would mean huge latency and server load.
+- **Mechanism:** a **distributed in-memory cache**, with cache servers spread around the world. When a query comes in, the system checks the cache first. **Hit:** return instantly. **Miss:** run the full pipeline, then store the result so the next person (or the same person) gets a hit.
+
+### Netflix: cache heavy data close to the user
+- **Problem:** Netflix ships huge volumes of video to users everywhere. Each title is also **encoded into several resolutions** (1080p, 720p, 480p…) so the right version can be sent for the device and network speed. Serving all of that from origin servers in one country means people far away get long latency and buffering, and the origin gets crushed.
+- **Mechanism:** a **CDN (content delivery network)**. Copies of content sit on **edge servers** placed in many regions, so a user in India is served from nearby instead of from the US.
+- **Subset again:** Netflix doesn't put its whole catalogue on every edge. It uses trend analysis and machine learning on what each region watches to decide **which subset** to cache where.
+- 🎓 The same idea serves web pages too: static assets (JS, HTML, CSS) are served from edges. Platforms like **Vercel** run an edge network that answers from the region closest to you.
+
+### X (Twitter) trending: cache a result that changes slowly
+- **Problem:** working out trending topics means analysing millions of tweets with ML and lots of GPUs. If every visit to the trending tab triggered that computation, the servers would fall over within seconds.
+- **Why it's safe to cache:** trends change over **hours or days**, not seconds. An election stays trending for a long time.
+- **Mechanism:** a background computation runs **every few minutes** (the exact schedule isn't public), and writes its output to an **in-memory key-value store such as Redis**. User requests just read that key, which is why the tab opens instantly.
+
+### The pattern
+Caching shows up whenever you want to avoid **(a) repeating heavy computation** or **(b) repeatedly moving heavy data**.
+
+<Mermaid chart={`flowchart TD
+  Q{"Is the work expensive<br/>and repeated?"}
+  Q -->|"heavy computation"| C1["Cache the RESULT<br/>search results, trends, query output"]
+  Q -->|"heavy data transfer"| C2["Cache the BYTES near the user<br/>CDN edges"]
+  Q -->|"neither"| N["Don't cache: added complexity for nothing"]
+  C1 --> S{"Does it change slowly<br/>compared with how often it's read?"}
+  C2 --> S
+  S -->|"yes"| OK["Good candidate: pick a TTL"]
+  S -->|"no, must be real-time"| NO["Cache very briefly or not at all"]`} />
+
+---
+
+## 3. The three levels you'll meet as a backend engineer 🎓
+
+Caching exists everywhere (hardware, OS, browsers, networks). The lesson narrows it to three levels:
+
+| Level | Examples | How you interact |
+|---|---|---|
+| **Network** | CDN, DNS | Headers, TTLs, provider config |
+| **Hardware** | CPU L1/L2/L3, RAM | Indirectly (data layout, access patterns) |
+| **Software** | Redis, Memcached, ElastiCache | A client library in your code |
+
+"Software caching" isn't purely software: Redis is fast **because** it sits in RAM, a hardware cache layer. It's called software caching because you talk to it through a library.
+
+---
+
+## 4. Network level: how a CDN works 🎓
+
+**Goal:** cache content on servers geographically close to the user (the **edge**), to reduce latency and take load off the **origin**.
+
+Terms:
+- **Edge server / edge node:** a cache server near users. Anything called "edge" means "it runs close to you, not at the origin".
+- **PoP (point of presence):** a location that groups several edge servers for a region.
+- **Origin server:** where the real, authoritative content lives.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant U as Browser
+  participant D as CDN DNS
+  participant E as Edge server in nearest PoP
+  participant O as Origin
+  U->>D: resolve cdn.example.com
+  D-->>U: IP of the best PoP (location, network conditions)
+  U->>E: GET /video/ep1/720p/seg42
+  alt cache hit and TTL not expired
+    E-->>U: content from the edge
+  else cache miss or expired
+    E->>O: fetch the content
+    O-->>E: content + caching headers
+    E->>E: store with a TTL
+    E-->>U: content
+  end`} />
+
+1. The user enters a URL. The browser sends a **DNS query** to turn the domain into an IP.
+2. The **CDN's DNS** routes the user to the **nearest PoP**, based on location and **network conditions**. (The lesson's example: a user in New York is sent to a PoP near New York. On a poor connection, the routing may favour a PoP that can serve a lower-quality version with less buffering.)
+3. The edge server checks its cache. **Hit:** serve it. **Miss:** fetch from the origin (say, in the US while the user is in India), serve it, and keep a copy.
+4. Every cached item has a **TTL**. Companies choose a sensible duration (for example a few hours), after which the next request goes back to the origin for a fresh copy, and that copy gets a new TTL.
+
+### 🔧 Going deeper: how you control a CDN from the backend
+You don't usually configure each edge. You **set HTTP headers on the origin response**, and the CDN obeys them.
+
+```ts title="cache-headers.ts"
+// Immutable, content-hashed asset: cache for a year, never revalidate
+res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+
+// HTML or API that can be slightly stale:
+//   browsers cache 60 s, the CDN caches 5 min (s-maxage),
+//   and after that the CDN may serve the stale copy for 1 more minute while it refetches in the background
+res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=60');
+
+// Per-user or sensitive response: never store in shared caches
+res.setHeader('Cache-Control', 'private, no-store');
+```
+
+**Edge cases:**
+- **Stale content after a deploy:** if the URL stays the same, edges keep the old copy until the TTL expires. Fix it with **content-hashed file names** (a new hash means a new URL) or an explicit **purge** through the CDN's API.
+- **Never cache personalised responses publicly.** A response that depends on cookies or `Authorization` must be `private` or `no-store`, or one user's data can be served to another.
+
+---
+
+## 5. Network level: DNS caching 🎓
+
+### Problem
+Turning `example.com` into an IP can take several network round trips to different servers. Billions of users do this all the time, so doing the full lookup on every request would be slow and would hammer the DNS infrastructure.
+
+### The full lookup (what caching saves you from)
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant C as Your device
+  participant R as Recursive resolver<br/>ISP or 1.1.1.1 / 8.8.8.8
+  participant Root as Root server
+  participant TLD as .com TLD server
+  participant A as Authoritative server<br/>for example.com
+  C->>R: IP of example.com?
+  R->>R: check local cache
+  alt cached
+    R-->>C: IP (cache hit)
+  else not cached
+    R->>Root: example.com?
+    Root-->>R: ask the .com TLD servers (referral)
+    R->>TLD: example.com?
+    TLD-->>R: ask example.com's authoritative servers (referral)
+    R->>A: example.com?
+    A-->>R: 93.184.x.x with a TTL
+    R->>R: cache the answer for its TTL
+    R-->>C: IP
+  end`} />
+
+- The **recursive resolver** is run by your **ISP** (for example Jio, ACT or Airtel in India) or by a public DNS provider such as **Google** or **Cloudflare**. It's called *recursive* because it keeps following referrals until it reaches the answer.
+- **Root servers** don't know `example.com`, but they know where the **TLD** servers for `.com`, `.in` and so on are.
+- The **TLD** server doesn't know the IP either, but it knows the **authoritative name server** for `example.com`, which finally gives the answer.
+
+### Where the caches are
+DNS is cached at **several layers**, each one checked before the next:
+
+<Mermaid chart={`flowchart LR
+  B["Browser DNS cache"] -->|miss| OS["OS resolver cache"]
+  OS -->|miss| R["Recursive resolver cache"]
+  R -->|miss| W["Root, TLD, authoritative<br/>(some also cache)"]
+  B -->|hit| IP["IP address"]
+  OS -->|hit| IP
+  R -->|hit| IP
+  W --> IP`} />
+
+(The lesson describes the OS checking first and the browser next. In practice the browser normally checks its own cache before asking the OS; either way, the principle is the same: every layer that remembers the answer skips all the layers behind it.)
+
+### 🔧 Going deeper
+- **TTL comes from the record.** The authoritative server publishes a TTL with each record (for example 300 s), and every cache along the way honours it. This is why a DNS change "takes time to propagate": old answers live until their TTLs expire. **Lower the TTL a day before a planned migration**, then raise it again afterwards.
+- **Root servers:** the lesson isn't sure whether there are 13 or 14. There are **13 named root server identities** (`a` to `m`.root-servers.net), but each one is served by many machines worldwide through **anycast**, so there are well over a thousand actual instances.
+- **Negative caching:** "this name doesn't exist" (NXDOMAIN) answers are cached too, so a typo'd domain doesn't cause repeated full lookups.
+- See it yourself: `dig example.com` shows the remaining TTL in the answer, and running it twice shows it counting down from the resolver's cache. On Windows, `ipconfig /displaydns` lists the OS cache.
+
+---
+
+## 6. Hardware level: CPU caches and RAM 🎓
+
+<Mermaid chart={`flowchart LR
+  CPU["CPU core"] --> L1["L1 cache<br/>smallest, fastest"]
+  L1 --> L2["L2 cache"]
+  L2 --> L3["L3 cache<br/>shared between cores"]
+  L3 --> RAM["RAM / main memory<br/>fast, volatile, limited"]
+  RAM --> DISK["SSD / HDD<br/>slow, persistent, large"]`} />
+
+- The CPU keeps **L1, L2 and L3** caches so that frequently used data and repeated computations don't have to come from RAM each time. L3 is **shared** between cores.
+- **The array example:** iterating an array in order is fast because the CPU **predicts** you'll want the next elements and loads the surrounding block of memory into cache ahead of time. That is why sequential array access beats jumping around.
+
+### Why RAM is fast, and why it can't replace disk
+- **RAM (random access memory)** reaches any address directly with electrical signals. Access time is **roughly the same wherever the data is**, which is exactly what "random access" means.
+- A **hard disk** is mechanical: a head physically moves to where the data is. (🔧 SSDs have no moving parts, but they are still orders of magnitude slower than RAM.)
+- **The trade-off:** RAM gives you speed but is **limited in capacity** and **volatile**: power off and its contents are gone. Disk is slower but **persistent** and cheap per GB. So RAM is not a replacement for disk; each has its job.
+
+🔧 Rough orders of magnitude (they vary by hardware, but the gaps are what matter):
+
+| Operation | Approximate time |
+|---|---|
+| L1 cache read | ~1 ns |
+| RAM read | ~100 ns |
+| SSD random read | ~100 µs (≈ 1,000× RAM) |
+| Round trip inside a data centre | ~0.5 ms |
+| HDD seek | ~5–10 ms |
+
+This table is why a Redis lookup over the network (one round trip + a RAM read) is so much cheaper than a database query that may touch disk, take locks and run a planner.
+
+---
+
+## 7. Software level: in-memory key-value stores 🎓
+
+**Redis**, **Memcached** and managed versions such as **AWS ElastiCache** are what you'll actually use. The lesson unpacks their description, "**in-memory, key-value, NoSQL database**", word by word:
+
+| Word | Meaning |
+|---|---|
+| **In-memory** | Data lives in **RAM**, not on disk like Postgres or MySQL. That's where the speed comes from |
+| **Key-value** | No tables, rows or strict schema. A key maps to a value: a string, number, list, JSON blob and so on (the available types depend on the product) |
+| **NoSQL** | No relational schema and no SQL; operations are simple gets and sets |
+| **Database** | It still stores data, and can persist it |
+
+**How persistence works despite RAM being volatile:** reads and writes happen in memory, and **behind the scenes** the store writes to disk so it can **reload the data into RAM on restart**. Persistence is the store's job; your code still just reads and writes RAM-speed keys.
+
+🔧 In Redis, the two persistence mechanisms are **RDB** (periodic point-in-time snapshots) and **AOF** (an append-only log of every write, replayed on start). For a pure cache you can often switch both off; for sessions or queues you want them on.
+
+### High availability: replicas, Sentinel and Cluster ➕
+
+Persistence answers "can I get my data back after a restart?"; once Redis holds sessions, rate-limit counters or queues, the next question is "what serves traffic while that machine is down?".
+
+#### Replication is asynchronous, so a failover can lose writes
+**Problem:** a single Redis node is a single point of failure. If it dies, every request that touches sessions or rate limits fails until it comes back.
+
+**Why it happens:** the fix is a **replica** that receives a copy of every write, but Redis replicates **asynchronously** by default. The primary applies your `SET`, replies `OK` to you, and only then streams the command to its replicas. If the primary crashes in that gap, the replica that gets promoted has never seen the write. You were told "OK" for data that no longer exists.
+
+**Mechanism:** two knobs narrow the window, neither closes it:
+- `WAIT numreplicas timeout` blocks the calling client until that many replicas have acknowledged everything written so far. The Redis docs are explicit that this does **not** make Redis strongly consistent: acknowledged writes can still be lost in some failover cases.
+- `min-replicas-to-write` + `min-replicas-max-lag` make the primary **refuse writes** when too few replicas are keeping up, which bounds how much can be lost to a few seconds.
+
+```ts title="critical-write.ts"
+await redis.set(`sess:${token}`, payload, 'EX', SESSION_TTL);
+const acked = (await redis.call('WAIT', '1', '100')) as number;   // wait up to 100 ms for 1 replica
+if (acked < 1) logger.warn({ token: '[redacted]' }, 'session write not yet replicated');
+```
+
+**Edge cases:**
+- **Persistence off + auto-restart wipes everything.** If a primary with no persistence crashes and is restarted at once, it comes back **empty**, and its replicas faithfully sync the empty dataset. The Redis docs warn against exactly this; either keep persistence on or disable automatic restarts.
+- **Decide per use case how bad loss is.** A lost cache entry is a miss. A lost session is a forced logout. A lost queue entry is a lost job, which is why queue workers must be idempotent and producers should use an outbox (see the task queues lesson).
+
+#### Sentinel: automatic failover for one primary
+**Problem:** replicas don't promote themselves, and your application still points at the dead primary's address.
+
+**Mechanism:** **Redis Sentinel** is a separate set of processes that watch the primary. When enough of them (the **quorum**) agree the primary is unreachable, one Sentinel must be **elected by a majority** of all Sentinels before it may promote a replica. Clients don't hard-code the primary: they ask Sentinel for the current address and reconnect after a failover. The docs ask for **at least three** Sentinels on machines that fail independently (different hosts or availability zones), because with two, losing one leaves no majority.
+
+```ts title="redis-sentinel.ts"
+import Redis from 'ioredis';
+
+export const redis = new Redis({
+  sentinels: [{ host: 'sentinel-1', port: 26379 }, { host: 'sentinel-2', port: 26379 }, { host: 'sentinel-3', port: 26379 }],
+  name: 'mymaster',                                   // the monitored primary's logical name
+  retryStrategy: times => Math.min(times * 200, 2000), // keep reconnecting through the failover
+});
+```
+
+**Edge cases:**
+- **Failover takes seconds**, not milliseconds. Commands in flight fail; the cache layer must treat those errors as misses (section 8.1), and session or rate-limit code needs a clear fail-open or fail-closed rule.
+- **Split brain:** an old primary cut off in a minority partition can keep accepting writes from clients on its side. When the partition heals it is demoted and those writes are discarded. `min-replicas-to-write` limits how long it can do that.
+
+#### Cluster: sharding when one node isn't enough
+**Problem:** the dataset no longer fits in one machine's RAM, or one node's CPU can't keep up with the write rate (Redis runs commands on a single main thread).
+
+**Mechanism:** **Redis Cluster** splits the keyspace into **16,384 hash slots**. A key's slot is `CRC16(key) mod 16384`, each primary owns a range of slots (with its own replicas), and a node that receives a key it doesn't own answers with a `MOVED` redirect. Cluster-aware clients cache the slot map so they usually go straight to the right node.
+
+The catch: **commands that touch several keys only work if all keys are in the same slot**; otherwise you get a `CROSSSLOT` error. **Hash tags** fix that: if a key contains `{...}`, only the part inside the braces is hashed, so `{user:42}:profile` and `{user:42}:sessions` land together.
+
+```ts title="redis-cluster.ts"
+import Redis from 'ioredis';
+const cluster = new Redis.Cluster([{ host: 'redis-0', port: 6379 }, { host: 'redis-1', port: 6379 }]);
+
+// fine: one key
+await cluster.set('product:42', json, 'EX', 3600);
+
+// CROSSSLOT error: these keys almost certainly hash to different slots
+// await cluster.del('product:42', 'product:43');
+
+// works: delete per key in a pipeline (ioredis routes each command to its node)
+const p = cluster.pipeline();
+for (const k of keysToDelete) p.del(k);
+await p.exec();
+
+// works: keys that must move together share a hash tag
+await cluster.multi().set('{user:42}:profile', profile).sadd('{user:42}:sessions', token).exec();
+```
+
+**Edge cases:**
+- **Hash tags concentrate load.** Putting a whole tenant behind one tag puts that tenant on one node. Tag only what genuinely needs multi-key atomicity.
+- **The dependency-set trick in section 11.1** (`SADD deps:product:42 ...` then delete them all) needs per-key deletes in a cluster.
+- **Lua scripts** must declare every key they touch, and those keys must share a slot.
+
+| Use | Reasonable topology |
+|---|---|
+| Pure cache, losing it is only slow | One primary + one replica, or a managed single-shard instance |
+| Sessions, rate limits, queues | Primary + replicas with automatic failover (Sentinel or a managed Multi-AZ setup), persistence on |
+| Dataset or write load larger than one node | Cluster, with keys designed around hash slots |
+
+---
+
+## 8. Caching strategies 🎓
+
+### 8.1 Cache-aside (lazy caching)
+
+**Mechanism:** the application owns the logic. On a read, check the cache; on a miss, read the database, **store the result in the cache**, then return it. It's "lazy" because nothing is cached until someone actually asks for it.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant API as Backend
+  participant R as Redis
+  participant DB as Postgres
+  C->>API: GET /products/42
+  API->>R: GET product:42
+  alt hit
+    R-->>API: JSON
+  else miss
+    R-->>API: nil
+    API->>DB: SELECT ... WHERE id = 42
+    DB-->>API: row
+    API->>R: SET product:42 JSON EX 3600
+  end
+  API-->>C: product`} />
+
+🔧 Implementation with `ioredis`:
+
+```ts title="cache-aside.ts"
+import Redis from 'ioredis';
+const redis = new Redis(process.env.REDIS_URL!);
+
+export async function cached<T>(key: string, ttlSec: number, load: () => Promise<T>): Promise<T> {
+  const hit = await redis.get(key);
+  if (hit !== null) return JSON.parse(hit) as T;
+
+  const value = await load();                                   // slow path: DB, API, computation
+  const jitter = Math.floor(Math.random() * ttlSec * 0.1);      // spread expiries (see "edge cases")
+  await redis.set(key, JSON.stringify(value), 'EX', ttlSec + jitter);
+  return value;
+}
+
+// usage
+const product = await cached(`product:${id}`, 3600, () => db.product.findUnique({ where: { id } }));
+```
+
+**🔧 Edge cases and how each is engineered:**
+
+| Problem | Why it happens | Fix |
+|---|---|---|
+| **Stale reads** | The DB changes but the cached copy lives until its TTL | On every write, **delete the key** (`DEL product:42`) so the next read reloads it. Keep a TTL anyway as a safety net |
+| **Cache stampede (thundering herd)** | A hot key expires, and 1,000 concurrent requests all miss and all hit the DB at once | Let **one** request rebuild: take a short lock with `SET lock:key 1 NX EX 10`; others wait briefly and retry the cache, or are served the stale value |
+| **Synchronised expiry** | Many keys written at the same time with the same TTL expire together | Add **random jitter** to TTLs (done above) |
+| **Cache penetration** | Requests for IDs that don't exist always miss and always hit the DB (attackers can do this deliberately) | **Cache the "not found"** too, with a short TTL |
+| **Redis is down** | The cache is a dependency like any other | Treat cache errors as misses: catch them, read from the DB, and don't fail the request |
+
+```ts title="stampede-guard.ts"
+export async function cachedWithLock<T>(key: string, ttl: number, load: () => Promise<T>): Promise<T> {
+  for (let i = 0; i < 50; i++) {
+    const hit = await redis.get(key).catch(() => null);         // Redis down → behave like a miss
+    if (hit !== null) return JSON.parse(hit);
+
+    const gotLock = await redis.set(`lock:${key}`, '1', 'EX', 10, 'NX').catch(() => 'OK');
+    if (gotLock === 'OK') {
+      try {
+        const value = await load();
+        await redis.set(key, JSON.stringify(value), 'EX', ttl).catch(() => {});
+        return value;
+      } finally {
+        await redis.del(`lock:${key}`).catch(() => {});
+      }
+    }
+    await new Promise(r => setTimeout(r, 50));                  // someone else is rebuilding; wait and re-check
+  }
+  return load();                                                // give up waiting; go to the source
+}
+```
+
+### 8.2 Hot keys, early refresh and warming ➕
+
+The lock above protects the database **after** a popular key has expired; three related problems remain: every request still waits at the moment of expiry, a single key can be too popular for one Redis node, and a brand-new cache starts with nothing in it. (Collapsing concurrent misses **inside one process** with a shared promise, "single-flight", is shown with code in the scaling lesson's caching section.)
+
+#### Probabilistic early refresh (XFetch)
+**Problem:** with a lock, the first request after expiry rebuilds while every other request for that key **waits or polls**. A key that takes 300 ms to rebuild produces a 300 ms latency spike for its readers once per TTL, forever.
+
+**Why it happens:** expiry is a cliff. Until second 3600 nobody refreshes; at second 3600 everybody needs a refresh at once.
+
+**Mechanism:** let readers refresh **a little before** expiry, at random, with a probability that rises as expiry approaches. The "XFetch" rule from Vattani, Chierichetti and Lowenstein (VLDB 2015) is: refresh now if `now - delta * beta * ln(random()) >= expiry`, where `delta` is how long the last rebuild took and `beta` (default 1) tunes eagerness. Because `ln(random())` is negative, the left side is "now plus a random head start"; slow rebuilds (big `delta`) start earlier. In practice one request refreshes in the background a bit early, and nobody ever sees the cliff.
+
+```ts title="xfetch.ts"
+type Entry<T> = { v: T; delta: number; expiry: number };     // delta and expiry in ms
+
+export async function cachedXFetch<T>(key: string, ttlSec: number, load: () => Promise<T>, beta = 1): Promise<T> {
+  const raw = await redis.get(key).catch(() => null);
+  if (raw) {
+    const e = JSON.parse(raw) as Entry<T>;
+    const early = Date.now() - e.delta * beta * Math.log(Math.random()) >= e.expiry;
+    if (!early) return e.v;
+    // this reader volunteers to refresh; others keep getting the current value meanwhile
+    void refresh(key, ttlSec, load).catch(err => logger.warn({ err, key }, 'early refresh failed'));
+    return e.v;
+  }
+  return refresh(key, ttlSec, load);                              // true miss (cold key)
+}
+
+async function refresh<T>(key: string, ttlSec: number, load: () => Promise<T>) {
+  const t0 = Date.now();
+  const v = await load();
+  const delta = Date.now() - t0;
+  const entry: Entry<T> = { v, delta, expiry: Date.now() + ttlSec * 1000 };
+  // keep the Redis TTL a bit longer than the logical expiry so early refreshers still find a value
+  await redis.set(key, JSON.stringify(entry), 'EX', ttlSec + Math.ceil(delta / 1000) + 5).catch(() => {});
+  return v;
+}
+```
+
+**Edge cases:**
+- **It doesn't replace the lock for cold keys.** A key that doesn't exist yet (first request, or after eviction) still stampedes; combine XFetch for warm keys with the `SET NX` lock for misses.
+- **Several early refreshers can overlap** on a very hot key: the probability is per request, so at 10,000 requests per second a few may fire together. Guard the background refresh with the same `NX` lock if the rebuild is expensive.
+- **It relies on clocks.** `expiry` is wall-clock time written by one server and read by others; normal NTP skew of milliseconds is harmless, but a server with a badly wrong clock refreshes too often or never.
+
+#### Hot keys: when one key overloads one node
+**Problem:** a celebrity's profile or a flash-sale product is read 100,000 times a second. In a Redis Cluster, **all** of those reads go to the one node that owns that key's slot. That node's CPU or network saturates while the others idle, and every key on that node gets slow.
+
+**Why it happens:** hashing spreads **keys** evenly, not **load**. One key always maps to one slot, so no amount of extra nodes helps it.
+
+**Mechanism:** first **find** the key (with an LFU eviction policy, `redis-cli --hotkeys` reports the most frequently accessed keys; otherwise count reads per key prefix in the application). Then spread it, in order of preference:
+1. **Serve it from process memory** for a second or two (section 8.5). 100,000 reads become one Redis read per server per second.
+2. **Replicate the key** under N suffixes that hash to different slots, write all copies, read a random one.
+
+```ts title="hot-key-copies.ts"
+const COPIES = 8;
+const copyKey = (key: string, i: number) => `${key}#${i}`;    // different suffix → different slot
+
+export async function setHot(key: string, value: string, ttl: number) {
+  const p = redis.pipeline();
+  for (let i = 0; i < COPIES; i++) p.set(copyKey(key, i), value, 'EX', ttl);
+  await p.exec();
+}
+
+export const getHot = (key: string) => redis.get(copyKey(key, Math.floor(Math.random() * COPIES)));
+
+export async function delHot(key: string) {                   // invalidation must remove every copy
+  const p = redis.pipeline();
+  for (let i = 0; i < COPIES; i++) p.del(copyKey(key, i));
+  await p.exec();
+}
+```
+
+**Edge cases:**
+- **Copies can disagree** if a pipeline partly fails; keep a TTL so they converge, and only use copies for data where a few seconds of disagreement is acceptable.
+- **Reading from replicas** (`READONLY` in Cluster) also spreads load, but replicas lag behind the primary, so reads can be stale.
+
+#### Cold starts and cache warming
+**Problem:** a new Redis, a `FLUSHALL`, or a key-format version bump (section 8.4) means a **0% hit ratio**. Using the numbers from section 1, the database suddenly sees 100% of traffic instead of 5%: a 20× jump, often enough to take it down right after a deploy.
+
+**Mechanism:** fill the most valuable keys **before** traffic arrives, from a list of what is actually hot (a sorted set of read counts, or yesterday's access logs), and do it **gently** so the warmer doesn't become the outage.
+
+```ts title="warm-cache.ts"
+// during normal operation, count reads cheaply:  ZINCRBY hot:products 1 <id>
+export async function warmTopProducts(limit = 1000, batch = 50) {
+  const ids = await redis.zrevrange('hot:products', 0, limit - 1);
+  for (let i = 0; i < ids.length; i += batch) {
+    const slice = ids.slice(i, i + batch);
+    const rows = await db.product.findMany({ where: { id: { in: slice } } });   // one query per batch
+    const p = redis.pipeline();
+    for (const r of rows) p.set(`product:v3:${r.id}`, JSON.stringify(r), 'EX', 3600 + Math.floor(Math.random() * 360));
+    await p.exec();
+    await new Promise(r => setTimeout(r, 100));                                 // throttle: protect the DB
+  }
+}
+```
+
+**Edge cases:**
+- **Warm the top, not everything.** Loading the whole table pushes out keys that would have been hot and can trigger evictions.
+- **Version bumps can be rolled out gradually** (a percentage of servers on the new key version first) so the database absorbs the cold misses over minutes, not seconds.
+- **Warmed keys share a write time,** so they need TTL jitter (above) or they all expire together an hour later.
+
+### 8.3 Write-through
+
+**Mechanism:** this is about **updating** the cache. Whenever a write happens (POST, PUT, PATCH), the **same request** updates the database **and** the cache.
+
+- **Benefit:** the cache is **always fresh**; reads never see an old value.
+- **Cost:** every write does extra work, so writes get slower.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant API as Backend
+  participant DB as Postgres
+  participant R as Redis
+  C->>API: PATCH /users/7 (new bio)
+  API->>DB: UPDATE users SET bio = ... WHERE id = 7
+  DB-->>API: updated row
+  API->>R: SET user:7 updated JSON
+  API-->>C: 200 OK`} />
+
+**🔧 Edge cases:**
+- **Partial failure:** the DB update succeeds but the cache write fails (or the process crashes in between), leaving the cache wrong. Always write the **database first**, keep a **TTL** on cache entries so mistakes heal themselves, and log or retry cache-write failures.
+- **Race between two writers:** request A writes v1 to the DB, B writes v2 to the DB, then B's cache write lands **before** A's, so the cache ends up with v1. This is why many teams prefer **delete-on-write** (invalidate instead of overwrite) together with cache-aside: a delete can't "win" with an old value.
+- **Write-behind** is a third variant (write to the cache now, flush to the DB later in a batch). It's fast but can lose data if the cache dies, so it's rarely right for core business data.
+
+### 8.4 Cache key design and versioning ➕
+
+Every strategy above reads, writes and deletes **by key**, so the key format decides whether invalidation is even possible and whether one user can ever see another's data.
+
+#### Namespaces and normalisation
+**Problem:** two different things end up under one key (one user sees another's cached view), or one thing ends up under many keys (`Delhi` and `delhi` miss each other and the hit ratio drops).
+
+**Why it happens:** a cached value is a function of its inputs. If the key leaves out an input that changes the output (tenant, locale, currency, the caller's role), two different outputs collide. If the key includes noise (parameter order, case, whitespace), equal outputs scatter.
+
+**Mechanism:** build keys in **one function**, never by ad-hoc string templates scattered through the code. Use a fixed shape such as `app:entity:version:id:variant`, include **every input that changes the result**, normalise them, and hash anything long or user-supplied.
+
+```ts title="cache-keys.ts"
+import { createHash } from 'node:crypto';
+
+const sha = (s: string) => createHash('sha256').update(s).digest('base64url').slice(0, 22);
+
+export function listKey(entity: string, version: number, scope: { tenantId: string; locale: string; role: string },
+                        params: Record<string, string | number | undefined>) {
+  const norm = Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== '')
+    .map(([k, v]) => [k, String(v).trim().toLowerCase()])
+    .sort(([a], [b]) => a.localeCompare(b));                      // ?b=2&a=1 and ?a=1&b=2 → same key
+  return `shop:${entity}:v${version}:${scope.tenantId}:${scope.locale}:${scope.role}:${sha(JSON.stringify(norm))}`;
+}
+
+// listKey('products', 3, { tenantId: 't_9', locale: 'en-IN', role: 'customer' }, { category: 'Laptops', page: 2 })
+```
+
+**Edge cases:**
+- **A missing tenant or role in the key is a data leak**, not just a bug. Put the scope first in the signature, as above, so it can't be forgotten.
+- **High-cardinality inputs** (free-text search terms, arbitrary filters) create millions of keys that are each read once: memory fills, the hit ratio stays near zero. Cache those only at a coarser level (popular queries) or not at all.
+- **Hashed keys can't be inspected or deleted by pattern.** That's fine if you invalidate with generations (below), not with wildcards.
+
+#### Version the format inside the key
+**Problem:** a deploy changes the shape of a cached object (a field renamed, a nested object added). During a rolling deploy, **old and new servers run side by side**: new code reads an entry written by old code and crashes on a missing field, or old code reads the new shape.
+
+**Mechanism:** put a **format version** in the key (`product:v3:42`). Bump it whenever the cached shape changes. Old servers keep using `v2`, new servers use `v3`, they never read each other's entries, and the `v2` keys expire by TTL.
+
+**Edge cases:**
+- **A bump is a cold start** for that entity (section 8.2's warming applies).
+- **Both versions occupy memory** during the rollout, so a large entity can briefly need twice the space.
+- **Writes must invalidate every live version.** While old and new servers coexist, a product update must delete `product:v2:42` **and** `product:v3:42`, or the old servers serve stale data until TTL.
+
+#### Generation counters for bulk invalidation
+**Problem:** "something changed for tenant 42, drop all its cached lists". There is no cheap wildcard delete: `KEYS` blocks the whole server while it scans, and `SCAN` is slow, must run against every node in a cluster, and can't see hashed keys you can't reconstruct.
+
+**Mechanism:** don't delete; **make the old keys unreachable**. Keep a small counter per scope, include it in every key for that scope, and `INCR` it to invalidate everything at once. Old entries are never read again and disappear through TTL or eviction.
+
+```ts title="generations.ts"
+const genKey = (tenantId: string) => `gen:tenant:${tenantId}`;
+
+export async function tenantScopedKey(tenantId: string, rest: string) {
+  const gen = (await redis.get(genKey(tenantId))) ?? '0';
+  return `t:${tenantId}:g${gen}:${rest}`;
+}
+
+export async function invalidateTenant(tenantId: string) {
+  await redis.incr(genKey(tenantId));          // O(1): every key built from the old generation is now dead
+}
+```
+
+**Edge cases:**
+- **An extra round trip per read** to fetch the generation. Batch it with the value lookup in one pipeline, or hold the generation in process memory for a second (accepting a second of staleness).
+- **Dead entries still use memory** until they expire, so a TTL on every generation-scoped key is mandatory, and an eviction policy such as `allkeys-lru` should be on.
+- **Increment after the database commit**, for the same reason you delete after the commit: otherwise a concurrent reader can refill the new generation with old data.
+
+### 8.5 Two-level caches: keeping in-process copies consistent ➕
+
+The scaling lesson introduces a small in-process cache in front of Redis; the part it leaves open is how ten servers' local copies learn that something changed.
+
+#### Why local copies go stale
+**Problem:** server A updates product 42 and deletes it from Redis and from **its own** memory. Servers B to J still hold the old product in their local maps and keep serving it.
+
+**Why it happens:** process memory isn't shared. Nothing tells B to J about A's write, so the only bound on their staleness is the **local TTL**. That's why local TTLs are usually a few seconds: it's the worst-case staleness you're accepting.
+
+**Mechanism:** either accept the TTL bound explicitly (fine for product descriptions, wrong for permissions or prices at checkout), or broadcast invalidations as below.
+
+#### Broadcasting invalidations with Pub/Sub
+**Mechanism:** after the database commit, the writer deletes the Redis key and **publishes** the key on a channel. Every server keeps one subscriber connection open and evicts the key from its local map when a message arrives.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant A as Server A (writer)
+  participant DB as Postgres
+  participant R as Redis
+  participant B as Server B
+  participant C as Server C
+  A->>DB: UPDATE product 42, COMMIT
+  A->>R: DEL product:v3:42
+  A->>R: PUBLISH cache-inval product:v3:42
+  R-->>B: message product:v3:42
+  R-->>C: message product:v3:42
+  B->>B: local.delete(key)
+  C->>C: local.delete(key)`} />
+
+```ts title="local-cache.ts"
+import Redis from 'ioredis';
+import { LRUCache } from 'lru-cache';
+
+export const local = new LRUCache<string, unknown>({ max: 10_000, ttl: 10_000 });   // 10 s worst-case backstop
+const sub = new Redis(process.env.REDIS_URL!);                                      // subscriber needs its own connection
+
+await sub.subscribe('cache-inval');
+sub.on('message', (_channel, key) => local.delete(key));
+sub.on('ready', () => local.clear());   // after any reconnect we may have missed messages: start clean
+
+export async function invalidate(key: string) {
+  await redis.del(key);
+  await redis.publish('cache-inval', key);
+  local.delete(key);
+}
+```
+
+**Edge cases:**
+- **Pub/Sub is fire-and-forget.** A server that is disconnected (network blip, Redis failover) when the message is published never receives it. Hence the two backstops in the code: **clear the local cache on reconnect**, and keep a **short local TTL** anyway.
+- **The refill race:** server B starts loading key 42 from Redis, the invalidation arrives and deletes nothing (the key isn't local yet), then B's load returns the old value and stores it. Mark keys as "loading" before the read and skip storing if an invalidation arrived meanwhile, or simply rely on the short TTL for data where seconds of staleness are acceptable.
+- **In Redis Cluster**, classic `PUBLISH` is broadcast to every node; for high message rates, Redis 7's sharded Pub/Sub (`SPUBLISH` / `SSUBSCRIBE`) keeps a channel on one shard.
+
+#### Server-assisted client-side caching (`CLIENT TRACKING`)
+**Problem:** with plain Pub/Sub, **you** must remember to publish on every write path, and every server receives every invalidation even for keys it never cached.
+
+**Mechanism:** since Redis 6, the server can track this for you. A connection enables tracking, and Redis remembers which keys that client has **read**; when any client modifies, expires or evicts one of those keys, Redis sends that connection an **invalidation message** for it. Two modes:
+- **Default mode:** Redis stores, per key, which clients may have it cached. Precise, but costs server memory proportional to keys × clients.
+- **Broadcast mode (`BCAST PREFIX product:`):** Redis stores nothing per key and notifies every subscribed client about any change under the prefix. No server memory, more messages.
+
+With RESP3 the invalidation arrives as a push message on the same connection; with RESP2 you redirect it to a second connection subscribed to `__redis__:invalidate`:
+
+```text title="tracking with RESP2 (two connections)"
+# connection 1: receives invalidations
+CLIENT ID                         → 4
+SUBSCRIBE __redis__:invalidate
+
+# connection 2: normal reads, tracked
+CLIENT TRACKING ON REDIRECT 4
+GET product:v3:42                 → app stores the value locally
+
+# any client, anywhere
+SET product:v3:42 ...             → connection 1 receives: invalidate [product:v3:42]
+```
+
+**Edge cases (from the Redis docs):**
+- **Flush the local cache if the invalidation connection drops**, and ping it periodically to detect a silent break; otherwise you serve stale data without knowing.
+- **Redis can invalidate keys that didn't change.** The server's tracking table has a size limit; when it's full it evicts entries by sending a "fake" invalidation. Correct, but your local hit ratio drops.
+- **With two connections there is a race**: the invalidation can arrive before the reply to your `GET`. Put a placeholder in the local cache before sending the read and don't store the reply if the placeholder was removed meanwhile.
+- **Still set a max TTL locally**, as a guard against bugs and missed messages.
+
+---
+
+## 9. Eviction policies 🎓
+
+### Problem
+RAM is limited (and managed services like ElastiCache have a fixed size), so the cache **will** eventually fill up. Since a cache is only a subset, you need a rule for **what to throw out** to make room for newer, more valuable data.
+
+### The policies (lesson's examples)
+Assume keys 1, 2, 3 and 4 fill the cache and key 5 arrives.
+
+| Policy | Rule | Lesson's example |
+|---|---|---|
+| **No eviction** | Nothing is removed; writes fail with an out-of-memory error | It's what you get if you configure nothing |
+| **LRU** (least recently used) | Track **when** each key was last accessed; remove the oldest | Keys 1–3 were read today, key 4 yesterday → **4 goes**, 5 comes in |
+| **LFU** (least frequently used) | Track **how often** each key was accessed; remove the least used | Key 1 read 5 times, 2 read 10, 3 read 6, 4 read 23 → **1 goes** |
+| **TTL-based** | Among keys with an expiry, remove the one **closest to expiring** | The key with the lowest remaining TTL goes |
+
+### 🔧 How Redis actually does it
+You configure two settings:
+
+```bash
+# redis.conf (or CONFIG SET at runtime)
+maxmemory 2gb
+maxmemory-policy allkeys-lru
+```
+
+| Redis policy | Pool it evicts from | Rule |
+|---|---|---|
+| `noeviction` | — | Reject writes when full (reads still work) |
+| `allkeys-lru` / `volatile-lru` | All keys / only keys with a TTL | Least recently used |
+| `allkeys-lfu` / `volatile-lfu` | All / TTL keys | Least frequently used |
+| `allkeys-random` / `volatile-random` | All / TTL keys | Random |
+| `volatile-ttl` | TTL keys | Shortest remaining TTL |
+
+Things worth knowing:
+- **Redis's LRU is approximate.** Tracking a perfect order for millions of keys would cost memory, so Redis **samples** a few keys (`maxmemory-samples`, default 5) and evicts the best candidate from a pool. In practice it behaves almost exactly like true LRU.
+- **LFU** uses a small probabilistic counter per key that **decays over time**, so something that was popular last week can still be evicted once it goes cold.
+- **`volatile-*` policies act like `noeviction` if no key has a TTL.** A classic production surprise: you set `volatile-lru`, forget TTLs, and writes start failing.
+- **Rule of thumb from the Redis docs:** `allkeys-lru` is a good default for a pure cache. If one Redis also holds data that must never be evicted (for example BullMQ queues), use a **separate instance** for those.
+- Check health with `INFO stats`: hit ratio = `keyspace_hits ÷ (keyspace_hits + keyspace_misses)`, and watch `evicted_keys`.
+
+### 🔧 How LRU is built (the classic interview implementation)
+A hash map gives O(1) lookup; you also need O(1) "move to most recent" and "remove oldest". In JavaScript a `Map` keeps insertion order, so deleting and re-inserting a key moves it to the end:
+
+```ts title="lru-cache.ts"
+export class LRUCache<K, V> {
+  private map = new Map<K, V>();
+  constructor(private capacity: number) {}
+
+  get(key: K): V | undefined {
+    if (!this.map.has(key)) return undefined;
+    const value = this.map.get(key)!;
+    this.map.delete(key);          // move to the "most recent" end
+    this.map.set(key, value);
+    return value;
+  }
+
+  set(key: K, value: V) {
+    if (this.map.has(key)) this.map.delete(key);
+    else if (this.map.size >= this.capacity) {
+      const oldest = this.map.keys().next().value as K;   // first key = least recently used
+      this.map.delete(oldest);
+    }
+    this.map.set(key, value);
+  }
+}
+```
+
+(In other languages you'd build this from a hash map plus a doubly linked list.)
+
+### Sizing Redis memory and measuring the cache ➕
+
+An eviction policy decides **what** to throw out once memory is full; the engineering question before that is **how much** memory you need, what is really using it, and whether the cache is earning its keep.
+
+#### What one key really costs
+**Problem:** you estimate "10 million products × 2 KB = 20 GB" and the instance fills at 14 million.
+
+**Why it happens:** every key carries overhead beyond your bytes: the key string, the internal object header, the dictionary entry, the expiry entry if it has a TTL, and allocator rounding. The Redis docs show an **empty** string key measuring **56 bytes** on Redis 7.2 with jemalloc. For millions of small values, overhead can rival the data.
+
+**Mechanism:** measure instead of guessing. `MEMORY USAGE key` reports the real bytes for one key (for collections it samples 5 nested values by default; `SAMPLES 0` checks all). Sample a few hundred keys per prefix, average, and multiply by the key count:
+
+```ts title="estimate-memory.ts"
+export async function estimatePrefix(match: string, sample = 500) {
+  let cursor = '0', seen = 0, bytes = 0;
+  do {
+    const [next, keys] = await redis.scan(cursor, 'MATCH', match, 'COUNT', 1000);   // SCAN, never KEYS
+    cursor = next;
+    for (const k of keys) {
+      if (seen >= sample) break;
+      bytes += ((await redis.memory('USAGE', k)) as number | null) ?? 0;
+      seen++;
+    }
+  } while (cursor !== '0' && seen < sample);
+  return { avgBytes: seen ? Math.round(bytes / seen) : 0, sampled: seen };
+}
+// avgBytes × expected key count = dataset estimate; compare with INFO memory → used_memory_dataset
+```
+
+**Edge cases:**
+- **Many tiny keys are expensive.** Grouping related small fields into one hash (`HSET user:42 name ... plan ...`) usually uses much less memory than one key per field, because small hashes get a compact encoding.
+- **Shorter keys help at scale**, but not at the cost of readability; measure before shortening.
+
+#### Headroom: memory that `maxmemory` doesn't count
+**Problem:** `maxmemory` is set to the machine's full RAM, and the process is killed by the OS (or the container's memory limit) without ever evicting.
+
+**Why it happens:** `maxmemory` limits the **dataset**, not the process. The Redis docs note that the buffers holding writes waiting to go to replicas or the AOF are **not counted** toward `maxmemory` (counting them would trigger eviction feedback loops); `INFO memory` reports them as `mem_not_counted_for_evict`. On top of that come **fragmentation** (`mem_fragmentation_ratio` well above 1 means freed memory isn't returned in usable chunks), client output buffers, and the fork used for RDB snapshots and AOF rewrites, which shares pages copy-on-write and grows as writes touch them.
+
+**Mechanism:** set `maxmemory` clearly **below** the RAM or container limit, and size that gap from what you observe: `used_memory_rss` vs `used_memory`, `mem_not_counted_for_evict`, and the peak during a snapshot under real write load. Replicas ignore `maxmemory` by default (they wait for the primary's evictions), so give them at least as much RAM as the primary.
+
+```bash
+redis-cli INFO memory | grep -E 'used_memory:|used_memory_rss:|used_memory_dataset:|mem_fragmentation_ratio|mem_not_counted_for_evict|maxmemory:'
+```
+
+**Edge cases:** on managed services (ElastiCache, Memorystore) part of this is handled with reserved memory settings; read your provider's guidance before raising them.
+
+#### Big keys
+**Problem:** one 50 MB hash or a list with millions of elements. Reading it moves 50 MB over the network; deleting it with `DEL` frees memory on the main thread and **blocks every other client** while it does; in a cluster it makes one node much fuller than the rest.
+
+**Why it happens:** Redis executes commands one at a time, so any single command that is O(size of the key) delays everything queued behind it.
+
+**Mechanism:** find them with `redis-cli --bigkeys` (largest key per type) or `redis-cli --memkeys` (by memory), both of which use `SCAN` and are safe to run in production. Fix the data model: split a big hash into buckets (`cart:42:0` … `cart:42:15` by hashing the field), cap lists (`LTRIM`), and delete big keys with **`UNLINK`**, which removes the key immediately and reclaims its memory in a background thread.
+
+**Edge cases:** a "big key" is often a cache of a whole list endpoint (`products:all`). Cache pages or IDs instead, and look up the items individually (with `MGET`).
+
+#### Serialisation cost
+**Problem:** Redis answers in 0.3 ms, yet the cache path takes 8 ms and the Node event loop shows high CPU.
+
+**Why it happens:** the cost moved from the network to **your process**. `JSON.stringify` and `JSON.parse` are synchronous: a 500 KB cached object is parsed on every hit, blocking the event loop for every other request on that server.
+
+**Mechanism:** cache **less**: only the fields the endpoint returns, not the whole ORM entity with relations. For large payloads, compress above a size threshold (CPU for bandwidth and memory), and keep a marker so readers know which format they got.
+
+```ts title="codec.ts"
+import { gzipSync, gunzipSync } from 'node:zlib';
+const THRESHOLD = 8 * 1024;
+
+export const encode = (v: unknown): Buffer => {
+  const json = Buffer.from(JSON.stringify(v));
+  return json.length < THRESHOLD ? Buffer.concat([Buffer.from('j'), json])
+                                 : Buffer.concat([Buffer.from('z'), gzipSync(json)]);
+};
+export const decode = <T>(b: Buffer): T =>
+  JSON.parse((b[0] === 0x7a ? gunzipSync(b.subarray(1)) : b.subarray(1)).toString()) as T;   // 0x7a = 'z'
+
+// read with redis.getBuffer(key) so binary data isn't mangled into a UTF-8 string
+```
+
+**Edge cases:** compression is synchronous here too; for values above a few hundred KB, the real fix is a smaller value. Changing the codec is a format change, so bump the key version (section 8.4).
+
+#### Measuring hit ratio per key family
+**Problem:** `INFO stats` gives one hit ratio for the whole server. 92% overall can hide a sessions prefix at 99.9% and a search-results prefix at 4% that only wastes memory.
+
+**Mechanism:** count hits and misses **in the application**, labelled by key **prefix** (never the full key), and graph the ratio per prefix next to its memory share.
+
+```ts title="cache-metrics.ts"
+import { Counter } from 'prom-client';
+const lookups = new Counter({ name: 'cache_lookups_total', help: 'cache lookups', labelNames: ['family', 'result'] });
+
+export async function cachedMeasured<T>(family: string, key: string, ttl: number, load: () => Promise<T>) {
+  const hit = await redis.get(key).catch(() => null);
+  lookups.inc({ family, result: hit !== null ? 'hit' : 'miss' });
+  if (hit !== null) return JSON.parse(hit) as T;
+  const v = await load();
+  await redis.set(key, JSON.stringify(v), 'EX', ttl).catch(() => {});
+  return v;
+}
+// PromQL: sum by (family) (rate(cache_lookups_total{result="hit"}[5m])) / sum by (family) (rate(cache_lookups_total[5m]))
+```
+
+**Edge cases:** a low ratio isn't automatically bad (a short-TTL cache that absorbs bursts may still save the DB), so read it together with **origin load saved**. Labelling by full key would create one time series per key and overload your metrics system. (Metrics design in general is covered in the logging, monitoring and observability lesson.)
+
+---
+
+## 10. Using Redis day to day 🎓
+
+The client side is simple: install the library for your language (for Node, `redis` or `ioredis`), **set a key with a value**, and **get it back by key**. No joins, no query language. The value of the theory above is that it helps you make **good decisions** about what to cache, for how long, and what happens when memory runs out.
+
+---
+
+## 11. Four backend use cases 🎓
+
+### 11.1 Database query caching
+
+**Problem:** a query joins many tables over millions of rows and aggregates them down to a few rows. Monitoring shows the API behind it (say, on the landing page or dashboard) is called very often, and it's loading the database.
+
+**Mechanism:** cache-aside with a TTL (the lesson uses **1 hour**). On a write that affects the result, **update or delete** the cache entry.
+
+Real-world versions from the lesson:
+- **Amazon product pages during a sale:** millions of people open the same MacBook page. Product details and images rarely change, so serving them from the cache keeps the DB free for the work that matters (orders, payments). Prices and inventory are cached too in some cases.
+- **Social media profiles:** a profile changes a few times a year but a celebrity's page may be read thousands or, around a movie release, millions of times a day. Cache it, and **invalidate on edit**.
+
+**Rule:** **read-heavy + infrequent writes → cache it.**
+
+```ts title="dashboard.service.ts"
+const key = `dashboard:stats:${orgId}`;
+
+export const getDashboardStats = (orgId: string) =>
+  cached(key, 3600, () => db.$queryRaw`SELECT ... heavy joins + aggregation ... WHERE org_id = ${orgId}`);
+
+// whenever something that feeds the dashboard changes:
+export async function onOrderCreated(orgId: string) {
+  await redis.del(`dashboard:stats:${orgId}`);   // next read recomputes once
+}
+```
+
+🔧 **Edge case:** invalidation gets hard when one entity feeds many cached results (a product appears in search results, category pages, recommendations). Either keep TTLs short for those aggregate keys, or keep a set of dependent keys per entity (`SADD deps:product:42 key1 key2`) and delete them all on change.
+
+### 11.2 Session storage
+
+**Problem:** with stateful authentication (covered in the playlist's auth lesson), **every API call** needs to look up the session. Doing that against the main database adds latency to every request and puts load on the DB.
+
+**Mechanism:** store sessions in Redis, keyed by the session token, with a TTL equal to the session lifetime.
+
+```ts title="sessions.ts"
+import { randomBytes } from 'node:crypto';
+
+const SESSION_TTL = 60 * 60 * 24 * 7; // 7 days
+
+export async function createSession(userId: string) {
+  const token = randomBytes(32).toString('base64url');
+  await redis.set(`sess:${token}`, JSON.stringify({ userId, createdAt: Date.now() }), 'EX', SESSION_TTL);
+  return token;                                           // goes into an HttpOnly cookie
+}
+
+export async function getSession(token: string) {
+  const raw = await redis.get(`sess:${token}`);
+  if (!raw) return null;
+  await redis.expire(`sess:${token}`, SESSION_TTL);       // sliding expiry
+  return JSON.parse(raw) as { userId: string; createdAt: number };
+}
+
+export const destroySession = (token: string) => redis.del(`sess:${token}`); // logout is instant
+```
+
+🔧 **Edge cases:** sessions are data you don't want evicted, so don't put them in a Redis that uses `allkeys-lru` alongside throwaway cache entries, and turn on persistence. "Log out everywhere" needs an index of sessions per user (a set `user:7:sessions`).
+
+### 11.3 Caching external API calls
+
+**Problem:** your backend calls a third-party API (the lesson's example: a **weather** API) on every request from your frontend. With many users you make thousands of outbound calls, which **raises your bill** and makes you **hit their rate limit**.
+
+**Why it's safe:** weather doesn't change second to second.
+
+**Mechanism:** cache the response with a TTL (**1 hour** in the lesson). For that hour, every request uses the cached value; when it expires, the next request fetches fresh data and re-caches it.
+
+```ts title="weather.ts"
+export const getWeather = (city: string) =>
+  cached(`weather:${city.toLowerCase()}`, 3600, async () => {
+    const res = await fetch(`https://api.weather.example/v1/current?city=${encodeURIComponent(city)}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) throw new Error(`weather API ${res.status}`);   // don't cache errors
+    return res.json();
+  });
+```
+
+🔧 **Edge cases:** normalise the cache key (`Delhi` and `delhi` should share an entry), **never cache error responses** with the normal TTL, and consider serving a slightly stale value if the provider is down (keep a second, longer-lived "last known good" key).
+
+### 11.4 Rate limiting
+
+**Problem:** protect expensive endpoints from bots and abuse, for example **50 requests per minute per client**.
+
+**Mechanism (as the lesson describes it):**
+1. A **rate-limit middleware** runs before your route handler.
+2. It identifies the client by IP, typically from the **`X-Forwarded-For`** header added by your reverse proxy (Nginx or similar).
+3. It keeps a **counter per IP** for the current minute in Redis and increments it on each request.
+4. If the counter goes over the limit within the window, it rejects the request with **`429 Too Many Requests`**.
+
+<Mermaid chart={`flowchart LR
+  REQ["Request"] --> MW["Rate-limit middleware"]
+  MW --> K["key = rl + IP + current minute"]
+  K --> INC["Redis INCR key<br/>set 60 s expiry on first hit"]
+  INC --> CHK{"count above 50?"}
+  CHK -->|"yes"| R429["429 Too Many Requests<br/>+ Retry-After"]
+  CHK -->|"no"| H["Route handler"]`} />
+
+**Why Redis and not Postgres?** You *can* store counters in Postgres, but:
+1. **Latency:** this check runs on **every** request. Even an extra 20–30 ms per call is noticeable.
+2. **Load:** with 1,000 users making 100 requests a minute, the DB would be flooded by rate-limit bookkeeping alone.
+
+🔧 Implementation (fixed window):
+
+```ts title="rate-limit.middleware.ts"
+import type { Request, Response, NextFunction } from 'express';
+
+const LIMIT = 50;
+const WINDOW_SEC = 60;
+
+export async function rateLimit(req: Request, res: Response, next: NextFunction) {
+  const ip = req.ip;                                         // with app.set('trust proxy', 1) Express reads X-Forwarded-For safely
+  const window = Math.floor(Date.now() / 1000 / WINDOW_SEC);
+  const key = `rl:${ip}:${window}`;
+
+  try {
+    const [[, count]] = (await redis.multi()
+      .incr(key)
+      .expire(key, WINDOW_SEC, 'NX')                         // set expiry only once (Redis 7+); atomic with INCR
+      .exec()) as [[null, number], [null, number]];
+
+    res.setHeader('X-RateLimit-Remaining', Math.max(0, LIMIT - count));
+    if (count > LIMIT) {
+      res.setHeader('Retry-After', WINDOW_SEC - (Math.floor(Date.now() / 1000) % WINDOW_SEC));
+      return res.status(429).json({ message: 'Too many requests' });
+    }
+  } catch {
+    // Redis unavailable: fail open (allow) for normal endpoints; fail closed for login/OTP endpoints
+  }
+  next();
+}
+```
+
+**🔧 Edge cases:**
+- **Spoofed `X-Forwarded-For`:** a client can send this header itself. Only trust it when it was set by **your** proxy (in Express, `trust proxy` set to the number of proxies in front of you), otherwise attackers rotate fake IPs and bypass the limit.
+- **Why `INCR` + `EXPIRE` must be atomic:** if the process crashes between the two, the key never expires and that IP is blocked forever. `MULTI` (or a Lua script) avoids it.
+- **Burst at the window edge:** a fixed window allows 50 requests at 0:59 and 50 more at 1:00, so 100 in two seconds. If that matters, use a **sliding window** (a sorted set of timestamps per client) or a **token bucket**.
+- **Users behind one NAT** (an office, a college) share an IP. For logged-in traffic, limit by **user ID or API key** instead.
+
+---
+
+## 12. Recap 🎓
+
+- Caching = keeping a **subset** of data somewhere **faster**, so you avoid **repeating heavy computation** or **moving heavy data**.
+- Google (results), Netflix (CDN edges), X (precomputed trends in Redis) all follow that pattern.
+- **Network level:** CDNs (DNS routing to the nearest PoP, edge hit or miss, origin fetch, TTL) and DNS (browser → OS → recursive resolver → root → TLD → authoritative, with caches along the way).
+- **Hardware level:** L1/L2/L3 and RAM. RAM is fast because it's random access, but it's small and volatile, so it complements disk rather than replacing it.
+- **Software level:** Redis, Memcached, ElastiCache: in-memory, key-value NoSQL stores that persist to disk in the background.
+- **Strategies:** **cache-aside** (lazy: fill on a miss) and **write-through** (update the cache on every write: always fresh, slower writes).
+- **Eviction:** no eviction, **LRU**, **LFU**, **TTL-based**.
+- **Use cases:** DB query results, sessions, external API responses, rate-limit counters.
+- ➕ **High availability:** replication is asynchronous, so failover can lose acknowledged writes; Sentinel automates failover for one primary (three or more Sentinels); Cluster shards keys over 16,384 slots, and multi-key commands need hash tags.
+- ➕ **Hot keys:** XFetch refreshes popular keys just before expiry; a key too hot for one node is served from process memory or copied under several suffixes; warm the top keys after a cold start, gently.
+- ➕ **Keys:** one key builder with every output-affecting input (tenant first), a format version in the key, and generation counters instead of wildcard deletes.
+- ➕ **Two-level caches:** local copies are stale up to their TTL; broadcast invalidations with Pub/Sub (clear on reconnect) or use Redis client-side tracking.
+- ➕ **Memory and measurement:** measure per-key cost with `MEMORY USAGE`, leave headroom for buffers and fragmentation, hunt big keys, keep cached values small, and track hit ratio per key family.
+- **Next step from the lesson:** install Redis (or its open-source fork **Valkey**), use a client library, and feel the difference against a relational database yourself.
+
+---
+
+## Interview questions
+
+1. **Define caching precisely.** **Keeping a subset of data, chosen by access patterns, in a faster and cheaper-to-read location, to cut the time and effort of repeated work.**
+2. **When is something a good caching candidate?** **When it's expensive to compute or transfer, read often, and changes slowly relative to how often it's read.**
+3. **Walk through a CDN request.** **DNS routes the user to the nearest PoP; the edge serves on a hit; on a miss it fetches from the origin, stores it with a TTL and serves it.**
+4. **Walk through a DNS lookup and name the cache layers.** **Recursive resolver → root → TLD → authoritative; caches exist in the browser, the OS, the resolver and sometimes the authoritative server, each honouring the record's TTL.**
+5. **Why is RAM faster than disk, and why can't it replace disk?** **Any address is reached directly by electrical signals instead of mechanical seeks; but RAM is small, expensive and volatile.**
+6. **Cache-aside vs write-through?** **Cache-aside fills the cache lazily on a miss and can serve stale data until invalidation or TTL; write-through updates the cache on every write, so it's always fresh but writes cost more.**
+7. **What is a cache stampede and how do you prevent it?** **A hot key expires and many concurrent misses all hit the DB; prevent it with a rebuild lock (SET NX), serving stale data while one request refreshes, and TTL jitter.**
+8. **LRU vs LFU?** **LRU evicts what was used longest ago; LFU evicts what is used least often. LFU protects steadily popular keys from a one-off scan; LRU adapts faster to new patterns.**
+9. **What happens with `volatile-lru` if no keys have a TTL?** **Nothing is evictable, so it behaves like noeviction and writes fail when memory is full.**
+10. **Why store rate-limit counters in Redis rather than Postgres?** **The check runs on every request, so it must add almost no latency and must not flood the primary DB.**
+11. **Why must `INCR` and `EXPIRE` be atomic in a rate limiter?** **If the process dies between them, the counter never expires and the client stays blocked forever.**
+12. **Why is it risky to trust `X-Forwarded-For`?** **The client can set it; only trust the value appended by your own proxy, or attackers bypass IP limits.**
+13. ➕ **Can a Redis failover lose a write that returned OK?** **Yes. Replication is asynchronous, so a write acknowledged by the primary may not have reached the replica that gets promoted; WAIT and min-replicas-to-write narrow the window but don't close it.**
+14. ➕ **Why do multi-key commands fail in Redis Cluster, and how do you fix it?** **Keys hash to different slots on different nodes (CROSSSLOT); use per-key commands in a pipeline, or hash tags so related keys share a slot.**
+15. ➕ **How does probabilistic early expiration (XFetch) avoid stampedes?** **Each reader refreshes before expiry with a probability that grows as expiry nears and with rebuild time, so usually one request refreshes early and nobody waits at the cliff.**
+16. ➕ **One key gets 100k reads per second in a cluster. What do you do?** **Serve it from a short-lived in-process cache, or write N copies under different suffixes and read a random one; invalidate every copy.**
+17. ➕ **How do you invalidate thousands of keys for one tenant without KEYS or SCAN?** **Include a per-tenant generation number in the keys and INCR it; old keys become unreachable and expire through TTL.**
+18. ➕ **Why put a version in the cache key?** **During a rolling deploy old and new code run together; separate key versions stop each from reading the other's object shape.**
+19. ➕ **How do you keep in-process caches on many servers consistent?** **Short local TTLs plus invalidation broadcasts (Pub/Sub, clearing the local cache on reconnect) or Redis server-assisted client-side caching.**
+20. ➕ **Why can Redis be OOM-killed even with maxmemory set?** **maxmemory covers the dataset, not replication and AOF buffers, fragmentation, client buffers or fork copy-on-write; leave headroom below the RAM limit.**
+
+## Sources
+
+- [Lesson video: Caching, the secret behind it all (Sriniously)](https://youtu.be/estH64OkwxU)
+- [Redis: Key eviction (policies, approximated LRU, LFU)](https://redis.io/docs/latest/develop/reference/eviction/)
+- [Redis: SET command (EX, NX options)](https://redis.io/docs/latest/commands/set/)
+- [Redis: INCR command and the rate-limiter pattern](https://redis.io/docs/latest/commands/incr/)
+- [Redis: Persistence (RDB and AOF)](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+- [MDN: Cache-Control](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control)
+- [IANA: Root servers](https://www.iana.org/domains/root/servers)
+- [Express: Behind proxies (trust proxy)](https://expressjs.com/en/guide/behind-proxies.html)
+- [Valkey](https://valkey.io/)
+- [Redis: Replication (asynchronous replication, WAIT, maxmemory on replicas)](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/)
+- [Redis: High availability with Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/)
+- [Redis: Cluster specification (hash slots, hash tags)](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)
+- [Redis: Client-side caching reference (CLIENT TRACKING)](https://redis.io/docs/latest/develop/reference/client-side-caching/)
+- [Redis: MEMORY USAGE](https://redis.io/docs/latest/commands/memory-usage/)
+- [Redis: UNLINK (background memory reclaim)](https://redis.io/docs/latest/commands/unlink/)
+- [Redis CLI (--bigkeys, --memkeys, --hotkeys)](https://redis.io/docs/latest/develop/tools/cli/)
+- [Vattani, Chierichetti, Lowenstein: Optimal Probabilistic Cache Stampede Prevention (VLDB 2015)](https://www.vldb.org/pvldb/vol8/p886-vattani.pdf)

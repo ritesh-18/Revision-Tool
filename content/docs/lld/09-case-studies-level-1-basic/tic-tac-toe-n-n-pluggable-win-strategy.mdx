@@ -1,0 +1,656 @@
+---
+title: "9.2 Tic-Tac-Toe (N×N, pluggable win strategy)"
+---
+
+## Problem & where it's asked
+
+Tic-Tac-Toe is reported at **Flipkart** (as a machine-coding problem, alongside Snake & Ladder), **Amazon** and **Microsoft**. It also appears for **Uber** and **Atlassian** in an aggregated "35 machine coding questions" list, and for **Google** in CodeZym's list. Treat those three as uncertain. The standard ask is an N×N board, two or more players taking turns, and detecting a win or a draw. The reported follow-ups are an **O(1) win check** using row and column counters, **undo** (inferred) and a **bot player**.
+
+It looks like a toy problem, and that's the trap. Graders use it to see whether you model the board, players, turns and rules as separate things, and whether invalid moves get proper errors instead of silently corrupting the board.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Board size? | Any N ≥ 3, given at game creation. |
+| How many players? | 2 or more, each with a unique one-character symbol. |
+| Win condition? | K in a row (horizontal, vertical, diagonal). The default K is N; *Gomoku-style* K &lt; N must also be supported. |
+| Who moves first? | Players take turns in the order given. |
+| Invalid move behaviour? | Throw a typed error and leave the state unchanged. The same player tries again. |
+| Undo? | Yes, any number of steps. Undo after a win reopens the game. |
+| UI? | Console rendering only. |
+
+## Requirements
+
+**Functional**: create a game (N, players, K); `play(player, row, col)` validates turn, bounds, occupancy and status; detect win or draw after each move; `undo()`; render the board; query the status and winner.
+
+**Non-functional**: the win check must be O(1) for K = N and O(K) otherwise; adding a rule (e.g. "only diagonals count") must not touch `Game`; errors must be precise.
+
+**Out of scope**: networking, persistence, AI beyond a simple bot (extension), time limits.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Player` | Name and symbol | `Game` has 2..* players |
+| `Board` | N×N cells, bounds and occupancy checks, rendering | Owned by `Game` |
+| `Move` | Row, column and player index (the command record) | Stored in `Game.history` |
+| `WinStrategy` | Decides if the last move wins; can revert | Injected into `Game` |
+| `CounterWinStrategy` | O(1) counters for K = N | implements `WinStrategy` |
+| `LineScanWinStrategy` | Scans 4 directions for K in a row | implements `WinStrategy` |
+| `Game` | Turn order, status, validation, undo | Uses `Board`, `WinStrategy` |
+| `GameFactory` | Chooses the right strategy from the config | Creates `Game` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Player {
+        +string name
+        +string symbol
+    }
+    class Board {
+        +number size
+        +place(row, col, symbol) void
+        +clear(row, col) void
+        +isInside(row, col) bool
+        +isEmpty(row, col) bool
+        +render() string
+    }
+    class WinStrategy {
+        <<interface>>
+        +recordMove(board, move) bool
+        +revertMove(board, move) void
+    }
+    class CounterWinStrategy
+    class LineScanWinStrategy
+    class Game {
+        +GameStatus status
+        +play(playerName, row, col) string
+        +undo() void
+        +currentPlayer() Player
+    }
+    class Move {
+        +number row
+        +number col
+        +number playerIndex
+    }
+    WinStrategy <|.. CounterWinStrategy
+    WinStrategy <|.. LineScanWinStrategy
+    Game *-- Board
+    Game o-- Player
+    Game --> WinStrategy
+    Game *-- Move : history`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> IN_PROGRESS
+    IN_PROGRESS --> IN_PROGRESS : valid move, no result
+    IN_PROGRESS --> WON : winning move
+    IN_PROGRESS --> DRAW : board full
+    WON --> IN_PROGRESS : undo
+    DRAW --> IN_PROGRESS : undo`} />
+
+## Design decisions & patterns
+
+- **Strategy for the win rule.** The classic O(1) trick (per-player counters for each row, column and the two diagonals) only works when K = N. Gomoku-style K &lt; N needs a local scan. Putting both behind `WinStrategy` means `Game` doesn't care which one it has, and a new variant ("wrap-around board", "only diagonals count") is a new class.
+- **Strategies are stateful and revertible.** The counter strategy keeps state, so undo must tell it to decrement. That's why the interface has `revertMove`. A stateless scan strategy just does nothing there.
+- **Command-style history for undo.** Each `Move` is a small record, and undo pops it, clears the cell, reverts the strategy and restores the turn. We don't need full Command objects with `execute()` because there's only one kind of action. Say this in the interview: it shows you know when a pattern would be overkill.
+- **Game status as an enum, not the State pattern.** There are three states and the behaviour difference is just "moves are allowed or not". A `switch`-free guard is clearer than three state classes. The State pattern earns its place in 9.4 (vending machine), where behaviour really differs per state.
+- **Factory picks the strategy** so callers don't need to know that counters only work when K = N.
+- **Rejected:** checking the entire board after every move (O(N²), and it looks naive at SDE-2 level), and storing the board as a string (hard to validate and render).
+
+## Implementation
+
+**Part 1: enums, errors and models.**
+
+```ts
+enum GameStatus { IN_PROGRESS = 'IN_PROGRESS', WON = 'WON', DRAW = 'DRAW' }
+
+class GameError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class InvalidConfigError extends GameError {}
+class InvalidMoveError extends GameError {}
+class NotYourTurnError extends GameError {}
+class GameOverError extends GameError {}
+
+class Player {
+  constructor(readonly name: string, readonly symbol: string) {
+    if (!name.trim()) throw new InvalidConfigError('Player name is required');
+    if (symbol.length !== 1 || symbol === '.') throw new InvalidConfigError(`Invalid symbol "${symbol}"`);
+  }
+}
+
+interface Move {
+  readonly row: number;
+  readonly col: number;
+  readonly playerIndex: number;
+}
+
+class Board {
+  private readonly cells: (string | null)[][];
+  private filled = 0;
+
+  constructor(readonly size: number) {
+    if (!Number.isInteger(size) || size < 3) throw new InvalidConfigError(`Board size must be >= 3, got ${size}`);
+    this.cells = Array.from({ length: size }, () => Array<string | null>(size).fill(null));
+  }
+
+  isInside(row: number, col: number): boolean {
+    return Number.isInteger(row) && Number.isInteger(col) && row >= 0 && col >= 0 && row < this.size && col < this.size;
+  }
+  symbolAt(row: number, col: number): string | null {
+    return this.isInside(row, col) ? (this.cells[row]?.[col] ?? null) : null;
+  }
+  isEmpty(row: number, col: number): boolean { return this.symbolAt(row, col) === null; }
+  isFull(): boolean { return this.filled === this.size * this.size; }
+
+  place(row: number, col: number, symbol: string): void {
+    const line = this.cells[row];
+    if (!line || !this.isInside(row, col)) throw new InvalidMoveError(`(${row},${col}) is outside the ${this.size}x${this.size} board`);
+    if (line[col] !== null) throw new InvalidMoveError(`(${row},${col}) is already taken by ${line[col]}`);
+    line[col] = symbol;
+    this.filled++;
+  }
+
+  clear(row: number, col: number): void {
+    const line = this.cells[row];
+    if (line && line[col] !== null) {
+      line[col] = null;
+      this.filled--;
+    }
+  }
+
+  render(): string {
+    return this.cells.map((line) => line.map((c) => c ?? '.').join(' ')).join('\n');
+  }
+}
+```
+
+**Part 2: win strategies.** The counter strategy keeps one integer per (player, row), (player, column) and (player, diagonal). A player wins when any counter reaches N. The scan strategy walks outwards from the last move in four directions.
+
+```ts
+interface WinStrategy {
+  readonly name: string;
+  recordMove(board: Board, move: Move): boolean;
+  revertMove(board: Board, move: Move): void;
+}
+
+class CounterWinStrategy implements WinStrategy {
+  readonly name = 'counters O(1)';
+  private readonly rows: number[][];
+  private readonly cols: number[][];
+  private readonly diag: number[];
+  private readonly anti: number[];
+
+  constructor(private readonly n: number, players: number) {
+    this.rows = Array.from({ length: players }, () => Array<number>(n).fill(0));
+    this.cols = Array.from({ length: players }, () => Array<number>(n).fill(0));
+    this.diag = Array<number>(players).fill(0);
+    this.anti = Array<number>(players).fill(0);
+  }
+
+  recordMove(_board: Board, m: Move): boolean { return this.apply(m, +1); }
+  revertMove(_board: Board, m: Move): void { this.apply(m, -1); }
+
+  private apply({ row, col, playerIndex: p }: Move, delta: number): boolean {
+    const r = this.rows[p];
+    const c = this.cols[p];
+    if (!r || !c) throw new InvalidConfigError(`Unknown player index ${p}`);
+    r[row] = (r[row] ?? 0) + delta;
+    c[col] = (c[col] ?? 0) + delta;
+    if (row === col) this.diag[p] = (this.diag[p] ?? 0) + delta;
+    if (row + col === this.n - 1) this.anti[p] = (this.anti[p] ?? 0) + delta;
+    return r[row] === this.n || c[col] === this.n || this.diag[p] === this.n || this.anti[p] === this.n;
+  }
+}
+
+class LineScanWinStrategy implements WinStrategy {
+  readonly name: string;
+  private static readonly DIRECTIONS: readonly (readonly [number, number])[] = [[0, 1], [1, 0], [1, 1], [1, -1]];
+
+  constructor(private readonly k: number) {
+    this.name = `scan ${k}-in-a-row`;
+  }
+
+  recordMove(board: Board, { row, col }: Move): boolean {
+    const symbol = board.symbolAt(row, col);
+    if (symbol === null) return false;
+    return LineScanWinStrategy.DIRECTIONS.some(([dr, dc]) => {
+      const count = 1 + this.countFrom(board, row, col, dr, dc, symbol) + this.countFrom(board, row, col, -dr, -dc, symbol);
+      return count >= this.k;
+    });
+  }
+
+  revertMove(): void { /* stateless: nothing to undo */ }
+
+  private countFrom(board: Board, row: number, col: number, dr: number, dc: number, symbol: string): number {
+    let count = 0;
+    let r = row + dr;
+    let c = col + dc;
+    while (count < this.k - 1 && board.symbolAt(r, c) === symbol) {
+      count++;
+      r += dr;
+      c += dc;
+    }
+    return count;
+  }
+}
+```
+
+**Part 3: the game service.** `play` validates everything *before* it changes anything. That ordering is what keeps a failed move from half-applying.
+
+```ts
+class Game {
+  private readonly history: Move[] = [];
+  private turn = 0;
+  private _status = GameStatus.IN_PROGRESS;
+  private _winner: Player | null = null;
+
+  constructor(
+    private readonly board: Board,
+    private readonly players: readonly Player[],
+    private readonly winStrategy: WinStrategy,
+  ) {
+    if (players.length < 2) throw new InvalidConfigError('Need at least 2 players');
+    const symbols = new Set(players.map((p) => p.symbol));
+    if (symbols.size !== players.length) throw new InvalidConfigError('Player symbols must be unique');
+  }
+
+  get status(): GameStatus { return this._status; }
+  get winner(): Player | null { return this._winner; }
+  get strategyName(): string { return this.winStrategy.name; }
+
+  currentPlayer(): Player {
+    const p = this.players[this.turn];
+    if (!p) throw new GameError('Corrupt turn index');
+    return p;
+  }
+
+  play(playerName: string, row: number, col: number): string {
+    if (this._status !== GameStatus.IN_PROGRESS) throw new GameOverError(`Game already ended: ${this.describe()}`);
+    const player = this.currentPlayer();
+    if (player.name !== playerName) throw new NotYourTurnError(`It is ${player.name}'s turn, not ${playerName}'s`);
+
+    this.board.place(row, col, player.symbol); // throws on bounds/occupied, state unchanged
+    const move: Move = { row, col, playerIndex: this.turn };
+    this.history.push(move);
+
+    if (this.winStrategy.recordMove(this.board, move)) {
+      this._status = GameStatus.WON;
+      this._winner = player;
+    } else if (this.board.isFull()) {
+      this._status = GameStatus.DRAW;
+    } else {
+      this.turn = (this.turn + 1) % this.players.length;
+    }
+    return `${player.name}(${player.symbol}) -> (${row},${col}) ${this.describe()}`;
+  }
+
+  undo(): string {
+    const move = this.history.pop();
+    if (!move) throw new InvalidMoveError('Nothing to undo');
+    this.board.clear(move.row, move.col);
+    this.winStrategy.revertMove(this.board, move);
+    this.turn = move.playerIndex; // the player who made the move gets to replay
+    this._status = GameStatus.IN_PROGRESS;
+    this._winner = null;
+    return `undo (${move.row},${move.col}); next: ${this.currentPlayer().name}`;
+  }
+
+  describe(): string {
+    if (this._status === GameStatus.WON) return `WON by ${this._winner?.name}`;
+    if (this._status === GameStatus.DRAW) return 'DRAW';
+    return `next: ${this.currentPlayer().name}`;
+  }
+
+  render(): string { return this.board.render(); }
+}
+
+interface GameConfig {
+  size: number;
+  players: readonly { name: string; symbol: string }[];
+  winLength?: number;
+}
+
+function createGame(config: GameConfig): Game {
+  const board = new Board(config.size); // validates the size first
+  const k = config.winLength ?? config.size;
+  if (k < 3 || k > config.size) throw new InvalidConfigError(`winLength must be between 3 and ${config.size}, got ${k}`);
+  const players = config.players.map((p) => new Player(p.name, p.symbol));
+  const strategy = k === config.size
+    ? new CounterWinStrategy(config.size, players.length)
+    : new LineScanWinStrategy(k);
+  return new Game(board, players, strategy);
+}
+```
+
+**Part 4: driver.**
+
+```ts
+function attempt(fn: () => string): void {
+  try {
+    console.log(fn());
+  } catch (err) {
+    if (err instanceof GameError) console.log(`  ! ${err.name}: ${err.message}`);
+    else throw err;
+  }
+}
+
+console.log('--- Game 1: 3x3, two players ---');
+const g1 = createGame({ size: 3, players: [{ name: 'Alice', symbol: 'X' }, { name: 'Bob', symbol: 'O' }] });
+console.log(`strategy: ${g1.strategyName}`);
+attempt(() => g1.play('Alice', 0, 0));
+attempt(() => g1.play('Bob', 0, 0));
+attempt(() => g1.play('Alice', 1, 1));
+attempt(() => g1.play('Bob', 3, 1));
+attempt(() => g1.play('Bob', 0, 1));
+attempt(() => g1.play('Alice', 1, 1));
+attempt(() => g1.play('Bob', 0, 2));
+attempt(() => g1.play('Alice', 2, 2));
+attempt(() => g1.play('Bob', 2, 0));
+console.log(g1.render());
+attempt(() => g1.undo());
+attempt(() => g1.play('Alice', 1, 0));
+console.log(`status after undo+replay: ${g1.status}`);
+
+console.log('--- Game 2: draw ---');
+const g2 = createGame({ size: 3, players: [{ name: 'Asha', symbol: 'X' }, { name: 'Ravi', symbol: 'O' }] });
+const drawMoves: [number, number][] = [[0, 0], [0, 1], [0, 2], [1, 1], [1, 0], [1, 2], [2, 1], [2, 0], [2, 2]];
+let last = '';
+drawMoves.forEach(([r, c], i) => { last = g2.play(i % 2 === 0 ? 'Asha' : 'Ravi', r, c); });
+console.log(last);
+console.log(g2.render());
+
+console.log('--- Game 3: 4x4, three players, 3 in a row ---');
+const g3 = createGame({
+  size: 4,
+  winLength: 3,
+  players: [{ name: 'P1', symbol: 'A' }, { name: 'P2', symbol: 'B' }, { name: 'P3', symbol: 'C' }],
+});
+console.log(`strategy: ${g3.strategyName}`);
+const g3Moves: [string, number, number][] = [
+  ['P1', 3, 0], ['P2', 0, 0], ['P3', 0, 3],
+  ['P1', 2, 1], ['P2', 1, 1], ['P3', 1, 3],
+  ['P1', 1, 2],
+];
+for (const [name, r, c] of g3Moves) attempt(() => g3.play(name, r, c));
+console.log(g3.render());
+
+console.log('--- Bad configs ---');
+attempt(() => createGame({ size: 2, players: [{ name: 'A', symbol: 'X' }, { name: 'B', symbol: 'O' }] }).describe());
+attempt(() => createGame({ size: 3, players: [{ name: 'A', symbol: 'X' }, { name: 'B', symbol: 'X' }] }).describe());
+attempt(() => createGame({ size: 3, winLength: 5, players: [{ name: 'A', symbol: 'X' }, { name: 'B', symbol: 'O' }] }).describe());
+```
+
+## Demo output
+
+```text
+--- Game 1: 3x3, two players ---
+strategy: counters O(1)
+Alice(X) -> (0,0) next: Bob
+  ! InvalidMoveError: (0,0) is already taken by X
+  ! NotYourTurnError: It is Bob's turn, not Alice's
+  ! InvalidMoveError: (3,1) is outside the 3x3 board
+Bob(O) -> (0,1) next: Alice
+Alice(X) -> (1,1) next: Bob
+Bob(O) -> (0,2) next: Alice
+Alice(X) -> (2,2) WON by Alice
+  ! GameOverError: Game already ended: WON by Alice
+X O O
+. X .
+. . X
+undo (2,2); next: Alice
+Alice(X) -> (1,0) next: Bob
+status after undo+replay: IN_PROGRESS
+--- Game 2: draw ---
+Asha(X) -> (2,2) DRAW
+X O X
+X O O
+O X X
+--- Game 3: 4x4, three players, 3 in a row ---
+strategy: scan 3-in-a-row
+P1(A) -> (3,0) next: P2
+P2(B) -> (0,0) next: P3
+P3(C) -> (0,3) next: P1
+P1(A) -> (2,1) next: P2
+P2(B) -> (1,1) next: P3
+P3(C) -> (1,3) next: P1
+P1(A) -> (1,2) WON by P1
+B . . C
+. B A C
+. A . .
+A . . .
+--- Bad configs ---
+  ! InvalidConfigError: Board size must be >= 3, got 2
+  ! InvalidConfigError: Player symbols must be unique
+  ! InvalidConfigError: winLength must be between 3 and 3, got 5
+
+```
+
+In game 3, P1 wins with `(3,0) (2,1) (1,2)`: three cells of the four-cell anti-diagonal. The counter strategy waits for a counter to reach N = 4, so it would never report this win. That's exactly why K &lt; N needs a different algorithm.
+
+## Concurrency
+
+A local game has no concurrency. An **online** game (a Flipkart or Uber interviewer may push you there) has two classic races. The same client double-submits a move because of a flaky network retry, and two browser tabs of the same player both send a move for the same turn. The fix is **optimistic concurrency**: every move carries the move number the client saw (`expectedVersion`). The server applies the move only if the version still matches, and an idempotency key makes an exact retry return the original result instead of an error.
+
+```ts
+class StaleMoveError extends Error {}
+
+interface MoveRequest { requestId: string; player: string; cell: number; expectedVersion: number }
+
+class OnlineGame {
+  private version = 0;
+  private readonly cells = new Map<number, string>();
+  private readonly processed = new Map<string, string>(); // idempotency: requestId -> result
+
+  submit(req: MoveRequest): string {
+    const previous = this.processed.get(req.requestId);
+    if (previous) return `${previous} (replayed)`;
+    if (req.expectedVersion !== this.version) {
+      throw new StaleMoveError(`${req.requestId}: expected v${req.expectedVersion} but game is at v${this.version}`);
+    }
+    if (this.cells.has(req.cell)) throw new Error(`${req.requestId}: cell ${req.cell} taken`);
+    this.cells.set(req.cell, req.player);
+    this.version++;
+    const result = `${req.requestId}: ${req.player} took ${req.cell}, now v${this.version}`;
+    this.processed.set(req.requestId, result);
+    return result;
+  }
+}
+
+// Simulate HTTP handlers arriving in the same tick from two tabs + one retry.
+const game = new OnlineGame();
+const requests: MoveRequest[] = [
+  { requestId: 'tab1-m1', player: 'X', cell: 4, expectedVersion: 0 },
+  { requestId: 'tab2-m1', player: 'X', cell: 0, expectedVersion: 0 },
+  { requestId: 'tab1-m1', player: 'X', cell: 4, expectedVersion: 0 },
+];
+const results = await Promise.allSettled(requests.map(async (r) => game.submit(r)));
+for (const r of results) console.log(r.status === 'fulfilled' ? r.value : `rejected: ${(r.reason as Error).message}`);
+```
+
+```text
+tab1-m1: X took 4, now v1
+rejected: tab2-m1: expected v0 but game is at v1
+tab1-m1: X took 4, now v1 (replayed)
+
+```
+
+With a database behind it, the same idea becomes `UPDATE games SET state=$1, version=version+1 WHERE id=$2 AND version=$3`, followed by a check that exactly one row changed.
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|-----------|---------------|
+| **O(1) win check** | Already done: `CounterWinStrategy`. Explain it before being asked. |
+| **Undo / redo** | Already done for undo. For redo, keep a second stack and clear it on any new move. |
+| **Bot player** | Introduce a `MoveProvider` interface (human input vs bot). The bot is a Strategy: win if possible, else block, else take the centre, else the first free cell. Implemented below. |
+| **Leaderboard across games** | A `ScoreBoard` observer listens for `GameEnded` events. |
+| **Different board shapes / rules** | New `WinStrategy`. `Game` is untouched. |
+| **Timed turns** | Inject a `Clock`, store the turn start, and auto-skip or forfeit on timeout. |
+
+The bot extension. Players become `MoveProvider`s, so the game loop doesn't care whether a human or a bot is moving.
+
+```ts
+type Cell = string | null;
+interface MoveProvider { readonly name: string; readonly symbol: string; nextMove(board: Cell[], n: number): number }
+
+function lines(n: number): number[][] {
+  const out: number[][] = [];
+  for (let i = 0; i < n; i++) {
+    out.push(Array.from({ length: n }, (_, j) => i * n + j));
+    out.push(Array.from({ length: n }, (_, j) => j * n + i));
+  }
+  out.push(Array.from({ length: n }, (_, j) => j * n + j));
+  out.push(Array.from({ length: n }, (_, j) => j * n + (n - 1 - j)));
+  return out;
+}
+
+function winner(board: Cell[], n: number): string | null {
+  for (const line of lines(n)) {
+    const first = board[line[0] ?? -1];
+    if (first && line.every((i) => board[i] === first)) return first;
+  }
+  return null;
+}
+
+class ScriptedHuman implements MoveProvider {
+  constructor(readonly name: string, readonly symbol: string, private readonly script: number[]) {}
+  nextMove(): number {
+    const move = this.script.shift();
+    if (move === undefined) throw new Error(`${this.name} has no more moves`);
+    return move;
+  }
+}
+
+class RuleBot implements MoveProvider {
+  constructor(readonly name: string, readonly symbol: string, private readonly opponent: string) {}
+  nextMove(board: Cell[], n: number): number {
+    return this.completing(board, n, this.symbol) // 1. win
+      ?? this.completing(board, n, this.opponent) // 2. block
+      ?? this.centre(board, n) // 3. centre
+      ?? board.findIndex((c) => c === null); // 4. first free
+  }
+  private completing(board: Cell[], n: number, symbol: string): number | undefined {
+    for (const line of lines(n)) {
+      const mine = line.filter((i) => board[i] === symbol).length;
+      const empty = line.filter((i) => board[i] === null);
+      if (mine === n - 1 && empty.length === 1) return empty[0];
+    }
+    return undefined;
+  }
+  private centre(board: Cell[], n: number): number | undefined {
+    const c = Math.floor(n / 2) * n + Math.floor(n / 2);
+    return board[c] === null ? c : undefined;
+  }
+}
+
+function playGame(n: number, players: MoveProvider[]): void {
+  const board: Cell[] = Array<Cell>(n * n).fill(null);
+  for (let turn = 0; turn < n * n; turn++) {
+    const p = players[turn % players.length];
+    if (!p) return;
+    const cell = p.nextMove(board, n);
+    if (board[cell] !== null) throw new Error(`${p.name} chose occupied cell ${cell}`);
+    board[cell] = p.symbol;
+    console.log(`${p.name} -> cell ${cell}`);
+    const w = winner(board, n);
+    if (w) { console.log(`winner: ${w}`); return; }
+  }
+  console.log('draw');
+}
+
+// The human threatens 0-1-2, the bot blocks at 2, then completes its own 2-4-6 diagonal.
+playGame(3, [new ScriptedHuman('human', 'X', [0, 1, 5]), new RuleBot('bot', 'O', 'X')]);
+```
+
+```text
+human -> cell 0
+bot -> cell 4
+human -> cell 1
+bot -> cell 2
+human -> cell 5
+bot -> cell 6
+winner: O
+```
+
+## Edge cases
+
+- A move outside the board, with negative or non-integer coordinates: `InvalidMoveError`, the turn doesn't change.
+- A move on an occupied cell: rejected, and the same player moves again.
+- A move after the game has ended: `GameOverError`.
+- A player moves out of turn: `NotYourTurnError`.
+- A winning move on the very last cell: must report **WON, not DRAW**. Check for a win before checking for a full board.
+- Undo with an empty history, and undo after a win: the game reopens and the winner is cleared.
+- Duplicate symbols, fewer than two players, N &lt; 3, or K > N: rejected at creation.
+- An odd N has a centre cell that lies on both diagonals. The counter strategy increments both, which is correct.
+
+## Complexity
+
+| Operation | Counter strategy (K = N) | Scan strategy (K &lt; N) |
+|-----------|--------------------------|-----------------------|
+| `play` | O(1) | O(K) |
+| `undo` | O(1) | O(1) |
+| Memory | O(P·N) counters + O(N²) board | O(N²) board |
+| Draw detection | O(1) using the `filled` counter | O(1) |
+
+## What graders look for / common mistakes
+
+- **Look for:** separate `Board`, `Player` and `Game`; validation before mutation; clean turn rotation; a pluggable win check; tests for the tricky cases (win on the last cell, anti-diagonal).
+- **Mistake:** scanning the whole board after every move and calling it done.
+- **Mistake:** hard-coding two players (`turn = turn === 'X' ? 'O' : 'X'`), which breaks the "3 players" follow-up.
+- **Mistake:** checking for a draw before a win.
+- **Mistake:** mixing `console.log` and prompt reading into `Game`, which makes it impossible to add a bot or a web UI.
+- **Mistake:** using the counter trick for K &lt; N. It gives wrong answers.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–8 | Clarify N, K, number of players, undo and the bot. |
+| 8–15 | Entities and diagram. Name the `WinStrategy` interface early. |
+| 15–45 | `Board`, `Player`, `Game.play` with validation, counter strategy. |
+| 45–60 | Driver: win, draw, invalid moves. |
+| 60–75 | Undo and the scan strategy for K &lt; N. |
+| 75–90 | Bot or online-concurrency discussion, complexity and edge cases. |
+
+## Interview Q&A
+
+**Q1. Explain the O(1) win check. Why does it need per-player counters?**
+
+<details>
+<summary>Answer</summary>
+
+For each player, keep a count of their marks in every row and column and on both diagonals. A move at (r, c) increments `rows[p][r]` and `cols[p][c]`, plus the diagonal if r = c and the anti-diagonal if r + c = N − 1. The player wins when any of those reaches N. The counters are per player because a row with 2 X's and 1 O is not a win. The +1/−1 trick (X adds, O subtracts) is a neat variant, but it only works for exactly two players.
+
+</details>
+
+**Q2. How does undo interact with the win strategy?**
+
+<details>
+<summary>Answer</summary>
+
+A stateful strategy must be reverted, otherwise its counters still include the undone mark and a later move can trigger a false win. That's why `WinStrategy` has `revertMove`. The scan strategy reads the board directly, so its revert is a no-op.
+
+</details>
+
+**Q3. Why not the State pattern for game status?**
+
+<details>
+<summary>Answer</summary>
+
+The states only differ in "is a move allowed?". A single guard at the top of `play` expresses that, and three classes would add indirection without removing any conditionals. I'd switch to State if each status had different behaviour, e.g. a *paused* state that accepts `resume` but rejects moves and undo, plus a *waiting-for-players* state.
+
+</details>
+
+**Q4. How would you support a bot without changing `Game`?**
+
+<details>
+<summary>Answer</summary>
+
+Put a `MoveProvider` interface in front of each player: humans read from input, bots compute a move. The game loop asks the current provider for a move and passes it to `Game.play`, which still validates it. Bot difficulty levels are just different providers (rule-based, minimax for 3×3).
+
+</details>

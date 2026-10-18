@@ -1,0 +1,851 @@
+---
+title: "12.3 File System"
+---
+
+## Problem & where it's asked
+
+Design an in-memory hierarchical file system with directories and files. It should support creating directories (including `mkdir -p`), writing and reading files, listing, deleting, moving and renaming, computing a directory's total size, and finding nodes that match a condition, such as "all `.ts` files larger than 1 KB".
+
+- **CRED (reported, 150-minute round, snippet-level):** insert, delete and move files and folders; search by exact name or by pattern. CRED's rubric stresses OOP, SOLID and clean abstractions.
+- **Amazon, Uber (reported in aggregated lists):** variants add `cd` with wildcards and a Unix-style `find` with combinable filters.
+- **Atlassian (frontend, reported):** a "File Explorer" tree UI. The model below is the same tree you would render.
+- **Graded on:** the **Composite** pattern, a filter **Specification** that can be combined, and careful path and edge-case handling.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Absolute or relative paths? | The core API takes absolute paths; relative paths and `cd` are the extension. |
+| `.` and `..` allowed? | Yes, and they are normalised. `..` at the root stays at the root. |
+| File size? | The content length (ASCII, so characters equal bytes). A directory's size is the sum of its descendants. |
+| Symlinks, permissions, hard links? | Out of scope; mentioned in follow-ups. |
+| Move onto an existing path? | If the target is a directory, move *into* it (like `mv a dir/`). If the target is a file, reject it (no silent overwrite). |
+| Delete a non-empty directory? | Only with `recursive: true`. |
+| Search semantics? | `find(start, filter)` returns matching **descendants** of `start`, sorted by path. Filters combine with AND, OR and NOT. |
+| Name rules? | 1–255 characters; no `/`, NUL, `*` or `?`, since those are reserved for globs. |
+
+## Requirements
+
+**Functional:** `mkdir(path, {parents})`, `writeFile(path, content, {append})`, `readFile`, `ls`, `rm(path, {recursive})`, `move(src, dst)`, `du(path)`, `find(path, filter)`, `tree(path)`.
+
+**Non-functional:** O(depth) path resolution using hash maps per directory; deterministic ordering of listings; typed errors that mirror POSIX (`ENOENT`, `EEXIST`, `ENOTDIR`, `EISDIR`, `ENOTEMPTY`, `EINVAL`).
+
+**Out of scope:** persistence, permissions, links, streaming large files, multiple users.
+
+## Entities & relationships
+
+| Entity | Role | Relationship |
+|---|---|---|
+| `FsNode` (abstract) | Component: `name`, `parent`, `modifiedAt`, `size()`, `path()` | Base of files and directories |
+| `FileNode` | Leaf: `content` | Has a parent `DirectoryNode` |
+| `DirectoryNode` | Composite: `children: Map<name, FsNode>` | Contains 0..n `FsNode`s |
+| `NodeFilter` | Specification: `test(node)` | Composed with `and`, `or`, `not` |
+| `FileSystem` | Facade: path parsing, validation, operations | Owns the root `DirectoryNode` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class FsNode {
+        <<abstract>>
+        +name string
+        +parent DirectoryNode
+        +modifiedAt number
+        +size() number
+        +path() string
+    }
+    class FileNode {
+        +content string
+        +extension string
+        +size() number
+    }
+    class DirectoryNode {
+        -children Map
+        +size() number
+        +child(name) FsNode
+        +addChild(node) void
+        +removeChild(name) void
+        +list() FsNode[]
+    }
+    class NodeFilter {
+        <<interface>>
+        +label string
+        +test(node) boolean
+    }
+    class FileSystem {
+        +mkdir(path, opts) void
+        +writeFile(path, content, opts) void
+        +readFile(path) string
+        +ls(path) string[]
+        +rm(path, opts) void
+        +move(src, dst) string
+        +du(path) number
+        +find(path, filter) string[]
+    }
+    FsNode <|-- FileNode
+    FsNode <|-- DirectoryNode
+    DirectoryNode o-- FsNode : children
+    FileSystem --> DirectoryNode : root
+    FileSystem ..> NodeFilter`} />
+
+## Design decisions & patterns
+
+- **Composite.** Files and directories share an interface (`size()`, `path()`), so `du`, `find` and `tree` treat them uniformly: "a directory's size is the sum of its children's sizes" is one line of recursion with no `instanceof` switch. That is the whole point of the pattern, and graders look for it.
+- **A `Map` per directory, not an array.** Name lookup is O(1) and duplicate names are impossible by construction. We sort only when listing.
+- **Parent pointers.** `path()`, "is this an ancestor?" (needed to block `mv /a /a/b`) and removal from the old parent all need to walk *up* the tree. Without parent pointers each of those becomes a search from the root.
+- **Specification for search.** `find` takes a `NodeFilter`, and filters combine with `and`, `or` and `not`. A new criterion, such as "modified after", is one new factory function, and `find` never changes (Open/Closed). The alternative, `find(name?, ext?, minSize?, …)`, grows forever.
+- **Facade.** Callers use string paths; `FileSystem` owns parsing and validation. Nodes stay simple and don't know about paths as strings.
+- **Rejected:** Visitor. It is useful if you have many unrelated tree operations (export, checksum, permissions audit), but for `du`, `find` and `tree` it is ceremony. Mention it as the next step if the interviewer keeps adding operations.
+
+## Implementation
+
+**Part 1: errors, clock and path parsing.** The clock is a logical counter, which is enough to order modifications deterministically.
+
+```ts
+class FsError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(`${code}: ${message}`);
+    this.name = new.target.name;
+  }
+}
+class InvalidPathError extends FsError {
+  constructor(message: string) {
+    super('EINVAL', message);
+  }
+}
+class NotFoundError extends FsError {
+  constructor(path: string) {
+    super('ENOENT', `${path} does not exist`);
+  }
+}
+class AlreadyExistsError extends FsError {
+  constructor(path: string) {
+    super('EEXIST', `${path} already exists`);
+  }
+}
+class NotADirectoryError extends FsError {
+  constructor(path: string) {
+    super('ENOTDIR', `${path} is not a directory`);
+  }
+}
+class IsADirectoryError extends FsError {
+  constructor(path: string) {
+    super('EISDIR', `${path} is a directory`);
+  }
+}
+class DirectoryNotEmptyError extends FsError {
+  constructor(path: string) {
+    super('ENOTEMPTY', `${path} is not empty (use recursive)`);
+  }
+}
+
+interface Clock {
+  now(): number;
+}
+class LogicalClock implements Clock {
+  private tick = 0;
+  now(): number {
+    return ++this.tick;
+  }
+}
+
+const NAME_PATTERN = /^[^/\0*?]{1,255}$/;
+
+/** "/a/./b/../c" -> ["a", "c"]. Only absolute paths are accepted here. */
+function parsePath(path: string): string[] {
+  if (!path.startsWith('/')) throw new InvalidPathError(`path must be absolute: "${path}"`);
+  const parts: string[] = [];
+  for (const segment of path.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      parts.pop();
+      continue;
+    }
+    if (!NAME_PATTERN.test(segment)) throw new InvalidPathError(`invalid name "${segment}"`);
+    parts.push(segment);
+  }
+  return parts;
+}
+
+const joinPath = (parts: readonly string[]): string => `/${parts.join('/')}`;
+```
+
+**Part 2: the Composite.** `FsNode` is the component, `FileNode` is the leaf and `DirectoryNode` is the composite.
+
+```ts
+abstract class FsNode {
+  constructor(
+    public name: string,
+    public parent: DirectoryNode | null,
+    public modifiedAt: number,
+  ) {}
+
+  abstract readonly kind: 'file' | 'dir';
+  abstract size(): number;
+
+  path(): string {
+    if (!this.parent) return '/';
+    const parentPath = this.parent.path();
+    return parentPath === '/' ? `/${this.name}` : `${parentPath}/${this.name}`;
+  }
+
+  isAncestorOf(node: FsNode): boolean {
+    for (let current = node.parent; current; current = current.parent) {
+      if ((current as FsNode) === this) return true;
+    }
+    return false;
+  }
+}
+
+class FileNode extends FsNode {
+  override readonly kind = 'file';
+
+  constructor(
+    name: string,
+    parent: DirectoryNode,
+    modifiedAt: number,
+    public content: string,
+  ) {
+    super(name, parent, modifiedAt);
+  }
+
+  override size(): number {
+    return this.content.length;
+  }
+
+  get extension(): string {
+    const dot = this.name.lastIndexOf('.');
+    return dot > 0 ? this.name.slice(dot + 1) : '';
+  }
+}
+
+class DirectoryNode extends FsNode {
+  override readonly kind = 'dir';
+  private readonly children = new Map<string, FsNode>();
+
+  override size(): number {
+    let total = 0;
+    for (const child of this.children.values()) total += child.size(); // recursion via the Composite
+    return total;
+  }
+
+  child(name: string): FsNode | undefined {
+    return this.children.get(name);
+  }
+
+  addChild(node: FsNode): void {
+    node.parent = this;
+    this.children.set(node.name, node);
+  }
+
+  removeChild(name: string): void {
+    this.children.delete(name);
+  }
+
+  get isEmpty(): boolean {
+    return this.children.size === 0;
+  }
+
+  list(): FsNode[] {
+    return [...this.children.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
+}
+```
+
+**Part 3: filters (the Specification pattern).** Each filter carries a `label`, so logs and error messages can say what was searched for.
+
+```ts
+interface NodeFilter {
+  readonly label: string;
+  test(node: FsNode): boolean;
+}
+
+function globToRegExp(glob: string): RegExp {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^${escaped.replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
+}
+
+const Filters = {
+  nameIs: (name: string): NodeFilter => ({ label: `name=${name}`, test: (n) => n.name === name }),
+  nameMatches: (glob: string): NodeFilter => {
+    const re = globToRegExp(glob);
+    return { label: `name~${glob}`, test: (n) => re.test(n.name) };
+  },
+  filesOnly: (): NodeFilter => ({ label: 'type=file', test: (n) => n instanceof FileNode }),
+  extension: (ext: string): NodeFilter => ({
+    label: `ext=${ext}`,
+    test: (n) => n instanceof FileNode && n.extension === ext,
+  }),
+  minSize: (bytes: number): NodeFilter => ({ label: `size>=${bytes}`, test: (n) => n.size() >= bytes }),
+  modifiedAfter: (tick: number): NodeFilter => ({ label: `mtime>${tick}`, test: (n) => n.modifiedAt > tick }),
+  and: (...filters: NodeFilter[]): NodeFilter => ({
+    label: `(${filters.map((f) => f.label).join(' AND ')})`,
+    test: (n) => filters.every((f) => f.test(n)),
+  }),
+  or: (...filters: NodeFilter[]): NodeFilter => ({
+    label: `(${filters.map((f) => f.label).join(' OR ')})`,
+    test: (n) => filters.some((f) => f.test(n)),
+  }),
+  not: (filter: NodeFilter): NodeFilter => ({ label: `NOT ${filter.label}`, test: (n) => !filter.test(n) }),
+};
+```
+
+**Part 4: the `FileSystem` facade.** All path handling lives here. Notice how `move` handles its three cases: move into an existing directory, rename to a new name, or reject.
+
+```ts
+class FileSystem {
+  private readonly root: DirectoryNode;
+
+  constructor(private readonly clock: Clock) {
+    this.root = new DirectoryNode('', null, clock.now());
+  }
+
+  mkdir(path: string, options: { parents?: boolean } = {}): void {
+    const parts = parsePath(path);
+    if (parts.length === 0) throw new AlreadyExistsError('/');
+    let dir = this.root;
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      const isLast = i === parts.length - 1;
+      const existing = dir.child(name);
+      if (existing) {
+        if (!(existing instanceof DirectoryNode)) throw new NotADirectoryError(existing.path());
+        if (isLast && !options.parents) throw new AlreadyExistsError(existing.path());
+        dir = existing;
+        continue;
+      }
+      if (!isLast && !options.parents) throw new NotFoundError(joinPath(parts.slice(0, i + 1)));
+      const created = new DirectoryNode(name, dir, this.clock.now());
+      dir.addChild(created);
+      dir.modifiedAt = created.modifiedAt;
+      dir = created;
+    }
+  }
+
+  writeFile(path: string, content: string, options: { append?: boolean } = {}): void {
+    const { parent, name } = this.splitParent(path);
+    const existing = parent.child(name);
+    const now = this.clock.now();
+    if (existing instanceof DirectoryNode) throw new IsADirectoryError(existing.path());
+    if (existing instanceof FileNode) {
+      existing.content = options.append ? existing.content + content : content;
+      existing.modifiedAt = now;
+      return;
+    }
+    parent.addChild(new FileNode(name, parent, now, content));
+    parent.modifiedAt = now;
+  }
+
+  readFile(path: string): string {
+    const node = this.resolve(path);
+    if (!(node instanceof FileNode)) throw new IsADirectoryError(node.path());
+    return node.content;
+  }
+
+  ls(path: string): string[] {
+    const node = this.resolve(path);
+    if (node instanceof FileNode) return [node.name];
+    if (!(node instanceof DirectoryNode)) return [];
+    return node.list().map((child) => (child.kind === 'dir' ? `${child.name}/` : child.name));
+  }
+
+  rm(path: string, options: { recursive?: boolean } = {}): void {
+    const node = this.resolve(path);
+    if (!node.parent) throw new InvalidPathError('cannot remove /');
+    if (node instanceof DirectoryNode && !node.isEmpty && !options.recursive) {
+      throw new DirectoryNotEmptyError(node.path());
+    }
+    node.parent.removeChild(node.name);
+    node.parent.modifiedAt = this.clock.now();
+  }
+
+  /** `mv src dst`: into dst if dst is a directory, otherwise rename to dst. Returns the new path. */
+  move(src: string, dst: string): string {
+    const node = this.resolve(src);
+    const oldParent = node.parent;
+    if (!oldParent) throw new InvalidPathError('cannot move /');
+
+    let targetDir: DirectoryNode;
+    let newName: string;
+    const destination = this.tryResolve(dst);
+    if (destination instanceof DirectoryNode) {
+      targetDir = destination;
+      newName = node.name;
+    } else if (destination) {
+      throw new AlreadyExistsError(destination.path());
+    } else {
+      ({ parent: targetDir, name: newName } = this.splitParent(dst));
+    }
+
+    if (node === targetDir || node.isAncestorOf(targetDir)) {
+      throw new InvalidPathError(`cannot move ${node.path()} into itself`);
+    }
+    const clash = targetDir.child(newName);
+    if (clash) throw new AlreadyExistsError(clash.path());
+
+    const now = this.clock.now();
+    oldParent.removeChild(node.name);
+    oldParent.modifiedAt = now;
+    node.name = newName;
+    targetDir.addChild(node);
+    targetDir.modifiedAt = now;
+    return node.path();
+  }
+
+  du(path: string): number {
+    return this.resolve(path).size();
+  }
+
+  find(path: string, filter: NodeFilter): string[] {
+    const start = this.resolve(path);
+    const matches: string[] = [];
+    const visit = (node: FsNode): void => {
+      if (node !== start && filter.test(node)) matches.push(node.path());
+      if (node instanceof DirectoryNode) node.list().forEach(visit);
+    };
+    visit(start);
+    return matches;
+  }
+
+  tree(path: string): string[] {
+    const lines: string[] = [];
+    const visit = (node: FsNode, depth: number): void => {
+      const label = node.parent ? node.name : '/';
+      const suffix = node instanceof DirectoryNode && node.parent ? '/' : '';
+      lines.push(`${'  '.repeat(depth)}${label}${suffix} (${node.size()}B)`);
+      if (node instanceof DirectoryNode) node.list().forEach((child) => visit(child, depth + 1));
+    };
+    visit(this.resolve(path), 0);
+    return lines;
+  }
+
+  // ---------- helpers ----------
+  private tryResolve(path: string): FsNode | undefined {
+    let node: FsNode = this.root;
+    for (const name of parsePath(path)) {
+      if (!(node instanceof DirectoryNode)) return undefined;
+      const next = node.child(name);
+      if (!next) return undefined;
+      node = next;
+    }
+    return node;
+  }
+
+  private resolve(path: string): FsNode {
+    const node = this.tryResolve(path);
+    if (!node) throw new NotFoundError(joinPath(parsePath(path)));
+    return node;
+  }
+
+  private splitParent(path: string): { parent: DirectoryNode; name: string } {
+    const parts = parsePath(path);
+    const name = parts.pop();
+    if (name === undefined) throw new InvalidPathError('path must name an entry below /');
+    const parent = this.resolve(joinPath(parts));
+    if (!(parent instanceof DirectoryNode)) throw new NotADirectoryError(parent.path());
+    return { parent, name };
+  }
+}
+```
+
+**Part 5: the driver.**
+
+```ts
+const clock = new LogicalClock();
+const fs = new FileSystem(clock);
+
+function attempt(label: string, action: () => unknown): void {
+  try {
+    action();
+    console.log(`${label} -> ok`);
+  } catch (err) {
+    console.log(`${label} -> ${(err as Error).message}`);
+  }
+}
+
+fs.mkdir('/home/ritesh/projects/trading', { parents: true });
+fs.writeFile('/home/ritesh/projects/trading/orders.ts', 'export const orders = [];\n');
+fs.writeFile('/home/ritesh/projects/trading/README.md', '# Trading engine\n');
+fs.writeFile('/home/ritesh/notes.txt', 'buy low, sell high\n');
+fs.mkdir('/home/ritesh/photos');
+fs.writeFile('/home/ritesh/photos/goa.jpg', 'x'.repeat(2048));
+fs.mkdir('/var/log', { parents: true });
+fs.writeFile('/var/log/app.log', 'boot\n');
+const mark = clock.now();
+fs.writeFile('/var/log/app.log', 'ready\n', { append: true });
+
+console.log(`ls /home/ritesh: ${fs.ls('/home/ritesh').join(' ')}`);
+console.log(`cat app.log: ${JSON.stringify(fs.readFile('/var/log/app.log'))}`);
+console.log(fs.tree('/').join('\n'));
+console.log(`du /home/ritesh = ${fs.du('/home/ritesh')}B`);
+
+const searches = [
+  Filters.nameMatches('*.ts'),
+  Filters.and(Filters.filesOnly(), Filters.minSize(1000)),
+  Filters.or(Filters.extension('md'), Filters.extension('txt')),
+  Filters.and(Filters.filesOnly(), Filters.not(Filters.nameMatches('*.??'))),
+  Filters.modifiedAfter(mark),
+];
+for (const filter of searches) {
+  console.log(`find / ${filter.label}: ${fs.find('/', filter).join(', ') || '(none)'}`);
+}
+
+console.log(`mv notes.txt -> ${fs.move('/home/ritesh/notes.txt', '/home/ritesh/projects')}`);
+console.log(`mv trading -> ${fs.move('/home/ritesh/projects/trading', '/home/ritesh/projects/broker')}`);
+console.log(`find by exact name: ${fs.find('/home', Filters.nameIs('orders.ts')).join(', ')}`);
+
+attempt('mkdir existing', () => fs.mkdir('/home/ritesh/projects'));
+attempt('mkdir without -p', () => fs.mkdir('/opt/tools/bin'));
+attempt('mkdir under a file', () => fs.mkdir('/var/log/app.log/x', { parents: true }));
+attempt('cat a directory', () => fs.readFile('/home'));
+attempt('rm non-empty', () => fs.rm('/home'));
+attempt('mv into own subtree', () => fs.move('/home', '/home/ritesh/projects/home'));
+attempt('mv onto a file', () => fs.move('/home/ritesh/photos/goa.jpg', '/var/log/app.log'));
+attempt('relative path', () => fs.writeFile('notes.txt', 'x'));
+attempt('glob char in name', () => fs.writeFile('/tmp*', 'x'));
+attempt('read missing', () => fs.readFile('/home/ritesh/../ritesh/missing.txt'));
+attempt('rm -r /var', () => fs.rm('/var', { recursive: true }));
+console.log(`ls /: ${fs.ls('/').join(' ')}`);
+console.log(fs.tree('/home/ritesh/projects').join('\n'));
+```
+
+## Demo output
+
+```text
+ls /home/ritesh: notes.txt photos/ projects/
+cat app.log: "boot\nready\n"
+/ (2121B)
+  home/ (2110B)
+    ritesh/ (2110B)
+      notes.txt (19B)
+      photos/ (2048B)
+        goa.jpg (2048B)
+      projects/ (43B)
+        trading/ (43B)
+          README.md (17B)
+          orders.ts (26B)
+  var/ (11B)
+    log/ (11B)
+      app.log (11B)
+du /home/ritesh = 2110B
+find / name~*.ts: /home/ritesh/projects/trading/orders.ts
+find / (type=file AND size>=1000): /home/ritesh/photos/goa.jpg
+find / (ext=md OR ext=txt): /home/ritesh/notes.txt, /home/ritesh/projects/trading/README.md
+find / (type=file AND NOT name~*.??): /home/ritesh/notes.txt, /home/ritesh/photos/goa.jpg, /var/log/app.log
+find / mtime>14: /var/log/app.log
+mv notes.txt -> /home/ritesh/projects/notes.txt
+mv trading -> /home/ritesh/projects/broker
+find by exact name: /home/ritesh/projects/broker/orders.ts
+mkdir existing -> EEXIST: /home/ritesh/projects already exists
+mkdir without -p -> ENOENT: /opt does not exist
+mkdir under a file -> ENOTDIR: /var/log/app.log is not a directory
+cat a directory -> EISDIR: /home is a directory
+rm non-empty -> ENOTEMPTY: /home is not empty (use recursive)
+mv into own subtree -> EINVAL: cannot move /home into itself
+mv onto a file -> EEXIST: /var/log/app.log already exists
+relative path -> EINVAL: path must be absolute: "notes.txt"
+glob char in name -> EINVAL: invalid name "tmp*"
+read missing -> ENOENT: /home/ritesh/missing.txt does not exist
+rm -r /var -> ok
+ls /: home/
+projects/ (62B)
+  broker/ (43B)
+    README.md (17B)
+    orders.ts (26B)
+  notes.txt (19B)
+```
+
+The `NOT *.??` search keeps `README.md` out of its results (two-character extension) but lets `notes.txt`, `goa.jpg` and `app.log` through (three-character extensions). Also note that `du` and `tree` never needed to know which node was a file.
+
+## Concurrency
+
+In a single-threaded process, every synchronous operation above is atomic. Trouble starts when operations become **async**, which real file systems are: a `du` that awaits I/O per entry can observe a directory **halfway through** a concurrent `rm -r`, and a `move` can race with a `writeFile` into the directory being moved.
+
+The standard answer has two parts:
+
+1. A **readers-writer lock**: many readers (`ls`, `du`, `find`) at once, writers (`rm`, `move`, `write`) exclusively.
+2. For finer granularity, **hierarchical locking**: lock ancestors in intention mode and the target exclusively, always in root-to-leaf order, so that two moves can't deadlock.
+
+Here is a small async readers-writer lock, with the torn read it prevents:
+
+```ts
+const pause = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 1));
+
+class AsyncRwLock {
+  private readers = 0;
+  private writer = false;
+  private readonly waiting: Array<{ write: boolean; wake: () => void }> = [];
+
+  async read<T>(task: () => Promise<T>): Promise<T> {
+    await this.acquire(false);
+    try {
+      return await task();
+    } finally {
+      this.readers--;
+      this.drain();
+    }
+  }
+
+  async write<T>(task: () => Promise<T>): Promise<T> {
+    await this.acquire(true);
+    try {
+      return await task();
+    } finally {
+      this.writer = false;
+      this.drain();
+    }
+  }
+
+  private canEnter(write: boolean): boolean {
+    return write ? !this.writer && this.readers === 0 : !this.writer;
+  }
+
+  private enter(write: boolean): void {
+    if (write) this.writer = true;
+    else this.readers++;
+  }
+
+  private acquire(write: boolean): Promise<void> {
+    if (this.waiting.length === 0 && this.canEnter(write)) {
+      this.enter(write);
+      return Promise.resolve();
+    }
+    return new Promise((resolve) =>
+      this.waiting.push({ write, wake: () => { this.enter(write); resolve(); } }),
+    );
+  }
+
+  private drain(): void {
+    // FIFO: wake a writer alone, or a run of consecutive readers.
+    for (let head = this.waiting[0]; head && this.canEnter(head.write); head = this.waiting[0]) {
+      this.waiting.shift();
+      head.wake();
+      if (head.write) break;
+    }
+  }
+}
+
+class DataDir {
+  readonly files = new Map([['a', 100], ['b', 100], ['c', 100], ['d', 100]]);
+  async du(): Promise<number> {
+    let total = 0;
+    for (const size of this.files.values()) {
+      total += size;
+      await pause(); // simulated stat() call per file
+    }
+    return total;
+  }
+  async rmAll(): Promise<void> {
+    await pause();
+    this.files.clear();
+  }
+}
+
+const unlocked = new DataDir();
+const [tornTotal] = await Promise.all([unlocked.du(), unlocked.rmAll()]);
+console.log(`without lock: du saw ${tornTotal}B (a state that never existed)`);
+
+const locked = new DataDir();
+const lock = new AsyncRwLock();
+const [total, , after] = await Promise.all([
+  lock.read(() => locked.du()),
+  lock.write(() => locked.rmAll()),
+  lock.read(() => locked.du()),
+]);
+console.log(`with rw-lock: du before rm = ${total}B, du after rm = ${after}B`);
+```
+
+```text
+without lock: du saw 200B (a state that never existed)
+with rw-lock: du before rm = 400B, du after rm = 0B
+```
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|---|---|
+| **`cd` with relative paths and wildcards** (Amazon/Uber variant) | A `Shell` holds a `cwd` node and resolves segments against a *set* of candidates. **Implemented below.** |
+| **Search by pattern** (CRED) | Already covered by `Filters.nameMatches`; for regex, add `Filters.nameRegex`. |
+| **Fast `du` on huge trees** | Cache the size in each directory; on write, add the delta to every ancestor (O(depth)) instead of recomputing (O(subtree)). |
+| **Symlinks** | A new leaf `SymlinkNode(target)`; resolution follows links with a hop limit to stop cycles. |
+| **Permissions** | `mode`/`owner` on `FsNode`; check in the facade before each operation. |
+| **Many unrelated operations** | Introduce a Visitor (`accept(visitor)`) so new operations don't touch node classes. |
+| **Very large files** | Store content as chunks (blocks), as real file systems do with inodes and block lists. |
+
+**`cd` with wildcards.** The trick is to resolve a path against a *set* of candidate directories, segment by segment. At the end there must be exactly one match, otherwise the path is "not found" or "ambiguous". This standalone version keeps only directories, to stay short.
+
+```ts
+class ShellError extends Error {}
+
+class Dir {
+  readonly children = new Map<string, Dir>();
+  constructor(
+    readonly name: string,
+    readonly parent: Dir | null,
+  ) {}
+
+  path(): string {
+    return this.parent ? `${this.parent.path() === '/' ? '' : this.parent.path()}/${this.name}` : '/';
+  }
+
+  mkdirs(relative: string): void {
+    let dir: Dir = this;
+    for (const name of relative.split('/').filter(Boolean)) {
+      let next = dir.children.get(name);
+      if (!next) {
+        next = new Dir(name, dir);
+        dir.children.set(name, next);
+      }
+      dir = next;
+    }
+  }
+}
+
+const globToRegExp = (glob: string): RegExp =>
+  new RegExp(`^${glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
+
+class Shell {
+  private cwd: Dir;
+
+  constructor(private readonly root: Dir) {
+    this.cwd = root;
+  }
+
+  pwd(): string {
+    return this.cwd.path();
+  }
+
+  cd(path: string): string {
+    let candidates: Dir[] = [path.startsWith('/') ? this.root : this.cwd];
+    for (const segment of path.split('/')) {
+      if (segment === '' || segment === '.') continue;
+      const next = new Set<Dir>();
+      for (const dir of candidates) {
+        if (segment === '..') {
+          next.add(dir.parent ?? dir);
+        } else if (/[*?]/.test(segment)) {
+          const re = globToRegExp(segment);
+          for (const child of dir.children.values()) if (re.test(child.name)) next.add(child);
+        } else {
+          const child = dir.children.get(segment);
+          if (child) next.add(child);
+        }
+      }
+      candidates = [...next];
+    }
+    const [only, ...others] = candidates;
+    if (!only) throw new ShellError(`cd: ${path}: no such directory`);
+    if (others.length > 0) {
+      const paths = candidates.map((d) => d.path()).sort();
+      throw new ShellError(`cd: ${path}: ambiguous (${paths.join(', ')})`);
+    }
+    this.cwd = only;
+    return this.pwd();
+  }
+}
+
+const root = new Dir('', null);
+root.mkdirs('home/ritesh/projects/trading');
+root.mkdirs('home/ritesh/projects/travel');
+root.mkdirs('home/guest/downloads');
+const shell = new Shell(root);
+
+for (const target of ['/home/r*/projects', 'tr*', 'tra*/../trad*', '../../..', '/nope', '/home/*/projects', '/home/*', '..']) {
+  try {
+    console.log(`cd ${target} -> ${shell.cd(target)}`);
+  } catch (err) {
+    console.log(`${(err as Error).message} (still in ${shell.pwd()})`);
+  }
+}
+```
+
+```text
+cd /home/r*/projects -> /home/ritesh/projects
+cd: tr*: ambiguous (/home/ritesh/projects/trading, /home/ritesh/projects/travel) (still in /home/ritesh/projects)
+cd tra*/../trad* -> /home/ritesh/projects/trading
+cd ../../.. -> /home
+cd: /nope: no such directory (still in /home)
+cd /home/*/projects -> /home/ritesh/projects
+cd: /home/*: ambiguous (/home/guest, /home/ritesh) (still in /home/ritesh/projects)
+cd .. -> /home/ritesh
+```
+
+## Edge cases
+
+- `mkdir /` and `rm /` and `mv / …`: all rejected.
+- `mkdir -p` over an existing *file* segment gives `ENOTDIR`; `mkdir -p` on an existing directory is a no-op.
+- `mv /a /a/b`: moving into your own subtree would detach the tree into a cycle. It is caught with `isAncestorOf`.
+- `mv x existingDir`: moves into it. `mv x existingFile`: rejected. `mv x sameName` inside the same directory: `EEXIST`.
+- Path normalisation: `//a/./b/../c` becomes `/a/c`, and `/..` stays at `/`.
+- Names containing `/`, NUL, `*` or `?`, empty names and names over 255 characters are all rejected.
+- `writeFile` on a directory gives `EISDIR`; `readFile` on a directory gives `EISDIR`.
+- `find` excludes the start node itself and returns sorted results for stable output.
+- The glob converter escapes regex metacharacters, so `a+b.txt` matches literally.
+
+## Complexity
+
+With d the path depth, c the children of one directory and n the nodes in a subtree:
+
+| Operation | Cost |
+|---|---|
+| Resolve a path | O(d) (hash lookup per level) |
+| `mkdir`, `writeFile`, `readFile`, `rm` | O(d) (+ content length for writes) |
+| `ls` | O(d + c log c) (sorting) |
+| `move` | O(d_src + d_dst + d_dst) (includes the ancestor check) |
+| `du`, `tree` | O(n) (O(1) for `du` with cached sizes) |
+| `find` | O(n · f), where f is the filter cost (plus sorting each directory as it is visited) |
+| `path()` | O(d) (walks parent pointers) |
+
+## What graders look for / common mistakes
+
+- ✅ Composite with polymorphic `size()`, and no `if (isFile)` scattered across services.
+- ✅ Combinable filters instead of a method with many optional parameters.
+- ✅ Parent pointers kept correct on move (update `parent` *and* both directories' maps).
+- ✅ POSIX-like error types; the move-into-itself check.
+- ❌ Storing full path strings as keys in one flat `Map<string, Node>`. A rename then has to rewrite every descendant key, which is O(n).
+- ❌ Children in an array with linear lookup and possible duplicate names.
+- ❌ A `File` class that shadows the DOM/Node `File` global (we used `FileNode`).
+- ❌ Forgetting `..` and double slashes in paths.
+
+## 90-minute plan (CRED gives 150; budget 90 for the core)
+
+| Minutes | Activity |
+|---|---|
+| 0–10 | Clarify path rules, move semantics and search needs; list the commands. |
+| 10–20 | Composite diagram; decide on parent pointers and a `Map` of children. |
+| 20–45 | Nodes, `parsePath`, `resolve`, `mkdir`, `writeFile`, `readFile`, `ls`. |
+| 45–60 | `rm`, `move` (with the ancestor check), `du`, `tree`. |
+| 60–75 | Filters with `and`, `or` and `not`; `find`. |
+| 75–90 | Driver with error cases; mention caching sizes and the RW lock. |
+
+## Interview Q&A
+
+<details>
+<summary>Q1. Why Composite instead of a single Node class with an `isDirectory` flag?</summary>
+
+With one class, every operation branches on the flag, and file-only fields (`content`) sit uselessly on directories, and the other way round. Composite puts the branching into polymorphism: `size()` is "content length" on a leaf and "sum of children" on a composite. Adding a new node type, such as a symlink, doesn't change `du`.
+
+</details>
+
+<details>
+<summary>Q2. How would you make `du` O(1)?</summary>
+
+Store `cachedSize` on each directory. When a file's size changes by Δ (write, append or delete), walk up the parent chain adding Δ, which costs O(depth). A move subtracts the subtree size from the old ancestors and adds it to the new ones. The invariant: `dir.cachedSize === sum(child sizes)`. Test it with a property test that compares against the recursive version.
+
+</details>
+
+<details>
+<summary>Q3. Search "all files larger than 1 MB and modified in the last day, excluding node_modules". How?</summary>
+
+`Filters.and(Filters.filesOnly(), Filters.minSize(1_048_576), Filters.modifiedAfter(t))` for matching. "Excluding node_modules" is a **pruning** rule, not a match rule, so `find` needs a second, optional `shouldDescend(dir)` predicate. That avoids walking the excluded subtree at all.
+
+</details>
+
+<details>
+<summary>Q4. How does a real file system make rename atomic?</summary>
+
+A rename within one volume is a metadata operation: remove the directory entry in the old parent and add it in the new one, inside a single journal transaction, so a crash leaves either the old state or the new one. Our in-memory `move` gets the same effect by validating everything first and mutating only at the end.
+
+</details>

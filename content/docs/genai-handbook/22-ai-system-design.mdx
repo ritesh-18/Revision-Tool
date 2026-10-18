@@ -1,0 +1,864 @@
+---
+title: "22. AI System Design"
+description: "System design for GenAI is the practice of taking a product idea and producing a working architecture — components, data flows, scaling story, failure..."
+---
+
+<Callout type="info">
+**How to read this chapter.** 📘 **Handbook**: the original chapter text. 🔧 **Going deeper**: code and extra depth on topics the chapter already covers. ➕ **Beyond the handbook**: new topics the original chapter did not cover.
+</Callout>
+
+## 22.1 Concept Explanation
+
+System design for GenAI is the practice of taking a product idea and producing a working architecture — components, data flows, scaling story, failure modes, cost envelope. The output is a diagram you can defend in front of skeptical engineers, plus a written rationale for every choice.
+
+This chapter walks through canonical AI system designs: ChatGPT-like products, enterprise RAG, copilots, multi-agent platforms, voice AI, AI search, AI IDEs, AI workflow systems. Each section follows the same pattern: requirements, high-level design, low-level design, tradeoffs, scaling, bottlenecks, cost.
+
+## 22.2 Design Method
+
+A reliable approach for any AI system design:
+
+1. **Requirements.** Functional (what it does), non-functional (latency, throughput, availability, compliance), and constraints (budget, team size, timeline).
+2. **High-level design.** Boxes and arrows. Identify components, their responsibilities, and the data flow.
+3. **Low-level design.** APIs between components, data schemas, key algorithms.
+4. **Tradeoffs.** Every choice has alternatives; name them.
+5. **Scaling.** What changes at 10×, 100×, 1000× traffic.
+6. **Bottlenecks.** What breaks first, what breaks worst, what is easy to fix.
+7. **Cost.** Order-of-magnitude estimate.
+
+You will be evaluated on the *reasoning*, not the diagram. Saying "I would use Pinecone" is weaker than "I would start with pgvector because we already operate Postgres and our scale is under 10M vectors; I would move to Pinecone or Qdrant past that scale because dedicated vector DBs handle high-cardinality filtering better."
+
+## 22.2a Budgets and Evals in the Design Method 🔧
+
+The seven steps above leave two things implicit that AI designs depend on: turning "fast and cheap" into numbers each component must meet, and deciding how you will know the system is correct.
+
+### Step 1.5: turn requirements into a latency budget
+
+**Problem.** "p95 under 3 seconds" is a requirement for the whole system. No single team can design to it until it is split into per-stage budgets.
+
+**Why splitting is subtle.** Percentiles do not add. If retrieval, reranking and the LLM call each have their own p95, the end-to-end p95 is lower than their sum for independent stages, so summing per-stage p95s is a safe, slightly pessimistic budget. Fan-out is where tails get worse: a request that waits on 10 parallel calls, each with a 1% chance of being slow, is slow `1 - 0.99^10 ≈ 9.6%` of the time. The more parallel dependencies a request waits on, the tighter each one's tail must be.
+
+**Mechanism.** Write the budget as a table in the design doc and as config in code, so that tracing (Chapter 19) can flag the stage that overspends.
+
+```ts
+type Stage = { name: string; p95Ms: number };
+
+export const ragBudget: Stage[] = [
+  { name: "auth + rate limit", p95Ms: 30 },
+  { name: "query embedding", p95Ms: 60 },
+  { name: "hybrid retrieval", p95Ms: 150 },
+  { name: "rerank top 50", p95Ms: 250 },
+  { name: "LLM time-to-first-token", p95Ms: 900 },
+  { name: "LLM streaming after first token (400 tokens)", p95Ms: 1_500 },
+];
+
+export function checkBudget(stages: Stage[], targetMs: number) {
+  const total = stages.reduce((sum, s) => sum + s.p95Ms, 0);
+  return { total, headroomMs: targetMs - total, ok: total <= targetMs };
+}
+// checkBudget(ragBudget, 3_000) -> { total: 2890, headroomMs: 110, ok: true }
+```
+
+### Step 7, made concrete: cost per request
+
+```ts
+type Price = { inPerM: number; outPerM: number; cachedInPerM?: number }; // USD per 1M tokens
+
+export function costPerRequest(p: Price, inputTokens: number, outputTokens: number, cachedShare = 0) {
+  const cached = inputTokens * cachedShare;
+  const fresh = inputTokens - cached;
+  return (fresh * p.inPerM + cached * (p.cachedInPerM ?? p.inPerM) + outputTokens * p.outPerM) / 1e6;
+}
+
+// Example prices only; check your provider's current price sheet.
+const midTier: Price = { inPerM: 3, outPerM: 15, cachedInPerM: 0.3 };
+costPerRequest(midTier, 6_000, 400);        // 0.024 USD
+costPerRequest(midTier, 6_000, 400, 0.7);   // about 0.0127 USD with 70% of the prompt cached
+```
+
+The second line is why prompt layout (stable prefix first) is a system-design decision, not a prompt detail.
+
+### A time-boxed interview structure
+
+For a 45-minute AI system design interview:
+
+| Minutes | Step | What to say out loud |
+|---|---|---|
+| 0 to 5 | Requirements | users, QPS, latency target, data sensitivity, what "correct" means |
+| 5 to 10 | Budgets | the latency table and cost per request above |
+| 10 to 25 | Architecture | high-level design first, then deep dive on the riskiest component |
+| 25 to 35 | Evals | golden set, online metrics, release gate (22.11c) |
+| 35 to 45 | Failure modes and scale | what breaks at 10×, provider outage plan, cost at 10× |
+
+**Failure mode of the method itself.** Candidates often spend 30 minutes on boxes and never reach evals. Interviewers for AI roles weigh "how do you know it works?" heavily, because it is the part that differs most from classic system design.
+
+## 22.3 Design 1 — A ChatGPT-Like System
+
+**Requirements.** Multi-turn chat, streaming responses, conversation history, code rendering, file uploads, sub-2s time-to-first-token, 10M monthly active users.
+
+**HLD.**
+<Mermaid chart={`flowchart LR
+    BR[Browser] <-->|SSE| ELB[Edge load balancer]
+    ELB --> APIGW[API gateway]
+    APIGW --> CHAT[Chat service]
+    CHAT --> LLMGW[LLM gateway]
+    LLMGW --> INF[Inference pool]
+    CHAT --> PG["Postgres (users, conversations)"]
+    CHAT --> REDIS["Redis (sessions, rate limits, cache)"]
+    CHAT --> OBJ["Object store (file uploads)"]
+    CHAT --> BUS["Event bus (logs, billing)"]
+    CHAT --> OBS[Observability]`} />
+
+**LLD.**
+- Conversation stored as event log; current state derived.
+- Streaming via SSE; one connection per active turn.
+- Rate limit by user and by org via Redis token bucket.
+- Inference on a mix of model sizes; router decides.
+- Files uploaded to object store with presigned URLs; embedded in background.
+
+**Tradeoffs.** SSE over WebSocket (simpler; suffices for one-way streaming). Postgres for conversation state (consistency matters). Redis for rate limits and ephemeral session (latency matters). Self-hosted inference for hot models; provider fallback for surge.
+
+**Scale.** Hot path is the inference pool; scale by replicas. Vector DB if RAG is added. Edge by region for global latency.
+
+**Bottlenecks.** GPU capacity, KV cache concurrency, long-tail latency from long conversations.
+
+**Cost.** Inference dominates. With efficient batching and routing, $0.001-0.005 per resolved turn. 10M MAU × 5 turns/day average × 30 days = 1.5B turns/month. At $0.002 average: $3M/month inference cost.
+
+**🔧 Capacity check: how many GPUs is that?** The cost line above gives turns per month; the GPU fleet is sized from peak tokens per second. Assume 1,500 input and 400 output tokens per turn, and the 3× peak factor from 22.13:
+
+```text
+average turns/s  = 1.5e9 / (30 × 86,400)        ≈ 580
+peak turns/s     = 580 × 3                      ≈ 1,740
+peak output tok/s = 1,740 × 400                 ≈ 696,000
+peak input tok/s  = 1,740 × 1,500               ≈ 2.6M (much of it prefix-cached history)
+
+If one 8-GPU replica of a 70B model sustains 2,500 output tok/s at the target inter-token latency
+(an assumption: measure it with your engine, batch size and prompt mix):
+replicas = 696,000 / 2,500 ≈ 280  →  about 2,240 GPUs at peak
+```
+
+Two design consequences follow. First, routing even half the turns to a small model that sustains 10 times the throughput per GPU removes about 1,000 GPUs, which is why "router decides" in the LLD is a cost decision. Second, input tokens are almost four times the output tokens, so prefix caching of conversation history and prefix-aware routing ([Chapter 21.20a](/docs/genai-handbook/21-distributed-systems-for-ai)) matter as much as raw decode speed.
+
+## 22.4 Design 2 — Enterprise RAG
+
+**Requirements.** Knowledge assistant for 5000-person company. Document corpus 1M files (Confluence, SharePoint, Slack). ACL-aware. p95 under 3 seconds. SSO. Audit logs. Data residency in two regions.
+
+**HLD.**
+<Mermaid chart={`flowchart TD
+    USER[User browser] --> SSO[SSO]
+    SSO --> APIGW[API gateway]
+    APIGW --> CHAT[Chat service]
+    CHAT --> RET["Retrieval service (hybrid: vector + BM25 + reranker)"]
+    RET --> VDB["Vector DB (per-region, ACL-tagged)"]
+    RET --> BM25[BM25 index]
+    RET --> RR["Reranker (Cohere or self-hosted)"]
+    CHAT --> LLMGW[LLM gateway]
+    LLMGW --> RINF[Regional inference]
+    CHAT --> AUDIT[Audit log]
+    AUDIT --> AOS[Append-only store]
+    ING["Ingestion pipeline (connectors, parser, chunker, embedder)"] --> VDB
+    ING --> BM25`} />
+
+**LLD.**
+- Chunks tagged with source, ACL groups, language, timestamp.
+- Retrieval filters by user's effective groups before vector search.
+- Reranker runs over top 50 candidates; top 10 to the LLM.
+- Citations rendered as clickable references.
+- Audit log captures: who asked what, what was retrieved, what was returned.
+
+**Tradeoffs.** Hybrid retrieval (better recall than pure vector). Per-region indices for residency. Cross-encoder reranker (latency cost) is worth it for quality. Cohere Rerank vs self-hosted BGE-Reranker: managed for simplicity, self-hosted for cost at scale.
+
+**Scale.** Vector DB sharded by source or tenant. Inference scales with QPS. Ingestion is batch + streaming for new content.
+
+**Bottlenecks.** ACL filtering performance; retrieval reranker latency; ingestion freshness for time-sensitive docs.
+
+**Cost.** Embedding ingestion is one-time + delta. Storage moderate. Inference proportional to user activity. Reranker calls add 20-30% to per-query cost.
+
+### 22.4a Sizing and ACL-aware retrieval in Postgres 🔧
+
+The design above says "filter by the user's effective groups before vector search"; this sub-section sizes the index and shows that filter in Node with pgvector.
+
+#### Capacity numbers
+
+```text
+corpus          1M files × about 12 chunks/file          = 12M chunks
+vectors         12M × 1,024 dims × 4 bytes (float32)     ≈ 49 GB   (≈ 25 GB as halfvec)
+HNSW graph      m = 16 → up to 32 neighbours × 4-8 bytes  ≈ +0.5 to 1.5 GB of links, plus tuple overhead
+query load      5,000 users × 10 questions/day / 8 working hours ≈ 1.7 QPS average, 5-10 QPS peak
+```
+
+At under 10 QPS and 12M vectors per region, Postgres with pgvector on one well-sized primary plus a read replica is enough, which matches the "start with pgvector" reasoning in 22.2. The hard part is not scale but the ACL filter.
+
+#### Why the ACL filter breaks naive vector search
+
+An HNSW index returns the nearest `ef_search` candidates first and applies the `WHERE` clause afterwards. If a user can see only 2% of the corpus, about 98% of those candidates are dropped, and a query asking for 50 results may get 2. pgvector 0.8 added iterative index scans, which keep walking the graph until enough rows pass the filter.
+
+```ts
+import { Pool } from "pg";
+const pool = new Pool();
+
+// CREATE TABLE chunks (
+//   id bigserial PRIMARY KEY, region text NOT NULL, acl_groups text[] NOT NULL,
+//   source_url text, content text, embedding vector(1024)
+// );
+// CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+// CREATE INDEX ON chunks USING gin (acl_groups);
+
+export async function retrieve(queryEmbedding: number[], userGroups: string[], region: string) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL hnsw.iterative_scan = relaxed_order"); // keep scanning until LIMIT is met
+    await client.query("SET LOCAL hnsw.ef_search = 200");
+    const { rows } = await client.query(
+      `SELECT id, source_url, content, embedding <=> $1::vector AS distance
+         FROM chunks
+        WHERE region = $3
+          AND acl_groups && $2::text[]          -- overlaps the user's effective groups
+        ORDER BY embedding <=> $1::vector
+        LIMIT 50`,
+      [JSON.stringify(queryEmbedding), userGroups, region],
+    );
+    await client.query("COMMIT");
+    return rows; // next: rerank these 50, send the top 10 to the LLM
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+```
+
+#### Edge cases
+
+- **Effective groups.** "Effective groups" means nested groups expanded from the identity provider. Cache the expansion for minutes, not hours, because a revoked user keeps access until the cache expires.
+- **ACL changes on documents.** When a SharePoint folder's permissions change, every chunk under it needs new `acl_groups`. The ingestion pipeline must handle permission-change events, not only content changes.
+- **`relaxed_order`.** Results can come back slightly out of distance order. The reranker reorders them anyway, so this is harmless here; use `strict_order` if you return vector results directly.
+- **Very selective users.** The iterative scan gives up after `hnsw.max_scan_tuples` rows (20,000 by default), so a user who can see only a few hundred chunks may still get too few results. For them, skip the index and scan their rows exactly. Pick the plan by the size of the user's visible set.
+
+## 22.5 Design 3 — AI Copilot in an IDE
+
+**Requirements.** Inline code suggestions, multi-line completions, chat panel, refactor commands, sub-500ms suggestion latency, support 50 languages.
+
+**HLD.**
+<Mermaid chart={`flowchart LR
+    IDE[IDE plugin] -->|"HTTPS / WebSocket"| EDGE[Edge]
+    EDGE --> AUTH[Auth]
+    AUTH --> COP[Copilot service]
+    COP --> CTX["Context builder (open files, project structure)"]
+    CTX --> LLMGW[LLM gateway]
+    LLMGW --> SMALL["Small fast model for inline (FIM: fill-in-middle)"]
+    LLMGW --> LARGE["Large model for chat / refactor"]
+    SMALL --> POST["Result post-processor (cancel-aware)"]
+    LARGE --> POST`} />
+
+**LLD.**
+- Context window assembled from current file + nearby files + project header + cursor position.
+- Specialized FIM (fill-in-middle) prompting for inline suggestions.
+- Aggressive cancellation: user types another keystroke, cancel inflight suggestion.
+- Telemetry: acceptance, edit-after-accept, rejection patterns.
+
+**Tradeoffs.** Tiny specialized model for inline vs general LLM (inline needs sub-500ms). Streaming vs full completion (streaming gives perceived speed but inline UX wants the whole suggestion at once). Self-hosted (cost) vs API (capability).
+
+**Scale.** QPS very high for inline (every keystroke can trigger). Burst tolerance critical. Cache common patterns.
+
+**Bottlenecks.** Latency, latency, latency. Cold model load, network RTT, model inference time. Aggressive caching and locality.
+
+**Cost.** Volume × per-call cost. Most copilots subsidize cost from subscriptions.
+
+## 22.6 Design 4 — Multi-Agent Platform
+
+**Requirements.** Users describe goals in natural language; the system orchestrates multiple specialized agents (research, code, design, communication) to deliver outcomes. Long-running (minutes to hours). Resumable. Auditable.
+
+**HLD.**
+<Mermaid chart={`flowchart TD
+    USER[User] --> INTAKE[Goal intake]
+    INTAKE --> PLAN["Planner agent (decomposes goal into sub-tasks)"]
+    PLAN --> WF["Workflow engine (Temporal) tracks task graph"]
+    WF --> SPEC["Specialist agents (one per domain)"]
+    SPEC --> TOOLS["Tool layer (MCP servers + custom tools)"]
+    TOOLS --> MEM["Shared memory (vector DB + structured)"]
+    MEM --> OUT[Output assembler]
+    OUT --> HITL[Human-in-the-loop checkpoints]`} />
+
+**LLD.**
+- Each agent is a deterministic loop of (read state, call LLM, optionally call tools, write state).
+- Workflow engine durably stores state; resumable on crash.
+- Specialist agents have scoped tools (code agent can run sandboxed code; research agent can browse).
+- Inter-agent messages structured (typed schemas).
+- Costs tracked per agent run and per goal.
+
+**Tradeoffs.** Durable workflows vs in-memory loops. Hierarchical orchestration vs peer-to-peer. Strict role separation vs flexible delegation.
+
+**Scale.** Throughput in goals/minute. Cost per goal varies wildly with complexity. Backpressure essential.
+
+**Bottlenecks.** Compound failure (one agent's wrong output poisons downstream). Cost runaway. Debug complexity.
+
+**Cost.** Hard. A goal might be $0.10 or $50.00. Per-user budget enforcement is mandatory.
+
+## 22.7 Design 5 — Voice AI Assistant
+
+**Requirements.** Sub-300ms latency from user speech to assistant response start. Natural interruption. Multilingual. Hosts thousands of concurrent calls.
+
+**HLD.**
+<Mermaid chart={`flowchart TD
+    PHONE["Phone / WebRTC"] --> MEDIA[Media server]
+    MEDIA --> STT["Streaming STT (Deepgram, Whisper streaming)"]
+    MEDIA --> VAD["Voice activity detection + interrupt handling"]
+    STT --> LLM[LLM with streaming]
+    VAD --> LLM
+    LLM --> TTS["Streaming TTS (ElevenLabs, Cartesia)"]
+    VAD -. interrupt .-> TTS
+    TTS --> BACK[Audio back to caller]`} />
+
+**LLD.**
+- Audio streams in WebRTC chunks (20ms typical).
+- STT produces partial transcripts; LLM is called when end-of-utterance detected.
+- LLM streaming responses tokenized into sentences and sent to TTS chunk by chunk.
+- VAD detects new user speech mid-response and cancels.
+- Tool calls (e.g., "book me a meeting") run server-side with confirmation prompts.
+
+**Tradeoffs.** Cascaded (STT+LLM+TTS) vs end-to-end speech model. Cascaded is more flexible and currently lower-latency in production; end-to-end is the future.
+
+**Scale.** Concurrent calls × audio bandwidth. Voice infrastructure is heavy (encoding, transport).
+
+**Bottlenecks.** Latency every millisecond matters. Cold starts. Tail latency on STT or TTS spoils experience.
+
+**Cost.** Per minute of conversation. STT, LLM, and TTS each add cost. Often $0.05-0.30 per minute fully loaded.
+
+### 22.7a The voice latency budget, stage by stage 🔧
+
+The requirement above says sub-300 ms; this sub-section shows where the time actually goes in a cascaded pipeline, so you can decide which stages to attack.
+
+#### Why voice is unforgiving
+
+In human conversation, the typical gap between one speaker stopping and the next starting is about 200 ms, across many languages (Stivers et al., 2009). Gaps much beyond about a second feel like the other side did not hear you. Text chat hides latency behind streaming text; voice cannot, because silence is the only thing the user hears.
+
+#### Budget for one turn, from end of user speech to first audio
+
+| Stage | Typical range | Why it costs that |
+|---|---|---|
+| Endpointing (deciding the user has finished) | 200 to 500 ms | VAD waits for a stretch of silence; too short and it cuts users off mid-sentence |
+| Final STT transcript | 50 to 150 ms | the last audio chunk must be decoded after endpointing |
+| LLM time-to-first-token | 150 to 400 ms | prefill of system prompt, history and tool schemas |
+| Tokens until the first speakable phrase | 50 to 200 ms | TTS needs a phrase, not a single token |
+| TTS time-to-first-audio | 80 to 200 ms | model warm-up and first audio frame |
+| Network and jitter buffer | 50 to 150 ms | WebRTC or telephony transport, both directions |
+| **Total** | **about 600 to 1,600 ms** | |
+
+Sub-300 ms from end of speech is therefore not reachable by making each stage a little faster; the stages must overlap. The standard techniques, in order of payoff:
+
+1. **Smarter endpointing.** A turn-detection model that reads the partial transcript ("I want to book a..." is clearly unfinished) can cut the silence wait from 500 ms to under 200 ms without cutting users off.
+2. **Speculative LLM calls.** Start the LLM on the partial transcript while endpointing is still deciding. If the final transcript matches, you have already saved the TTFT. If not, cancel and restart.
+3. **Prefix caching.** Keep the system prompt and tool schemas stable so that TTFT is mostly the new user turn, not the whole prompt.
+4. **Phrase-level TTS.** Send the first clause to TTS as soon as it is complete, as in the code below.
+5. **Co-location.** Run STT, LLM and TTS in the same region as the media server. Each cross-region hop adds 50 to 150 ms of round trip.
+
+#### Implementation: stream sentences to TTS and stop on barge-in
+
+```ts
+// Split an LLM token stream into speakable chunks: full sentences, or a clause once it is long enough.
+export async function* speakableChunks(tokens: AsyncIterable<string>): AsyncGenerator<string> {
+  let buf = "";
+  for await (const token of tokens) {
+    buf += token;
+    while (true) {
+      const sentence = buf.match(/^(.+?[.!?])\s+(.*)$/s);
+      const clause = buf.length > 80 ? buf.match(/^(.+?[,;:])\s+(.*)$/s) : null;
+      const m = sentence ?? clause;
+      if (!m) break;
+      yield m[1];
+      buf = m[2];
+    }
+  }
+  if (buf.trim()) yield buf;
+}
+
+type Deps = {
+  llm: (history: string[], signal: AbortSignal) => AsyncIterable<string>; // streaming tokens
+  tts: (text: string, signal: AbortSignal) => Promise<void>;              // streams audio frames to the call
+};
+
+// Returns what the caller actually heard, so history stays truthful after an interruption.
+export async function speakTurn(history: string[], deps: Deps, signal: AbortSignal): Promise<string> {
+  const spoken: string[] = [];
+  for await (const chunk of speakableChunks(deps.llm(history, signal))) {
+    if (signal.aborted) break;
+    await deps.tts(chunk, signal);
+    if (!signal.aborted) spoken.push(chunk);
+  }
+  return spoken.join(" ");
+}
+
+// Wiring: one AbortController per assistant turn.
+// vad.on("speechStart", () => currentTurn.abort());   // barge-in stops LLM and TTS together
+```
+
+#### Edge cases
+
+- **History after barge-in.** If the user interrupts after two of five sentences, store only the two that were played. Otherwise the model believes it said things the user never heard, and later turns refer to them.
+- **False barge-in.** Coughs, background TV and the assistant's own echo trigger VAD. Require a minimum speech duration (for example 150 to 250 ms) or a few recognised words before cancelling, and use echo cancellation on the media path.
+- **Tool calls in the middle of a turn.** A tool that takes 2 seconds creates dead air. Speak a short filler ("Let me check that") from a pre-synthesised cache while the tool runs.
+- **Numbers and symbols.** TTS reads `3/4` or `$1.5M` badly. Normalise text before TTS, or instruct the LLM to write numbers as words.
+
+## 22.8 Design 6 — AI Search Engine
+
+**Requirements.** Web-scale search with conversational interface. Returns answers with citations. Sub-2s end-to-end.
+
+**HLD.**
+<Mermaid chart={`flowchart TD
+    Q[Query] --> QU["Query understanding (intent, decomposition)"]
+    QU --> WIS["Web index search (keyword + vector + freshness signals)"]
+    WIS --> PF["Page fetcher (parallel)"]
+    PF --> PP["Page parser + extractor"]
+    PP --> RR["Retrieval + reranking"]
+    RR --> LLM[LLM with citations]
+    LLM --> RES[Result with sourced answer]`} />
+
+**LLD.**
+- Web index built and maintained by crawler infrastructure (out of scope for many startups; use Bing or Brave APIs).
+- Fast first pass: keyword + a small set of candidate URLs.
+- Fetch top candidates concurrently with strict timeouts.
+- Extract main content; chunk; embed; rerank against query.
+- LLM composes answer with citation numbers.
+
+**Tradeoffs.** Self-built crawler (massive investment) vs search API (per-query cost). Cache aggressively; many queries repeat.
+
+**Scale.** Latency dominated by page fetch. Aggressive parallelism, strict per-page timeouts, fallback when fetches fail.
+
+**Bottlenecks.** Long-tail slow pages, freshness vs latency, hallucination from irrelevant fetched content.
+
+**Cost.** Search API + LLM + bandwidth. Per-query cost is the bill driver.
+
+## 22.9 Design 7 — AI IDE / Code Editor
+
+Beyond a copilot, an AI-first IDE understands the whole codebase, runs commands, edits files, and reviews PRs.
+
+<Mermaid chart={`flowchart LR
+    ED[Editor] <-->|gRPC| AS[Agent service]
+    AS --> IDX["Repo indexer (embeddings + symbol graph)"]
+    AS --> SBX[Code execution sandbox]
+    AS --> FS[File system tools]
+    AS --> TEST[Test runner]
+    AS --> GIT[Git integration]
+    AS --> LLMGW[LLM gateway]`} />
+
+Distinctive challenges:
+- Whole-repo context that cannot fit in any context window — selective retrieval.
+- Edit application that respects file structure (diff-aware).
+- Long-running sessions with growing context.
+- Strict permission control for destructive operations.
+
+## 22.10 Design 8 — AI Workflow Engine
+
+A platform where non-engineers build automations using AI agents and tools.
+
+<Mermaid chart={`flowchart TD
+    UI[Designer UI] --> DEF["Workflow definition (DAG)"]
+    DEF --> RT["Workflow runtime (Temporal)"]
+    RT --> LLMS[LLM steps]
+    RT --> TOOLS[Tool steps]
+    RT --> HUMAN[Human approval]
+    RT --> COND[Conditional branches]
+    LLMS --> AUDIT[Audit trail]
+    TOOLS --> AUDIT
+    HUMAN --> AUDIT
+    COND --> AUDIT`} />
+
+Challenges: schema versioning of workflow definitions, observability per workflow run, cost tracking per workflow, security boundary per tool.
+
+## 22.10a Design 9: Document-Processing Pipeline ➕
+
+The eight designs above are all interactive; this one is the most common batch AI system in companies (invoices, contracts, claims, KYC forms), and it is designed around throughput and accuracy instead of time-to-first-token.
+
+### Requirements
+
+200,000 documents per day, 10 pages on average, mixed scanned and digital PDFs. Extract about 30 fields per document into a fixed JSON schema. Results within 1 hour of upload. Field-level accuracy of at least 98% on fields that are released without human review.
+
+### Capacity numbers
+
+```text
+pages/day        200,000 × 10                         = 2M pages/day
+pages/s          2M / 86,400 ≈ 23 average, × 3 peak    ≈ 70 pages/s at peak
+OCR / layout     assume 10 pages/s per GPU worker       → 7 GPU workers at peak
+LLM input        10 pages × 800 tokens + 1,500 prompt  ≈ 9,500 tokens/doc
+LLM tokens/day   200,000 × 9,500 ≈ 1.9B input + 200,000 × 600 ≈ 0.12B output
+
+example prices (check current sheets):
+  small model    $0.10 in / $0.40 out per 1M  → ≈ $240/day
+  mid-tier model $3 in / $15 out per 1M       → ≈ $7,500/day
+  batch APIs     typically 50% off, for results within 24 h, which this 1-hour SLA cannot use
+```
+
+The 30× gap between model tiers is the main design decision. The usual answer is to run the small model on everything and escalate only low-confidence documents to the larger one.
+
+### Architecture
+
+<Mermaid chart={`flowchart TD
+    UP[Upload API] --> OBJ[Object store]
+    OBJ -->|object created event| Q[Document queue]
+    Q --> SPLIT[Page splitter and dedup by content hash]
+    SPLIT --> OCR["OCR + layout workers (GPU)"]
+    OCR --> EXT["Extraction LLM, small model (structured output)"]
+    EXT --> VAL["Schema + business-rule validator"]
+    VAL -->|"valid, high confidence"| DB[(Postgres results)]
+    VAL -->|invalid or low confidence| ESC[Escalate to larger model]
+    ESC --> VAL2[Validate again]
+    VAL2 -->|valid| DB
+    VAL2 -->|still failing| HR[Human review queue]
+    HR --> DB
+    DB --> HOOK[Webhook to the customer system]`} />
+
+### Implementation: validate, repair once, then escalate
+
+Structured outputs guarantee valid JSON syntax but not correct business values: a total that does not equal the sum of line items is valid JSON. Validate with a schema plus business rules, feed the errors back once, then escalate.
+
+```ts
+import { z } from "zod";
+
+const Invoice = z.object({
+  invoiceNumber: z.string().min(1),
+  issueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  currency: z.enum(["USD", "EUR", "GBP", "INR"]),
+  lineItems: z.array(z.object({ description: z.string(), amount: z.number() })).min(1),
+  total: z.number(),
+}).refine(
+  (inv) => Math.abs(inv.lineItems.reduce((s, li) => s + li.amount, 0) - inv.total) < 0.01,
+  { message: "total must equal the sum of line items" },
+);
+
+type Extract = (pagesText: string, model: "small" | "large", feedback?: string) => Promise<unknown>;
+
+export async function extractInvoice(pagesText: string, llm: Extract) {
+  for (const model of ["small", "large"] as const) {
+    let feedback: string | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {           // first try + one repair
+      const parsed = Invoice.safeParse(await llm(pagesText, model, feedback));
+      if (parsed.success) return { status: "done" as const, model, data: parsed.data };
+      feedback = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("\n");
+    }
+  }
+  return { status: "needs_review" as const };                 // human review queue
+}
+```
+
+### Failure modes
+
+- **Poison documents.** A 900-page scan or a corrupt PDF ties up a worker for minutes. Cap pages per document, give oversized files their own queue, and move a document to a dead-letter queue after N failures.
+- **Duplicates.** Customers upload the same file twice. Key every job by the content hash (21.14 in [Chapter 21](/docs/genai-handbook/21-distributed-systems-for-ai)) so it is processed and billed once.
+- **Partial failure.** Page 7 of 10 fails OCR. Retry per page, not per document, and record which pages are missing rather than extracting from 9 pages silently.
+- **Confidence that means nothing.** LLM self-reported confidence is poorly calibrated. Use checks you can compute instead: business-rule checks, agreement between two extractions, or field-level matches against reference data (a known vendor list).
+- **Drift.** A new invoice layout from a large vendor drops accuracy for one customer overnight. Track accuracy per document type and per sender, using the human-review corrections as labels.
+
+## 22.11 Cross-Cutting Concerns
+
+Across all designs:
+- **Observability** end to end.
+- **Auth and rate limit** at the edge.
+- **Tenant isolation** at every persistence layer.
+- **Cost accounting** per request and per tenant.
+- **Eval harness** for every model and prompt path.
+- **Failure modes** documented per dependency.
+- **Region awareness** for compliance and latency.
+
+## 22.11a The Model Gateway: Routing, Fallback and Quotas ➕
+
+Every design above contains an "LLM gateway" box; [Chapter 6](/docs/genai-handbook/06-backend-for-genai) introduces the products (LiteLLM, Portkey), and this section designs what goes inside the box.
+
+### Routing ➕
+
+**Problem.** Different requests need different models: inline completions need the fastest model, contract review needs the strongest, and most traffic is somewhere in between. If application code names models directly, every model change becomes a code change in every service.
+
+**Mechanism.** Callers name a *task* (`support-answer`, `classify-intent`), never a model. The gateway maps each task to an ordered list of targets. The first entry is the primary, the rest are fallbacks. The route table is config, versioned and evaluated like a prompt.
+
+### Fallback ➕
+
+**Why it is needed.** A single provider will have outages and rate-limit episodes, and the chapter lists "single point of failure on a single model provider" as a common mistake. Fallback is how the design avoids it.
+
+**Rules.** Fall back on `429`, `5xx`, timeouts and an open circuit (Chapter 21.16). Do not fall back on `400`, because the same bad request will fail everywhere. Only fall back before the first token has been streamed.
+
+### Quotas and budgets ➕
+
+**Why request-count limits fail.** One request can cost 100 tokens or 100,000 tokens. Limits must be in tokens (or dollars) per tenant per window, reserved up front from an estimate and corrected afterwards from the provider's reported usage.
+
+### Implementation
+
+```ts
+import Redis from "ioredis";
+const redis = new Redis();
+
+type Target = { provider: "vllm" | "anthropic" | "openai"; model: string; inPerM: number; outPerM: number };
+type Usage = { inputTokens: number; outputTokens: number };
+type Call = (t: Target, body: unknown, signal: AbortSignal) => Promise<{ status: number; usage?: Usage; json?: unknown }>;
+
+// Example route table. Model names and prices are placeholders.
+const routes: Record<string, Target[]> = {
+  "support-answer": [
+    { provider: "vllm", model: "llama-3.3-70b-instruct", inPerM: 0.4, outPerM: 0.4 },
+    { provider: "anthropic", model: "mid-tier-model", inPerM: 3, outPerM: 15 },
+  ],
+};
+
+async function reserveTokens(tenant: string, tokens: number, perMinuteLimit: number) {
+  const key = `quota:${tenant}:${Math.floor(Date.now() / 60_000)}`;
+  const [[, used]] = (await redis.multi().incrby(key, tokens).expire(key, 120).exec()) as [[null, number]];
+  if (used > perMinuteLimit) {
+    await redis.decrby(key, tokens);
+    throw Object.assign(new Error("tenant token quota exceeded"), { status: 429 });
+  }
+  return key;
+}
+
+export async function complete(task: string, tenant: string, body: { maxTokens: number; prompt: string }, call: Call) {
+  const estimate = Math.ceil(body.prompt.length / 4) + body.maxTokens;
+  const quotaKey = await reserveTokens(tenant, estimate, 200_000);
+
+  let lastStatus = 0;
+  for (const target of routes[task] ?? []) {
+    const res = await call(target, body, AbortSignal.timeout(30_000)).catch(() => ({ status: 599 }));
+    lastStatus = res.status;
+    if (res.status === 200 && "usage" in res && res.usage) {
+      const actual = res.usage.inputTokens + res.usage.outputTokens;
+      await redis.incrby(quotaKey, actual - estimate);              // correct the reservation
+      const usd = (res.usage.inputTokens * target.inPerM + res.usage.outputTokens * target.outPerM) / 1e6;
+      console.log(JSON.stringify({ task, tenant, model: target.model, usd }));  // ship to cost tracking
+      return res.json;
+    }
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable) break;                                           // a 4xx fails on every provider
+  }
+  await redis.decrby(quotaKey, estimate);                            // nothing was spent
+  throw Object.assign(new Error(`all targets failed for ${task}`), { status: lastStatus });
+}
+```
+
+### Edge cases and failure modes
+
+- **The fallback model is a different product.** A prompt tuned on one model can produce a different format or tone on another. Run the eval suite (22.11c) against every fallback target, not only the primary.
+- **Fallback cost spikes.** If the primary is a cheap self-hosted model and the fallback is a frontier API, a long outage can multiply the bill by 10 times. Put a dollar ceiling on fallback traffic per hour, and degrade (shorter answers, "try again later") when it is reached.
+- **Data residency.** Falling back from an EU-hosted model to a US endpoint may break a contract. Route tables need a residency tag, and the gateway must refuse targets that violate the tenant's region.
+- **Window edges.** A fixed one-minute window lets a tenant spend twice its limit across a window boundary. Use a sliding window or token bucket if that matters (generic rate-limiting algorithms are in [Scaling and Performance, part 2](/docs/backend-first-principles/22-scaling-performance-part-2)).
+
+## 22.11b Where Guardrails Go ➕
+
+The gateway decides which model runs; guardrails decide what may go in and come out. [Chapter 20](/docs/genai-handbook/20-security-for-genai) covers the attacks themselves, and this section is about placing the checks in the architecture.
+
+### Problem: one guardrail layer is not enough
+
+A single "moderation call" on the user message misses most real failures: indirect prompt injection arrives through retrieved documents, data leaks come out in answers, and the damaging step is usually a tool call, not text.
+
+### Placement
+
+<Mermaid chart={`flowchart LR
+    U[User input] --> IN["Input checks: PII redaction, injection classifier, topic policy"]
+    IN --> RET["Retrieval checks: ACL filter, strip instructions from documents"]
+    RET --> LLM[LLM call]
+    LLM --> TOOL["Tool checks: allowlist, argument validation, human approval for writes"]
+    TOOL --> LLM
+    LLM --> OUT["Output checks: schema, citation grounding, PII and secret scan"]
+    OUT --> R[Response to user]`} />
+
+| Layer | Catches | Latency cost if serial |
+|---|---|---|
+| Input | jailbreak attempts, PII sent to a third-party model, off-topic use | 20 to 200 ms (regex is near zero, a classifier model more) |
+| Retrieval | documents the user may not see, instructions hidden in documents | small, part of the query |
+| Tool | destructive or out-of-scope actions | human approval can take minutes, so only for writes |
+| Output | invented citations, leaked PII or secrets, schema errors | must work on a stream, or it delays the first token |
+
+### Implementation: run the input check in parallel with the LLM
+
+A serial 150 ms classifier adds 150 ms to every request. Running it in parallel adds nothing on the normal path; on the rare blocked request you waste a few tokens and cancel.
+
+```ts
+export async function guardedAnswer(
+  input: string,
+  classify: (text: string) => Promise<{ blocked: boolean; reason?: string }>,
+  generate: (text: string, signal: AbortSignal) => AsyncIterable<string>,
+  send: (chunk: string) => void,
+) {
+  const controller = new AbortController();
+  const verdict = classify(input);
+  const buffered: string[] = [];
+  let cleared = false;
+
+  for await (const token of generate(input, controller.signal)) {
+    if (!cleared) {
+      buffered.push(token);                   // hold tokens until the verdict arrives
+      const v = await Promise.race([verdict, Promise.resolve(null)]);
+      if (v === null) continue;               // verdict not ready yet
+      if (v.blocked) {
+        controller.abort();
+        send("I can't help with that request.");
+        return;
+      }
+      cleared = true;
+      buffered.splice(0).forEach(send);       // release what we held
+      continue;
+    }
+    send(token);
+  }
+  if (!cleared) {                              // stream ended before the verdict
+    const v = await verdict;
+    if (v.blocked) return send("I can't help with that request.");
+    buffered.forEach(send);
+  }
+}
+```
+
+### Edge cases
+
+- **Streaming output checks.** You cannot fully check an answer you have not finished. Check per sentence and stop the stream on a hit, accepting that the user may have seen part of a sentence, or buffer completely for high-risk surfaces (finance, health).
+- **False positives cost users.** A classifier with 2% false positives on a million requests a day blocks 20,000 legitimate users. Measure the false-positive rate on real traffic and give users a path to report it.
+- **Guardrails need evals too.** Keep a labelled set of attacks and benign look-alikes, and run it whenever the guardrail model or thresholds change.
+
+## 22.11c Evaluation Architecture ➕
+
+"Eval harness for every model and prompt path" appears in the list above; this section shows where the harness sits in the system and how its numbers become release decisions. Evaluation methods in general are covered in [Chapter 17](/docs/genai-handbook/17-mlops-for-genai) and [Chapter 19](/docs/genai-handbook/19-monitoring-observability).
+
+### Problem: AI changes ship without tests that can fail
+
+Changing a prompt, a model version, a chunk size or a reranker changes behaviour everywhere at once, and none of those changes break a unit test. Without an eval gate, regressions are found by customers.
+
+### The three loops
+
+<Mermaid chart={`flowchart LR
+    subgraph OFFLINE["Offline, before release"]
+        GS[Versioned golden set] --> RUN[Eval runner in CI]
+        RUN --> GATE{Scores above thresholds?}
+    end
+    subgraph ONLINE["Online, after release"]
+        PROD[Production traces] --> SAMPLE[Sample 1 to 5 percent]
+        SAMPLE --> JUDGE["LLM judge + user feedback"]
+        JUDGE --> DASH[Quality dashboard and alerts]
+    end
+    GATE -->|yes| DEPLOY[Canary deploy]
+    GATE -->|no| BLOCK[Block the change]
+    DEPLOY --> PROD
+    JUDGE -->|failures| TRIAGE[Human triage]
+    TRIAGE -->|new cases| GS`} />
+
+The third loop, production failures becoming new golden cases, is what makes the golden set track reality instead of the launch week.
+
+### How big must the golden set be?
+
+The score on a golden set is a sample estimate, so it has an error bar. For a pass rate `p` measured on `n` cases, the standard error is `sqrt(p × (1 - p) / n)`:
+
+```text
+p = 0.85, n = 100  → standard error ≈ 3.6 points → 95% interval ≈ ±7 points
+p = 0.85, n = 400  → standard error ≈ 1.8 points → 95% interval ≈ ±3.5 points
+p = 0.85, n = 1600 → standard error ≈ 0.9 points → 95% interval ≈ ±1.8 points
+```
+
+With 100 cases you cannot tell an 85% prompt from an 80% one. To detect a 3-point regression reliably you need many hundreds of cases per important slice.
+
+### Implementation: a CI gate
+
+```ts
+type Case = { id: string; input: string; expected: string; slice: string };
+type Grader = (c: Case, output: string) => Promise<boolean>;
+
+export async function evalGate(
+  cases: Case[], run: (input: string) => Promise<string>, grade: Grader,
+  baseline: Record<string, number>, maxDropPoints = 2,
+) {
+  const bySlice = new Map<string, { pass: number; n: number }>();
+  for (const c of cases) {
+    const ok = await grade(c, await run(c.input));
+    const s = bySlice.get(c.slice) ?? { pass: 0, n: 0 };
+    s.n += 1;
+    if (ok) s.pass += 1;
+    bySlice.set(c.slice, s);
+  }
+
+  const failures: string[] = [];
+  for (const [slice, { pass, n }] of bySlice) {
+    const rate = pass / n;
+    const halfWidth = 1.96 * Math.sqrt((rate * (1 - rate)) / n);  // 95% interval
+    const base = baseline[slice] ?? 0;
+    // Fail only when the drop is larger than both the allowed margin and the noise.
+    if ((base - rate) * 100 > Math.max(maxDropPoints, halfWidth * 100)) {
+      failures.push(`${slice}: ${(rate * 100).toFixed(1)}% vs baseline ${(base * 100).toFixed(1)}%`);
+    }
+  }
+  if (failures.length) {
+    console.error(failures.join("\n"));
+    process.exit(1);   // block the merge
+  }
+}
+```
+
+### Edge cases and failure modes
+
+- **Judge drift.** If the LLM judge's model is upgraded, every score moves at once. Pin the judge model version and re-baseline deliberately.
+- **Slices hide in averages.** A change can raise the overall score while breaking one language or one customer. Gate per slice, as above.
+- **Non-determinism.** Even at temperature 0, outputs vary slightly between runs. Run flaky cases several times and grade the majority, or the gate will block good changes at random.
+- **Eval cost.** A 2,000-case suite with an LLM judge costs real money on every pull request. Run a small smoke set on each commit and the full suite before release.
+
+## 22.12 Tradeoffs
+
+| Decision | Lean toward | When |
+|---|---|---|
+| Provider API | Faster start, less ops | Early stage, low volume |
+| Self-hosted | Lower unit cost, more control | Mature, high volume |
+| Workflow engine | Long, multi-step processes | Agents, batch jobs |
+| Streaming UX | Perceived speed matters | Chat, voice, copilots |
+| Strong consistency | State must be correct | Conversations, billing |
+| Eventual consistency | Latency matters more | Caches, indices |
+
+## 22.13 Cost Estimation Method
+
+For any system, estimate by:
+1. **Traffic.** Users × sessions/user × queries/session × tokens/query.
+2. **Unit cost.** Per-token at chosen model, plus fixed costs (vector DB, infra).
+3. **Inflation.** Add 30% for caches, retries, batch ingestion.
+4. **Headroom.** Plan for 3× peak vs average.
+
+Order of magnitude is usually enough in design. Exact numbers come from measuring.
+
+## 22.14 Interview Tips
+
+When asked to design an AI system:
+- Start by clarifying requirements before drawing.
+- Sketch the high-level boxes early so the interviewer can redirect.
+- Justify every choice with a tradeoff, not "I would use X."
+- Explicitly call out failure modes and how you handle them.
+- Mention cost early and often.
+- Discuss what changes at scale.
+
+### ➕ Practice questions
+
+- ➕ Your RAG assistant must answer in under 3 seconds at p95. How do you split the budget? **Write a per-stage table (auth, embedding, retrieval, rerank, TTFT, streaming) whose p95s sum below the target, keep fan-out small because parallel calls compound tail latency, and trace each stage against its budget.**
+- ➕ Why can a voice agent not hit 300 ms by making each stage faster? **Endpointing alone waits 200 to 500 ms of silence. You must overlap stages: semantic turn detection, speculative LLM calls on partial transcripts, prefix caching and phrase-level TTS.**
+- ➕ What belongs in a model gateway? **Task-based routing from versioned config, fallback only on retryable errors and only before the first token, per-tenant token quotas reserved up front and corrected from actual usage, and per-request cost logging.**
+- ➕ How many golden cases do you need? **Enough that the 95% interval, about `±1.96 × sqrt(p(1-p)/n)`, is smaller than the regression you care about. For a 3-point drop at 85% that means many hundreds of cases per slice, not 50.**
+- ➕ Where do guardrails go? **At input, retrieval, tool and output layers. Run input checks in parallel with the LLM call to avoid adding latency, and require human approval only for write actions.**
+
+## 22.15 Hands-on Exercises
+
+1. Pick one of the eight designs and write a one-page architecture doc covering all 17 elements of the chapter template.
+2. Estimate cost for that design at 10k users and at 10M users.
+3. Identify the three biggest risks and how you would mitigate each.
+
+## 22.16 Common Mistakes
+
+- Jumping to tools before requirements.
+- Ignoring failure modes.
+- Skipping cost estimation.
+- Single point of failure on a single model provider.
+- Tightly coupling prompt/model to application code.
+
+## 22.17 Enterprise Best Practices
+
+Design docs reviewed before building. Cost envelopes signed off by finance early. Tenant isolation explicitly designed, not assumed. Failure modes documented and exercised. Model and prompt swappability built in. Observability planned upfront.
+
+## Sources
+
+Checked October 2026. Prices, throughput and per-stage latencies in the worked examples are assumptions for illustration; replace them with your provider's price sheet and your own measurements.
+
+- pgvector, [README: HNSW, halfvec and iterative index scans](https://github.com/pgvector/pgvector) (iterative scans since 0.8.0, `hnsw.max_scan_tuples` default 20,000).
+- Stivers et al., [Universals and cultural variation in turn-taking in conversation](https://www.pnas.org/doi/10.1073/pnas.0903616106), PNAS 106 (2009): the roughly 200 ms gap between conversational turns.
+- OpenAI, [Batch API guide](https://platform.openai.com/docs/guides/batch) and Anthropic, [Message Batches](https://docs.anthropic.com/en/docs/build-with-claude/batch-processing): 50% discount for asynchronous jobs completed within 24 hours.
+- Anthropic, [Prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching): cached input tokens billed at a fraction of the base input price.
+- [Zod documentation](https://zod.dev/): `safeParse`, `refine` and `error.issues`.
+- [ioredis](https://github.com/redis/ioredis): `multi`, `incrby`, `expire`.
+- Dean and Barroso, [The Tail at Scale](https://research.google/pubs/the-tail-at-scale/), CACM (2013): why fan-out amplifies tail latency.

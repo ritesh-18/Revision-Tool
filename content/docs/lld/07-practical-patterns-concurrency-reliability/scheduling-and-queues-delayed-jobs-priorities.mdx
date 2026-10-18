@@ -1,0 +1,257 @@
+---
+title: "7.12 Scheduling and queues: delayed jobs, priorities, retries, DLQ"
+---
+
+## Intuition
+
+BullMQ gives you `queue.add(name, data, { delay, priority, attempts, backoff })`, and failed jobs end up in a "failed" set. Interviewers love asking you to build that in memory: "design a job scheduler", "GTT order trigger", "send the contract note at 6 PM", "retry webhooks with backoff".
+
+## The design
+
+- A **min-heap** gives O(log n) insert and O(log n) pop-min. That beats sorting the array on every insert.
+- **Two heaps:** `delayed` is ordered by `runAt`, and `ready` is ordered by `(priority, seq)`. On every tick, jobs whose time has come move from delayed to ready, and then ready jobs run in priority order. (A single heap ordered by `runAt` would run a low-priority job that happened to be scheduled 1 ms earlier ahead of an urgent one.)
+- `seq` is a monotonically increasing tie-breaker, so equal priorities run FIFO. Heaps are not stable on their own.
+- On failure: `attempts++`. If attempts remain, reschedule at `now + backoff(attempts)`. Otherwise move the job to the **dead-letter queue** with its last error, for a human or a replay tool.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> DELAYED: enqueue(delay > 0)
+  [*] --> READY: enqueue(delay = 0)
+  DELAYED --> READY: runAt <= now
+  READY --> RUNNING: picked by priority
+  RUNNING --> DONE: handler ok
+  RUNNING --> DELAYED: failed, attempts left (backoff)
+  RUNNING --> DEAD: failed, no attempts left
+  DONE --> [*]`} />
+
+```ts
+class MinHeap<T> {
+  private readonly items: T[] = [];
+  constructor(private readonly less: (a: T, b: T) => boolean) {}
+
+  get size(): number {
+    return this.items.length;
+  }
+  peek(): T | undefined {
+    return this.items[0];
+  }
+
+  push(item: T): void {
+    this.items.push(item);
+    let i = this.items.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (!this.less(this.items[i], this.items[parent])) break;
+      [this.items[i], this.items[parent]] = [this.items[parent], this.items[i]];
+      i = parent;
+    }
+  }
+
+  pop(): T | undefined {
+    if (this.items.length === 0) return undefined;
+    const top = this.items[0];
+    const last = this.items.pop() as T;
+    if (this.items.length > 0) {
+      this.items[0] = last;
+      let i = 0;
+      const n = this.items.length;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let smallest = i;
+        if (l < n && this.less(this.items[l], this.items[smallest])) smallest = l;
+        if (r < n && this.less(this.items[r], this.items[smallest])) smallest = r;
+        if (smallest === i) break;
+        [this.items[i], this.items[smallest]] = [this.items[smallest], this.items[i]];
+        i = smallest;
+      }
+    }
+    return top;
+  }
+}
+
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number {
+    return this.t;
+  }
+  set(ms: number): void {
+    this.t = ms;
+  }
+}
+
+interface Job {
+  id: string;
+  type: string;
+  payload: unknown;
+  priority: number; // lower = more urgent
+  runAt: number;
+  attempts: number;
+  maxAttempts: number;
+  seq: number;
+  lastError?: string;
+}
+type JobInfo = Readonly<Pick<Job, 'id' | 'attempts' | 'maxAttempts'>>;
+type HandlerMap<M> = { [K in keyof M]?: (payload: M[K], job: JobInfo) => Promise<void> };
+type AnyHandler = (payload: unknown, job: JobInfo) => Promise<void>;
+
+interface EnqueueOptions {
+  delayMs?: number;
+  priority?: number;
+  maxAttempts?: number;
+}
+
+class JobQueue<M extends Record<string, object>> {
+  private seq = 0;
+  private readonly handlers: HandlerMap<M> = {};
+  private readonly delayed = new MinHeap<Job>((a, b) => a.runAt < b.runAt || (a.runAt === b.runAt && a.seq < b.seq));
+  private readonly ready = new MinHeap<Job>((a, b) => a.priority < b.priority || (a.priority === b.priority && a.seq < b.seq));
+  readonly deadLetters: Job[] = [];
+
+  constructor(
+    private readonly clock: Clock,
+    private readonly backoffMs: (attempt: number) => number,
+    private readonly log: (line: string) => void,
+  ) {}
+
+  register<K extends keyof M & string>(type: K, handler: (payload: M[K], job: JobInfo) => Promise<void>): void {
+    this.handlers[type] = handler;
+  }
+
+  enqueue<K extends keyof M & string>(type: K, payload: M[K], opts: EnqueueOptions = {}): string {
+    const seq = ++this.seq;
+    const job: Job = {
+      id: `job-${seq}`,
+      type,
+      payload,
+      priority: opts.priority ?? 5,
+      runAt: this.clock.now() + (opts.delayMs ?? 0),
+      attempts: 0,
+      maxAttempts: opts.maxAttempts ?? 3,
+      seq,
+    };
+    this.delayed.push(job);
+    return job.id;
+  }
+
+  /** When a real scheduler should wake up next (setTimeout(nextRunAt - now)). */
+  nextRunAt(): number | undefined {
+    return this.ready.size > 0 ? this.clock.now() : this.delayed.peek()?.runAt;
+  }
+
+  async runDue(): Promise<number> {
+    const now = this.clock.now();
+    for (let next = this.delayed.peek(); next && next.runAt <= now; next = this.delayed.peek()) {
+      this.ready.push(this.delayed.pop() as Job);
+    }
+    let processed = 0;
+    for (let job = this.ready.pop(); job; job = this.ready.pop()) {
+      await this.process(job);
+      processed++;
+    }
+    return processed;
+  }
+
+  private handlerFor(type: string): AnyHandler | undefined {
+    const handlers: Record<string, AnyHandler | undefined> = this.handlers as Record<string, AnyHandler | undefined>;
+    return handlers[type];
+  }
+
+  private async process(job: Job): Promise<void> {
+    job.attempts++;
+    const handler = this.handlerFor(job.type);
+    const tag = `t=${this.clock.now()} ${job.id}(${job.type},p${job.priority})`;
+    if (!handler) {
+      this.deadLetter(job, `no handler for ${job.type}`, tag);
+      return;
+    }
+    try {
+      await handler(job.payload, { id: job.id, attempts: job.attempts, maxAttempts: job.maxAttempts });
+      this.log(`${tag} done on attempt ${job.attempts}`);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      if (job.attempts >= job.maxAttempts) {
+        this.deadLetter(job, reason, tag);
+      } else {
+        const wait = this.backoffMs(job.attempts);
+        job.runAt = this.clock.now() + wait;
+        job.lastError = reason;
+        this.delayed.push(job);
+        this.log(`${tag} failed (${reason}), retry #${job.attempts + 1} in ${wait}ms`);
+      }
+    }
+  }
+
+  private deadLetter(job: Job, reason: string, tag: string): void {
+    job.lastError = reason;
+    this.deadLetters.push(job);
+    this.log(`${tag} -> DLQ after ${job.attempts} attempt(s): ${reason}`);
+  }
+}
+
+// ---- typed job catalogue ----
+type Jobs = {
+  settleTrade: { tradeId: string };
+  contractNote: { userId: string };
+  webhook: { url: string };
+  sms: { phone: string };
+  triggerGtt: { gttId: string };
+};
+
+const clock = new FakeClock(0);
+const queue = new JobQueue<Jobs>(clock, attempt => 100 * 2 ** (attempt - 1), line => console.log(line));
+
+let webhookCalls = 0;
+queue.register('settleTrade', async p => {
+  if (!p.tradeId) throw new Error('missing trade id');
+});
+queue.register('contractNote', async () => {});
+queue.register('webhook', async () => {
+  if (++webhookCalls < 3) throw new Error('HTTP 503');
+});
+queue.register('sms', async p => {
+  throw new Error(`DND number ${p.phone}`);
+});
+// note: no handler registered for triggerGtt
+
+queue.enqueue('contractNote', { userId: 'u1' }, { priority: 5 });
+queue.enqueue('settleTrade', { tradeId: 'T-9' }, { priority: 1 });
+queue.enqueue('webhook', { url: 'https://partner.example/hook' }, { priority: 3, maxAttempts: 4 });
+queue.enqueue('sms', { phone: '98xxxxxx01' }, { priority: 4, maxAttempts: 2 });
+queue.enqueue('triggerGtt', { gttId: 'G-1' }, { priority: 0, delayMs: 1_000 });
+// queue.enqueue('sms', { url: 'x' });  // compile error: wrong payload for 'sms'
+
+// Deterministic driver loop: jump the fake clock to the next due time
+for (let wake = queue.nextRunAt(); wake !== undefined; wake = queue.nextRunAt()) {
+  clock.set(Math.max(clock.now(), wake));
+  await queue.runDue();
+}
+console.log(`DLQ: ${queue.deadLetters.map(j => `${j.id}[${j.type}] "${j.lastError}"`).join('; ')}`);
+```
+
+```text
+t=0 job-2(settleTrade,p1) done on attempt 1
+t=0 job-3(webhook,p3) failed (HTTP 503), retry #2 in 100ms
+t=0 job-4(sms,p4) failed (DND number 98xxxxxx01), retry #2 in 100ms
+t=0 job-1(contractNote,p5) done on attempt 1
+t=100 job-3(webhook,p3) failed (HTTP 503), retry #3 in 200ms
+t=100 job-4(sms,p4) -> DLQ after 2 attempt(s): DND number 98xxxxxx01
+t=300 job-3(webhook,p3) done on attempt 3
+t=1000 job-5(triggerGtt,p0) -> DLQ after 1 attempt(s): no handler for triggerGtt
+DLQ: job-4[sms] "DND number 98xxxxxx01"; job-5[triggerGtt] "no handler for triggerGtt"
+```
+
+## Production notes
+
+- **Durability:** in-memory queues lose jobs on a crash. BullMQ keeps them in Redis sorted sets (score = timestamp) and uses **visibility/lock timeouts**, so a job whose worker died is picked up again. That means handlers **must be idempotent** (at-least-once delivery).
+- **Concurrency:** the `runDue` loop above is serial. Put a semaphore (section 7.8.4) around `process` to run N jobs at once, and use per-key locks when jobs for the same account must stay ordered.
+- **Starvation:** strict priority can starve low-priority jobs forever. Fix it with **aging** (bump priority by waiting time) or weighted fair queues.
+- **Scheduler wake-up:** don't poll every 10 ms. Set one `setTimeout` for `nextRunAt - now`, and re-arm it when an earlier job is enqueued.
+- **DLQ operations:** alert on DLQ size, store the payload and the error, and provide a "replay" tool. Poison messages should not block the queue.
+- **Cron** jobs ("send contract notes at 18:00 IST") need a **leader** or a distributed lock, so that only one pod fires them. Also be careful with time zones and DST (India has no DST, but your partners may).
+
+## How to say it in an interview
+
+> "Two min-heaps: delayed by `runAt`, ready by priority with a sequence tie-breaker. A tick promotes due jobs, then runs ready ones. Failures reschedule with exponential backoff until `maxAttempts`, then go to a dead-letter queue with the last error. It's at-least-once, so handlers are idempotent, and the clock is injected, so the whole retry timeline is a deterministic test."

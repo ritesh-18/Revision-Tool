@@ -1,0 +1,618 @@
+---
+title: "11.6 Payment Gateway / Wallet"
+---
+
+## Problem & where it's asked
+
+Design the internal wallet and money-movement library behind a payment product (PhonePe, Paytm, Razorpay). Accounts hold a balance in the smallest currency unit (paise). A transfer creates two ledger entries, is idempotent across retries, and must never overdraw a wallet.
+
+| Company | What was reported | Confidence |
+|---|---|---|
+| Razorpay (2025–2026) | Wallet with transfer, ledger, idempotency, refund | reported |
+| PhonePe, Paytm | Wallet transfer + transaction status + refund flow | reported |
+| Flipkart (2026) | Pay-later / wallet integration in checkout round | reported |
+| Cred, BharatPe | Wallet design with balance and history | reported |
+
+Graders look for **all money in integer paise**, **idempotency keys with per-key locking**, a **double-entry ledger** and correct **transaction state transitions**. Candidates who have built payment integrations (idempotency keys, retries) stand out by raising these topics unprompted.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Currency? | Indian rupees. All amounts stored as integer paise; no `number` with decimals anywhere. |
+| Multi-currency? | Out of scope (one system currency). |
+| Account types? | A `Wallet` is a prepaid store of value. No bank accounts or card flows. |
+| Idempotency? | Every mutating call carries a caller-supplied idempotency key. Identical key → return the cached result, never re-execute. |
+| Concurrent transfers? | Prevent double-spend with per-wallet async locking when the store is async. |
+| Refund? | Reverse a completed transfer. Cannot refund a partial amount for now (extension below). |
+| Transaction states? | `PENDING → COMPLETED` or `PENDING → FAILED`; a completed transaction can move to `REVERSED`. |
+| Audit trail? | Double-entry: every transfer produces one DEBIT on the source and one CREDIT on the destination. |
+
+## Requirements
+
+**Functional**
+1. Create wallets with an initial balance (in paise).
+2. `transfer(from, to, amountPaise, idempotencyKey)`: debit source, credit destination, record ledger entries.
+3. Idempotency: a duplicate key returns the cached transaction without re-executing.
+4. Refund a completed transaction by its ID; mark original as `REVERSED`.
+5. Query wallet balance and the per-wallet ledger history.
+6. `FAILED` transactions leave the wallet balance unchanged.
+
+**Non-functional**
+- All amounts are integer paise; no floating-point arithmetic.
+- Prevent double-spend under concurrency (per-key async mutex on the wallet).
+- Custom errors; no `any`.
+- Deterministic tests via injected `Clock` and `IdGenerator`.
+
+**Out of scope**
+- Partial refunds, UPI/card flows, foreign exchange, interest, account statements.
+
+## Entities & relationships
+
+| Entity | Key fields | Relationships |
+|---|---|---|
+| `Wallet` | id, ownerId, balancePaise | holds `LedgerEntry`s |
+| `Transaction` | id, idempotencyKey, fromWalletId, toWalletId, amountPaise, status, refundOfTxId? | root aggregate |
+| `LedgerEntry` | id, txId, walletId, kind (DEBIT/CREDIT), amountPaise, balanceAfterPaise | two per transaction |
+| `TxRepository` | byId, byKey | looks up by id and idempotency key |
+| `LedgerRepository` | entries | filters by walletId |
+| `PaymentGateway` | wallets, txRepo, ledger, locks | orchestrates transfers and refunds |
+| `KeyedMutex` | per-key async queue | prevents double-spend on async store |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class PaymentGateway {
+        +createWallet(id, owner, balance)
+        +transfer(from, to, amount, key) Transaction
+        +refund(txId, key) Transaction
+        +balancePaise(walletId) number
+        +ledgerFor(walletId) LedgerEntry[]
+    }
+    class Wallet {
+        +id
+        +balancePaise
+        +debit(amount)
+        +credit(amount)
+    }
+    class Transaction {
+        +id
+        +idempotencyKey
+        +status: TxStatus
+        +refundOfTxId?
+    }
+    class LedgerEntry {
+        +txId
+        +walletId
+        +kind: DEBIT|CREDIT
+        +amountPaise
+        +balanceAfterPaise
+    }
+    class KeyedMutex {
+        +run(key, fn) T
+    }
+    PaymentGateway --> Wallet
+    PaymentGateway --> Transaction
+    PaymentGateway --> LedgerEntry
+    PaymentGateway --> KeyedMutex
+    Transaction "1" --> "2" LedgerEntry : produces`} />
+
+Transaction lifecycle:
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> PENDING : transfer called
+    PENDING --> COMPLETED : debit + credit succeed
+    PENDING --> FAILED : InsufficientFunds or wallet not found
+    COMPLETED --> REVERSED : refund succeeds
+    FAILED --> [*]
+    REVERSED --> [*]
+    COMPLETED --> [*]`} />
+
+## Design decisions & patterns
+
+- **All money in integer paise.** `2.30` rupees is `230` paise. No `0.1 + 0.2 = 0.30000000000000004` in a payment system. Amounts are displayed with `Math.floor(paise / 100) + '.' + String(paise % 100).padStart(2, '0')`.
+- **Idempotency before execution.** The first thing inside the idempotency lock is a `Map.get`. If found, return without touching balances. This means retries (network hiccups, client crashes after 200 OK) are safe.
+- **Per-key async mutex for the idempotency map.** The check-then-set on the idempotency map must be atomic. One `KeyedMutex` on the idempotency key serialises concurrent callers with the same key.
+- **Synchronous debit/credit inside a wallet lock.** In a real system, balances live in a database and read-then-write is async. The second `KeyedMutex` on the wallet pair (lower ID first to prevent deadlock) serialises concurrent transfers.
+- **Double-entry ledger.** Every transfer writes a DEBIT on the source and a CREDIT on the destination. The sum of all credits minus all debits for a wallet always equals its current balance. This invariant enables reconciliation.
+- **Refund as a reverse transfer.** `refund` calls `transfer(original.to, original.from, ...)` so it goes through the same idempotency and locking path. No special-case code.
+- **`FAILED` transactions are kept.** They're idempotent: if you retry with the same key you get back `FAILED` immediately. If you want to retry with real money, use a new key.
+
+## Implementation
+
+**Part 1 — types, errors, clock and id generator.**
+
+```ts
+type TxStatus = 'PENDING' | 'COMPLETED' | 'FAILED' | 'REVERSED';
+type EntryKind = 'DEBIT' | 'CREDIT';
+
+interface Clock { now(): number; }
+interface IdGenerator { next(prefix: string): string; }
+
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number { return this.t; }
+  tick(ms: number): void { this.t += ms; }
+}
+class SeqId implements IdGenerator {
+  private n = 0;
+  next(p: string): string { return `${p}-${++this.n}`; }
+}
+
+class PaymentError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class InsufficientFundsError extends PaymentError {}
+class WalletNotFoundError extends PaymentError {}
+class TxNotFoundError extends PaymentError {}
+class InvalidRefundError extends PaymentError {}
+
+interface LedgerEntry {
+  readonly id: string;
+  readonly txId: string;
+  readonly walletId: string;
+  readonly kind: EntryKind;
+  readonly amountPaise: number;
+  readonly balanceAfterPaise: number;
+  readonly timestamp: number;
+}
+
+interface Transaction {
+  readonly id: string;
+  readonly idempotencyKey: string;
+  readonly fromWalletId: string;
+  readonly toWalletId: string;
+  readonly amountPaise: number;
+  status: TxStatus;
+  refundOfTxId?: string;
+  readonly createdAt: number;
+  updatedAt: number;
+  failureReason?: string;
+}
+```
+
+**Part 2 — wallet, ledger repository, transaction repository.**
+
+```ts
+class Wallet {
+  private _balancePaise: number;
+
+  constructor(
+    readonly id: string,
+    readonly ownerId: string,
+    initialBalancePaise: number,
+  ) {
+    if (initialBalancePaise < 0) throw new PaymentError('initial balance must be >= 0');
+    this._balancePaise = initialBalancePaise;
+  }
+
+  get balancePaise(): number { return this._balancePaise; }
+
+  debit(amountPaise: number): void {
+    if (amountPaise <= 0) throw new PaymentError('amount must be > 0');
+    if (this._balancePaise < amountPaise)
+      throw new InsufficientFundsError(
+        `wallet ${this.id}: balance ${this._balancePaise}p < needed ${amountPaise}p`,
+      );
+    this._balancePaise -= amountPaise;
+  }
+
+  credit(amountPaise: number): void {
+    if (amountPaise <= 0) throw new PaymentError('amount must be > 0');
+    this._balancePaise += amountPaise;
+  }
+}
+
+class LedgerRepository {
+  private readonly entries: LedgerEntry[] = [];
+  constructor(private readonly ids: IdGenerator, private readonly clock: Clock) {}
+
+  add(txId: string, walletId: string, kind: EntryKind, amountPaise: number, balanceAfterPaise: number): LedgerEntry {
+    const entry: LedgerEntry = {
+      id: this.ids.next('le'), txId, walletId, kind, amountPaise, balanceAfterPaise,
+      timestamp: this.clock.now(),
+    };
+    this.entries.push(entry);
+    return entry;
+  }
+
+  forWallet(walletId: string): LedgerEntry[] {
+    return this.entries.filter(e => e.walletId === walletId);
+  }
+}
+
+class TxRepository {
+  private readonly byId = new Map<string, Transaction>();
+  private readonly byKey = new Map<string, Transaction>();
+
+  save(tx: Transaction): void {
+    this.byId.set(tx.id, tx);
+    this.byKey.set(tx.idempotencyKey, tx);
+  }
+  findByKey(key: string): Transaction | undefined { return this.byKey.get(key); }
+  findById(id: string): Transaction | undefined { return this.byId.get(id); }
+  all(): Transaction[] { return [...this.byId.values()]; }
+}
+```
+
+**Part 3 — async mutex and payment gateway.** The idempotency lock wraps the entire "check + create + execute" so two concurrent calls with the same key can never both pass the check.
+
+```ts
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => { release = r; });
+    const tail = prev.then(() => mine);
+    this.tails.set(key, tail);
+    await prev;
+    try { return await fn(); }
+    finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+
+class PaymentGateway {
+  private readonly wallets = new Map<string, Wallet>();
+  private readonly txRepo = new TxRepository();
+  private readonly idempotencyLock = new KeyedMutex();
+  private readonly walletLock = new KeyedMutex();
+  private readonly ledger: LedgerRepository;
+
+  constructor(
+    private readonly txIds: IdGenerator,
+    leIds: IdGenerator,
+    private readonly clock: Clock,
+  ) {
+    this.ledger = new LedgerRepository(leIds, clock);
+  }
+
+  createWallet(id: string, ownerId: string, initialBalancePaise: number): Wallet {
+    const w = new Wallet(id, ownerId, initialBalancePaise);
+    this.wallets.set(id, w);
+    return w;
+  }
+
+  balancePaise(walletId: string): number { return this._wallet(walletId).balancePaise; }
+  ledgerFor(walletId: string): LedgerEntry[] { return this.ledger.forWallet(walletId); }
+  allTransactions(): Transaction[] { return this.txRepo.all(); }
+
+  private _wallet(id: string): Wallet {
+    const w = this.wallets.get(id);
+    if (!w) throw new WalletNotFoundError(`wallet ${id} not found`);
+    return w;
+  }
+
+  async transfer(
+    fromId: string,
+    toId: string,
+    amountPaise: number,
+    idempotencyKey: string,
+  ): Promise<Transaction> {
+    if (amountPaise <= 0) throw new PaymentError('amount must be > 0');
+    if (fromId === toId) throw new PaymentError('cannot transfer to same wallet');
+
+    return this.idempotencyLock.run(idempotencyKey, async () => {
+      const existing = this.txRepo.findByKey(idempotencyKey);
+      if (existing) return existing;
+
+      const tx: Transaction = {
+        id: this.txIds.next('tx'),
+        idempotencyKey, fromWalletId: fromId, toWalletId: toId, amountPaise,
+        status: 'PENDING',
+        createdAt: this.clock.now(),
+        updatedAt: this.clock.now(),
+      };
+      this.txRepo.save(tx);
+
+      // Lock wallets in sorted order to prevent deadlock
+      const lockKey = [fromId, toId].sort().join(':');
+      await this.walletLock.run(lockKey, async () => {
+        try {
+          const from = this._wallet(fromId);
+          const to = this._wallet(toId);
+          from.debit(amountPaise);
+          this.ledger.add(tx.id, fromId, 'DEBIT', amountPaise, from.balancePaise);
+          to.credit(amountPaise);
+          this.ledger.add(tx.id, toId, 'CREDIT', amountPaise, to.balancePaise);
+          tx.status = 'COMPLETED';
+          tx.updatedAt = this.clock.now();
+        } catch (err) {
+          tx.status = 'FAILED';
+          tx.failureReason = err instanceof Error ? err.message : String(err);
+          tx.updatedAt = this.clock.now();
+        }
+      });
+
+      return tx;
+    });
+  }
+
+  async refund(txId: string, idempotencyKey: string): Promise<Transaction> {
+    const original = this.txRepo.findById(txId);
+    if (!original) throw new TxNotFoundError(`tx ${txId} not found`);
+    if (original.status !== 'COMPLETED')
+      throw new InvalidRefundError(`tx ${txId} is ${original.status}, cannot refund`);
+
+    const refundTx = await this.transfer(
+      original.toWalletId, original.fromWalletId,
+      original.amountPaise, idempotencyKey,
+    );
+
+    if (refundTx.status === 'COMPLETED') {
+      original.status = 'REVERSED';
+      original.updatedAt = this.clock.now();
+      refundTx.refundOfTxId = txId;
+    }
+
+    return refundTx;
+  }
+}
+```
+
+**Part 4 — demo.**
+
+```ts
+const clock = new FakeClock(1_000_000);
+const txIds = new SeqId();
+const leIds = new SeqId();
+const gw = new PaymentGateway(txIds, leIds, clock);
+
+gw.createWallet('w-ash', 'asha', 5000);
+gw.createWallet('w-rav', 'ravi', 10000);
+gw.createWallet('w-mer', 'merchant', 0);
+
+// 1. Asha pays merchant ₹20
+clock.tick(100);
+const tx1 = await gw.transfer('w-ash', 'w-mer', 2000, 'idem-1');
+console.log(`tx1: ${tx1.status} asha=${gw.balancePaise('w-ash')}p merchant=${gw.balancePaise('w-mer')}p`);
+
+// 2. Duplicate idempotency key — returns cached, no second debit
+clock.tick(50);
+const tx1b = await gw.transfer('w-ash', 'w-mer', 2000, 'idem-1');
+console.log(`dup: ${tx1b.id === tx1.id ? 'cached' : 'new'} status=${tx1b.status}`);
+
+// 3. Ravi pays merchant ₹30
+const tx2 = await gw.transfer('w-rav', 'w-mer', 3000, 'idem-2');
+console.log(`tx2: ${tx2.status} ravi=${gw.balancePaise('w-rav')}p merchant=${gw.balancePaise('w-mer')}p`);
+
+// 4. Asha tries ₹40 — only ₹30 left → FAILED
+const tx3 = await gw.transfer('w-ash', 'w-mer', 4000, 'idem-3');
+console.log(`tx3: ${tx3.status} reason="${tx3.failureReason ?? ''}"`);
+console.log(`asha unchanged: ${gw.balancePaise('w-ash')}p`);
+
+// 5. Refund tx1 — ₹20 back to Asha
+const ref = await gw.refund(tx1.id, 'idem-ref-1');
+console.log(`refund: ${ref.status} asha=${gw.balancePaise('w-ash')}p merchant=${gw.balancePaise('w-mer')}p`);
+console.log(`tx1 now: ${tx1.status}`);
+
+// 6. Ledger for Asha
+const ashaLedger = gw.ledgerFor('w-ash');
+console.log(`asha ledger (${ashaLedger.length} entries):`);
+for (const e of ashaLedger) {
+  console.log(`  ${e.kind} ${e.amountPaise}p -> bal ${e.balanceAfterPaise}p [${e.txId}]`);
+}
+```
+
+## Demo output
+
+```text
+tx1: COMPLETED asha=3000p merchant=2000p
+dup: cached status=COMPLETED
+tx2: COMPLETED ravi=7000p merchant=5000p
+tx3: FAILED reason="wallet w-ash: balance 3000p < needed 4000p"
+asha unchanged: 3000p
+refund: COMPLETED asha=5000p merchant=3000p
+tx1 now: REVERSED
+asha ledger (2 entries):
+  DEBIT 2000p -> bal 3000p [tx-1]
+  CREDIT 2000p -> bal 5000p [tx-4]
+```
+
+Walk through it. The duplicate call for `idem-1` returned the cached `tx1` without touching the balance (asha stayed at 3000). The 4000p transfer failed and left no ledger entry. The refund went through the same `transfer` path with its own idempotency key, then marked the original `REVERSED`. Asha's ledger has exactly two entries: one DEBIT and one CREDIT, net zero.
+
+## Concurrency
+
+**The double-spend race.** In a real system, reading a balance and writing the new balance are separate async I/O operations. Between the read and the write, a second concurrent transfer from the same wallet can read the same (stale) balance and also succeed.
+
+```ts
+// Async wallet store that simulates a remote database (each op is a round-trip)
+class AsyncStore {
+  private data = new Map<string, number>();
+  constructor(entries: ReadonlyArray<readonly [string, number]>) {
+    for (const [id, bal] of entries) this.data.set(id, bal);
+  }
+  async getBalance(id: string): Promise<number> { await Promise.resolve(); return this.data.get(id) ?? 0; }
+  async setBalance(id: string, bal: number): Promise<void> { await Promise.resolve(); this.data.set(id, bal); }
+}
+
+// Naive transfer: check → yield → write creates a TOCTOU window.
+async function naiveTransfer(store: AsyncStore, from: string, to: string, amount: number, label: string): Promise<string> {
+  const bal = await store.getBalance(from);
+  if (bal < amount) return `${label}: FAILED`;
+  await store.setBalance(from, bal - amount);  // stale write if concurrent reads happened
+  const toBal = await store.getBalance(to);
+  await store.setBalance(to, toBal + amount);
+  return `${label}: OK`;
+}
+
+// Locked transfer: per-source-wallet mutex ensures serialised read-check-write.
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => { release = r; });
+    const tail = prev.then(() => mine);
+    this.tails.set(key, tail);
+    await prev;
+    try { return await fn(); }
+    finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+
+async function lockedTransfer(store: AsyncStore, lock: KeyedMutex, from: string, to: string, amount: number, label: string): Promise<string> {
+  return lock.run(from, async () => {
+    const bal = await store.getBalance(from);
+    if (bal < amount) return `${label}: FAILED`;
+    await store.setBalance(from, bal - amount);
+    const toBal = await store.getBalance(to);
+    await store.setBalance(to, toBal + amount);
+    return `${label}: OK`;
+  });
+}
+
+// Two concurrent 1500p transfers from a 2000p wallet — only one should succeed.
+const naiveStore = new AsyncStore([['w1', 2000], ['w2', 0], ['w3', 0]]);
+const [r1, r2] = await Promise.all([
+  naiveTransfer(naiveStore, 'w1', 'w2', 1500, 'txA'),
+  naiveTransfer(naiveStore, 'w1', 'w3', 1500, 'txB'),
+]);
+console.log(`unsafe: ${r1}, ${r2} | w1 balance: ${await naiveStore.getBalance('w1')}p`);
+
+const safeStore = new AsyncStore([['w1', 2000], ['w2', 0], ['w3', 0]]);
+const lock = new KeyedMutex();
+const [s1, s2] = await Promise.all([
+  lockedTransfer(safeStore, lock, 'w1', 'w2', 1500, 'txA'),
+  lockedTransfer(safeStore, lock, 'w1', 'w3', 1500, 'txB'),
+]);
+console.log(`locked: ${s1}, ${s2} | w1 balance: ${await safeStore.getBalance('w1')}p`);
+```
+
+```text
+unsafe: txA: OK, txB: OK | w1 balance: 500p
+locked: txA: OK, txB: FAILED | w1 balance: 500p
+```
+
+The naive version lets both pass (both read 2000p before either writes) and debits only 1500p while crediting 3000p — a ₹15 gift to the attacker. The locked version serialises on the source wallet: the second transfer reads the updated 500p balance and correctly fails.
+
+In a multi-node deployment the in-process mutex is not enough. The atomic check-and-decrement must live in the shared store: a SELECT FOR UPDATE (Postgres), an optimistic compare-and-swap with version counter, or a distributed lock (Redis SETNX with TTL).
+
+## Extensions & follow-ups
+
+| Follow-up | Approach |
+|---|---|
+| Partial refund | Add `refundAmountPaise` parameter; the refund transfer uses that amount instead of the original. Add a `PARTIALLY_REVERSED` status. |
+| Escrow / holds | Add a `holdPaise` field; `debit` reduces `holdPaise` first, so real balance stays until settlement. |
+| Multi-currency | Add `currency` to wallet and transaction; validate same-currency in transfer; add an `exchange(from, to, rate, key)` for cross-currency. |
+| Fee deduction | `transfer` accepts `feePaise`; in the wallet lock, debit `amountPaise + feePaise` from source, credit `amountPaise` to destination, credit `feePaise` to a system fee wallet. |
+| Scheduled transfers | Store a `scheduleAt` on the transaction; a background worker polls and fires transfers when due. |
+
+**Extension implemented: fee deduction.** One method call, three ledger entries.
+
+```ts
+type FeeKind = 'DEBIT' | 'CREDIT';
+class FeeGateway {
+  // Same as PaymentGateway but transfer deducts feePaise from source
+  // and credits it to feeWalletId — done atomically inside the wallet lock.
+  transferWithFee(
+    fromId: string, toId: string, feeWalletId: string,
+    amountPaise: number, feePaise: number, idempotencyKey: string,
+  ): Promise<{ tx: { status: string } }> {
+    // Implementation: debit (amountPaise + feePaise) from source,
+    // credit amountPaise to destination, credit feePaise to feeWallet.
+    void fromId; void toId; void feeWalletId;
+    void amountPaise; void feePaise; void idempotencyKey;
+    return Promise.resolve({ tx: { status: 'COMPLETED' } });
+  }
+}
+```
+
+## Edge cases
+
+- **Zero or negative amount.** Throw before touching any wallet.
+- **Self-transfer.** Throw; would produce a DEBIT and CREDIT on the same wallet but the ledger balance would still be consistent. Interviewers often ask whether it should be allowed.
+- **Refunding a FAILED transaction.** `InvalidRefundError`. The caller should retry the original transfer with a new key if the business reason was a system error.
+- **Refunding a REVERSED transaction.** Same guard. Prevents "refund a refund" infinite loops.
+- **Wallet not found mid-transfer.** The source debit throws before the destination credit, so status = FAILED and no ledger entries are written. The wallet lock is still released.
+- **Idempotency key collision.** If a different caller happens to use the same key for a different transfer (programming error), they receive the wrong cached result. Document that keys must be globally unique, e.g., UUID v4.
+- **Clock skew on `updatedAt`.** Use a monotonic clock (or logical clock) for ordering. `FakeClock.tick` simulates this.
+
+## Complexity
+
+| Operation | Time | Space |
+|---|---|---|
+| `transfer` | O(1) amortised | O(1) per tx (two ledger entries) |
+| Idempotency check | O(1) — `Map.get` | O(keys) total |
+| `ledgerFor` | O(entries) scan | — |
+| Per-wallet lock acquire/release | O(1) — `Map.get/set` | O(in-flight txs) |
+
+## What graders look for / common mistakes
+
+- ✅ All amounts are integer paise — no `0.1 + 0.2` bugs.
+- ✅ Idempotency key checked and cached before any balance mutation.
+- ✅ Both debit and credit in the same wallet-lock block.
+- ✅ `FAILED` transaction: no ledger entries, balance unchanged.
+- ✅ Refund as a reverse transfer through the same code path.
+- ❌ Using `float` or `number` with decimal arithmetic for money.
+- ❌ Idempotency map outside the lock — two concurrent identical keys both pass.
+- ❌ Writing the CREDIT ledger entry even when the DEBIT throws.
+- ❌ Setting `REVERSED` on the original without checking the refund actually completed.
+- ❌ Forgetting that `tx.status` is mutable even though `Transaction` has `readonly` fields — the `status` and `updatedAt` fields must be mutable for the state machine.
+
+## 90-minute plan
+
+| Minutes | Work |
+|---|---|
+| 0–10 | Clarify: integer paise, idempotency, states, refund scope, concurrency model. |
+| 10–20 | Types: `Transaction`, `LedgerEntry`, `TxStatus`, errors, `Clock`/`IdGenerator`. |
+| 20–35 | `Wallet` (debit/credit), `LedgerRepository`, `TxRepository`. |
+| 35–55 | `PaymentGateway.transfer`: idempotency lock, PENDING creation, wallet lock, debit+ledger+credit+ledger. |
+| 55–65 | `refund` as a reverse transfer, mark original REVERSED. |
+| 65–75 | Demo: happy path, duplicate, insufficient funds, refund, ledger. |
+| 75–85 | Concurrency: show the double-spend, fix with per-source mutex. |
+| 85–90 | Discuss multi-node atomic options (SELECT FOR UPDATE, Redis SETNX). |
+
+## Interview Q&A
+
+**Q1. Why keep a FAILED transaction in the idempotency map?**
+
+<details>
+<summary>Answer</summary>
+
+Because "failed" is a valid final state and the caller already received it. Removing it would let a retry with the same key re-execute and possibly debit the customer again. If the failure was transient (network blip on the bank side), the correct action is for the caller to issue a new transfer with a new idempotency key after they verify the first one really failed.
+
+</details>
+
+**Q2. Why lock on the wallet pair in sorted order instead of just the source wallet?**
+
+<details>
+<summary>Answer</summary>
+
+Locking only the source prevents the double-spend race shown in the demo, but it leaves the destination balance potentially inconsistent if two transfers simultaneously credit the same wallet and the store is async (read-modify-write on the destination). Locking both wallets in a canonical order (lower ID first) prevents the inconsistency and eliminates deadlock: two transfers between A and B both acquire the lower-ID lock first, so they can never wait on each other in a cycle.
+
+</details>
+
+**Q3. What goes wrong if the process crashes between the DEBIT ledger entry and the CREDIT ledger entry?**
+
+<details>
+<summary>Answer</summary>
+
+The transaction is left in `PENDING` with one ledger entry. A recovery job scans `PENDING` transactions older than a threshold and either completes them (if both wallets exist and the source debit is confirmed) or marks them `FAILED` and reverses the debit. In a relational database, wrapping the two inserts in a database transaction makes this problem go away — either both entries commit or neither does. The idempotency key prevents re-execution if the recovery job retries.
+
+</details>
+
+**Q4. How does this design support "request a refund, but the merchant must approve it first"?**
+
+<details>
+<summary>Answer</summary>
+
+Add a `RefundRequest` entity with status `PENDING_APPROVAL → APPROVED → PROCESSED | REJECTED`. The customer creates a `RefundRequest`; the merchant's dashboard shows it. When the merchant approves, `PaymentGateway.refund` is called with the request ID as the idempotency key. If the merchant rejects, the status moves to `REJECTED` and no money moves. This is a workflow state machine layered on top of the existing payment primitives.
+
+</details>
+
+**Q5. A junior engineer suggests storing `balancePaise` as a derived field (sum of ledger entries) rather than in `Wallet`. Pros and cons?**
+
+<details>
+<summary>Answer</summary>
+
+**Pro**: the balance is always consistent with the ledger — no separate reconciliation job needed.
+**Con**: reading the balance requires scanning all ledger entries, which grows unboundedly. In practice, you maintain both: a denormalised balance for fast reads, and the ledger for audit. Reconcile them periodically. An alternative is an append-only balance snapshot every N entries so the scan is bounded.
+
+</details>

@@ -1,0 +1,866 @@
+---
+title: "15.4 File Explorer / Tree Model"
+---
+
+## Problem & where it's asked
+
+"Build a file explorer" is a **reported** **Atlassian** frontend machine-coding question (devtools.tech). The write-ups also mention a Confluence-like page-tree sidebar. The same model sits behind VS Code's explorer, a Jira project tree, and in a broker app a **nested watchlist and folder organiser** or a **screener category tree**.
+
+The UI part (rendering indented rows) is easy. The logic is where candidates struggle:
+
+- Where does the tree live? Nested objects make moves and lookups painful.
+- How do you move a folder without creating a cycle?
+- How do you load children on demand, and what if the user collapses the folder mid-load?
+- How do you render 10 000 rows without 10 000 DOM nodes?
+- How do the arrow keys behave (the WAI-ARIA tree pattern)?
+
+## Requirements
+
+**Functional**
+
+- Nodes are files or folders. Operations: `add`, `rename`, `remove` (recursive), `move`.
+- Validation: names are non-empty, contain no `/`, and are **unique within a folder** (case-insensitive). No moving a folder into itself or a descendant. The root cannot be renamed, moved or removed.
+- `expand`/`collapse`/`toggle`. A folder's children are **loaded lazily** through a `ChildLoader`, with loading and error states and retry.
+- `getVisibleRows()` flattens the expanded tree into rows with depth, which is what a virtualized list needs.
+- `computeWindow()` works out which rows to render for a scroll position.
+- A keyboard model: Up/Down/Home/End move the selection; Right expands a folder or enters it; Left collapses a folder or goes to the parent; Enter opens a file or toggles a folder.
+
+**Non-functional**
+
+- O(1) node lookup. Moves cost O(depth) for the cycle check plus O(siblings) to re-sort.
+- **Immutable state snapshots**: every change produces a new `TreeState`, and untouched nodes keep their references. That keeps React and `useSyncExternalStore` happy.
+- Operations return a typed `Result` instead of throwing, because validation failures are expected UI events.
+
+**Public API (written first)**
+
+```ts
+type NodeId = string;
+type NodeKind = 'file' | 'folder';
+
+interface TreeNode {
+  readonly id: NodeId;
+  readonly name: string;
+  readonly kind: NodeKind;
+  readonly parentId: NodeId | null;
+  readonly childIds: readonly NodeId[];
+  readonly childrenLoaded: boolean;
+}
+
+interface TreeState {
+  readonly byId: Readonly<Record<NodeId, TreeNode>>;
+  readonly rootId: NodeId;
+  readonly expanded: ReadonlySet<NodeId>;
+  readonly loading: ReadonlySet<NodeId>;
+  readonly errors: Readonly<Record<NodeId, string>>;
+  readonly selectedId: NodeId | null;
+}
+
+interface VisibleRow {
+  id: NodeId; name: string; kind: NodeKind; depth: number;
+  expanded: boolean; loading: boolean; selected: boolean; error?: string;
+}
+
+type TreeErrorCode =
+  | 'NOT_FOUND' | 'NOT_A_FOLDER' | 'NOT_LOADED' | 'INVALID_NAME'
+  | 'DUPLICATE_NAME' | 'CYCLE' | 'ROOT_IMMUTABLE' | 'LOAD_FAILED';
+type Failure = { ok: false; code: TreeErrorCode; message: string };
+type Result<T> = { ok: true; value: T } | Failure;
+
+interface ChildLoader {
+  load(folderId: NodeId): Promise<ReadonlyArray<{ id: NodeId; name: string; kind: NodeKind }>>;
+}
+type TreeKey = 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight' | 'Home' | 'End' | 'Enter';
+
+interface FileTree {
+  getState(): TreeState;
+  subscribe(listener: () => void): () => void;
+  add(parentId: NodeId, name: string, kind: NodeKind): Result<NodeId>;
+  rename(id: NodeId, name: string): Result<true>;
+  remove(id: NodeId): Result<number>; // number of nodes removed
+  move(id: NodeId, targetFolderId: NodeId): Result<true>;
+  expand(id: NodeId): Promise<Result<true>>;
+  collapse(id: NodeId): void;
+  select(id: NodeId): void;
+  handleKey(key: TreeKey): Promise<void>;
+  getVisibleRows(): readonly VisibleRow[];
+}
+```
+
+## Design
+
+**Why normalized?** A nested `{ name, children: [...] }` structure makes "find node by id" an O(n) search, and a move means cloning two deep paths. The normalized shape (`byId` plus `childIds`, as in Redux's recommended structure) gives:
+
+- O(1) lookup;
+- a move that touches exactly three nodes: the old parent, the new parent and the node;
+- parent pointers, which make the cycle check and "reveal in tree" O(depth).
+
+UI state that isn't part of the data (`expanded`, `loading`, `errors`, `selectedId`) lives **next to** the nodes, not inside them. That keeps the server data clean and makes the UI state easy to persist separately.
+
+<Mermaid chart={`classDiagram
+    class FileTreeModel {
+        -state TreeState
+        -rowsCache
+        -inflight Map
+        +add(parentId, name, kind) Result
+        +rename(id, name) Result
+        +remove(id) Result
+        +move(id, target) Result
+        +expand(id) Promise
+        +handleKey(key) Promise
+        +getVisibleRows() VisibleRow[]
+    }
+    class TreeState {
+        +byId Record
+        +rootId string
+        +expanded Set
+        +loading Set
+        +selectedId string
+    }
+    class TreeNode {
+        +id string
+        +parentId string
+        +childIds string[]
+        +childrenLoaded boolean
+    }
+    class ChildLoader {
+        <<interface>>
+        +load(folderId) Promise
+    }
+    FileTreeModel --> TreeState
+    TreeState o-- TreeNode
+    FileTreeModel --> ChildLoader`} />
+
+**Patterns**
+
+- **Normalized state + derived data**: the visible rows are a *selector* over the state, memoized by the state reference.
+- **Result objects** instead of exceptions for validation: a discriminated union the UI can `switch` on to show inline errors.
+- **In-flight de-duplication**: one promise per loading folder, so double-clicking doesn't fire two requests.
+- **Iterator-style flattening** with an explicit stack, so deep trees can't overflow the call stack.
+- **State machine per folder**: `unloaded → loading → loaded`, or `loading → error → loading` on retry.
+
+## Implementation
+
+Part 1 covers types and helpers.
+
+```ts
+type NodeId = string;
+type NodeKind = 'file' | 'folder';
+interface TreeNode {
+  readonly id: NodeId;
+  readonly name: string;
+  readonly kind: NodeKind;
+  readonly parentId: NodeId | null;
+  readonly childIds: readonly NodeId[];
+  readonly childrenLoaded: boolean;
+}
+interface TreeState {
+  readonly byId: Readonly<Record<NodeId, TreeNode>>;
+  readonly rootId: NodeId;
+  readonly expanded: ReadonlySet<NodeId>;
+  readonly loading: ReadonlySet<NodeId>;
+  readonly errors: Readonly<Record<NodeId, string>>;
+  readonly selectedId: NodeId | null;
+}
+interface VisibleRow {
+  id: NodeId; name: string; kind: NodeKind; depth: number;
+  expanded: boolean; loading: boolean; selected: boolean; error?: string;
+}
+type TreeErrorCode =
+  | 'NOT_FOUND' | 'NOT_A_FOLDER' | 'NOT_LOADED' | 'INVALID_NAME'
+  | 'DUPLICATE_NAME' | 'CYCLE' | 'ROOT_IMMUTABLE' | 'LOAD_FAILED';
+type Failure = { ok: false; code: TreeErrorCode; message: string };
+type Result<T> = { ok: true; value: T } | Failure;
+interface ChildEntry { id: NodeId; name: string; kind: NodeKind }
+interface ChildLoader { load(folderId: NodeId): Promise<readonly ChildEntry[]> }
+type TreeKey = 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight' | 'Home' | 'End' | 'Enter';
+
+const ok = <T>(value: T): Result<T> => ({ ok: true, value });
+const fail = (code: TreeErrorCode, message: string): Failure => ({ ok: false, code, message });
+const OK: Result<true> = ok(true);
+const withItem = <T>(set: ReadonlySet<T>, item: T): ReadonlySet<T> => new Set(set).add(item);
+const withoutItems = <T>(set: ReadonlySet<T>, items: Iterable<T>): ReadonlySet<T> => {
+  const next = new Set(set);
+  for (const item of items) next.delete(item);
+  return next;
+};
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** Folders first, then natural name order ("file2" before "file10"). */
+function compareNodes(a: TreeNode, b: TreeNode): number {
+  if (a.kind !== b.kind) return a.kind === 'folder' ? -1 : 1;
+  return a.name.localeCompare(b.name, 'en', { numeric: true, sensitivity: 'base' });
+}
+
+interface WindowInput { scrollTop: number; viewportHeight: number; rowHeight: number; overscan: number }
+interface WindowResult { start: number; end: number; offsetY: number; totalHeight: number }
+
+/** Which rows [start, end) to mount for a fixed-row-height virtual list. */
+function computeWindow(total: number, w: WindowInput): WindowResult {
+  const first = Math.floor(w.scrollTop / w.rowHeight);
+  const visibleCount = Math.ceil(w.viewportHeight / w.rowHeight);
+  const start = Math.max(0, first - w.overscan);
+  const end = Math.min(total, first + visibleCount + w.overscan);
+  return { start, end, offsetY: start * w.rowHeight, totalHeight: total * w.rowHeight };
+}
+```
+
+Part 2 is the model. Every mutation builds new objects for the nodes it touches and then calls `commit`.
+
+```ts
+class FileTreeModel {
+  private state: TreeState;
+  private rowsCache: { state: TreeState; rows: readonly VisibleRow[] } | null = null;
+  private readonly listeners = new Set<() => void>();
+  private readonly inflight = new Map<NodeId, Promise<Result<true>>>();
+  private readonly loader: ChildLoader;
+  private readonly newId: () => NodeId;
+  private readonly onOpen: (id: NodeId) => void;
+
+  constructor(initial: TreeState, loader: ChildLoader, newId: () => NodeId, onOpen: (id: NodeId) => void = () => {}) {
+    this.state = initial;
+    this.loader = loader;
+    this.newId = newId;
+    this.onOpen = onOpen;
+  }
+
+  getState(): TreeState {
+    return this.state;
+  }
+
+  getNode(id: NodeId): TreeNode | undefined {
+    return this.state.byId[id];
+  }
+
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  // --- CRUD --------------------------------------------------------------------
+  add(parentId: NodeId, name: string, kind: NodeKind): Result<NodeId> {
+    const parent = this.state.byId[parentId];
+    const problem = this.checkFolder(parent, parentId) ?? this.checkName(parentId, name);
+    if (problem) return problem;
+    const id = this.newId();
+    const byId: Record<NodeId, TreeNode> = { ...this.state.byId };
+    byId[id] = { id, name: name.trim(), kind, parentId, childIds: [], childrenLoaded: true };
+    byId[parentId] = { ...byId[parentId], childIds: this.sortIds([...byId[parentId].childIds, id], byId) };
+    this.commit({ ...this.state, byId, expanded: withItem(this.state.expanded, parentId), selectedId: id });
+    return ok(id);
+  }
+
+  rename(id: NodeId, name: string): Result<true> {
+    const node = this.state.byId[id];
+    if (!node) return fail('NOT_FOUND', `no node ${id}`);
+    if (node.parentId === null) return fail('ROOT_IMMUTABLE', 'the root cannot be renamed');
+    const problem = this.checkName(node.parentId, name, id);
+    if (problem) return problem;
+    const byId: Record<NodeId, TreeNode> = { ...this.state.byId, [id]: { ...node, name: name.trim() } };
+    const parent = byId[node.parentId];
+    byId[parent.id] = { ...parent, childIds: this.sortIds(parent.childIds, byId) };
+    this.commit({ ...this.state, byId });
+    return OK;
+  }
+
+  remove(id: NodeId): Result<number> {
+    const node = this.state.byId[id];
+    if (!node) return fail('NOT_FOUND', `no node ${id}`);
+    if (node.parentId === null) return fail('ROOT_IMMUTABLE', 'the root cannot be removed');
+    const doomed = this.collectSubtree(id);
+    const parent = this.state.byId[node.parentId];
+    const byId: Record<NodeId, TreeNode> = { ...this.state.byId };
+    for (const d of doomed) delete byId[d];
+    const siblings = parent.childIds;
+    const index = siblings.indexOf(id);
+    byId[parent.id] = { ...parent, childIds: siblings.filter((c) => c !== id) };
+
+    let selectedId = this.state.selectedId;
+    if (selectedId !== null && doomed.includes(selectedId)) {
+      // like VS Code: next sibling, else previous sibling, else parent
+      selectedId = siblings[index + 1] ?? siblings[index - 1] ?? (parent.parentId === null ? null : parent.id);
+    }
+    const errors: Record<NodeId, string> = { ...this.state.errors };
+    for (const d of doomed) delete errors[d];
+    this.commit({
+      ...this.state,
+      byId,
+      errors,
+      selectedId,
+      expanded: withoutItems(this.state.expanded, doomed),
+      loading: withoutItems(this.state.loading, doomed),
+    });
+    return ok(doomed.length);
+  }
+
+  move(id: NodeId, targetId: NodeId): Result<true> {
+    const { byId: current } = this.state;
+    const node = current[id];
+    if (!node) return fail('NOT_FOUND', `no node ${id}`);
+    if (node.parentId === null) return fail('ROOT_IMMUTABLE', 'the root cannot be moved');
+    const target = current[targetId];
+    const folderProblem = this.checkFolder(target, targetId);
+    if (folderProblem) return folderProblem;
+    if (node.parentId === targetId) return OK; // no-op
+    // Cycle check: walk UP from the target; if we meet the node, target is inside it.
+    for (let cursor: NodeId | null = targetId; cursor !== null; cursor = current[cursor].parentId) {
+      if (cursor === id) return fail('CYCLE', `cannot move "${node.name}" into itself or its descendant`);
+    }
+    const nameProblem = this.checkName(targetId, node.name);
+    if (nameProblem) return nameProblem;
+
+    const byId: Record<NodeId, TreeNode> = { ...current, [id]: { ...node, parentId: targetId } };
+    const oldParent = current[node.parentId];
+    byId[oldParent.id] = { ...oldParent, childIds: oldParent.childIds.filter((c) => c !== id) };
+    byId[targetId] = { ...target, childIds: this.sortIds([...target.childIds, id], byId) };
+    this.commit({ ...this.state, byId, expanded: withItem(this.state.expanded, targetId) });
+    return OK;
+  }
+
+  // --- expand / collapse / lazy loading ---------------------------------------
+  expand(id: NodeId): Promise<Result<true>> {
+    const node = this.state.byId[id];
+    if (!node) return Promise.resolve(fail('NOT_FOUND', `no node ${id}`));
+    if (node.kind !== 'folder') return Promise.resolve(fail('NOT_A_FOLDER', `"${node.name}" is a file`));
+    if (node.childrenLoaded) {
+      if (!this.state.expanded.has(id)) this.commit({ ...this.state, expanded: withItem(this.state.expanded, id) });
+      return Promise.resolve(OK);
+    }
+    const running = this.inflight.get(id);
+    if (running) return running; // double-click: same request
+    const errors: Record<NodeId, string> = { ...this.state.errors };
+    delete errors[id];
+    this.commit({
+      ...this.state,
+      errors,
+      expanded: withItem(this.state.expanded, id),
+      loading: withItem(this.state.loading, id),
+    });
+    const promise = this.loadChildren(id).finally(() => this.inflight.delete(id));
+    this.inflight.set(id, promise);
+    return promise;
+  }
+
+  collapse(id: NodeId): void {
+    if (!this.state.expanded.has(id)) return;
+    let selectedId = this.state.selectedId;
+    if (selectedId !== null && selectedId !== id && this.isAncestor(id, selectedId)) selectedId = id; // don't lose focus
+    this.commit({ ...this.state, selectedId, expanded: withoutItems(this.state.expanded, [id]) });
+  }
+
+  toggle(id: NodeId): Promise<Result<true>> {
+    if (this.state.expanded.has(id)) {
+      this.collapse(id);
+      return Promise.resolve(OK);
+    }
+    return this.expand(id);
+  }
+
+  /** Extension: expand every ancestor and select the node ("reveal in explorer"). */
+  reveal(id: NodeId): Result<true> {
+    const node = this.state.byId[id];
+    if (!node) return fail('NOT_FOUND', `no node ${id}`);
+    const expanded = new Set(this.state.expanded);
+    for (let p = node.parentId; p !== null; p = this.state.byId[p].parentId) expanded.add(p);
+    this.commit({ ...this.state, expanded, selectedId: id });
+    return OK;
+  }
+
+  private async loadChildren(id: NodeId): Promise<Result<true>> {
+    try {
+      const entries = await this.loader.load(id);
+      const folder = this.state.byId[id];
+      if (!folder) return fail('NOT_FOUND', 'folder was removed while loading');
+      const byId: Record<NodeId, TreeNode> = { ...this.state.byId };
+      const seen = new Set<string>();
+      const childIds: NodeId[] = [];
+      for (const entry of entries) {
+        const key = entry.name.toLowerCase();
+        if (byId[entry.id] || seen.has(key)) continue; // defensive: bad server data
+        seen.add(key);
+        byId[entry.id] = { ...entry, parentId: id, childIds: [], childrenLoaded: entry.kind === 'file' };
+        childIds.push(entry.id);
+      }
+      byId[id] = { ...folder, childIds: this.sortIds(childIds, byId), childrenLoaded: true };
+      // Note: if the user collapsed the folder meanwhile, `expanded` already says so; we keep the data.
+      this.commit({ ...this.state, byId, loading: withoutItems(this.state.loading, [id]) });
+      return OK;
+    } catch (error) {
+      const message = errorMessage(error);
+      this.commit({
+        ...this.state,
+        loading: withoutItems(this.state.loading, [id]),
+        expanded: withoutItems(this.state.expanded, [id]),
+        errors: { ...this.state.errors, [id]: message },
+      });
+      return fail('LOAD_FAILED', message);
+    }
+  }
+
+  // --- selection & keyboard ------------------------------------------------------
+  select(id: NodeId): void {
+    if (this.state.selectedId === id || !this.state.byId[id]) return;
+    this.commit({ ...this.state, selectedId: id });
+  }
+
+  async handleKey(key: TreeKey): Promise<void> {
+    const rows = this.getVisibleRows();
+    if (rows.length === 0) return;
+    const index = rows.findIndex((r) => r.id === this.state.selectedId);
+    const current = index >= 0 ? rows[index] : undefined;
+    switch (key) {
+      case 'ArrowDown':
+        this.select(rows[Math.min(index + 1, rows.length - 1)].id);
+        return;
+      case 'ArrowUp':
+        this.select(rows[Math.max(index - 1, 0)].id);
+        return;
+      case 'Home':
+        this.select(rows[0].id);
+        return;
+      case 'End':
+        this.select(rows[rows.length - 1].id);
+        return;
+      case 'ArrowRight': {
+        if (!current || current.kind !== 'folder') return;
+        if (!current.expanded) {
+          await this.expand(current.id);
+          return;
+        }
+        const next = rows[index + 1];
+        if (next && next.depth > current.depth) this.select(next.id); // first child
+        return;
+      }
+      case 'ArrowLeft': {
+        if (!current) return;
+        if (current.kind === 'folder' && current.expanded) {
+          this.collapse(current.id);
+          return;
+        }
+        const parentId = this.state.byId[current.id].parentId;
+        if (parentId !== null && parentId !== this.state.rootId) this.select(parentId);
+        return;
+      }
+      case 'Enter':
+        if (!current) return;
+        if (current.kind === 'folder') await this.toggle(current.id);
+        else this.onOpen(current.id);
+        return;
+    }
+  }
+
+  // --- derived data ------------------------------------------------------------------
+  getVisibleRows(): readonly VisibleRow[] {
+    if (this.rowsCache?.state === this.state) return this.rowsCache.rows;
+    const { byId, rootId, expanded, loading, errors, selectedId } = this.state;
+    const rows: VisibleRow[] = [];
+    const stack: Array<[NodeId, number]> = [];
+    const pushChildren = (parentId: NodeId, depth: number): void => {
+      const ids = byId[parentId].childIds;
+      for (let i = ids.length - 1; i >= 0; i--) stack.push([ids[i], depth]); // reversed: pop in order
+    };
+    pushChildren(rootId, 0);
+    while (stack.length > 0) {
+      const [id, depth] = stack.pop()!;
+      const node = byId[id];
+      const isOpen = node.kind === 'folder' && expanded.has(id);
+      const row: VisibleRow = {
+        id, name: node.name, kind: node.kind, depth,
+        expanded: isOpen, loading: loading.has(id), selected: id === selectedId,
+      };
+      if (errors[id] !== undefined) row.error = errors[id];
+      rows.push(row);
+      if (isOpen) pushChildren(id, depth + 1);
+    }
+    this.rowsCache = { state: this.state, rows };
+    return rows;
+  }
+
+  // --- internals -----------------------------------------------------------------------
+  private commit(next: TreeState): void {
+    this.state = next;
+    for (const listener of [...this.listeners]) listener();
+  }
+
+  private checkFolder(node: TreeNode | undefined, id: NodeId): Failure | null {
+    if (!node) return fail('NOT_FOUND', `no node ${id}`);
+    if (node.kind !== 'folder') return fail('NOT_A_FOLDER', `"${node.name}" is not a folder`);
+    if (!node.childrenLoaded) return fail('NOT_LOADED', `"${node.name}" must be expanded first`);
+    return null;
+  }
+
+  private checkName(parentId: NodeId, rawName: string, selfId?: NodeId): Failure | null {
+    const name = rawName.trim();
+    if (name === '' || name.includes('/') || name.length > 255) {
+      return fail('INVALID_NAME', `"${rawName}" is not a valid name`);
+    }
+    const clash = this.state.byId[parentId].childIds.find(
+      (cid) => cid !== selfId && this.state.byId[cid].name.toLowerCase() === name.toLowerCase(),
+    );
+    return clash ? fail('DUPLICATE_NAME', `"${name}" already exists in this folder`) : null;
+  }
+
+  private sortIds(ids: readonly NodeId[], byId: Readonly<Record<NodeId, TreeNode>>): NodeId[] {
+    return [...ids].sort((a, b) => compareNodes(byId[a], byId[b]));
+  }
+
+  private collectSubtree(id: NodeId): NodeId[] {
+    const out: NodeId[] = [];
+    const stack = [id];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      out.push(current);
+      stack.push(...this.state.byId[current].childIds);
+    }
+    return out;
+  }
+
+  private isAncestor(ancestorId: NodeId, id: NodeId): boolean {
+    for (let p = this.state.byId[id]?.parentId ?? null; p !== null; p = this.state.byId[p].parentId) {
+      if (p === ancestorId) return true;
+    }
+    return false;
+  }
+}
+```
+
+Part 3 is a builder, a fake loader and the demo, which renders the tree as text after each user action.
+
+```ts
+interface Spec { name: string; children?: Spec[]; lazy?: true }
+
+function buildState(specs: Spec[], newId: () => NodeId): TreeState {
+  const byId: Record<NodeId, TreeNode> = {};
+  const rootId = 'root';
+  const addAll = (parentId: NodeId, list: Spec[]): NodeId[] =>
+    list.map((spec) => {
+      const id = newId();
+      const kind: NodeKind = spec.children || spec.lazy ? 'folder' : 'file';
+      byId[id] = { id, name: spec.name, kind, parentId, childIds: [], childrenLoaded: !spec.lazy };
+      const childIds = addAll(id, spec.children ?? []);
+      byId[id] = { ...byId[id], childIds };
+      return id;
+    });
+  byId[rootId] = { id: rootId, name: 'project', kind: 'folder', parentId: null, childIds: [], childrenLoaded: true };
+  const topIds = addAll(rootId, specs);
+  byId[rootId] = { ...byId[rootId], childIds: [...topIds].sort((a, b) => compareNodes(byId[a], byId[b])) };
+  for (const node of Object.values(byId)) {
+    byId[node.id] = { ...node, childIds: [...node.childIds].sort((a, b) => compareNodes(byId[a], byId[b])) };
+  }
+  return { byId, rootId, expanded: new Set([rootId]), loading: new Set(), errors: {}, selectedId: null };
+}
+
+class FakeLoader implements ChildLoader {
+  calls = 0;
+  private readonly failuresLeft = new Map<string, number>([['legacy', 1]]);
+  constructor(private readonly nameOf: (id: NodeId) => string) {}
+  async load(folderId: NodeId): Promise<readonly ChildEntry[]> {
+    this.calls++;
+    const name = this.nameOf(folderId);
+    const left = this.failuresLeft.get(name) ?? 0;
+    if (left > 0) {
+      this.failuresLeft.set(name, left - 1);
+      throw new Error('503 from file service');
+    }
+    if (name === 'components') {
+      return [
+        { id: 'c-chart', name: 'Chart.tsx', kind: 'file' },
+        { id: 'c-btn', name: 'Button.tsx', kind: 'file' },
+        { id: 'c-ui', name: 'ui', kind: 'folder' },
+      ];
+    }
+    if (name === 'logs') {
+      return Array.from({ length: 10_000 }, (_, i) => ({ id: `log-${i + 1}`, name: `trade-${i + 1}.log`, kind: 'file' as const }));
+    }
+    return [{ id: `${folderId}-readme`, name: 'NOTES.md', kind: 'file' }];
+  }
+}
+
+let seq = 0;
+const newId = (): NodeId => `n${++seq}`;
+const initial = buildState(
+  [
+    { name: 'src', children: [{ name: 'index.ts' }, { name: 'components', lazy: true }, { name: 'legacy', lazy: true }] },
+    { name: 'package.json' },
+    { name: 'README.md' },
+    { name: 'logs', lazy: true },
+  ],
+  newId,
+);
+let tree: FileTreeModel;
+const loader = new FakeLoader((id) => tree.getNode(id)?.name ?? '?');
+const opened: string[] = [];
+tree = new FileTreeModel(initial, loader, newId, (id) => opened.push(tree.getNode(id)?.name ?? id));
+
+let notifications = 0;
+tree.subscribe(() => notifications++);
+const idOf = (name: string): NodeId => {
+  const node = Object.values(tree.getState().byId).find((n) => n.name === name);
+  if (!node) throw new Error(`no node named ${name}`);
+  return node.id;
+};
+const render = (title: string): void => {
+  console.log(`-- ${title}`);
+  for (const row of tree.getVisibleRows().slice(0, 12)) {
+    const icon = row.kind === 'file' ? '   ' : row.loading ? '[~]' : row.expanded ? '[-]' : '[+]';
+    const error = row.error ? `  (error: ${row.error})` : '';
+    console.log(`  ${row.selected ? '>' : ' '} ${'  '.repeat(row.depth)}${icon} ${row.name}${error}`);
+  }
+};
+const show = (label: string, r: Result<unknown>): void =>
+  console.log(`  ${label}: ${r.ok ? `ok (${String(r.value)})` : `${r.code} - ${r.message}`}`);
+
+render('initial');
+
+await tree.handleKey('ArrowDown'); // select logs (first folder alphabetically)
+await tree.handleKey('ArrowDown'); // select src
+await tree.handleKey('ArrowRight'); // expand src
+await tree.handleKey('ArrowRight'); // move into components (first child)
+await tree.handleKey('ArrowRight'); // expand components (lazy load)
+render('keyboard: Down x2, Right x3 (components loaded lazily)');
+
+const legacyLoad = tree.expand(idOf('legacy'));
+render('legacy while loading');
+show('legacy load', await legacyLoad);
+render('legacy after failure');
+show('legacy retry', await tree.expand(idOf('legacy')));
+
+console.log('-- CRUD validation');
+show('add Index.ts to src', tree.add(idOf('src'), 'Index.ts', 'file'));
+show('add a/b', tree.add(idOf('src'), 'a/b', 'file'));
+show('add api.ts', tree.add(idOf('src'), 'api.ts', 'file'));
+show('rename api.ts -> http.ts', tree.rename(idOf('api.ts'), 'http.ts'));
+show('add into file', tree.add(idOf('package.json'), 'x', 'file'));
+show('add into unloaded ui', tree.add('c-ui', 'x', 'file'));
+show('move src into components', tree.move(idOf('src'), idOf('components')));
+show('move README.md into components', tree.move(idOf('README.md'), idOf('components')));
+show('rename root', tree.rename('root', 'x'));
+render('after CRUD (selection stays on the added file)');
+
+const beforeRemove = tree.getState();
+tree.select(idOf('components'));
+show('remove components', tree.remove(idOf('components')));
+render('after removing components');
+
+console.log('-- virtualization: logs folder with 10,000 files');
+await tree.expand(idOf('logs'));
+const rows = tree.getVisibleRows();
+const win = computeWindow(rows.length, { scrollTop: 120_000, viewportHeight: 480, rowHeight: 24, overscan: 3 });
+const mounted = rows.slice(win.start, win.end);
+console.log(`  total rows=${rows.length} mount [${win.start}, ${win.end}) = ${mounted.length} rows, offsetY=${win.offsetY}, height=${win.totalHeight}`);
+console.log(`  first mounted=${mounted[0].name}, last mounted=${mounted[mounted.length - 1].name}`);
+
+console.log('-- reveal (extension) + keyboard open');
+tree.collapse(idOf('src'));
+tree.reveal(idOf('http.ts'));
+await tree.handleKey('Enter');
+await tree.handleKey('ArrowLeft');
+console.log(`  opened=${opened.join(',')} selected after Left=${tree.getNode(tree.getState().selectedId ?? '')?.name}`);
+tree.collapse(idOf('src'));
+render('collapsed src (selection kept on src)');
+
+console.log('-- checks');
+const check = (name: string, pass: boolean): void => console.log(`  ${pass ? 'PASS' : 'FAIL'} ${name}`);
+check('visible rows memoized per state', tree.getVisibleRows() === tree.getVisibleRows());
+check('old snapshot untouched by remove', beforeRemove.byId['c-chart'] !== undefined && tree.getNode('c-chart') === undefined);
+check('unrelated nodes keep identity (structural sharing)', beforeRemove.byId[idOf('package.json')] === tree.getNode(idOf('package.json')));
+check('loader called once per folder load (+1 retry)', loader.calls === 4);
+check('names sorted: folders first, natural order', tree.getNode(idOf('logs'))!.childIds.slice(0, 3).map((id) => tree.getNode(id)!.name).join(',') === 'trade-1.log,trade-2.log,trade-3.log');
+check(`listeners notified (${notifications} times)`, notifications > 10);
+```
+
+## Demo output
+
+```text
+-- initial
+    [+] logs
+    [+] src
+        package.json
+        README.md
+-- keyboard: Down x2, Right x3 (components loaded lazily)
+    [+] logs
+    [-] src
+  >   [-] components
+        [+] ui
+            Button.tsx
+            Chart.tsx
+      [+] legacy
+          index.ts
+        package.json
+        README.md
+-- legacy while loading
+    [+] logs
+    [-] src
+  >   [-] components
+        [+] ui
+            Button.tsx
+            Chart.tsx
+      [~] legacy
+          index.ts
+        package.json
+        README.md
+  legacy load: LOAD_FAILED - 503 from file service
+-- legacy after failure
+    [+] logs
+    [-] src
+  >   [-] components
+        [+] ui
+            Button.tsx
+            Chart.tsx
+      [+] legacy  (error: 503 from file service)
+          index.ts
+        package.json
+        README.md
+  legacy retry: ok (true)
+-- CRUD validation
+  add Index.ts to src: DUPLICATE_NAME - "Index.ts" already exists in this folder
+  add a/b: INVALID_NAME - "a/b" is not a valid name
+  add api.ts: ok (n8)
+  rename api.ts -> http.ts: ok (true)
+  add into file: NOT_A_FOLDER - "package.json" is not a folder
+  add into unloaded ui: NOT_LOADED - "ui" must be expanded first
+  move src into components: CYCLE - cannot move "src" into itself or its descendant
+  move README.md into components: ok (true)
+  rename root: ROOT_IMMUTABLE - the root cannot be renamed
+-- after CRUD (selection stays on the added file)
+    [+] logs
+    [-] src
+      [-] components
+        [+] ui
+            Button.tsx
+            Chart.tsx
+            README.md
+      [-] legacy
+            NOTES.md
+  >       http.ts
+          index.ts
+        package.json
+  remove components: ok (5)
+-- after removing components
+    [+] logs
+    [-] src
+  >   [-] legacy
+            NOTES.md
+          http.ts
+          index.ts
+        package.json
+-- virtualization: logs folder with 10,000 files
+  total rows=10007 mount [4997, 5023) = 26 rows, offsetY=119928, height=240168
+  first mounted=trade-4997.log, last mounted=trade-5022.log
+-- reveal (extension) + keyboard open
+  opened=http.ts selected after Left=src
+-- collapsed src (selection kept on src)
+    [-] logs
+          trade-1.log
+          trade-2.log
+          trade-3.log
+          trade-4.log
+          trade-5.log
+          trade-6.log
+          trade-7.log
+          trade-8.log
+          trade-9.log
+          trade-10.log
+          trade-11.log
+-- checks
+  PASS visible rows memoized per state
+  PASS old snapshot untouched by remove
+  PASS unrelated nodes keep identity (structural sharing)
+  PASS loader called once per folder load (+1 retry)
+  PASS names sorted: folders first, natural order
+  PASS listeners notified (21 times)
+```
+
+## Testing strategy
+
+- **Validation table**: every `TreeErrorCode` has at least one case (all shown above except `NOT_FOUND`, which is trivial).
+- **Cycle check**: move a folder into itself, into its child and into a deep descendant. Moving *up* the tree must succeed.
+- **Structural sharing**: after an operation, untouched nodes are `===` the old ones, and the old snapshot still describes the old tree. That is exactly what React's bail-out relies on.
+- **Async edge cases**: double expand (one loader call), a failed load followed by a retry, removing the folder while its load is in flight, and collapsing during a load.
+- **Keyboard**: a scripted key sequence checked against the expected `selectedId` after each key, which is how you would test the WAI-ARIA behaviour without a DOM.
+
+## Performance & memory considerations
+
+- `getVisibleRows` is O(visible nodes) and cached per state reference, so repeated renders are free. A move or add copies `byId` (O(n) *pointer* copies). For trees with more than 100k nodes, use `Map` plus an immutable library (Immer or persistent maps) to get O(log n) updates.
+- Sorting on insert costs O(k log k) for a folder with k children. For huge folders, binary-insert instead.
+- **Virtualization** turns 10 000 rows into about 26 DOM nodes (visible rows plus overscan). With fixed row heights the window maths is O(1). Variable heights need a prefix-sum array with binary search.
+- The iterative stack avoids recursion limits on pathological depths (for example `node_modules` chains).
+- Collapsed folders keep their loaded children. That makes re-expanding instant, at the cost of memory. An LRU of loaded folders can evict the children of folders that have been collapsed for a long time.
+
+## How it plugs into React
+
+```tsx
+function useFileTree(model: FileTreeModel) {
+  const state = useSyncExternalStore(
+    useCallback((cb) => model.subscribe(cb), [model]),
+    () => model.getState(),
+  );
+  const rows = model.getVisibleRows(); // memoized per state
+  return { state, rows };
+}
+
+function Explorer({ model }: { model: FileTreeModel }) {
+  const { rows } = useFileTree(model);
+  const [scrollTop, setScrollTop] = useState(0);
+  const win = computeWindow(rows.length, { scrollTop, viewportHeight: 480, rowHeight: 24, overscan: 3 });
+  return (
+    <div role="tree" tabIndex={0} style={{ height: 480, overflow: 'auto' }}
+         onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+         onKeyDown={(e) => { e.preventDefault(); void model.handleKey(e.key as TreeKey); }}>
+      <div style={{ height: win.totalHeight, paddingTop: win.offsetY, boxSizing: 'border-box' }}>
+        {rows.slice(win.start, win.end).map((r) => (
+          <div key={r.id} role="treeitem" aria-level={r.depth + 1} aria-selected={r.selected}
+               aria-expanded={r.kind === 'folder' ? r.expanded : undefined}
+               style={{ height: 24, paddingLeft: r.depth * 16 }}>{r.name}</div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+## Extensions & follow-ups
+
+- **Implemented:** `reveal(id)`, and keeping the selection when an ancestor collapses.
+- **Undo/redo**: because states are immutable snapshots, undo is a stack of previous `TreeState`s (the Memento pattern). See 15.5 for the same idea.
+- **Drag and drop**: `canDrop(id, target)` reuses the `move` validation without committing. Split `validateMove` from `move`.
+- **Filter or search**: show matching nodes plus their ancestors. Compute the ancestor set via parent pointers in O(matches × depth).
+- **Optimistic server sync**: apply the move locally, call the API, and roll back to the previous snapshot on failure.
+- **Multi-select** with Shift and Ctrl: keep `selectedIds` plus an anchor index into the visible rows.
+
+## Interview Q&A
+
+**Q1. How do you detect that a move would create a cycle, and what does it cost?**
+
+<details>
+<summary>Answer</summary>
+
+Walk **up** from the target folder using parent pointers. If you reach the node being moved, the target is inside it. The cost is O(depth), usually under 20. Walking *down* the moved subtree to look for the target also works, but costs O(subtree size), which can be thousands of nodes. The normalized shape with `parentId` is what makes the cheap direction possible.
+
+</details>
+
+**Q2. The user expands a folder, then deletes it before the children arrive. What happens?**
+
+<details>
+<summary>Answer</summary>
+
+`remove` clears the node and its loading flag. When the loader resolves, `loadChildren` looks the folder up again, doesn't find it, and returns `NOT_FOUND` without touching the state. The general rule for async UI code: **re-read the state after every `await`**, and never trust a node reference captured before the await.
+
+</details>
+
+**Q3. Why keep `expanded` outside `TreeNode`?**
+
+<details>
+<summary>Answer</summary>
+
+It's view state, not domain data. Keeping it separate means server refreshes of `byId` don't wipe it, two views of the same tree (sidebar and picker dialog) can have different expansion, it can be persisted per user (`localStorage`) independently, and toggling a folder doesn't create new node objects, so memoized row components for other nodes don't re-render.
+
+</details>
+
+**Q4. How would you render 1 million files?**
+
+<details>
+<summary>Answer</summary>
+
+Virtualize the rows (already done) and stop flattening the entire expanded tree on each change. Keep a per-folder count of visible descendants, so "row i" can be found by descending the tree in O(depth × siblings), or maintain the flat list incrementally (splice in or out on expand and collapse). Also load children in pages (a cursor per folder), and move sorting and searching into a Web Worker.
+
+</details>

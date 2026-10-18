@@ -1,0 +1,272 @@
+---
+title: "5.1 Adapter"
+---
+
+## Intent
+
+Convert the interface of an existing class into the interface your code expects, so classes that couldn't work together now can.
+
+## Problem
+
+Your checkout service depends on a clean `PaymentGateway` interface: amounts in paise, a `Promise<ChargeResult>` with status `'SUCCESS' | 'FAILED'`. Then business signs two vendors:
+
+- a Razorpay-like SDK: `createPayment({ amount, currency, receipt })` returning `{ id, status: 'captured' | 'failed', error_description }`;
+- a Stripe-like SDK: `paymentIntents.create({ amount, currency, metadata })` returning `{ id, status: 'succeeded' | 'requires_payment_method', last_payment_error }`, and it wants lowercase currency codes.
+
+You can't edit vendor code, and you don't want vendor field names leaking into your domain (if you switch vendors, you'd rewrite checkout). An adapter per vendor translates between the two worlds.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class PaymentGateway {
+        <<interface>>
+        +charge(req) Promise~ChargeResult~
+    }
+    class CheckoutService {
+        +pay(orderId, rupees) Promise~string~
+    }
+    class RazorLikeAdapter {
+        -RazorLikeSdk sdk
+        +charge(req) Promise~ChargeResult~
+    }
+    class StripeLikeAdapter {
+        -StripeLikeSdk sdk
+        +charge(req) Promise~ChargeResult~
+    }
+    class RazorLikeSdk {
+        +createPayment(opts) Promise~RazorPayment~
+    }
+    class StripeLikeSdk {
+        +paymentIntents
+    }
+    CheckoutService --> PaymentGateway
+    PaymentGateway <|.. RazorLikeAdapter
+    PaymentGateway <|.. StripeLikeAdapter
+    RazorLikeAdapter --> RazorLikeSdk : adaptee
+    StripeLikeAdapter --> StripeLikeSdk : adaptee`} />
+
+## TypeScript implementation
+
+```ts
+// ---------- Our domain's interface (the "target") ----------
+interface ChargeRequest {
+  orderId: string;
+  amountPaise: number;
+  currency: 'INR' | 'USD';
+}
+
+interface ChargeResult {
+  status: 'SUCCESS' | 'FAILED';
+  providerRef: string;
+  reason?: string;
+}
+
+interface PaymentGateway {
+  readonly name: string;
+  charge(req: ChargeRequest): Promise<ChargeResult>;
+}
+
+// ---------- Vendor SDKs we cannot change (the "adaptees") ----------
+interface RazorPayment {
+  id: string;
+  status: 'captured' | 'failed';
+  error_description: string | null;
+}
+
+class RazorLikeSdk {
+  async createPayment(opts: { amount: number; currency: string; receipt: string }): Promise<RazorPayment> {
+    const failed = opts.amount > 5_000_000; // demo rule: > Rs.50,000 fails
+    return {
+      id: `pay_${opts.receipt}`,
+      status: failed ? 'failed' : 'captured',
+      error_description: failed ? 'Amount exceeds UPI limit' : null,
+    };
+  }
+}
+
+interface StripeIntent {
+  id: string;
+  status: 'succeeded' | 'requires_payment_method';
+  last_payment_error?: { message: string };
+}
+
+class StripeLikeSdk {
+  readonly paymentIntents = {
+    create: async (p: {
+      amount: number;
+      currency: string;
+      metadata: Record<string, string>;
+    }): Promise<StripeIntent> => {
+      if (p.currency !== p.currency.toLowerCase()) throw new Error('currency must be lowercase');
+      const declined = p.metadata.order_id.endsWith('9');
+      return declined
+        ? { id: 'pi_declined', status: 'requires_payment_method', last_payment_error: { message: 'Card declined' } }
+        : { id: `pi_${p.metadata.order_id}`, status: 'succeeded' };
+    },
+  };
+}
+
+// ---------- Adapters ----------
+class RazorLikeAdapter implements PaymentGateway {
+  readonly name = 'razorlike';
+  constructor(private readonly sdk: RazorLikeSdk) {}
+
+  async charge(req: ChargeRequest): Promise<ChargeResult> {
+    const p = await this.sdk.createPayment({
+      amount: req.amountPaise, // already smallest unit
+      currency: req.currency,
+      receipt: req.orderId,
+    });
+    return p.status === 'captured'
+      ? { status: 'SUCCESS', providerRef: p.id }
+      : { status: 'FAILED', providerRef: p.id, reason: p.error_description ?? 'unknown' };
+  }
+}
+
+class StripeLikeAdapter implements PaymentGateway {
+  readonly name = 'stripelike';
+  constructor(private readonly sdk: StripeLikeSdk) {}
+
+  async charge(req: ChargeRequest): Promise<ChargeResult> {
+    try {
+      const intent = await this.sdk.paymentIntents.create({
+        amount: req.amountPaise,
+        currency: req.currency.toLowerCase(), // translate conventions
+        metadata: { order_id: req.orderId },
+      });
+      return intent.status === 'succeeded'
+        ? { status: 'SUCCESS', providerRef: intent.id }
+        : { status: 'FAILED', providerRef: intent.id, reason: intent.last_payment_error?.message };
+    } catch (err) {
+      // translate vendor exceptions into our result type too
+      return { status: 'FAILED', providerRef: 'n/a', reason: (err as Error).message };
+    }
+  }
+}
+
+// ---------- Client: knows only PaymentGateway ----------
+class CheckoutService {
+  constructor(private readonly gateway: PaymentGateway) {}
+
+  async pay(orderId: string, rupees: number): Promise<string> {
+    const r = await this.gateway.charge({ orderId, amountPaise: Math.round(rupees * 100), currency: 'INR' });
+    return `${this.gateway.name} ${orderId}: ${r.status} (${r.providerRef})${r.reason ? ` - ${r.reason}` : ''}`;
+  }
+}
+
+const gateways: PaymentGateway[] = [new RazorLikeAdapter(new RazorLikeSdk()), new StripeLikeAdapter(new StripeLikeSdk())];
+for (const g of gateways) {
+  const checkout = new CheckoutService(g);
+  console.log(await checkout.pay('ord_101', 499.5));
+  console.log(await checkout.pay(g.name === 'razorlike' ? 'ord_102' : 'ord_109', 60_000));
+}
+```
+
+```text
+razorlike ord_101: SUCCESS (pay_ord_101)
+razorlike ord_102: FAILED (pay_ord_102) - Amount exceeds UPI limit
+stripelike ord_101: SUCCESS (pi_ord_101)
+stripelike ord_109: FAILED (pi_declined) - Card declined
+```
+
+**Adapting a push-based market-data vendor.** Adapters don't only rename fields; they also translate *styles*. Here a vendor pushes pipe-delimited strings with prices in paise, while our app wants typed `Tick` objects via a subscribe-with-unsubscribe API.
+
+```ts
+interface Tick {
+  symbol: string;
+  ltp: number; // rupees
+  volume: number;
+}
+
+interface MarketDataFeed {
+  subscribe(symbol: string, onTick: (t: Tick) => void): () => void; // returns unsubscribe
+}
+
+// Vendor: one global listener, raw strings like "NSE|INFY|150025|1200"
+class VendorFeed {
+  private listener: ((raw: string) => void) | null = null;
+  onMessage(cb: (raw: string) => void): void {
+    this.listener = cb;
+  }
+  emit(raw: string): void {
+    this.listener?.(raw);
+  }
+}
+
+class VendorFeedAdapter implements MarketDataFeed {
+  private readonly handlers = new Map<string, Set<(t: Tick) => void>>();
+
+  constructor(vendor: VendorFeed) {
+    vendor.onMessage((raw) => this.dispatch(raw));
+  }
+
+  subscribe(symbol: string, onTick: (t: Tick) => void): () => void {
+    const set = this.handlers.get(symbol) ?? new Set();
+    set.add(onTick);
+    this.handlers.set(symbol, set);
+    return () => set.delete(onTick);
+  }
+
+  private dispatch(raw: string): void {
+    const [, symbol, paise, volume] = raw.split('|');
+    const tick: Tick = { symbol, ltp: Number(paise) / 100, volume: Number(volume) };
+    this.handlers.get(symbol)?.forEach((h) => h(tick));
+  }
+}
+
+const vendor = new VendorFeed();
+const feed: MarketDataFeed = new VendorFeedAdapter(vendor);
+const stop = feed.subscribe('INFY', (t) => console.log(`${t.symbol} ltp=${t.ltp.toFixed(2)} vol=${t.volume}`));
+
+vendor.emit('NSE|INFY|150025|1200');
+vendor.emit('NSE|TCS|410000|300'); // nobody subscribed
+stop();
+vendor.emit('NSE|INFY|150100|50'); // after unsubscribe: ignored
+console.log('done');
+```
+
+```text
+INFY ltp=1500.25 vol=1200
+done
+```
+
+## When to use / when NOT to use
+
+- **Use** when integrating third-party SDKs, legacy modules or multiple vendors behind one domain interface (ports-and-adapters / hexagonal architecture is this idea at scale).
+- **Don't use** when you own both sides; just change the interface. Don't write an adapter that is a 1:1 pass-through with identical names, unless you need the seam for testing or vendor swap.
+
+## Pitfalls
+
+- **Leaky adapters**: returning vendor types (`RazorPayment`) or throwing vendor errors through your interface. Translate results *and* errors.
+- **Unit mismatches**: paise vs rupees, cents vs dollars, seconds vs milliseconds, IST vs UTC. Most real adapter bugs live here.
+- **Business logic creeping in**: retries, risk checks and fee logic belong elsewhere (decorators, services). An adapter translates.
+- Adapting a **lowest-common-denominator** interface that hides a feature one vendor has and you need (e.g. UPI intent flows). Design the target interface from your domain's needs.
+
+## Related patterns
+
+- **Decorator** keeps the same interface and adds behaviour; Adapter changes the interface and adds none.
+- **Proxy** keeps the same interface and controls access.
+- **Facade** defines a *new, simpler* interface over *many* objects; Adapter makes *one* object conform to an *existing* interface.
+- **Bridge** is designed up front to let two sides vary; Adapter is usually retrofitted after the fact.
+
+## Where it shows up in LLD interview problems
+
+- Payment system with multiple gateways.
+- Trading platform with multiple exchange or market-data vendors.
+- Notification system wrapping SendGrid/Twilio/FCM-like SDKs.
+- Ride-sharing using different map providers; weather app merging APIs with different units.
+
+Interview line: *"Checkout depends on my `PaymentGateway` port. Each vendor gets an adapter that translates units, statuses and errors, so switching vendors touches one class."*
+
+## Quick check
+
+1. The Stripe-like SDK throws on uppercase currency. Where should that be handled, and why?
+2. Adapter vs Facade in one sentence?
+
+<details>
+<summary>Answers</summary>
+
+1. In the adapter: it is a vendor convention, so the adapter lowercases the code and also turns vendor exceptions into a `FAILED` result. The domain should never know about it.
+2. Adapter makes one existing object fit an interface your code already expects; Facade invents a simpler interface over a whole subsystem.
+
+</details>

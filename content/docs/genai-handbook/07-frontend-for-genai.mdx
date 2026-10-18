@@ -1,0 +1,761 @@
+---
+title: "7. Frontend for GenAI"
+description: "The frontend is where GenAI actually meets users, and the design decisions made here determine whether the product feels magical or broken. This chapter..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth added to a topic the chapter already covers.
+  - ➕ **Beyond the handbook**: a topic the chapter does not cover, added because a GenAI engineer should know it.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams. Code is React 18+ with TypeScript, talking to the SSE endpoints built in [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai).
+</Callout>
+
+## 7.1 Concept Explanation
+
+The frontend is where GenAI actually meets users, and the design decisions made here determine whether the product feels magical or broken. This chapter teaches enough frontend to build AI-first interfaces. We deliberately skip framework internals — your job is not to write a virtual DOM, it is to ship a streaming, responsive, accessible chat that handles failure gracefully.
+
+The defining property of an AI frontend: latency is variable and partial responses are normal. A traditional form submits and renders an answer; an AI frontend renders answer fragments as they arrive, must handle mid-stream cancellation, must show intermediate states (tool calls, citations, plan steps), and must recover from network blips without losing context.
+
+## 7.2 React Basics — Just Enough
+
+React is the dominant view library for AI apps. The essentials:
+- Components are functions that return UI based on props (inputs) and state.
+- State changes trigger re-renders.
+- Effects let you synchronize with external systems (network, timers, subscriptions).
+- Refs hold mutable values that should not trigger re-renders (DOM handles, abort controllers).
+
+For AI UIs, you spend most of your time managing streaming state: an array of messages, the current in-flight message being built up, and abort handles for cancellation. The rest is layout.
+
+## 7.3 Next.js Basics
+
+Next.js is React plus server-side rendering, routing, and an integrated backend (API routes, server actions). For AI products, Next.js shines because it lets you co-locate the streaming backend handler and the chat UI in one codebase and one deployment.
+
+Two architectural choices matter:
+- **Server components vs client components.** Server components run on the server and stream rendered HTML. Client components run in the browser and handle interactivity. AI chat UIs are almost entirely client components because they need stateful streaming behavior.
+- **Edge runtime vs Node runtime.** Edge functions run on a global CDN, cold-start fast, but have fewer Node APIs. Useful for thin LLM proxies. Node runtime is needed for heavier work.
+
+## 7.4 Streaming UI — The Heart of Chat UX
+
+A chat UI must render tokens as they arrive. Three implementation layers:
+
+1. **Network layer.** Open an SSE or fetch-with-streaming connection. Read chunks as they arrive.
+2. **State layer.** Append each chunk to the current message's text in state.
+3. **Render layer.** React re-renders the message component on each state update.
+
+The trap: re-rendering the entire message list on every token is expensive once messages get long or numerous. The mitigation: render the streaming message as its own component that owns its text state, so the parent list does not re-render.
+
+A second trap: scrolling. As text grows, the user wants the view pinned to the bottom unless they have scrolled up to read history. Implement "stick to bottom unless user scrolled" — a small piece of logic that, done wrong, makes the UI feel like it is fighting the user.
+
+## 7.4a Consuming a POST Stream in React 🔧
+
+The three layers above map onto about 80 lines of code. This section writes them out, with the traps the chapter names handled in the code.
+
+### Network layer: parsing SSE from `fetch`
+
+**Problem.** The browser's `EventSource` API parses SSE for you, but it can only send GET requests, cannot set an `Authorization` header and cannot send a body. A chat request needs all three.
+
+**Why it happens.** `EventSource` was designed for subscribing to a feed, not for submitting a request. So chat clients use `fetch`, whose response body is a `ReadableStream` of bytes, and parse the SSE format themselves.
+
+**Mechanism.** Decode bytes to text with `TextDecoderStream`. Events are separated by a blank line. Each line is a `field: value` pair. Lines that start with a colon are comments (the server's heartbeats) and are skipped. Multiple `data` lines in one event are joined with newlines.
+
+```ts
+// sse.ts
+export interface SseEvent { event: string; data: string; id?: string }
+
+export async function* parseSse(body: ReadableStream<Uint8Array>): AsyncGenerator<SseEvent> {
+  const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += value.replace(/\r\n?/g, '\n');
+      let sep: number;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const raw = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        let event = 'message';
+        let id: string | undefined;
+        const data: string[] = [];
+        for (const line of raw.split('\n')) {
+          if (line === '' || line.startsWith(':')) continue;   // heartbeat comment
+          const colon = line.indexOf(':');
+          const field = colon === -1 ? line : line.slice(0, colon);
+          const val = colon === -1 ? '' : line.slice(colon + 1).replace(/^ /, '');
+          if (field === 'event') event = val;
+          else if (field === 'data') data.push(val);
+          else if (field === 'id') id = val;
+        }
+        if (data.length) yield { event, data: data.join('\n'), id };
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+```
+
+**Edge cases.** A network chunk can end in the middle of an event, or even in the middle of a multi-byte character. The buffer handles the first, and `TextDecoderStream` handles the second (a plain `TextDecoder` without `stream: true` would corrupt characters split across chunks). Libraries such as `eventsource-parser` implement the full spec if you prefer not to own this.
+
+### State and render layers: one render per frame
+
+**Problem.** Fast models emit hundreds of small chunks per second. Calling `setState` for each one re-renders the message, and re-parses its markdown, hundreds of times a second, which makes typing in the composer lag.
+
+**Why it happens.** The screen only repaints about 60 times a second. Any render beyond one per frame is work the user never sees.
+
+**Mechanism.** Collect incoming text in a ref (which does not trigger renders) and schedule at most one state update per animation frame. The hook owns the abort controller, so stopping and unmounting both close the stream.
+
+```tsx
+// useChatStream.ts
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { parseSse } from './sse';
+
+export type StreamStatus = 'idle' | 'streaming' | 'done' | 'stopped' | 'error';
+
+export function useChatStream(url = '/api/chat/stream') {
+  const [text, setText] = useState('');
+  const [status, setStatus] = useState<StreamStatus>('idle');
+  const abortRef = useRef<AbortController | null>(null);
+  const pending = useRef('');
+  const frame = useRef<number | null>(null);
+
+  const flush = useCallback(() => {
+    frame.current = null;
+    const chunk = pending.current;
+    pending.current = '';
+    if (chunk) setText((t) => t + chunk);
+  }, []);
+
+  const enqueue = useCallback((t: string) => {
+    pending.current += t;
+    if (frame.current === null) frame.current = requestAnimationFrame(flush);
+  }, [flush]);
+
+  const send = useCallback(async (message: string) => {
+    abortRef.current?.abort();                      // one stream at a time
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setText('');
+    setStatus('streaming');
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      for await (const ev of parseSse(res.body)) {
+        if (ev.event === 'token') enqueue(JSON.parse(ev.data).t);
+        else if (ev.event === 'error') throw new Error(JSON.parse(ev.data).message);
+        else if (ev.event === 'done') break;
+      }
+      flush();
+      setStatus('done');
+    } catch {
+      flush();                                       // keep what already arrived
+      setStatus(ctrl.signal.aborted ? 'stopped' : 'error');
+    }
+  }, [url, enqueue, flush]);
+
+  const stop = useCallback(() => abortRef.current?.abort(), []);
+
+  useEffect(() => () => {                            // unmount: close the stream
+    abortRef.current?.abort();
+    if (frame.current !== null) cancelAnimationFrame(frame.current);
+  }, []);
+
+  return { text, status, send, stop };
+}
+```
+
+**Edge cases.**
+- Browsers pause `requestAnimationFrame` in background tabs. Text keeps collecting in the ref and appears when the tab is visible again. The final `flush()` makes sure a finished answer is complete even if no frame ran.
+- Keep this hook inside the component that renders the streaming message, as 7.4 says, so the list of earlier messages does not re-render with every frame.
+- Libraries such as the Vercel AI SDK's `useChat` (from `@ai-sdk/react`) do the same work and add message history, tool parts and retries. Knowing the mechanism underneath helps when you debug them.
+
+### Stick to bottom unless the user scrolled up
+
+**Problem.** Either the view jumps to the bottom while the user is reading earlier text, or it stays put while the answer grows off-screen.
+
+**Why it happens.** Auto-scroll must depend on where the user was before the content grew. Checking after the new content has rendered always finds the view "not at the bottom".
+
+**Mechanism.** Record on each scroll whether the user is near the bottom. After each render, scroll down only if they were.
+
+```tsx
+import { useEffect, useLayoutEffect, useRef } from 'react';
+
+export function useStickToBottom<T extends HTMLElement>(content: unknown, threshold = 48) {
+  const ref = useRef<T>(null);
+  const pinned = useRef(true);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const onScroll = () => {
+      pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [threshold]);
+
+  useLayoutEffect(() => {                  // before paint: no visible jump
+    const el = ref.current;
+    if (el && pinned.current) el.scrollTop = el.scrollHeight;
+  }, [content]);
+
+  return ref;
+}
+```
+
+**Edge cases.** Images and code blocks that load or highlight after the text grow the content without a new token. A `ResizeObserver` on the content element catches those. Show a "jump to latest" button while the user is unpinned and new text arrives.
+
+## 7.5 AI Chat Interface Patterns
+
+The conversation list. Each message is a turn (user or assistant). The assistant turn may contain text, tool calls, citations, code blocks, images. Render each part appropriately.
+
+The composer. A text area with send button, file attachments, voice input, model selector, optional system prompt control. Keyboard shortcut for send (typically Cmd/Ctrl+Enter). Disable send while a response is streaming, or implement "stop generating."
+
+The action affordances. Copy message, regenerate, rate response, fork conversation, share. The patterns are converging across products — copy what works.
+
+Empty state and onboarding. First-time users do not know what to type. Suggest prompts. Show example flows.
+
+## 7.6 Markdown Rendering
+
+LLMs love markdown. Headings, lists, tables, code blocks, links, bold, italic. Render it.
+
+Use a markdown library (react-markdown plus remark plugins is the standard). Add syntax highlighting for code blocks. Render LaTeX for math if your domain needs it. Sanitize HTML aggressively — LLM output can contain malicious tags if not filtered, especially in agent flows where the model might be quoting user input.
+
+Streaming markdown is tricky. A partially streamed code block may not yet have its closing fence, and the renderer may panic on the incomplete syntax. Defensive rendering: try to parse, fall back to plain text on failure, re-parse on each new chunk.
+
+## 7.6a Rendering Partial Markdown Safely 🔧
+
+"Re-parse on each new chunk" works, but it gets slow on long answers and it does nothing about output that is safe markdown yet still harmful. Three techniques cover both.
+
+### Close what the model has not closed yet
+
+**Problem.** Mid-stream, the text contains an opening code fence without its closing fence. The renderer treats everything after it as code, or the layout jumps when the fence finally closes.
+
+**Why it happens.** Markdown is defined for complete documents. A prefix of a valid document is often not valid in the same way, and the most visible case is an unclosed fence.
+
+**Mechanism.** Before rendering the in-progress text, count fence lines. If the count is odd, append a temporary closing fence. The stored message is never changed, only the copy you render.
+
+### Re-render only the last block
+
+**Problem.** A 4,000-word answer is re-parsed from the start on every frame. Parsing time grows with the length of the answer, so streaming gets slower the longer it runs.
+
+**Why it happens.** Every block except the last one is finished: new tokens only ever extend the end. Re-parsing the finished blocks is wasted work.
+
+**Mechanism.** Split the text into blocks at blank lines that are outside code fences. Render each block with a memoized component. Finished blocks keep the same string, so React skips them, and only the last block re-renders.
+
+```tsx
+// StreamingMarkdown.tsx
+import { memo, useMemo } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+
+const FENCE = /^(`{3,}|~{3,})/;   // a line that opens or closes a code fence
+
+function closeOpenFence(md: string): string {
+  const fenceLines = md.split('\n').filter((l) => FENCE.test(l)).length;
+  return fenceLines % 2 === 1 ? `${md}\n${'`'.repeat(3)}` : md;
+}
+
+function splitBlocks(md: string): string[] {
+  const blocks: string[] = [];
+  let current: string[] = [];
+  let inFence = false;
+  for (const line of md.split('\n')) {
+    if (FENCE.test(line)) inFence = !inFence;
+    if (!inFence && line.trim() === '' && current.length) {
+      blocks.push(current.join('\n'));
+      current = [];
+    } else {
+      current.push(line);
+    }
+  }
+  if (current.length) blocks.push(current.join('\n'));
+  return blocks;
+}
+
+const Block = memo(function Block({ md }: { md: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ href, children }) => (
+          <a href={href} target="_blank" rel="noopener noreferrer nofollow">{children}</a>
+        ),
+        // Do not load remote images that the model wrote (see below)
+        img: ({ alt }) => <span className="image-placeholder">[image: {alt}]</span>,
+      }}
+    >
+      {md}
+    </ReactMarkdown>
+  );
+});
+
+export function StreamingMarkdown({ text, streaming }: { text: string; streaming: boolean }) {
+  const blocks = useMemo(() => splitBlocks(text), [text]);
+  return (
+    <>
+      {blocks.map((b, i) => {
+        const isLast = i === blocks.length - 1;
+        return <Block key={i} md={isLast && streaming ? closeOpenFence(b) : b} />;
+      })}
+    </>
+  );
+}
+```
+
+**Edge cases.** Splitting at blank lines changes the meaning of a few constructs: a "loose" list whose items are separated by blank lines becomes several lists, and reference-style links or footnotes defined in another block stop resolving. When streaming ends, render the whole message once as a single document to get the exact result. Syntax highlighting is often the slowest step. Highlight a code block only once it is closed, and show it as plain monospace text while it streams.
+
+### Treat model output as untrusted, including images and links
+
+**Problem.** A document the user uploaded contains hidden instructions. The model follows them and writes a markdown image whose URL is an attacker's server, with the user's private data in the query string. The browser loads the image, and the data has left without anyone clicking anything.
+
+**Why it happens.** Markdown images load automatically. Indirect prompt injection (7.14) lets an attacker control parts of the model's output, so any automatic network request in the rendered output becomes a channel out of your app.
+
+**Mechanism.**
+- react-markdown does not render raw HTML by default, and its default URL transform drops `javascript:` links. Keep both defaults. If you enable raw HTML with `rehype-raw`, add `rehype-sanitize` after it.
+- Do not load remote images from model output. Show a placeholder, or allow only your own domains or an image proxy that you control.
+- Open links in a new tab with `rel="noopener noreferrer"`, and consider showing the full domain before navigating.
+- Set a Content Security Policy with a strict `img-src` and `connect-src` as a second line of defense, in case a component renders something you did not expect.
+
+See [Security for GenAI](/docs/genai-handbook/20-security-for-genai) for prompt injection in depth.
+
+## 7.7 Token Streaming UX Details
+
+- **Time-to-first-token (TTFT).** The most important perceived-latency metric. Aim for under one second; above two seconds users start tabbing away.
+- **Smooth flow.** Tokens arriving in bursts feel choppy. A small animation delay (10–30ms) that smooths bursts can improve perceived quality.
+- **Cancellation.** A stop button that aborts the request immediately, frees server resources, and locks in whatever was generated.
+- **Resumability.** Network blip mid-stream — can the UI resume? Most apps do not bother, but enterprise apps with long completions should.
+
+## 7.7a Stop and Resume, End to End 🔧
+
+Cancellation and resumability each involve the browser, the server and the stored conversation, so here is what each layer has to do.
+
+### Stop generation
+
+**Problem.** The stop button hides the cursor, but the server keeps generating (and billing), or the saved conversation later shows a full answer the user never saw.
+
+**Why it happens.** Aborting `fetch` only closes the browser's side of the connection. The server must notice the disconnect and abort its provider call (6.5a in [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai)). And unless someone decides what to store, the database and the screen disagree.
+
+**Mechanism.**
+1. The client calls `stop()` from 7.4a, which aborts the `AbortController`. The hook keeps the partial text and sets the status to `stopped`.
+2. The server's response `close` handler aborts the provider stream, then saves the partial text with a `stopped` status in its `finally` block.
+3. The UI shows the partial answer with a "Stopped" marker and offers "Continue" or "Regenerate".
+4. On the next turn, decide whether the partial answer goes back into the model's context. Including it, marked as interrupted, keeps the model aware of what the user saw.
+
+```tsx
+function Composer({ status, onSend, onStop }: {
+  status: StreamStatus; onSend: (text: string) => void; onStop: () => void;
+}) {
+  const streaming = status === 'streaming';
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        const input = e.currentTarget.elements.namedItem('prompt') as HTMLTextAreaElement;
+        if (!streaming && input.value.trim()) { onSend(input.value); input.value = ''; }
+      }}
+      onKeyDown={(e) => { if (e.key === 'Escape' && streaming) onStop(); }}
+    >
+      <label htmlFor="prompt" className="sr-only">Message</label>
+      <textarea id="prompt" name="prompt" />
+      {streaming
+        ? <button type="button" onClick={onStop}>Stop generating</button>
+        : <button type="submit">Send</button>}
+    </form>
+  );
+}
+```
+
+**Edge cases.** The user can press stop between "request sent" and "first token". The abort still works, but the server may not have created the assistant message yet, so the server's cleanup must handle "nothing generated". If a tool call was running when the user pressed stop, show its real final state (completed or cancelled), not a guess.
+
+### Resume after a network drop
+
+**Problem.** A train enters a tunnel during a three-minute answer. The connection drops, and without resume the user loses the answer or has to pay for it again.
+
+**Why it happens.** With request-scoped streaming, the generation lives and dies with the connection. Resume needs the generation to continue on the server and its events to be replayable, which is the job pattern in 6.12a of [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai).
+
+**Mechanism.** Remember the `id` of the last event received. On a drop, reconnect with the `Last-Event-ID` header and the server replays from there. Reset the retry counter whenever an event arrives, so a long stream with occasional drops is not cut off by a fixed attempt limit.
+
+```ts
+export async function followJob(
+  jobId: string, onToken: (t: string) => void, signal: AbortSignal,
+): Promise<void> {
+  let lastId: string | undefined;
+  for (let attempt = 0; attempt < 6 && !signal.aborted; attempt++) {
+    try {
+      const res = await fetch(`/api/reports/${jobId}/events`, {
+        headers: lastId ? { 'Last-Event-ID': lastId } : {},
+        signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      for await (const ev of parseSse(res.body)) {
+        if (ev.id) lastId = ev.id;
+        attempt = 0;                                   // progress resets the retry budget
+        if (ev.event === 'token') onToken(JSON.parse(ev.data));
+        if (ev.event === 'done') return;
+      }
+    } catch {
+      if (signal.aborted) return;
+    }
+    await new Promise((r) => setTimeout(r, Math.min(10_000, 500 * 2 ** attempt)));
+  }
+  if (!signal.aborted) throw new Error('Lost the stream. The result will appear when it finishes.');
+}
+```
+
+**Edge cases.** Listen for the browser's `online` event to retry at once when the network returns, instead of waiting out the backoff. If the user reloads the page, the in-memory `lastId` is gone: store the job ID with the conversation so the page can reattach from the start of the log, or load the finished result from the database.
+
+## 7.8 File Uploads
+
+AI products increasingly accept files (PDFs, images, spreadsheets). The pipeline:
+1. User selects file.
+2. Client uploads to backend or pre-signed cloud storage URL.
+3. Backend extracts text, embeddings, or runs vision on it.
+4. UI shows progress and any extraction preview.
+5. The file becomes part of conversation context.
+
+Pre-signed URLs (S3, GCS) are the standard for any file over a few megabytes — they offload bandwidth from your backend. Show progress bars; large uploads on flaky connections will fail and users need to know.
+
+## 7.9 Voice Interfaces
+
+Voice introduces three pipelines:
+- **Speech-to-text (STT).** Browser MediaRecorder API or a streaming STT service like Deepgram, Whisper, or AssemblyAI.
+- **LLM** processes the transcribed text.
+- **Text-to-speech (TTS).** Streaming TTS like ElevenLabs, OpenAI, or Cartesia plays audio as it generates.
+
+For natural conversation, you need to handle interruption: the user starts speaking while the assistant is still talking. Detect voice activity, pause TTS, transcribe the new input. The whole loop must run under 300ms latency to feel real. WebRTC, WebSockets, and careful buffer management are required. This is genuinely hard engineering.
+
+## 7.9a The Voice Client with WebRTC and LiveKit 🔧
+
+Most of that hard engineering can sit on the server and in a media SFU, which leaves the browser a smaller, well-defined job.
+
+### What the browser owns, and what it does not
+
+**Problem.** Teams try to do voice activity detection, interruption and audio buffering in the browser, and every device behaves differently.
+
+**Why it happens.** Turn-taking needs the audio, the transcript and the agent's playback state in one place. That place is the agent worker, not the browser (see 6.7a in [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai) for why WebRTC and an SFU sit in between).
+
+**Mechanism.** The browser fetches a short-lived token from your API, joins the room, publishes the microphone and plays the agent's audio. Interruption detection runs in the agent worker, which stops its own speech when the user talks. The browser's job is to show state clearly: connecting, listening, thinking, speaking.
+
+```tsx
+// VoiceSession.tsx
+import {
+  LiveKitRoom, RoomAudioRenderer, BarVisualizer, useVoiceAssistant,
+} from '@livekit/components-react';
+
+const LABELS: Record<string, string> = {
+  connecting: 'Connecting', initializing: 'Starting the agent',
+  listening: 'Listening', thinking: 'Thinking', speaking: 'Speaking',
+};
+
+function AgentPanel() {
+  const { state, audioTrack, agentTranscriptions } = useVoiceAssistant();
+  return (
+    <section aria-label="Voice assistant">
+      <BarVisualizer state={state} trackRef={audioTrack} />
+      <p role="status">{LABELS[state] ?? 'Disconnected'}</p>
+      <ol aria-label="Transcript">
+        {agentTranscriptions.map((seg) => <li key={seg.id}>{seg.text}</li>)}
+      </ol>
+    </section>
+  );
+}
+
+export function VoiceSession({ serverUrl, token, onEnd }: {
+  serverUrl: string; token: string; onEnd: () => void;
+}) {
+  return (
+    <LiveKitRoom serverUrl={serverUrl} token={token} connect audio onDisconnected={onEnd}>
+      <RoomAudioRenderer />   {/* plays the agent's audio track */}
+      <AgentPanel />
+    </LiveKitRoom>
+  );
+}
+```
+
+### Edge cases and failure modes
+
+- **Autoplay and microphone permission.** Browsers block audio playback and microphone access until the user interacts with the page. Start the session from a button click, and handle a denied microphone with a clear message instead of a silent failure.
+- **Echo.** Without headphones, the agent hears itself through the user's microphone and interrupts itself. WebRTC's echo cancellation is on by default. Do not turn it off to "improve quality".
+- **Transcript as the accessible channel.** Show live captions of both sides. They help users who cannot hear well, users in noisy places, and anyone checking what the agent understood.
+- **API churn.** LiveKit marks its voice-assistant hooks as still evolving, and it now also offers ready-made agent UI components. Pin package versions and check the current docs before you upgrade.
+
+## 7.10 Realtime UX Patterns
+
+- **Optimistic UI.** When the user sends a message, render it instantly before the server confirms.
+- **Skeleton loaders.** While retrieval runs, show a placeholder so the UI does not appear frozen.
+- **Tool call indicators.** When an agent is calling a tool, show what tool and what input — transparency builds trust.
+- **Citation rendering.** Show source documents inline, with hover or click to expand.
+- **Conversation forking.** Let users branch off any message to try a different path without losing the original.
+
+## 7.10a Optimistic UI with Reconciliation 🔧
+
+Rendering the user's message at once is the easy half of optimistic UI. The hard half is what happens when the server disagrees or fails.
+
+### The problem: ghost and duplicate messages
+
+The message appears instantly, the request fails, and the message stays on screen as if it was sent. Or the request succeeds, the server returns its own copy, and the message shows twice.
+
+### Why it happens
+
+An optimistic message is a guess about future server state. Without an ID that links the guess to the server's record, the client cannot tell "my pending message, now confirmed" from "a new message".
+
+### Mechanism
+
+Give each message a client-generated ID and a delivery status. Send the ID to the server, which stores it (it doubles as the idempotency key from 6.10c in [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai)). When the server confirms, replace the pending message that has that ID. When the request fails, mark it failed and offer retry with the same ID.
+
+```tsx
+type Msg = {
+  clientId: string;
+  serverId?: string;
+  role: 'user' | 'assistant';
+  text: string;
+  status: 'pending' | 'sent' | 'failed' | 'streaming' | 'done' | 'stopped';
+};
+
+type Action =
+  | { type: 'optimistic'; msg: Msg }
+  | { type: 'confirmed'; clientId: string; serverId: string }
+  | { type: 'failed'; clientId: string };
+
+function messagesReducer(state: Msg[], a: Action): Msg[] {
+  switch (a.type) {
+    case 'optimistic':
+      return [...state, a.msg];
+    case 'confirmed':
+      return state.map((m) => m.clientId === a.clientId ? { ...m, serverId: a.serverId, status: 'sent' } : m);
+    case 'failed':
+      return state.map((m) => m.clientId === a.clientId ? { ...m, status: 'failed' } : m);
+  }
+}
+
+async function sendMessage(dispatch: React.Dispatch<Action>, text: string, clientId = crypto.randomUUID()) {
+  dispatch({ type: 'optimistic', msg: { clientId, role: 'user', text, status: 'pending' } });
+  try {
+    const res = await fetch('/api/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': clientId },
+      body: JSON.stringify({ clientId, text }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { id } = await res.json();
+    dispatch({ type: 'confirmed', clientId, serverId: id });
+  } catch {
+    dispatch({ type: 'failed', clientId });   // the retry button calls sendMessage with the same clientId
+  }
+}
+```
+
+### Edge cases and failure modes
+
+- **Retry must reuse the ID.** A retry with a new ID is a second message if the first one actually reached the server.
+- **Moderation.** If the server rejects the message (a policy violation, a file that is too large), show the reason on that message and keep the text so the user can edit it. Do not silently delete it.
+- **Several tabs.** A second tab receives the confirmed message from the server. Deduplicate on `clientId` when merging server updates into the list.
+- **React 19** adds a `useOptimistic` hook that removes optimistic entries automatically when the action settles. Chat usually needs the explicit failed state above, because a vanished message is more confusing than one marked "not sent".
+
+## 7.10b Rendering Tool Calls 🔧
+
+"Show what tool and what input" sounds simple, but a tool call goes through several states, and some calls should wait for the user's approval before they run at all.
+
+### The problem: a frozen or misleading UI during tool use
+
+The agent searches, then calls a booking API. The UI shows nothing for eight seconds, or a spinner that keeps spinning after the tool failed, or the arguments as raw JSON that users cannot read.
+
+### Why it happens
+
+A tool call is a small lifecycle, not one event. Its arguments stream in, then it runs, then it ends with a result or an error. Some tools also have a step before running: approval. If the UI models a tool call as a single "loading" flag, it cannot show any of these states correctly.
+
+### Mechanism: a discriminated union per tool part
+
+Model each tool call as a message part with an explicit state, and render each state on purpose. The Vercel AI SDK 5 uses this shape: assistant messages hold `parts`, tool parts are typed `tool-` plus the tool name, and their states include `input-streaming`, `input-available`, `approval-requested`, `output-available`, `output-error` and `output-denied`. Your own protocol can use the same idea.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> input_streaming: model starts the call
+  input_streaming --> input_available: arguments complete
+  input_available --> approval_requested: tool needs approval
+  approval_requested --> output_denied: user rejects
+  approval_requested --> running: user approves
+  input_available --> running: no approval needed
+  running --> output_available: tool returns
+  running --> output_error: tool fails
+  output_available --> [*]
+  output_error --> [*]
+  output_denied --> [*]
+`} />
+
+```tsx
+type ToolPart =
+  | { type: 'tool-searchFlights'; toolCallId: string; state: 'input-streaming' | 'input-available'; input?: Partial<{ from: string; to: string; date: string }> }
+  | { type: 'tool-searchFlights'; toolCallId: string; state: 'output-available'; input: { from: string; to: string; date: string }; output: { flights: { id: string; price: number }[] } }
+  | { type: 'tool-searchFlights'; toolCallId: string; state: 'output-error'; errorText: string }
+  | { type: 'tool-bookFlight'; toolCallId: string; state: 'approval-requested'; input: { flightId: string; price: number } };
+
+function ToolCallView({ part, onApprove, onDeny }: {
+  part: ToolPart; onApprove: (id: string) => void; onDeny: (id: string) => void;
+}) {
+  switch (part.state) {
+    case 'input-streaming':
+    case 'input-available':
+      return <p role="status">Searching flights {part.input?.from && `from ${part.input.from}`}...</p>;
+    case 'output-available':
+      return <p>Found {part.output.flights.length} flights from {part.input.from} to {part.input.to}.</p>;
+    case 'output-error':
+      return <p role="alert">Flight search failed: {part.errorText}</p>;
+    case 'approval-requested':
+      return (
+        <div role="group" aria-label="Approval needed">
+          <p>Book flight {part.input.flightId} for ${part.input.price}?</p>
+          <button onClick={() => onApprove(part.toolCallId)}>Book it</button>
+          <button onClick={() => onDeny(part.toolCallId)}>Cancel</button>
+        </div>
+      );
+  }
+}
+```
+
+### Edge cases and failure modes
+
+- **Approval is enforced on the server.** The approve button is a request, not a permission. The server must refuse to run a tool that needs approval without a matching, authenticated approval for that exact call ID and arguments.
+- **Show the real arguments.** If the model changes the price between the approval prompt and the call, the approval must not carry over. Bind it to the arguments shown.
+- **Readable summaries.** Show a human sentence for each tool ("Searching flights from BOS"), with the raw JSON behind a "details" toggle for power users.
+- **Errors the model will retry.** When a tool fails and the agent tries again, keep the failed attempt visible but collapsed, so the user understands the delay. Agent loop design is covered in [AI Agents](/docs/genai-handbook/11-ai-agents).
+
+## 7.10c Accessibility for Streaming Chat ➕
+
+The chapter asks to plan accessibility from the start (7.21), but a streaming chat has specific problems that a normal accessibility checklist misses.
+
+### Live regions that do not flood screen readers
+
+**Problem.** A screen reader user sends a message and hears either nothing, or the answer read again from the start every few words, so it never finishes.
+
+**Why it happens.** Screen readers learn about changing content through live regions (`aria-live`). Without one, new text is silent. With `aria-live` on the element whose text changes on every token, each update can trigger an announcement, and some screen readers restart reading the whole region.
+
+**Mechanism.** Mark the message list as a log (`role="log"`, which is polite by default), but do not let the streaming message announce itself token by token. Keep the in-progress message out of the live region (`aria-busy="true"` while it streams), then announce once when it is complete, through a separate visually hidden status element. Long answers can be announced in sentence-sized pieces instead of all at the end.
+
+```tsx
+function MessageList({ messages, streamingText, status }: {
+  messages: Msg[]; streamingText: string; status: StreamStatus;
+}) {
+  const [announcement, setAnnouncement] = useState('');
+  useEffect(() => {
+    if (status === 'done') setAnnouncement(`Assistant replied: ${streamingText.slice(0, 500)}`);
+    if (status === 'stopped') setAnnouncement('Generation stopped.');
+    if (status === 'error') setAnnouncement('The reply failed. Retry is available.');
+  }, [status]); // announce on state changes only, never per token
+
+  return (
+    <>
+      <div role="log" aria-label="Conversation" aria-relevant="additions">
+        {messages.map((m) => <article key={m.clientId} aria-label={m.role}>{m.text}</article>)}
+      </div>
+      {status === 'streaming' && (
+        <article aria-busy="true" aria-label="Assistant is replying">{streamingText}</article>
+      )}
+      <div className="sr-only" role="status" aria-live="polite">{announcement}</div>
+    </>
+  );
+}
+```
+
+**Edge cases.** Screen readers behave differently. Test with at least NVDA or JAWS on Windows and VoiceOver on macOS and iOS. Announcing only the first 500 characters is a choice: offer a keyboard shortcut that moves focus to the latest reply so users can read the whole thing with normal navigation.
+
+### Focus and keyboard
+
+**Problem.** After sending, focus jumps somewhere unexpected, the stop button cannot be reached by keyboard, or auto-focus pulls the user away from what they were reading (7.20).
+
+**Why it happens.** Streaming UIs add and remove controls (send turns into stop), and a removed element takes keyboard focus with it.
+
+**Mechanism.** Keep focus in the composer after sending. Swap the send and stop buttons in the same position so a keyboard user's next Tab lands on stop. Support Escape to stop (as in 7.7a). Never move focus while the user is typing or reading. Give icon-only buttons (copy, regenerate, rate) an `aria-label`.
+
+### Motion and timing
+
+**Problem.** The typewriter animation and smooth-flow delay (7.7) bother users with vestibular disorders, and some users read more slowly than the text arrives.
+
+**Mechanism.** Respect `prefers-reduced-motion`: show text in larger chunks and drop cursor animations. Never auto-dismiss errors or tool approval prompts on a timer. WCAG 2.2 asks that users can turn off, extend or adjust time limits, and an approval that expires while someone is still reading fails that.
+
+## 7.11 Production Architecture
+
+<Mermaid chart={`flowchart TD
+  B["Browser"] --> N["Next.js (SSR + client) or React SPA + separate API"]
+  N -->|"static assets"| E["Edge cache (static assets)"]
+  N -->|"streaming fetch / SSE / WebSocket"| BE["Backend (Chapter 6)"]
+`} />
+
+State management: for small apps, React's built-in `useState` and `useReducer` are sufficient. For larger apps, Zustand or Redux Toolkit. Avoid global state for streaming text — keep it scoped to the message component to avoid wholesale re-renders.
+
+## 7.12 Tradeoffs
+
+- **Next.js vs separate SPA + backend.** Next.js consolidates deployment and SSR. A separate React SPA + backend is cleaner architecturally but doubles the deployment surface.
+- **SSE vs WebSocket.** SSE is simpler for one-way streaming. WebSocket is required for bidirectional flows like voice.
+- **Build for "stop generating" vs not.** Stop generating costs effort but users expect it; skipping it makes the product feel cheap.
+
+## 7.13 Scaling Challenges
+
+Frontend scaling is mostly about CDN coverage and bundle size. Keep the bundle small; defer rarely-used components (file viewers, voice mode) behind dynamic imports. Use a CDN globally. For SSR-heavy AI apps, watch for slow page loads when the backend is also under load — the page itself can stall on a database query.
+
+## 7.14 Security Concerns
+
+- Sanitize all model output before rendering as HTML.
+- Beware of indirect prompt injection through document uploads — content displayed to the user may carry hidden instructions.
+- Cross-origin policies for API calls — typically same-origin for chat, with strict CORS for any external embedding.
+- Auth tokens in browser storage — prefer HttpOnly cookies over localStorage to limit XSS impact.
+
+## 7.15 Deployment Guide
+
+Static assets to a CDN (Vercel, Cloudflare Pages, Netlify, S3 + CloudFront). API routes either on the same platform (Vercel functions) or behind your own backend. Set up environment-specific previews so PRs can be reviewed visually. Roll forward with feature flags so risky AI changes can be turned off without redeploy.
+
+## 7.16 Monitoring Strategy
+
+Real-user monitoring (RUM) is critical. Track TTFB, TTFT, total response time, message render time, error rates, and user actions (stop, regenerate, rate). Tools: Sentry for errors, PostHog or Mixpanel for product analytics, OpenTelemetry web SDKs for tracing into the backend.
+
+## 7.17 Cost Optimization
+
+Frontend cost is mostly CDN bandwidth. Compress assets. Use modern image formats. Lazy-load heavy components. The big AI-specific lever: client-side caching of past conversations so the user does not refetch them on each visit.
+
+## 7.18 Interview Questions
+
+- How do you implement streaming chat without re-rendering the whole list on every token?
+- Describe the "stick to bottom" scroll behavior.
+- How do you handle network drop mid-stream?
+- Walk through markdown rendering during streaming.
+- What changes when you add voice mode?
+- ➕ Why do chat clients use `fetch` instead of `EventSource` for streaming? **`EventSource` only sends GET requests and cannot set headers or a body. Chat needs a POST with a JSON body and auth, so the client reads `response.body` and parses SSE itself.**
+- ➕ How do you keep streaming markdown fast on long answers? **Batch updates to one render per animation frame, split the text into blocks outside code fences, memoize the finished blocks, and re-parse only the last one (closing an open fence temporarily).**
+- ➕ How can a rendered markdown image leak data? **Injected instructions make the model write an image URL pointing to an attacker's server with private data in the query string. The browser loads it automatically. Block or proxy remote images from model output.**
+- ➕ How should a screen reader experience a streaming reply? **Not token by token. Keep the in-progress message out of the live region, then announce once on completion (or in sentence-sized pieces) through a polite status region.**
+- ➕ How do you avoid duplicate messages with optimistic UI? **A client-generated ID per message, sent to the server and used as the idempotency key. Confirmation replaces the pending message with that ID, and retry reuses it.**
+
+## 7.19 Hands-on Exercises
+
+1. Sketch the React component tree for a chat UI: list, message, composer, sidebar.
+2. Design a state shape that supports messages, in-flight streaming text, and abort controllers.
+3. Plan the voice interruption flow on paper — what events fire, what state changes, where buffers live.
+
+## 7.20 Common Mistakes
+
+- Re-rendering the full message list on every token.
+- Forgetting to clean up streams on component unmount.
+- Rendering raw model markdown without sanitization.
+- No stop button. No regenerate button. No copy button.
+- Letting the composer's auto-focus steal focus while the user is reading.
+
+## 7.21 Enterprise Best Practices
+
+Build a single chat-UI component library and reuse it across products. Standardize on a markdown renderer with shared sanitization rules. Build instrumentation hooks into every action so product analytics work uniformly. Plan accessibility from the start (keyboard navigation, screen readers, contrast). Localize from day one if your audience is international.
+
+## Sources
+
+- WHATWG HTML Standard, [Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) (event stream format, `Last-Event-ID`).
+- MDN, [Using readable streams](https://developer.mozilla.org/en-US/docs/Web/API/Streams_API/Using_readable_streams), [TextDecoderStream](https://developer.mozilla.org/en-US/docs/Web/API/TextDecoderStream), [AbortController](https://developer.mozilla.org/en-US/docs/Web/API/AbortController) and [ARIA live regions](https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Guides/Live_regions).
+- react-markdown, [README](https://github.com/remarkjs/react-markdown) (raw HTML off by default, `urlTransform`, `rehype-sanitize`).
+- Vercel AI SDK docs, [Chatbot tool usage](https://ai-sdk.dev/docs/ai-sdk-ui/chatbot-tool-usage) and [useChat reference](https://ai-sdk.dev/docs/reference/ai-sdk-ui/use-chat) (AI SDK 5 parts and tool states). Read in October 2026.
+- React docs, [useOptimistic](https://react.dev/reference/react/useOptimistic).
+- LiveKit docs, [useVoiceAssistant](https://docs.livekit.io/reference/components/react/hook/usevoiceassistant/), [BarVisualizer](https://docs.livekit.io/reference/components/react/component/barvisualizer) and [RoomAudioRenderer](https://docs.livekit.io/reference/components/react/component/roomaudiorenderer).
+- W3C, [WCAG 2.2](https://www.w3.org/TR/WCAG22/) (2.2.1 Timing Adjustable, 2.3.3 Animation from Interactions, 4.1.3 Status Messages).
+- OWASP, [LLM Top 10: Prompt Injection](https://genai.owasp.org/llmrisk/llm01-prompt-injection/) (indirect injection and data exfiltration).

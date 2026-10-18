@@ -1,0 +1,852 @@
+---
+title: "10.1 Splitwise — Expense Sharing"
+---
+
+## Problem & where it's asked
+
+Build the core of an expense-sharing app: users add expenses that one person paid for, split among several people in different ways (equally, by exact amounts, by percentage). The app shows who owes whom and can suggest the minimum set of payments to settle up.
+
+This is one of the most-reported machine-coding problems in India. It has been **reported** at **Flipkart** (classic 90-minute machine coding), **Razorpay** (backend SDE-2 machine-coding round), **Groww** (SDE-2 LLD round), **Upstox** (SDE-2 machine coding), **Goldman Sachs** (2026 list), **Meesho**, **Swiggy** and **Salesforce**. For a fintech like Angel One or PhonePe, it's a natural fit too (money, ledgers, rounding), but I have no direct report for those two, so treat that as **uncertain**.
+
+Graders look for three things above all: a **Strategy (or Factory) for split types**, **input validation** (percentages add up to 100, exact amounts add up to the total), and **code that runs**.
+
+## Clarifying questions
+
+| Question | Assumption for this design |
+|----------|----------------------------|
+| Which split types? | `EQUAL`, `EXACT`, `PERCENT`. New types must be addable without editing the service. |
+| Currency and precision? | Single currency (INR). All money is **integer paise**. No floats anywhere in the ledger. |
+| How is a rupee that can't be divided evenly handled? (₹100 / 3) | Leftover paise go to participants one by one in the order given, so shares always sum exactly to the total. |
+| Must the payer be a participant? | Not necessarily. The payer can pay for others without being included. |
+| Show balances how? | Two views: pairwise "A owes B ₹x" (netted, so A→B and B→A never both appear) and each user's net position. |
+| Simplify debts? | Yes, as a separate operation that proposes a minimal-ish set of transfers. It doesn't change recorded expenses. |
+| Groups? | Out of scope for the core; covered as an extension. |
+| Settle-up payments? | Supported as a special "payment" entry that moves balance. |
+| Persistence / concurrency? | In-memory repositories behind interfaces; concurrency discussed separately. |
+
+## Requirements
+
+**Functional**
+
+1. Register users (id, name, email).
+2. Add an expense: payer, total amount, participants, split type, and split details (exact amounts or percentages).
+3. Validate every expense: positive total, known users, no duplicate participants, exact amounts sum to total, percentages sum to 100.
+4. Show balances: all non-zero pairwise debts, balances for one user, and net position per user.
+5. Record a settle-up payment from one user to another.
+6. Suggest simplified settlements (fewer transactions).
+
+**Non-functional**
+
+- Correct to the paisa: shares always sum to the total.
+- Open for extension: new split types plug in through a registry (OCP).
+- Deterministic and testable: ids come from an injected generator.
+- Balance lookups are O(1) per pair; adding an expense is O(p) for p participants.
+
+**Out of scope**
+
+Multi-currency, authentication, notifications, persistence, UI, expense edit history.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `User` | Identity of a person | Pays for and participates in many expenses |
+| `Expense` | Immutable record: payer, total, split type, computed `Split[]` | Has 1 payer and 1..n splits |
+| `Split` | `{ userId, amountPaise }`, one participant's share | Belongs to one expense |
+| `SplitInput` | Raw request data per split type (discriminated union) | Consumed by a `SplitStrategy` |
+| `SplitStrategy` | Turns total + input into `Split[]` and validates | One per `SplitType`; stored in `SplitStrategyRegistry` |
+| `BalanceSheet` | Netted pairwise ledger `debtor → creditor → paise` | Updated by `ExpenseService` |
+| `DebtSimplifier` | Computes a small set of settling transfers from net positions | Reads `BalanceSheet` |
+| `ExpenseService` | Orchestrates validation, splitting, storing, ledger update | Uses repositories, registry, balance sheet |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class User {
+      +string id
+      +string name
+      +string email
+    }
+    class Expense {
+      +string id
+      +string paidBy
+      +number totalPaise
+      +SplitType type
+      +Split[] splits
+      +string description
+    }
+    class SplitStrategy {
+      <<interface>>
+      +SplitType type
+      +split(totalPaise, input) Split[]
+    }
+    class EqualSplitStrategy
+    class ExactSplitStrategy
+    class PercentSplitStrategy
+    class SplitStrategyRegistry {
+      +register(strategy)
+      +get(type) SplitStrategy
+    }
+    class BalanceSheet {
+      +addDebt(debtor, creditor, paise)
+      +owedBetween(a, b) number
+      +netPositions() Map
+    }
+    class DebtSimplifier {
+      +simplify(net) Transfer[]
+    }
+    class ExpenseService {
+      +addExpense(cmd) Expense
+      +settle(from, to, paise)
+      +balancesFor(userId) string[]
+    }
+    SplitStrategy <|.. EqualSplitStrategy
+    SplitStrategy <|.. ExactSplitStrategy
+    SplitStrategy <|.. PercentSplitStrategy
+    SplitStrategyRegistry o-- SplitStrategy
+    ExpenseService --> SplitStrategyRegistry
+    ExpenseService --> BalanceSheet
+    ExpenseService --> UserRepository
+    ExpenseService --> ExpenseRepository
+    Expense "1" *-- "many" Split
+    ExpenseService ..> DebtSimplifier`} />
+
+## Design decisions & patterns
+
+- **Strategy for split types.** Each split type differs only in *how shares are computed and validated*. That's exactly Strategy's job. The service never has a `switch (type)`, so adding `SHARES` (split 2:1:1) means writing one class and registering it.
+- **Registry instead of a hard-coded factory.** A `switch`-based factory still needs editing for each new type. A `Map<SplitType, SplitStrategy>` registry is populated at wiring time (the composition root), which is the NestJS way: providers are registered, not hard-coded.
+- **Discriminated union for input.** `SplitInput = { type: 'EQUAL', userIds } | { type: 'EXACT', shares } | ...`. TypeScript then guarantees a PERCENT request carries percentages. Each strategy checks that the input's `type` matches its own and throws otherwise.
+- **Integer paise + deterministic remainder.** `10000 / 3` becomes 3334 + 3333 + 3333. We never store 3333.33. Percentages are converted to **basis points** (1% = 100 bp) so 33.33% is still an integer.
+- **Netted pairwise ledger.** When B owes A ₹50 and later A owes B ₹20, we store only "B owes A ₹30". This keeps `showBalances` simple and stops the "A owes B and B owes A" bug that graders spot immediately.
+- **Simplification is a pure function.** `DebtSimplifier` takes net positions and returns transfers. It doesn't mutate the ledger, so it's trivially unit-testable. It's greedy (largest creditor with largest debtor). The true minimum is NP-hard, and saying so earns points.
+- **Rejected alternatives:** an inheritance tree `EqualExpense extends Expense` (mixes data with behaviour, and changing an expense's type becomes awkward); storing floats (rounding drift); recomputing balances from all expenses on every read (O(E) per read, fine for a demo but not at scale).
+
+## Implementation
+
+**Part 1: types, errors, formatting.** Everything money-related is an integer. `formatPaise` avoids floats even for display.
+
+```ts
+type UserId = string;
+type SplitType = 'EQUAL' | 'EXACT' | 'PERCENT';
+
+class ValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NotFoundError';
+  }
+}
+
+function formatPaise(paise: number): string {
+  const sign = paise < 0 ? '-' : '';
+  const abs = Math.abs(paise);
+  return `${sign}₹${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
+}
+
+function assertPositiveInt(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new ValidationError(`${label} must be a positive integer (paise), got ${value}`);
+  }
+}
+
+interface IdGenerator {
+  next(prefix: string): string;
+}
+class SequentialIds implements IdGenerator {
+  private counter = 0;
+  next(prefix: string): string {
+    this.counter += 1;
+    return `${prefix}-${this.counter}`;
+  }
+}
+
+class User {
+  constructor(
+    readonly id: UserId,
+    readonly name: string,
+    readonly email: string,
+  ) {}
+}
+
+interface Split {
+  readonly userId: UserId;
+  readonly amountPaise: number;
+}
+
+type SplitInput =
+  | { type: 'EQUAL'; userIds: UserId[] }
+  | { type: 'EXACT'; shares: { userId: UserId; amountPaise: number }[] }
+  | { type: 'PERCENT'; shares: { userId: UserId; percent: number }[] };
+
+interface Expense {
+  readonly id: string;
+  readonly paidBy: UserId;
+  readonly totalPaise: number;
+  readonly type: SplitType | 'SETTLEMENT';
+  readonly splits: readonly Split[];
+  readonly description: string;
+}
+```
+
+**Part 2: repositories.** Tiny, but they give the service a seam. Swapping to Postgres later touches only these classes.
+
+```ts
+class UserRepository {
+  private readonly users = new Map<UserId, User>();
+  save(user: User): void {
+    if (this.users.has(user.id)) throw new ValidationError(`User ${user.id} already exists`);
+    this.users.set(user.id, user);
+  }
+  get(id: UserId): User {
+    const user = this.users.get(id);
+    if (!user) throw new NotFoundError(`Unknown user ${id}`);
+    return user;
+  }
+}
+
+class ExpenseRepository {
+  private readonly expenses: Expense[] = [];
+  save(expense: Expense): void {
+    this.expenses.push(expense);
+  }
+  involving(userId: UserId): Expense[] {
+    return this.expenses.filter(
+      (e) => e.paidBy === userId || e.splits.some((s) => s.userId === userId),
+    );
+  }
+}
+```
+
+**Part 3: split strategies and the registry.** Each strategy owns its validation. The shared helper `ensureUnique` catches "Bob listed twice", a very common hidden test case.
+
+```ts
+interface SplitStrategy {
+  readonly type: SplitType;
+  split(totalPaise: number, input: SplitInput): Split[];
+}
+
+function ensureUnique(ids: UserId[]): void {
+  if (ids.length === 0) throw new ValidationError('At least one participant is required');
+  if (new Set(ids).size !== ids.length) throw new ValidationError('Duplicate participant in split');
+}
+
+/** Spreads leftover paise one by one so that shares sum exactly to the total. */
+function distributeRemainder(base: number[], remainder: number): number[] {
+  const result = [...base];
+  for (let i = 0; i < remainder; i++) result[i % result.length] += 1;
+  return result;
+}
+
+class EqualSplitStrategy implements SplitStrategy {
+  readonly type = 'EQUAL' as const;
+  split(totalPaise: number, input: SplitInput): Split[] {
+    if (input.type !== 'EQUAL') throw new ValidationError(`EQUAL strategy got ${input.type} input`);
+    ensureUnique(input.userIds);
+    const n = input.userIds.length;
+    const base = Math.floor(totalPaise / n);
+    const amounts = distributeRemainder(new Array<number>(n).fill(base), totalPaise - base * n);
+    return input.userIds.map((userId, i) => ({ userId, amountPaise: amounts[i] }));
+  }
+}
+
+class ExactSplitStrategy implements SplitStrategy {
+  readonly type = 'EXACT' as const;
+  split(totalPaise: number, input: SplitInput): Split[] {
+    if (input.type !== 'EXACT') throw new ValidationError(`EXACT strategy got ${input.type} input`);
+    ensureUnique(input.shares.map((s) => s.userId));
+    let sum = 0;
+    for (const s of input.shares) {
+      if (!Number.isSafeInteger(s.amountPaise) || s.amountPaise < 0) {
+        throw new ValidationError(`Invalid exact share for ${s.userId}`);
+      }
+      sum += s.amountPaise;
+    }
+    if (sum !== totalPaise) {
+      throw new ValidationError(
+        `Exact shares add up to ${formatPaise(sum)}, expected ${formatPaise(totalPaise)}`,
+      );
+    }
+    return input.shares.map((s) => ({ userId: s.userId, amountPaise: s.amountPaise }));
+  }
+}
+
+class PercentSplitStrategy implements SplitStrategy {
+  readonly type = 'PERCENT' as const;
+  split(totalPaise: number, input: SplitInput): Split[] {
+    if (input.type !== 'PERCENT') throw new ValidationError(`PERCENT strategy got ${input.type} input`);
+    ensureUnique(input.shares.map((s) => s.userId));
+    // Work in basis points (1% = 100 bp) so 33.33% stays an integer.
+    const bps = input.shares.map((s) => Math.round(s.percent * 100));
+    if (bps.some((b) => b < 0)) throw new ValidationError('Percent cannot be negative');
+    const totalBps = bps.reduce((a, b) => a + b, 0);
+    if (totalBps !== 10_000) {
+      throw new ValidationError(`Percentages add up to ${totalBps / 100}, expected 100`);
+    }
+    const base = bps.map((b) => Math.floor((totalPaise * b) / 10_000));
+    const allocated = base.reduce((a, b) => a + b, 0);
+    const amounts = distributeRemainder(base, totalPaise - allocated);
+    return input.shares.map((s, i) => ({ userId: s.userId, amountPaise: amounts[i] }));
+  }
+}
+
+class SplitStrategyRegistry {
+  private readonly strategies = new Map<SplitType, SplitStrategy>();
+  register(strategy: SplitStrategy): this {
+    this.strategies.set(strategy.type, strategy);
+    return this;
+  }
+  get(type: SplitType): SplitStrategy {
+    const strategy = this.strategies.get(type);
+    if (!strategy) throw new ValidationError(`Unsupported split type ${type}`);
+    return strategy;
+  }
+}
+```
+
+**Part 4: the ledger and the simplifier.** `BalanceSheet.addDebt` nets against the reverse direction first. That's the whole trick.
+
+```ts
+class BalanceSheet {
+  // debtor -> (creditor -> paise). Only one direction per pair is ever non-zero.
+  private readonly owes = new Map<UserId, Map<UserId, number>>();
+
+  private read(debtor: UserId, creditor: UserId): number {
+    return this.owes.get(debtor)?.get(creditor) ?? 0;
+  }
+  private write(debtor: UserId, creditor: UserId, paise: number): void {
+    const row = this.owes.get(debtor) ?? new Map<UserId, number>();
+    if (paise === 0) row.delete(creditor);
+    else row.set(creditor, paise);
+    if (row.size === 0) this.owes.delete(debtor);
+    else this.owes.set(debtor, row);
+  }
+
+  addDebt(debtor: UserId, creditor: UserId, paise: number): void {
+    if (debtor === creditor || paise === 0) return;
+    const reverse = this.read(creditor, debtor);
+    if (reverse >= paise) {
+      this.write(creditor, debtor, reverse - paise);
+    } else {
+      this.write(creditor, debtor, 0);
+      this.write(debtor, creditor, this.read(debtor, creditor) + paise - reverse);
+    }
+  }
+
+  /** Positive: `a` owes `b`. Negative: `b` owes `a`. */
+  owedBetween(a: UserId, b: UserId): number {
+    return this.read(a, b) - this.read(b, a);
+  }
+
+  entries(): { debtor: UserId; creditor: UserId; paise: number }[] {
+    const out: { debtor: UserId; creditor: UserId; paise: number }[] = [];
+    for (const [debtor, row] of this.owes) {
+      for (const [creditor, paise] of row) out.push({ debtor, creditor, paise });
+    }
+    return out.sort((x, y) => x.debtor.localeCompare(y.debtor) || x.creditor.localeCompare(y.creditor));
+  }
+
+  /** Net position per user: positive means the user should receive money. */
+  netPositions(): Map<UserId, number> {
+    const net = new Map<UserId, number>();
+    for (const { debtor, creditor, paise } of this.entries()) {
+      net.set(debtor, (net.get(debtor) ?? 0) - paise);
+      net.set(creditor, (net.get(creditor) ?? 0) + paise);
+    }
+    return net;
+  }
+}
+
+interface Transfer {
+  from: UserId;
+  to: UserId;
+  paise: number;
+}
+
+class DebtSimplifier {
+  /** Greedy: repeatedly match the biggest debtor with the biggest creditor. At most n-1 transfers. */
+  simplify(net: Map<UserId, number>): Transfer[] {
+    const creditors = [...net].filter(([, v]) => v > 0).map(([id, v]) => ({ id, amt: v }));
+    const debtors = [...net].filter(([, v]) => v < 0).map(([id, v]) => ({ id, amt: -v }));
+    const transfers: Transfer[] = [];
+    const byAmountThenId = (a: { id: string; amt: number }, b: { id: string; amt: number }) =>
+      b.amt - a.amt || a.id.localeCompare(b.id);
+    while (creditors.length > 0 && debtors.length > 0) {
+      creditors.sort(byAmountThenId);
+      debtors.sort(byAmountThenId);
+      const c = creditors[0];
+      const d = debtors[0];
+      const amount = Math.min(c.amt, d.amt);
+      transfers.push({ from: d.id, to: c.id, paise: amount });
+      c.amt -= amount;
+      d.amt -= amount;
+      if (c.amt === 0) creditors.shift();
+      if (d.amt === 0) debtors.shift();
+    }
+    return transfers;
+  }
+}
+```
+
+**Part 5: the service.** It validates, delegates the split, stores the expense, and updates the ledger: one responsibility per collaborator.
+
+```ts
+interface AddExpenseCommand {
+  paidBy: UserId;
+  totalPaise: number;
+  description: string;
+  input: SplitInput;
+}
+
+class ExpenseService {
+  constructor(
+    private readonly users: UserRepository,
+    private readonly expenses: ExpenseRepository,
+    private readonly strategies: SplitStrategyRegistry,
+    private readonly ledger: BalanceSheet,
+    private readonly ids: IdGenerator,
+    private readonly simplifier = new DebtSimplifier(),
+  ) {}
+
+  addUser(id: UserId, name: string, email: string): User {
+    const user = new User(id, name, email);
+    this.users.save(user);
+    return user;
+  }
+
+  addExpense(cmd: AddExpenseCommand): Expense {
+    assertPositiveInt(cmd.totalPaise, 'Expense total');
+    this.users.get(cmd.paidBy);
+    const splits = this.strategies.get(cmd.input.type).split(cmd.totalPaise, cmd.input);
+    for (const s of splits) this.users.get(s.userId); // every participant must exist
+    const expense: Expense = {
+      id: this.ids.next('exp'),
+      paidBy: cmd.paidBy,
+      totalPaise: cmd.totalPaise,
+      type: cmd.input.type,
+      splits,
+      description: cmd.description,
+    };
+    // Validate everything before mutating anything: no half-applied expenses.
+    this.expenses.save(expense);
+    for (const s of splits) this.ledger.addDebt(s.userId, cmd.paidBy, s.amountPaise);
+    return expense;
+  }
+
+  settle(from: UserId, to: UserId, paise: number): void {
+    assertPositiveInt(paise, 'Settlement');
+    this.users.get(from);
+    this.users.get(to);
+    const owed = this.ledger.owedBetween(from, to);
+    if (paise > owed) {
+      throw new ValidationError(`${from} owes ${to} only ${formatPaise(Math.max(owed, 0))}`);
+    }
+    // A payment from `from` to `to` is recorded as `to` now owing `from`, which nets the debt down.
+    this.expenses.save({
+      id: this.ids.next('pay'),
+      paidBy: from,
+      totalPaise: paise,
+      type: 'SETTLEMENT',
+      splits: [{ userId: to, amountPaise: paise }],
+      description: `${from} paid ${to}`,
+    });
+    this.ledger.addDebt(to, from, paise);
+  }
+
+  allBalances(): string[] {
+    return this.describe(this.ledger.entries());
+  }
+
+  balancesFor(userId: UserId): string[] {
+    this.users.get(userId);
+    return this.describe(
+      this.ledger.entries().filter((e) => e.debtor === userId || e.creditor === userId),
+    );
+  }
+
+  private describe(entries: { debtor: UserId; creditor: UserId; paise: number }[]): string[] {
+    const lines = entries.map(
+      (e) => `${this.users.get(e.debtor).name} owes ${this.users.get(e.creditor).name} ${formatPaise(e.paise)}`,
+    );
+    return lines.length ? lines : ['No balances'];
+  }
+
+  suggestSettlements(): string[] {
+    return this.simplifier
+      .simplify(this.ledger.netPositions())
+      .map((t) => `${this.users.get(t.from).name} -> ${this.users.get(t.to).name}: ${formatPaise(t.paise)}`);
+  }
+}
+```
+
+**Part 6: wiring and demo.** The composition root is the only place that knows the concrete strategies.
+
+```ts
+const registry = new SplitStrategyRegistry()
+  .register(new EqualSplitStrategy())
+  .register(new ExactSplitStrategy())
+  .register(new PercentSplitStrategy());
+const app = new ExpenseService(
+  new UserRepository(),
+  new ExpenseRepository(),
+  registry,
+  new BalanceSheet(),
+  new SequentialIds(),
+);
+
+app.addUser('u1', 'Asha', 'asha@x.in');
+app.addUser('u2', 'Bala', 'bala@x.in');
+app.addUser('u3', 'Chetan', 'chetan@x.in');
+app.addUser('u4', 'Divya', 'divya@x.in');
+
+const dinner = app.addExpense({
+  paidBy: 'u1',
+  totalPaise: 100_00,
+  description: 'Dinner',
+  input: { type: 'EQUAL', userIds: ['u1', 'u2', 'u3'] },
+});
+console.log(`${dinner.id} ${dinner.type}: ${dinner.splits.map((s) => `${s.userId}=${formatPaise(s.amountPaise)}`).join(', ')}`);
+
+app.addExpense({
+  paidBy: 'u2',
+  totalPaise: 1250_00,
+  description: 'Cab',
+  input: {
+    type: 'EXACT',
+    shares: [
+      { userId: 'u1', amountPaise: 370_00 },
+      { userId: 'u3', amountPaise: 880_00 },
+    ],
+  },
+});
+
+app.addExpense({
+  paidBy: 'u4',
+  totalPaise: 1200_00,
+  description: 'Hotel',
+  input: {
+    type: 'PERCENT',
+    shares: [
+      { userId: 'u1', percent: 40 },
+      { userId: 'u2', percent: 20 },
+      { userId: 'u3', percent: 20 },
+      { userId: 'u4', percent: 20 },
+    ],
+  },
+});
+
+console.log('--- balances ---');
+for (const line of app.allBalances()) console.log(line);
+
+console.log('--- Chetan only ---');
+for (const line of app.balancesFor('u3')) console.log(line);
+
+console.log('--- invalid inputs ---');
+const badInputs: AddExpenseCommand[] = [
+  { paidBy: 'u1', totalPaise: 500_00, description: 'x', input: { type: 'PERCENT', shares: [{ userId: 'u2', percent: 50 }, { userId: 'u3', percent: 40 }] } },
+  { paidBy: 'u1', totalPaise: 500_00, description: 'x', input: { type: 'EXACT', shares: [{ userId: 'u2', amountPaise: 100_00 }] } },
+  { paidBy: 'u1', totalPaise: 0, description: 'x', input: { type: 'EQUAL', userIds: ['u2'] } },
+  { paidBy: 'u1', totalPaise: 100, description: 'x', input: { type: 'EQUAL', userIds: ['u2', 'u2'] } },
+  { paidBy: 'u9', totalPaise: 100, description: 'x', input: { type: 'EQUAL', userIds: ['u2'] } },
+];
+for (const cmd of badInputs) {
+  try {
+    app.addExpense(cmd);
+  } catch (err) {
+    if (err instanceof Error) console.log(`${err.name}: ${err.message}`);
+  }
+}
+
+console.log('--- simplified settlements ---');
+for (const line of app.suggestSettlements()) console.log(line);
+
+app.settle('u3', 'u2', 880_00);
+console.log('--- after Chetan pays Bala ₹880 ---');
+for (const line of app.allBalances()) console.log(line);
+try {
+  app.settle('u3', 'u2', 1);
+} catch (err) {
+  if (err instanceof Error) console.log(`${err.name}: ${err.message}`);
+}
+```
+
+## Demo output
+
+```text
+exp-1 EQUAL: u1=₹33.34, u2=₹33.33, u3=₹33.33
+--- balances ---
+Asha owes Bala ₹336.67
+Asha owes Divya ₹480.00
+Bala owes Divya ₹240.00
+Chetan owes Asha ₹33.33
+Chetan owes Bala ₹880.00
+Chetan owes Divya ₹240.00
+--- Chetan only ---
+Chetan owes Asha ₹33.33
+Chetan owes Bala ₹880.00
+Chetan owes Divya ₹240.00
+--- invalid inputs ---
+ValidationError: Percentages add up to 90, expected 100
+ValidationError: Exact shares add up to ₹100.00, expected ₹500.00
+ValidationError: Expense total must be a positive integer (paise), got 0
+ValidationError: Duplicate participant in split
+NotFoundError: Unknown user u9
+--- simplified settlements ---
+Chetan -> Bala: ₹976.67
+Asha -> Divya: ₹783.34
+Chetan -> Divya: ₹176.66
+--- after Chetan pays Bala ₹880 ---
+Asha owes Bala ₹336.67
+Asha owes Divya ₹480.00
+Bala owes Divya ₹240.00
+Chetan owes Asha ₹33.33
+Chetan owes Divya ₹240.00
+ValidationError: u3 owes u2 only ₹0.00
+```
+
+Look at the balances. Asha owed Bala ₹370 for the cab, and Bala owed Asha ₹33.33 for dinner. The ledger stores only the net ₹336.67. The six pairwise debts collapse into three suggested transfers. "Chetan → Bala ₹976.67" is larger than anything Chetan owes Bala directly, because the simplifier works on *net positions*: Chetan also pays off, through Bala, the ₹96.67 that Bala is net owed by the others. Every person ends up at the same net position either way, with fewer payments. Finally, a second settlement is rejected because Chetan no longer owes Bala anything.
+
+## Concurrency
+
+In a Node service, the ledger update in `addExpense` is synchronous, so two HTTP requests can't interleave inside it. The race appears as soon as the balance lives in a **database or Redis** and you write "read balance → `await` → write balance". Two requests read the same old value, and one update is lost.
+
+The fix, in order of preference in production:
+
+1. **Let the database do it atomically:** `UPDATE balances SET paise = paise + $1 WHERE ...` (no read-modify-write in app code), or store immutable ledger entries and compute sums.
+2. **Optimistic locking:** a `version` column, `UPDATE ... WHERE version = $v`, retry on 0 rows.
+3. **Per-group mutex** (in-process, or a Redis lock across instances) around the read-modify-write.
+
+Here is the lost update and the per-key mutex fix, simulated with an async store:
+
+```ts
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 1));
+
+class AsyncBalanceStore {
+  private readonly data = new Map<string, number>();
+  async get(key: string): Promise<number> {
+    await tick(); // simulated network hop
+    return this.data.get(key) ?? 0;
+  }
+  async set(key: string, value: number): Promise<void> {
+    await tick();
+    this.data.set(key, value);
+  }
+}
+
+/** One promise chain per key: callers for the same key run one after another. */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async runExclusive<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => (release = resolve));
+    const tail = previous.then(() => current);
+    this.tails.set(key, tail);
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+
+async function addDebtUnsafe(store: AsyncBalanceStore, key: string, paise: number): Promise<void> {
+  const current = await store.get(key);
+  await store.set(key, current + paise);
+}
+
+const unsafeStore = new AsyncBalanceStore();
+await Promise.all([1, 2, 3, 4, 5].map(() => addDebtUnsafe(unsafeStore, 'bob->asha', 100)));
+console.log(`unsafe: expected 500, got ${await unsafeStore.get('bob->asha')}`);
+
+const safeStore = new AsyncBalanceStore();
+const mutex = new KeyedMutex();
+await Promise.all(
+  [1, 2, 3, 4, 5].map(() => mutex.runExclusive('group-goa', () => addDebtUnsafe(safeStore, 'bob->asha', 100))),
+);
+console.log(`with keyed mutex: expected 500, got ${await safeStore.get('bob->asha')}`);
+```
+
+```text
+unsafe: expected 500, got 100
+with keyed mutex: expected 500, got 500
+```
+
+Lock at the **group** level (or at the pair level, ordered as `min(a,b):max(a,b)` to avoid deadlocks), not globally. A global lock turns your whole app into a single queue.
+
+## Extensions & follow-ups
+
+| Follow-up (source) | Design change |
+|--------------------|---------------|
+| "Add a new split type" (reported, general) | New `SplitStrategy` + one `register` call. The service is untouched. This is the OCP demo. |
+| Simplify debts / minimise transactions (reported) | Already a separate `DebtSimplifier`. Mention that the exact minimum is NP-hard (it reduces to subset-sum partitioning), and greedy gives at most n−1 transfers. |
+| Groups (reported) | `Group { id, members }` and one `BalanceSheet` per group (`Map<GroupId, BalanceSheet>`). Validate that participants are members. |
+| Validate percentages sum to 100 (inferred) | Done in `PercentSplitStrategy` using basis points. |
+| Expense edit/delete | Store expenses as immutable. An edit = reversal entry + new entry (like accounting), so the ledger never drifts. |
+| Multi-currency | Store `{ amountMinor, currency }`, keep one ledger per currency, and convert only at display time. |
+
+Below, a **SHARE** split (e.g. 2:1:1) and **groups** are added without editing the core types. This block is self-contained, so the strategy interface is re-declared in compact form.
+
+```ts
+type UserId = string;
+interface Split { userId: UserId; amountPaise: number }
+type SplitInput =
+  | { type: 'EQUAL'; userIds: UserId[] }
+  | { type: 'SHARE'; shares: { userId: UserId; units: number }[] };
+interface SplitStrategy {
+  readonly type: SplitInput['type'];
+  split(totalPaise: number, input: SplitInput): Split[];
+}
+
+class ShareSplitStrategy implements SplitStrategy {
+  readonly type = 'SHARE' as const;
+  split(totalPaise: number, input: SplitInput): Split[] {
+    if (input.type !== 'SHARE') throw new Error('SHARE strategy needs share input');
+    const units = input.shares.reduce((sum, s) => sum + s.units, 0);
+    if (units <= 0 || input.shares.some((s) => !Number.isInteger(s.units) || s.units < 0)) {
+      throw new Error('Share units must be non-negative integers with a positive total');
+    }
+    const amounts = input.shares.map((s) => Math.floor((totalPaise * s.units) / units));
+    let leftover = totalPaise - amounts.reduce((a, b) => a + b, 0);
+    for (let i = 0; leftover > 0; i = (i + 1) % amounts.length) {
+      if (input.shares[i].units > 0) {
+        amounts[i] += 1;
+        leftover -= 1;
+      }
+    }
+    return input.shares.map((s, i) => ({ userId: s.userId, amountPaise: amounts[i] }));
+  }
+}
+
+class Group {
+  private readonly net = new Map<UserId, number>();
+  constructor(
+    readonly name: string,
+    private readonly members: ReadonlySet<UserId>,
+    private readonly strategies: ReadonlyMap<string, SplitStrategy>,
+  ) {}
+  addExpense(paidBy: UserId, totalPaise: number, input: SplitInput): void {
+    const strategy = this.strategies.get(input.type);
+    if (!strategy) throw new Error(`Unsupported split ${input.type}`);
+    const splits = strategy.split(totalPaise, input);
+    for (const id of [paidBy, ...splits.map((s) => s.userId)]) {
+      if (!this.members.has(id)) throw new Error(`${id} is not a member of ${this.name}`);
+    }
+    this.net.set(paidBy, (this.net.get(paidBy) ?? 0) + totalPaise);
+    for (const s of splits) this.net.set(s.userId, (this.net.get(s.userId) ?? 0) - s.amountPaise);
+  }
+  summary(): string {
+    return [...this.net].map(([id, v]) => `${id}:${v}`).join(' ');
+  }
+}
+
+const strategies = new Map<string, SplitStrategy>([['SHARE', new ShareSplitStrategy()]]);
+const goa = new Group('Goa trip', new Set(['asha', 'bala', 'chetan']), strategies);
+goa.addExpense('asha', 1000, { type: 'SHARE', shares: [{ userId: 'asha', units: 2 }, { userId: 'bala', units: 1 }, { userId: 'chetan', units: 0 }] });
+console.log(`net paise after share split: ${goa.summary()}`);
+for (const attempt of [
+  () => goa.addExpense('asha', 500, { type: 'SHARE', shares: [{ userId: 'zoya', units: 1 }] }),
+  () => goa.addExpense('asha', 500, { type: 'EQUAL', userIds: ['bala'] }),
+]) {
+  try {
+    attempt();
+  } catch (err) {
+    console.log(`rejected: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+```
+
+```text
+net paise after share split: asha:333 bala:-333 chetan:0
+rejected: zoya is not a member of Goa trip
+rejected: Unsupported split EQUAL
+```
+
+Notice that the group only registered `SHARE`, so an `EQUAL` request is rejected with a clear message. Each group (or tenant) can enable its own set of strategies.
+
+## Edge cases
+
+- ₹100 split three ways: shares must be 33.34 / 33.33 / 33.33, and they must sum to exactly ₹100.
+- Percentages like 33.33 + 33.33 + 33.34: handled through basis points. 33.333 rounds to 3333 bp and then fails the sum check (a clear error is better than silent drift).
+- Payer not among participants: allowed. Payer among participants: their own share creates no debt (`debtor === creditor` is skipped).
+- Duplicate participant, unknown user, zero or negative total, non-integer paise: all rejected **before** anything is mutated.
+- A settlement larger than the debt is rejected. Allowing overpayment would silently flip the direction of the debt.
+- Balances that net to exactly zero are removed from the map, so "A owes B ₹0" never prints.
+- An exact share of 0 for someone is allowed (they're listed but owe nothing).
+
+## Complexity
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `addExpense` | O(p) | p = participants; each ledger update is O(1) map access |
+| `owedBetween(a, b)` | O(1) | Two map lookups |
+| `allBalances` | O(E log E) | E = non-zero pairs (sorting for stable output) |
+| `netPositions` | O(E) | |
+| `simplify` | O(n² log n) as written | n = users with non-zero net. Use two heaps for O(n log n) |
+| Memory | O(U + E + X) | Users, non-zero pairs, expenses |
+
+## What graders look for / common mistakes
+
+- ✅ A `SplitStrategy` interface with a registry or factory. ❌ A giant `if (type === 'EQUAL') ... else if ...` inside `addExpense`.
+- ✅ Integer paise with deterministic remainder handling. ❌ `amount / 3` stored as a float, so balances show ₹33.333333.
+- ✅ Validation before mutation. ❌ Updating half the ledger and then throwing on the third participant.
+- ✅ Netting A→B against B→A. ❌ Printing both "A owes B ₹10" and "B owes A ₹4".
+- ✅ Separating "compute split" from "apply to ledger" (easy to test).
+- ❌ Making `Expense` subclasses per split type. The type is a *behaviour*, not an identity.
+- ❌ Claiming greedy simplification is optimal. It isn't always; say "heuristic, n−1 upper bound".
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–8 | Clarify: split types, rounding, payer-in-split, simplify needed? Write assumptions as comments. |
+| 8–18 | Entities + interfaces: `User`, `Expense`, `Split`, `SplitInput`, `SplitStrategy`, `BalanceSheet`. |
+| 18–40 | Strategies with validation (EQUAL with remainder first, then EXACT, PERCENT). |
+| 40–55 | `BalanceSheet` with netting + `ExpenseService`. |
+| 55–70 | Driver: the exact commands from the problem statement; print balances. Get it **running**. |
+| 70–80 | Simplify debts + error cases in the driver. |
+| 80–90 | Clean up names, add a README-style comment on how to add a split type; rehearse the walkthrough. |
+
+## Interview Q&A
+
+**Q1. How do you add a "split by shares" type tomorrow?**
+
+<details>
+<summary>Answer</summary>
+
+Write `ShareSplitStrategy implements SplitStrategy`, extend the `SplitInput` union with a `SHARE` variant, and call `registry.register(new ShareSplitStrategy())` in the composition root. `ExpenseService` doesn't change. The union extension is a type-level change only, and the compiler then points to every place that exhaustively handles input types (ideally none outside the strategies).
+
+</details>
+
+**Q2. Why integer paise and not `number` rupees with `toFixed(2)`?**
+
+<details>
+<summary>Answer</summary>
+
+Binary floating point can't represent 0.1 exactly, so repeated additions drift (`0.1 + 0.2 !== 0.3`). In a ledger, a one-paisa drift means the books don't balance. Integers are exact up to `Number.MAX_SAFE_INTEGER` (about ₹90 lakh crore in paise), which is plenty. For bigger values or currency conversion, use `bigint` or a decimal library.
+
+</details>
+
+**Q3. Is your debt simplification optimal?**
+
+<details>
+<summary>Answer</summary>
+
+No. The greedy "largest debtor pays largest creditor" gives at most n−1 transfers but not always the minimum. The true minimum requires finding the largest number of disjoint zero-sum subgroups, which is NP-hard (it generalises subset-sum). For small n (≤ 12–15 people in a group), a bitmask DP over subsets that sum to zero gives the exact answer. Beyond that, greedy is the practical choice.
+
+</details>
+
+**Q4. Where would you put the balance in a real database?**
+
+<details>
+<summary>Answer</summary>
+
+Two common designs. (a) An append-only `ledger_entries` table (expense id, debtor, creditor, amount) plus a materialised `balances` table updated in the same transaction with `UPDATE ... SET amount = amount + $1`. (b) Only the append-only table, and balances computed with `SUM` grouped by pair, cached. Option (a) gives O(1) reads. Option (b) is simpler to keep correct. Either way, the write happens in one DB transaction with the expense insert.
+
+</details>

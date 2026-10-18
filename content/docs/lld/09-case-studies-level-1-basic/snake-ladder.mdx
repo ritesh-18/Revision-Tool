@@ -1,0 +1,629 @@
+---
+title: "9.3 Snake & Ladder"
+---
+
+## Problem & where it's asked
+
+Snake & Ladder is the classic **Flipkart** machine-coding problem (a LeetCode write-up titled "Machine Coding Flipkart: Snake and Ladder"). It's also reported at **Microsoft SDE-2** (where class diagrams, analysis *and* working code were expected), **Goldman Sachs** (2026 list) and **Salesforce**. Amazon and Tekion appear only in aggregated lists (uncertain). The reported spec: a 100-cell board, configurable snakes and ladders, several players in round-robin turns, dice rolls and winner detection. Reported follow-ups: **several dice**, **special cells**, **a different board size** and, inferred, **keep playing until one player is left**.
+
+Flipkart grades this problem on a clean game loop and code that runs. The randomness is the hidden trap. If your dice call `Math.random()` directly, you can't write a single deterministic test, and the reviewer will notice.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Board size? | Configurable, default 100. |
+| Where do players start? | Position 0 (off the board). The first roll of N moves them to cell N. |
+| Overshooting the last cell? | The player stays put (exact finish). This is a rule flag. |
+| Can a snake's tail land on a ladder's bottom (chains)? | No. Reject the chain at board setup to keep moves predictable. |
+| Several players on one cell? | Allowed, no capture. |
+| Number of dice? | Configurable. The move is the sum of the dice. |
+| When does the game end? | By default when the first player wins. Optionally, keep going until one player is left and produce a ranking. |
+| Input format? | Program API plus a driver. In a Flipkart round, you'd parse stdin in the driver only. |
+
+## Requirements
+
+**Functional**: build a board with validated snakes and ladders; add 2+ players; roll the dice and move in turn; apply a snake or ladder; detect the winner (or the full ranking); emit a readable move log: `Anu rolled 3 and moved from 0 to 11`.
+
+**Non-functional**: deterministic tests (injected dice); game logic free of `console.log` (events instead); easy to add dice types and cell effects.
+
+**Out of scope**: UI, networking, saving games.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Jump` | A snake or a ladder (`from`, `to`) | Board has many |
+| `Board` | Size, validated jumps, `jumpAt(position)` | Used by `Game` |
+| `Dice` | `roll()` | `ScriptedDice`, `SeededDice`, `DiceSet` implement it |
+| `Player` | Name and position | `Game` has 2..* |
+| `GameRules` | Exact finish, play until one left | Config for `Game` |
+| `GameEvent` | What happened in a turn (discriminated union) | Emitted to listeners |
+| `GameListener` | Reacts to events (narrator, stats) | Observer of `Game` |
+| `Game` | Turn queue, move logic, end condition | Composes the above |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Board {
+        +number size
+        +jumpAt(pos) Jump
+    }
+    class Jump {
+        +number from
+        +number to
+        +kind
+    }
+    class Dice {
+        <<interface>>
+        +roll() number
+    }
+    class ScriptedDice
+    class SeededDice
+    class DiceSet
+    class Player {
+        +string name
+        +number position
+    }
+    class GameListener {
+        <<interface>>
+        +onEvent(event) void
+    }
+    class Narrator
+    class StatsCollector
+    class Game {
+        +playTurn() void
+        +playToEnd(maxTurns) string[]
+        +isOver() bool
+    }
+    Board *-- Jump
+    Dice <|.. ScriptedDice
+    Dice <|.. SeededDice
+    Dice <|.. DiceSet
+    DiceSet o-- Dice
+    GameListener <|.. Narrator
+    GameListener <|.. StatsCollector
+    Game --> Board
+    Game --> Dice
+    Game o-- Player
+    Game --> GameListener`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> InProgress : start
+    InProgress --> InProgress : turn (move, snake, ladder, blocked)
+    InProgress --> InProgress : a player finishes, others remain
+    InProgress --> Finished : first winner (default rule)
+    InProgress --> Finished : one player left (until-one-left rule)`} />
+
+## Design decisions & patterns
+
+- **Dice as a Strategy (plus Composite).** `ScriptedDice` makes tests exact, and `SeededDice` gives reproducible "random" games. `DiceSet` sums several dice and is itself a `Dice`, which is a tiny Composite. The "several dice" follow-up then needs zero changes to `Game`.
+- **Observer for output.** `Game` emits typed events (`MOVED`, `SNAKE`, `LADDER`, `BLOCKED`, `FINISHED`). A `Narrator` prints them and a `StatsCollector` counts them. Tomorrow a WebSocket broadcaster is just a third listener. This keeps the domain testable. You assert on events, not on console text.
+- **Discriminated union for events.** `switch (event.type)` gets exhaustiveness checking from TypeScript. Add a new event and the compiler shows every listener that needs updating.
+- **Validation in `Board`'s constructor.** A board that exists is always valid (no chains, no out-of-range or duplicate starts). `Game` never re-checks it.
+- **Turn order as a queue.** Finished players drop out of the queue, which makes "play until one is left" trivial.
+- **Rejected:** separate `Snake` and `Ladder` classes with identical fields. A `kind` field is enough, and validation is where they differ. **Rejected:** a `Cell` object for each of the 100 cells, which is wasteful when only a handful have jumps. A `Map<number, Jump>` is sparse and O(1). (The extension below *does* introduce cell effects, still stored sparsely.)
+
+## Implementation
+
+**Part 1: errors, dice and board.**
+
+```ts
+class GameError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class InvalidBoardError extends GameError {}
+class InvalidSetupError extends GameError {}
+class GameOverError extends GameError {}
+
+interface Dice { roll(): number }
+
+class ScriptedDice implements Dice {
+  private index = 0;
+  constructor(private readonly values: readonly number[]) {}
+  roll(): number {
+    const v = this.values[this.index++];
+    if (v === undefined) throw new GameError('ScriptedDice ran out of values');
+    return v;
+  }
+}
+
+// Deterministic PRNG (mulberry32), so a seed reproduces a whole game.
+class SeededDice implements Dice {
+  private state: number;
+  constructor(private readonly faces: number, seed: number) {
+    if (faces < 2) throw new InvalidSetupError('A die needs at least 2 faces');
+    this.state = seed >>> 0;
+  }
+  roll(): number {
+    this.state = (this.state + 0x6d2b79f5) >>> 0;
+    let t = this.state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    const r = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    return 1 + Math.floor(r * this.faces);
+  }
+}
+
+class DiceSet implements Dice {
+  constructor(private readonly dice: readonly Dice[]) {
+    if (dice.length === 0) throw new InvalidSetupError('DiceSet needs at least one die');
+  }
+  roll(): number { return this.dice.reduce((sum, d) => sum + d.roll(), 0); }
+}
+
+type JumpKind = 'SNAKE' | 'LADDER';
+interface Jump { readonly from: number; readonly to: number; readonly kind: JumpKind }
+
+class Board {
+  private readonly jumps = new Map<number, Jump>();
+
+  constructor(readonly size: number, snakes: readonly [number, number][], ladders: readonly [number, number][]) {
+    if (!Number.isInteger(size) || size < 10) throw new InvalidBoardError(`Board size must be >= 10, got ${size}`);
+    for (const [from, to] of snakes) this.add({ from, to, kind: 'SNAKE' });
+    for (const [from, to] of ladders) this.add({ from, to, kind: 'LADDER' });
+    for (const jump of this.jumps.values()) {
+      if (this.jumps.has(jump.to)) {
+        throw new InvalidBoardError(`Chained jump: ${jump.from}->${jump.to} lands on another jump`);
+      }
+    }
+  }
+
+  private add(jump: Jump): void {
+    const { from, to, kind } = jump;
+    if (from <= 1 || from >= this.size) throw new InvalidBoardError(`${kind} start ${from} must be between 2 and ${this.size - 1}`);
+    if (to < 1 || to > this.size) throw new InvalidBoardError(`${kind} end ${to} is off the board`);
+    if (kind === 'SNAKE' && to >= from) throw new InvalidBoardError(`Snake ${from}->${to} must go down`);
+    if (kind === 'LADDER' && to <= from) throw new InvalidBoardError(`Ladder ${from}->${to} must go up`);
+    if (this.jumps.has(from)) throw new InvalidBoardError(`Two jumps start at ${from}`);
+    this.jumps.set(from, jump);
+  }
+
+  jumpAt(position: number): Jump | undefined { return this.jumps.get(position); }
+}
+```
+
+**Part 2: players, rules and events.**
+
+```ts
+class Player {
+  position = 0;
+  constructor(readonly name: string) {
+    if (!name.trim()) throw new InvalidSetupError('Player name is required');
+  }
+}
+
+interface GameRules {
+  exactFinish: boolean; // overshoot = stay put
+  playUntilOneLeft: boolean; // otherwise stop at the first winner
+}
+
+type GameEvent =
+  | { type: 'MOVED'; player: string; roll: number; from: number; to: number }
+  | { type: 'BLOCKED'; player: string; roll: number; at: number }
+  | { type: 'SNAKE'; player: string; from: number; to: number }
+  | { type: 'LADDER'; player: string; from: number; to: number }
+  | { type: 'FINISHED'; player: string; rank: number; turn: number };
+
+interface GameListener { onEvent(event: GameEvent): void }
+
+class Narrator implements GameListener {
+  onEvent(e: GameEvent): void {
+    switch (e.type) {
+      case 'MOVED': console.log(`${e.player} rolled ${e.roll} and moved from ${e.from} to ${e.to}`); break;
+      case 'BLOCKED': console.log(`${e.player} rolled ${e.roll} but needs exact roll, stays at ${e.at}`); break;
+      case 'SNAKE': console.log(`  snake! ${e.player} slides ${e.from} -> ${e.to}`); break;
+      case 'LADDER': console.log(`  ladder! ${e.player} climbs ${e.from} -> ${e.to}`); break;
+      case 'FINISHED': console.log(`  ${e.player} finished at rank ${e.rank} (turn ${e.turn})`); break;
+    }
+  }
+}
+
+class StatsCollector implements GameListener {
+  readonly counts = new Map<string, { snakes: number; ladders: number }>();
+  onEvent(e: GameEvent): void {
+    if (e.type !== 'SNAKE' && e.type !== 'LADDER') return;
+    const c = this.counts.get(e.player) ?? { snakes: 0, ladders: 0 };
+    if (e.type === 'SNAKE') c.snakes++;
+    else c.ladders++;
+    this.counts.set(e.player, c);
+  }
+  summary(): string {
+    return [...this.counts.entries()].map(([p, c]) => `${p}: ${c.snakes} snakes, ${c.ladders} ladders`).join('; ');
+  }
+}
+```
+
+**Part 3: the game loop.** One turn is: roll, compute the target, apply the exact-finish rule, apply at most one jump, then check for a finish. Because the board rejects chains, "at most one jump" is safe.
+
+```ts
+class Game {
+  private readonly queue: Player[];
+  private readonly ranking: string[] = [];
+  private readonly listeners: GameListener[] = [];
+  private turnCount = 0;
+
+  constructor(
+    private readonly board: Board,
+    players: readonly Player[],
+    private readonly dice: Dice,
+    private readonly rules: GameRules = { exactFinish: true, playUntilOneLeft: false },
+  ) {
+    if (players.length < 2) throw new InvalidSetupError('Need at least 2 players');
+    const names = new Set(players.map((p) => p.name));
+    if (names.size !== players.length) throw new InvalidSetupError('Player names must be unique');
+    this.queue = [...players];
+  }
+
+  subscribe(listener: GameListener): void { this.listeners.push(listener); }
+
+  isOver(): boolean {
+    if (this.rules.playUntilOneLeft) return this.queue.length <= 1;
+    return this.ranking.length > 0;
+  }
+
+  playTurn(): void {
+    if (this.isOver()) throw new GameOverError('Game is already over');
+    const player = this.queue.shift();
+    if (!player) throw new GameOverError('No players left');
+    this.turnCount++;
+
+    const roll = this.dice.roll();
+    const from = player.position;
+    let target = from + roll;
+    if (target > this.board.size) {
+      if (this.rules.exactFinish) {
+        this.emit({ type: 'BLOCKED', player: player.name, roll, at: from });
+        this.queue.push(player);
+        return;
+      }
+      target = this.board.size;
+    }
+    player.position = target;
+    this.emit({ type: 'MOVED', player: player.name, roll, from, to: target });
+
+    const jump = this.board.jumpAt(target);
+    if (jump) {
+      player.position = jump.to;
+      this.emit({ type: jump.kind, player: player.name, from: jump.from, to: jump.to });
+    }
+
+    if (player.position === this.board.size) {
+      this.ranking.push(player.name);
+      this.emit({ type: 'FINISHED', player: player.name, rank: this.ranking.length, turn: this.turnCount });
+    } else {
+      this.queue.push(player); // back of the line
+    }
+  }
+
+  playToEnd(maxTurns = 10_000): string[] {
+    while (!this.isOver()) {
+      if (this.turnCount >= maxTurns) throw new GameError(`No result after ${maxTurns} turns`);
+      this.playTurn();
+    }
+    // In until-one-left mode, the last player still in the queue is ranked last.
+    return [...this.ranking, ...(this.rules.playUntilOneLeft ? this.queue.map((p) => p.name) : [])];
+  }
+
+  get turns(): number { return this.turnCount; }
+
+  private emit(event: GameEvent): void {
+    for (const l of this.listeners) l.onEvent(event);
+  }
+}
+```
+
+**Part 4: driver.** First a small, fully scripted game where every line can be checked by hand. Then a 100-cell board with two seeded dice and the "until one left" rule, where only the summary is printed.
+
+```ts
+function attempt(label: string, fn: () => string): void {
+  try {
+    console.log(`${label}: ${fn()}`);
+  } catch (err) {
+    if (err instanceof GameError) console.log(`${label}: ${err.name} - ${err.message}`);
+    else throw err;
+  }
+}
+
+console.log('--- Scripted game on 20 cells ---');
+const small = new Board(20, [[17, 4], [12, 2]], [[3, 11], [9, 15]]);
+const scripted = new Game(small, [new Player('Anu'), new Player('Bala')], new ScriptedDice([3, 5, 1, 4, 6, 6, 5, 5]));
+scripted.subscribe(new Narrator());
+const smallStats = new StatsCollector();
+scripted.subscribe(smallStats);
+attempt('result', () => scripted.playToEnd().join(', '));
+console.log(smallStats.summary());
+attempt('extra turn', () => { scripted.playTurn(); return 'played'; });
+
+console.log('--- 100 cells, two dice, until one left ---');
+const classic = new Board(
+  100,
+  [[99, 54], [70, 55], [52, 42], [25, 2], [95, 72]],
+  [[6, 26], [11, 40], [60, 85], [46, 90], [17, 69]],
+);
+const big = new Game(
+  classic,
+  ['Ritesh', 'Meera', 'Kabir'].map((n) => new Player(n)),
+  new DiceSet([new SeededDice(6, 7), new SeededDice(6, 99)]),
+  { exactFinish: true, playUntilOneLeft: true },
+);
+const bigStats = new StatsCollector();
+big.subscribe(bigStats);
+attempt('ranking', () => big.playToEnd().join(' > '));
+console.log(`turns: ${big.turns}`);
+console.log(bigStats.summary());
+
+console.log('--- Invalid setups ---');
+attempt('chain', () => { new Board(30, [[20, 5]], [[5, 12]]); return 'ok'; });
+attempt('snake up', () => { new Board(30, [[5, 20]], []); return 'ok'; });
+attempt('ladder at end', () => { new Board(30, [], [[30, 30]]); return 'ok'; });
+attempt('one player', () => { new Game(small, [new Player('Solo')], new ScriptedDice([1])); return 'ok'; });
+```
+
+## Demo output
+
+```text
+--- Scripted game on 20 cells ---
+Anu rolled 3 and moved from 0 to 3
+  ladder! Anu climbs 3 -> 11
+Bala rolled 5 and moved from 0 to 5
+Anu rolled 1 and moved from 11 to 12
+  snake! Anu slides 12 -> 2
+Bala rolled 4 and moved from 5 to 9
+  ladder! Bala climbs 9 -> 15
+Anu rolled 6 and moved from 2 to 8
+Bala rolled 6 but needs exact roll, stays at 15
+Anu rolled 5 and moved from 8 to 13
+Bala rolled 5 and moved from 15 to 20
+  Bala finished at rank 1 (turn 8)
+result: Bala
+Anu: 1 snakes, 1 ladders; Bala: 0 snakes, 1 ladders
+extra turn: GameOverError - Game is already over
+--- 100 cells, two dice, until one left ---
+ranking: Meera > Ritesh > Kabir
+turns: 53
+Meera: 0 snakes, 1 ladders; Ritesh: 0 snakes, 1 ladders; Kabir: 1 snakes, 1 ladders
+--- Invalid setups ---
+chain: InvalidBoardError - Chained jump: 20->5 lands on another jump
+snake up: InvalidBoardError - Snake 5->20 must go down
+ladder at end: InvalidBoardError - LADDER start 30 must be between 2 and 29
+one player: InvalidSetupError - Need at least 2 players
+```
+
+Trace the scripted game by hand once. Anu's 3 lands on the ladder at 3 (to 11), and her 1 lands on the snake at 12 (to 2). Bala's 6 from 15 would reach 21, so the exact-finish rule keeps him at 15, and his later 5 lands exactly on 20.
+
+## Concurrency
+
+The in-memory game is single-threaded, and turns are strictly sequential, so there's nothing to race. The questions come in the online version:
+
+1. **Who rolls?** The server must roll. A client-reported roll is a cheating vector.
+2. **Out-of-turn or duplicate "roll" clicks.** Each request carries the player ID and the turn number it believes is current. The server rejects anything that doesn't match (optimistic check), exactly like the Tic-Tac-Toe version in 9.2.
+3. **One game object shared by several request handlers.** If the turn handler ever awaits (for example, saving to the DB) between reading and writing state, serialize handlers per game ID with a per-key mutex.
+
+```ts
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async run<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    const result = prev.then(task);
+    const tail = result.then(() => undefined, () => undefined);
+    this.tails.set(key, tail);
+    void tail.then(() => { if (this.tails.get(key) === tail) this.tails.delete(key); }); // avoid leaking keys
+    return result;
+  }
+}
+
+interface TurnRequest { gameId: string; playerId: string; expectedTurn: number }
+interface GameState { turn: number; currentPlayerId: string }
+
+class OnlineTurnService {
+  constructor(
+    private readonly locks: KeyedMutex,
+    private readonly load: (id: string) => Promise<GameState>,
+    private readonly rollAndSave: (id: string, state: GameState) => Promise<number>,
+  ) {}
+
+  rollFor(req: TurnRequest): Promise<number> {
+    return this.locks.run(req.gameId, async () => {
+      const state = await this.load(req.gameId);
+      if (state.currentPlayerId !== req.playerId) throw new Error('Not your turn');
+      if (state.turn !== req.expectedTurn) throw new Error('Stale turn, refresh the board');
+      return this.rollAndSave(req.gameId, state); // server-side roll
+    });
+  }
+}
+```
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|-----------|---------------|
+| **Several dice** | Already supported: `DiceSet`. |
+| **Different board size** | Already a constructor argument. Validation adapts. |
+| **Play until one player left** | Already a rule flag with a ranking. |
+| **Special cells** (boost, freeze, extra turn) | Generalise jumps into a `CellEffect` strategy that returns the new position and turn modifiers. Implemented below. |
+| **Extra turn on a 6, forfeit on three 6s** | A turn policy inside the loop, shown below. |
+| **Allow chains** | Loop `while (jumpAt(pos))` with a visited set to detect cycles at setup. |
+| **Undo / replay** | Events are already a log. Replaying them rebuilds the state (event sourcing in miniature). |
+
+Here snakes, ladders and new special cells all implement one `CellEffect` interface, and the loop adds the "roll a 6, roll again" rule, with three sixes in a row forfeiting the turn.
+
+```ts
+interface EffectResult { position: number; skipNextTurn?: boolean; note: string }
+interface CellEffect { apply(position: number): EffectResult }
+
+class JumpEffect implements CellEffect {
+  constructor(private readonly to: number, private readonly label: string) {}
+  apply(position: number): EffectResult { return { position: this.to, note: `${this.label} ${position}->${this.to}` }; }
+}
+class BoostEffect implements CellEffect {
+  constructor(private readonly steps: number) {}
+  apply(position: number): EffectResult { return { position: position + this.steps, note: `boost +${this.steps}` }; }
+}
+class FreezeEffect implements CellEffect {
+  apply(position: number): EffectResult { return { position, skipNextTurn: true, note: 'frozen, skips next turn' }; }
+}
+
+interface Racer { name: string; position: number; frozen: boolean }
+
+class SpecialGame {
+  constructor(
+    private readonly size: number,
+    private readonly effects: Map<number, CellEffect>,
+    private readonly racers: Racer[],
+    private readonly rolls: number[],
+  ) {}
+
+  private nextRoll(): number {
+    const r = this.rolls.shift();
+    if (r === undefined) throw new Error('out of rolls');
+    return r;
+  }
+
+  playTurn(racer: Racer): boolean {
+    if (racer.frozen) {
+      racer.frozen = false;
+      console.log(`${racer.name} is frozen, turn skipped`);
+      return false;
+    }
+    const start = racer.position;
+    for (let sixes = 0; ;) {
+      const roll = this.nextRoll();
+      if (roll === 6 && ++sixes === 3) {
+        racer.position = start; // three sixes: whole turn is void
+        console.log(`${racer.name} rolled three 6s, back to ${start}`);
+        return false;
+      }
+      const target = racer.position + roll;
+      if (target <= this.size) racer.position = target;
+      let line = `${racer.name} rolled ${roll} -> ${racer.position}`;
+      const effect = this.effects.get(racer.position);
+      if (effect) {
+        const res = effect.apply(racer.position);
+        racer.position = Math.min(res.position, this.size);
+        racer.frozen = res.skipNextTurn ?? false;
+        line += ` (${res.note})`;
+      }
+      console.log(line);
+      if (racer.position === this.size) return true;
+      if (roll !== 6) return false;
+    }
+  }
+
+  play(): string {
+    for (let round = 0; round < 50; round++) {
+      for (const r of this.racers) if (this.playTurn(r)) return `${r.name} wins`;
+    }
+    return 'no winner';
+  }
+}
+
+const effects = new Map<number, CellEffect>([
+  [4, new BoostEffect(3)],
+  [9, new FreezeEffect()],
+  [13, new JumpEffect(3, 'snake')],
+  [8, new JumpEffect(14, 'ladder')],
+]);
+const game = new SpecialGame(20, effects, [
+  { name: 'Anu', position: 0, frozen: false },
+  { name: 'Bala', position: 0, frozen: false },
+], [6, 6, 6, 4, 6, 3, 2, 5, 4, 6, 1, 3, 3]);
+console.log(game.play());
+```
+
+```text
+Anu rolled 6 -> 6
+Anu rolled 6 -> 12
+Anu rolled three 6s, back to 0
+Bala rolled 4 -> 4 (boost +3)
+Anu rolled 6 -> 6
+Anu rolled 3 -> 9 (frozen, skips next turn)
+Bala rolled 2 -> 9 (frozen, skips next turn)
+Anu is frozen, turn skipped
+Bala is frozen, turn skipped
+Anu rolled 5 -> 14
+Bala rolled 4 -> 13 (snake 13->3)
+Anu rolled 6 -> 20
+Anu wins
+```
+
+## Edge cases
+
+- Overshooting the last cell with exact finish: the player doesn't move, but the turn still passes.
+- A snake or ladder at cell 1, at the last cell, or going the wrong direction: rejected at setup.
+- Chained jumps and two jumps from the same cell: rejected at setup.
+- Duplicate player names, or only one player: rejected.
+- Scripted dice running out: a clear error instead of `undefined` sneaking into arithmetic.
+- An infinite game (a board where a snake always sends everyone back): the `maxTurns` guard stops the loop.
+- A turn after the game is over: `GameOverError`.
+- Players who already finished must not get turns (they're removed from the queue).
+
+## Complexity
+
+| Operation | Cost |
+|-----------|------|
+| Board setup | O(S + L) for S snakes and L ladders |
+| `playTurn` | O(D) for D dice, with an O(1) jump lookup and O(1) queue rotation (amortised; `shift` on a small array is fine, use a ring buffer for thousands of players) |
+| Full game | O(T · D) for T turns |
+| Memory | O(S + L + P), not O(board size) |
+
+## What graders look for / common mistakes
+
+- **Look for:** injected dice, a small `playTurn`, a validated board, the event log format they asked for, and a working driver that reads input.
+- **Mistake:** `Math.random()` inside `Game`, so no test can be reproduced.
+- **Mistake:** storing a 100-element array of cell objects just to hold 10 jumps.
+- **Mistake:** a `while (true)` loop with no turn cap.
+- **Mistake:** printing inside the domain logic, which makes the UI impossible to change.
+- **Mistake:** forgetting the overshoot rule, or letting a finished player keep rolling.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–8 | Clarify the start position, overshoot, chains, number of dice and the end condition. |
+| 8–15 | Entities, the event list and the output format. |
+| 15–40 | `Board` with validation, the `Dice` implementations, `Player`, `Game.playTurn`. |
+| 40–55 | Driver: parse input (snakes, ladders, players) and print moves. |
+| 55–70 | Rules: until-one-left, several dice. |
+| 70–90 | Special cells or extra-turn follow-up, edge cases and a quick test with scripted dice. |
+
+## Interview Q&A
+
+**Q1. How do you test a game that depends on dice?**
+
+<details>
+<summary>Answer</summary>
+
+Inject the dice. `ScriptedDice` returns a fixed sequence, so a test can say "roll 3, 5, 1…" and assert exact positions and events. `SeededDice` makes whole random games reproducible, which helps with fuzz-style tests like "every seeded game ends within 10,000 turns".
+
+</details>
+
+**Q2. Why emit events instead of returning strings?**
+
+<details>
+<summary>Answer</summary>
+
+Events keep the domain independent of presentation. The console narrator, a stats collector and a WebSocket broadcaster can all consume the same stream, and tests assert on structured data. With a discriminated union, adding an event type makes the compiler flag every `switch` that must handle it.
+
+</details>
+
+**Q3. How would you support chains (a ladder landing on a snake)?**
+
+<details>
+<summary>Answer</summary>
+
+Resolve jumps in a loop until the position has no jump. To avoid infinite loops, validate at setup by following each chain with a visited set and rejecting cycles. Emit one event per hop so the log stays readable.
+
+</details>
+
+**Q4. Where would the "roll a 6, roll again" rule live?**
+
+<details>
+<summary>Answer</summary>
+
+It's a turn policy, not a board or dice concern. I'd keep it in the loop behind a small `TurnPolicy` (or a rules flag), so the board and dice stay unchanged. The extension above shows it, including forfeiting on three sixes.
+
+</details>

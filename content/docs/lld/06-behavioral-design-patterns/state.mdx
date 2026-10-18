@@ -1,0 +1,424 @@
+---
+title: "6.4 State"
+---
+
+## Intent
+
+Let an object change its behavior when its internal state changes, by giving each state its own class. From the outside, the object seems to "change its class" at runtime.
+
+## Problem
+
+An order goes through a lifecycle: `PENDING → OPEN → PARTIALLY_FILLED → FILLED`, with side exits to `CANCELLED` and `REJECTED`. The rules depend on where the order is:
+
+- You can `cancel` an OPEN or PARTIALLY_FILLED order, but not a FILLED one.
+- You can `fill` only an OPEN or PARTIALLY_FILLED order.
+- `submit` is valid only from PENDING, and it may reject.
+
+The naive version puts a `switch (this.status)` inside **every** method (`submit`, `fill`, `cancel`, `modify`...). Adding a state such as `TRIGGER_PENDING` for stop-loss orders means editing every switch, and it's easy to miss one. That kind of mistake causes real incidents in trading systems.
+
+## Structure
+
+First, the lifecycle itself:
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> OPEN : submit ok
+    PENDING --> REJECTED : submit fails checks
+    PENDING --> CANCELLED : cancel
+    OPEN --> PARTIALLY_FILLED : partial fill
+    OPEN --> FILLED : full fill
+    OPEN --> CANCELLED : cancel
+    PARTIALLY_FILLED --> PARTIALLY_FILLED : partial fill
+    PARTIALLY_FILLED --> FILLED : remaining filled
+    PARTIALLY_FILLED --> CANCELLED : cancel rest
+    FILLED --> [*]
+    CANCELLED --> [*]
+    REJECTED --> [*]`} />
+
+Then the classes behind it:
+
+<Mermaid chart={`classDiagram
+    class OrderState {
+        <<interface>>
+        +name string
+        +submit(order)
+        +fill(order, qty)
+        +cancel(order)
+    }
+    class BaseState {
+        <<abstract>>
+    }
+    class PendingState
+    class OpenState
+    class PartiallyFilledState
+    class TerminalState
+    class Order {
+        -state OrderState
+        +submit()
+        +fill(qty)
+        +cancel()
+        +setState(s)
+    }
+    OrderState <|.. BaseState
+    BaseState <|-- PendingState
+    BaseState <|-- OpenState
+    OpenState <|-- PartiallyFilledState
+    BaseState <|-- TerminalState
+    Order o-- OrderState`} />
+
+## TypeScript implementation (state classes)
+
+The trick is a `BaseState` whose methods **throw by default**. Each concrete state overrides only the actions that are legal in it, so illegal transitions are rejected automatically.
+
+```ts
+interface OrderState {
+  readonly name: string;
+  submit(order: Order): void;
+  fill(order: Order, qty: number): void;
+  cancel(order: Order): void;
+}
+
+abstract class BaseState implements OrderState {
+  abstract readonly name: string;
+  submit(_order: Order): void {
+    throw new Error(`cannot submit an order in ${this.name}`);
+  }
+  fill(_order: Order, _qty: number): void {
+    throw new Error(`cannot fill an order in ${this.name}`);
+  }
+  cancel(_order: Order): void {
+    throw new Error(`cannot cancel an order in ${this.name}`);
+  }
+}
+
+class PendingState extends BaseState {
+  readonly name = 'PENDING';
+  override submit(order: Order): void {
+    if (order.qty <= 0) {
+      console.log(`  ${order.id} rejected: qty must be > 0`);
+      order.setState(new TerminalState('REJECTED'));
+      return;
+    }
+    order.setState(new OpenState());
+  }
+  override cancel(order: Order): void {
+    order.setState(new TerminalState('CANCELLED'));
+  }
+}
+
+class OpenState extends BaseState {
+  readonly name: string = 'OPEN';
+  override fill(order: Order, qty: number): void {
+    order.addFill(qty);
+    order.setState(order.filled === order.qty ? new TerminalState('FILLED') : new PartiallyFilledState());
+  }
+  override cancel(order: Order): void {
+    order.setState(new TerminalState('CANCELLED'));
+  }
+}
+
+// Same behavior as OPEN, only the name differs, so inheritance is fine here.
+class PartiallyFilledState extends OpenState {
+  override readonly name: string = 'PARTIALLY_FILLED';
+}
+
+// FILLED / CANCELLED / REJECTED: every action throws.
+class TerminalState extends BaseState {
+  constructor(readonly name: 'FILLED' | 'CANCELLED' | 'REJECTED') {
+    super();
+  }
+}
+
+class Order {
+  private state: OrderState = new PendingState();
+  filled = 0;
+
+  constructor(readonly id: string, readonly qty: number) {}
+
+  get status(): string {
+    return this.state.name;
+  }
+
+  // Context methods just delegate to the current state.
+  submit(): void {
+    this.state.submit(this);
+  }
+  fill(qty: number): void {
+    this.state.fill(this, qty);
+  }
+  cancel(): void {
+    this.state.cancel(this);
+  }
+
+  // Called by states only (in a real codebase, keep this package-internal).
+  setState(next: OrderState): void {
+    if (next.name !== this.state.name) console.log(`${this.id}: ${this.state.name} -> ${next.name}`);
+    this.state = next;
+  }
+
+  addFill(qty: number): void {
+    if (qty <= 0 || this.filled + qty > this.qty) {
+      throw new Error(`invalid fill ${qty} (filled ${this.filled}/${this.qty})`);
+    }
+    this.filled += qty;
+  }
+}
+
+function attempt(label: string, action: () => void): void {
+  try {
+    action();
+  } catch (err) {
+    console.log(`  ${label} failed: ${(err as Error).message}`);
+  }
+}
+
+const o1 = new Order('O1', 100);
+o1.submit();
+o1.fill(40);
+o1.fill(30);
+attempt('O1 fill 50', () => o1.fill(50));
+o1.fill(30);
+attempt('O1 cancel', () => o1.cancel());
+
+const o2 = new Order('O2', 0);
+o2.submit();
+attempt('O2 fill', () => o2.fill(10));
+
+const o3 = new Order('O3', 50);
+o3.submit();
+o3.cancel();
+attempt('O3 submit', () => o3.submit());
+
+console.log(`final: O1=${o1.status} (${o1.filled}/${o1.qty}), O2=${o2.status}, O3=${o3.status}`);
+```
+
+```text
+O1: PENDING -> OPEN
+O1: OPEN -> PARTIALLY_FILLED
+  O1 fill 50 failed: invalid fill 50 (filled 70/100)
+O1: PARTIALLY_FILLED -> FILLED
+  O1 cancel failed: cannot cancel an order in FILLED
+  O2 rejected: qty must be > 0
+O2: PENDING -> REJECTED
+  O2 fill failed: cannot fill an order in REJECTED
+O3: PENDING -> OPEN
+O3: OPEN -> CANCELLED
+  O3 submit failed: cannot submit an order in CANCELLED
+final: O1=FILLED (100/100), O2=REJECTED, O3=CANCELLED
+```
+
+## A second classic: the vending machine
+
+Interviewers love this one. The same button (`select`) does different things depending on whether money has been inserted.
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> HAS_MONEY : insert coin
+    HAS_MONEY --> HAS_MONEY : insert more or select with low balance
+    HAS_MONEY --> IDLE : select and dispense
+    HAS_MONEY --> IDLE : refund`} />
+
+```ts
+interface Item {
+  name: string;
+  price: number;
+  stock: number;
+}
+
+interface VendingState {
+  readonly name: string;
+  insert(vm: VendingMachine, amount: number): void;
+  select(vm: VendingMachine, code: string): void;
+  refund(vm: VendingMachine): void;
+}
+
+class IdleState implements VendingState {
+  readonly name = 'IDLE';
+  insert(vm: VendingMachine, amount: number): void {
+    vm.balance += amount;
+    vm.go(new HasMoneyState());
+  }
+  select(): void {
+    console.log('  insert money first');
+  }
+  refund(): void {
+    console.log('  nothing to refund');
+  }
+}
+
+class HasMoneyState implements VendingState {
+  readonly name = 'HAS_MONEY';
+  insert(vm: VendingMachine, amount: number): void {
+    vm.balance += amount;
+  }
+  select(vm: VendingMachine, code: string): void {
+    const item = vm.items.get(code);
+    if (!item || item.stock === 0) return console.log(`  ${code} unavailable`);
+    if (vm.balance < item.price) return console.log(`  need ${item.price - vm.balance} more`);
+    item.stock--;
+    console.log(`  dispensed ${item.name}, change ${vm.balance - item.price}`);
+    vm.balance = 0;
+    vm.go(new IdleState());
+  }
+  refund(vm: VendingMachine): void {
+    console.log(`  refunded ${vm.balance}`);
+    vm.balance = 0;
+    vm.go(new IdleState());
+  }
+}
+
+class VendingMachine {
+  balance = 0;
+  private state: VendingState = new IdleState();
+  constructor(readonly items: Map<string, Item>) {}
+
+  go(next: VendingState): void {
+    console.log(`  [state] ${this.state.name} -> ${next.name}`);
+    this.state = next;
+  }
+  insert(amount: number): void {
+    console.log(`insert ${amount}`);
+    this.state.insert(this, amount);
+  }
+  select(code: string): void {
+    console.log(`select ${code}`);
+    this.state.select(this, code);
+  }
+  refund(): void {
+    console.log('refund');
+    this.state.refund(this);
+  }
+}
+
+const vm = new VendingMachine(new Map([['A1', { name: 'Chips', price: 20, stock: 1 }]]));
+vm.select('A1');
+vm.insert(10);
+vm.select('A1');
+vm.insert(20);
+vm.select('A1');
+vm.insert(5);
+vm.select('A1');
+vm.refund();
+```
+
+```text
+select A1
+  insert money first
+insert 10
+  [state] IDLE -> HAS_MONEY
+select A1
+  need 10 more
+insert 20
+select A1
+  dispensed Chips, change 10
+  [state] HAS_MONEY -> IDLE
+insert 5
+  [state] IDLE -> HAS_MONEY
+select A1
+  A1 unavailable
+refund
+  refunded 5
+  [state] HAS_MONEY -> IDLE
+```
+
+An **elevator** follows the same recipe with the states `IdleState`, `MovingUpState`, `MovingDownState`, and `DoorsOpenState`. Pressing "open door" while moving is ignored, and it's the state class that ignores it.
+
+## Alternative: a table-driven state machine
+
+When states have **no behavior of their own** (they are just labels plus allowed transitions), a class per state is overkill. A transition table is smaller, easy to print as documentation, and can even come from config. TypeScript's `Record` types keep it safe.
+
+```ts
+type Status = 'PENDING' | 'OPEN' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED' | 'REJECTED';
+type Action = 'SUBMIT' | 'REJECT' | 'PARTIAL_FILL' | 'FULL_FILL' | 'CANCEL';
+
+const transitions: Record<Status, Partial<Record<Action, Status>>> = {
+  PENDING: { SUBMIT: 'OPEN', REJECT: 'REJECTED', CANCEL: 'CANCELLED' },
+  OPEN: { PARTIAL_FILL: 'PARTIALLY_FILLED', FULL_FILL: 'FILLED', CANCEL: 'CANCELLED' },
+  PARTIALLY_FILLED: { PARTIAL_FILL: 'PARTIALLY_FILLED', FULL_FILL: 'FILLED', CANCEL: 'CANCELLED' },
+  FILLED: {},
+  CANCELLED: {},
+  REJECTED: {},
+};
+
+function next(current: Status, action: Action): Status {
+  const target = transitions[current][action];
+  if (!target) throw new Error(`${action} not allowed in ${current}`);
+  return target;
+}
+
+function replay(actions: Action[]): void {
+  let status: Status = 'PENDING';
+  const path: string[] = [status];
+  try {
+    for (const a of actions) {
+      status = next(status, a);
+      path.push(status);
+    }
+    console.log(path.join(' -> '));
+  } catch (err) {
+    console.log(`${path.join(' -> ')} | error: ${(err as Error).message}`);
+  }
+}
+
+replay(['SUBMIT', 'PARTIAL_FILL', 'PARTIAL_FILL', 'FULL_FILL']);
+replay(['SUBMIT', 'CANCEL']);
+replay(['SUBMIT', 'FULL_FILL', 'CANCEL']);
+console.log(`allowed from OPEN: ${Object.keys(transitions.OPEN).join(', ')}`);
+```
+
+```text
+PENDING -> OPEN -> PARTIALLY_FILLED -> PARTIALLY_FILLED -> FILLED
+PENDING -> OPEN -> CANCELLED
+PENDING -> OPEN -> FILLED | error: CANCEL not allowed in FILLED
+allowed from OPEN: PARTIAL_FILL, FULL_FILL, CANCEL
+```
+
+**Which one to choose?** Use the table when transitions are the main thing and the side effects are small or can be handled uniformly (for example with an `onEnter` hook map). Use state classes when each state has **real, different behavior**, for example a vending machine that computes change in one state and refuses in another. Libraries like XState are the table approach scaled up.
+
+## When to use / when NOT to use
+
+**Use it when**
+- An object has a clear lifecycle and its methods behave differently per state.
+- You see the same `switch (status)` repeated in several methods.
+
+**Don't use it when**
+- There are two or three states with trivial behavior. An enum and one guard are enough.
+- States only gate transitions. Use the table version.
+
+## Pitfalls
+
+- **Transitions scattered everywhere.** Keep `setState` calls inside state classes (or the table), never in random services.
+- **States holding per-order data.** Keep data such as `filled` on the context. Then states can be stateless and even shared as singletons.
+- **Persisting state objects.** Store the *status string* in the database and rebuild the state object on load with a factory.
+- **Concurrency.** Two fill events can race. In a real system, guard transitions with optimistic locking (a version column) or process events for one order sequentially.
+- **Forgetting terminal states.** Make it explicit that FILLED, CANCELLED, and REJECTED accept nothing.
+
+## Related patterns
+
+- **State vs Strategy.** Their structures are nearly identical. The difference is intent: a strategy is picked by the client and rarely changes, while states replace *each other* in response to events.
+- **State + Singleton/Flyweight.** Stateless state objects can be shared.
+- **State + Command.** Commands (such as `cancel`) are what trigger transitions.
+
+## Where it shows up in LLD interview problems
+
+- **Vending machine / ATM:** idle, has-card, has-pin, dispensing.
+- **Elevator:** idle, moving, doors open, maintenance.
+- **Order / booking / payment lifecycle:** e-commerce orders, BookMyShow seat hold → booked → released.
+- **Traffic light, media player, TCP connection, document workflow** (draft → review → published).
+
+*How to say it:* "The order's behavior depends on its status, so each status is a class implementing `OrderState`. The base class rejects everything, and each state overrides only what's legal. Status is persisted as a string and rehydrated through a factory."
+
+## Quick check
+
+1. What does `BaseState` throwing by default buy you?
+2. When is a transition table better than state classes?
+3. Where should per-order data like `filled` live?
+
+<details>
+<summary>Answer</summary>
+
+1. Illegal actions are rejected automatically. A new state only has to override the actions it allows, so you can't accidentally forget a guard.
+2. When states have no distinct behavior and only define which transitions are allowed. The table is shorter, easy to inspect, and can be config-driven.
+3. On the context (`Order`). That keeps state objects stateless and shareable.
+
+</details>

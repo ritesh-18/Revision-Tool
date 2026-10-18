@@ -1,0 +1,233 @@
+---
+title: "4.6 Prototype"
+---
+
+## Intent
+
+Create new objects by copying an existing, pre-configured object (the prototype) instead of building from scratch.
+
+## Problem
+
+Your options-trading screen lets users save **strategy templates**: an iron condor with four legs, each with strike offsets, lot sizes and a stop-loss config. When a user deploys the template for today's expiry, you want a copy they can tweak without altering the saved template. Building it from scratch means re-running a lot of configuration; copying a ready object is simpler. The same is true for game entities, document templates, or default notification settings.
+
+The trap: a shallow copy (`{ ...template }`) shares the nested `legs` array. Editing the copy edits the template.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class Prototype~T~ {
+        <<interface>>
+        +clone() T
+    }
+    class StrategyTemplate {
+        +string name
+        +Leg[] legs
+        +RiskConfig risk
+        +clone() StrategyTemplate
+        +payoffSummary() string
+    }
+    class TemplateRegistry {
+        -Map templates
+        +register(key, proto)
+        +create(key) StrategyTemplate
+    }
+    Prototype <|.. StrategyTemplate
+    TemplateRegistry o-- StrategyTemplate`} />
+
+## TypeScript implementation
+
+**The shallow-copy bug, then the fix with an explicit `clone()`** and a prototype registry:
+
+```ts
+interface Prototype<T> {
+  clone(): T;
+}
+
+interface Leg {
+  side: 'BUY' | 'SELL';
+  optionType: 'CE' | 'PE';
+  strikeOffset: number;
+  lots: number;
+}
+
+interface RiskConfig {
+  stopLossPct: number;
+  targetPct: number;
+}
+
+class StrategyTemplate implements Prototype<StrategyTemplate> {
+  constructor(
+    public name: string,
+    public legs: Leg[],
+    public risk: RiskConfig,
+    public createdAt: Date,
+  ) {}
+
+  clone(): StrategyTemplate {
+    // Deep-copy the mutable parts explicitly; methods survive because we call `new`.
+    return new StrategyTemplate(
+      this.name,
+      this.legs.map((leg) => ({ ...leg })),
+      { ...this.risk },
+      new Date(this.createdAt),
+    );
+  }
+
+  summary(): string {
+    const lots = this.legs.reduce((sum, l) => sum + l.lots, 0);
+    return `${this.name}: ${this.legs.length} legs, ${lots} lots, SL ${this.risk.stopLossPct}%`;
+  }
+}
+
+class TemplateRegistry {
+  private readonly templates = new Map<string, Prototype<StrategyTemplate>>();
+
+  register(key: string, proto: Prototype<StrategyTemplate>): void {
+    this.templates.set(key, proto);
+  }
+
+  create(key: string): StrategyTemplate {
+    const proto = this.templates.get(key);
+    if (!proto) throw new Error(`unknown template ${key}`);
+    return proto.clone();
+  }
+}
+
+const ironCondor = new StrategyTemplate(
+  'Iron Condor',
+  [
+    { side: 'SELL', optionType: 'CE', strikeOffset: 200, lots: 1 },
+    { side: 'BUY', optionType: 'CE', strikeOffset: 400, lots: 1 },
+    { side: 'SELL', optionType: 'PE', strikeOffset: -200, lots: 1 },
+    { side: 'BUY', optionType: 'PE', strikeOffset: -400, lots: 1 },
+  ],
+  { stopLossPct: 30, targetPct: 50 },
+  new Date(Date.UTC(2026, 0, 1)),
+);
+
+// ❌ Shallow copy shares nested arrays
+const shallow = { ...ironCondor, legs: ironCondor.legs };
+shallow.legs[0].lots = 5;
+console.log(`after shallow edit, template leg0 lots = ${ironCondor.legs[0].lots}`);
+ironCondor.legs[0].lots = 1; // undo the damage
+
+// ✅ Prototype clone via the registry
+const registry = new TemplateRegistry();
+registry.register('iron-condor', ironCondor);
+
+const today = registry.create('iron-condor');
+today.name = 'Iron Condor (NIFTY weekly)';
+today.legs.forEach((leg) => (leg.lots = 2));
+today.risk.stopLossPct = 20;
+
+console.log(today.summary());
+console.log(ironCondor.summary());
+console.log(`clone is a StrategyTemplate: ${today instanceof StrategyTemplate}`);
+```
+
+```text
+after shallow edit, template leg0 lots = 5
+Iron Condor (NIFTY weekly): 4 legs, 8 lots, SL 20%
+Iron Condor: 4 legs, 4 lots, SL 30%
+clone is a StrategyTemplate: true
+```
+
+**`structuredClone` caveats.** `structuredClone` (available in browsers and Node 17+) does a real deep copy and handles `Date`, `Map`, `Set`, typed arrays and even circular references. But it is *not* a general "clone any object" button:
+
+```ts
+class Position {
+  constructor(
+    public symbol: string,
+    public qty: number,
+  ) {}
+  value(ltp: number): number {
+    return this.qty * ltp;
+  }
+}
+
+const book = {
+  owner: 'ritesh',
+  positions: new Map([['INFY', new Position('INFY', 10)]]),
+  updatedAt: new Date(Date.UTC(2026, 8, 17)),
+};
+book.positions.set('SELF', book.positions.get('INFY')!); // shared reference
+
+const copy = structuredClone(book);
+
+// 1. Maps, Dates and shared references are preserved
+console.log(`Map preserved: ${copy.positions instanceof Map}, Date preserved: ${copy.updatedAt instanceof Date}`);
+console.log(`shared ref kept: ${copy.positions.get('INFY') === copy.positions.get('SELF')}`);
+console.log(`deep copy: ${copy.positions.get('INFY') !== book.positions.get('INFY')}`);
+
+// 2. Class identity and methods are LOST: you get a plain object
+const pos = copy.positions.get('INFY')!;
+console.log(`instanceof Position: ${pos instanceof Position}, has value(): ${typeof pos.value}`);
+
+// 3. Functions (and DOM nodes, class-private #fields' behaviour, etc.) cannot be cloned at all
+try {
+  structuredClone({ symbol: 'TCS', onTick: () => 1 });
+} catch (err) {
+  console.log(`clone failed: ${(err as Error).name}`);
+}
+```
+
+```text
+Map preserved: true, Date preserved: true
+shared ref kept: true
+deep copy: true
+instanceof Position: false, has value(): undefined
+clone failed: DataCloneError
+```
+
+Note the type lie in point 2: TypeScript still types `pos` as `Position`, so `pos.value(1500)` compiles and then crashes at runtime. Summary of the options:
+
+| Technique | Depth | Keeps class/methods | Dates/Maps | Functions |
+| --- | --- | --- | --- | --- |
+| `{ ...obj }` / `Object.assign` | shallow | no (plain object) | shared refs | copied by reference |
+| `JSON.parse(JSON.stringify(obj))` | deep | no | Date becomes string, Map becomes `{}` | dropped |
+| `structuredClone(obj)` | deep | no | yes | throws `DataCloneError` |
+| Hand-written `clone()` | you decide | yes | you decide | yes |
+
+For domain objects with behaviour, write `clone()`. Use `structuredClone` for plain data (DTOs, Redux-style state, JSON-like config).
+
+## When to use / when NOT to use
+
+- **Use** when objects are expensive to configure but cheap to copy, when you need many variations of a preset, or when the concrete class is unknown at the call site (you hold a `Prototype<T>`, you call `clone()`).
+- **Don't use** when objects are simple to construct (just call the constructor or a builder), or when they hold resources that must not be duplicated (sockets, file handles, DB connections).
+
+## Pitfalls
+
+- **Shallow copies** sharing nested arrays and objects (the bug shown above).
+- `structuredClone` **drops prototypes** while TypeScript still believes the type is the class.
+- Cloning objects with **identity** (IDs, idempotency keys): the clone must get a new ID.
+- Circular references break hand-written recursive clones (and `JSON.stringify`).
+- Forgetting to update `clone()` when a new field is added: add a unit test that compares field counts.
+
+## Related patterns
+
+- **Factory Method / Abstract Factory** create via `new` and subclasses; Prototype creates via copying, which avoids a parallel hierarchy of factories.
+- **Prototype registry** is similar to the registry-based Simple Factory, except it stores configured instances rather than constructors.
+- **Memento** (Chapter 6) also copies state, but to restore it later (undo), not to make new objects.
+- JavaScript's own **prototype chain** (`Object.create(proto)`) is related in name and spirit but is about sharing behaviour through delegation, not copying data.
+
+## Where it shows up in LLD interview problems
+
+- Document editor / slide builder: duplicate a shape or slide.
+- Game design: spawning many enemies or chess pieces from a preset.
+- Trading: strategy templates, basket orders ("repeat yesterday's basket").
+- Notification templates or default user settings copied per user.
+
+Interview line: *"Users start from a saved template and customise it, so I'll clone the template with an explicit deep `clone()`; I won't rely on spread because the legs array would be shared."*
+
+## Quick check
+
+1. You `structuredClone` a `Position` instance and call `.value()` on the result. What happens, and why doesn't TypeScript warn you?
+2. Why is `JSON.parse(JSON.stringify(x))` a poor clone for an order with a `placedAt: Date`?
+
+<details>
+<summary>Answers</summary>
+
+1. A runtime `TypeError` (`value is not a function`): `structuredClone` returns a plain object without the class prototype. Its signature is `structuredClone<T>(value: T): T`, so TypeScript trusts that the type is preserved.
+2. The `Date` becomes an ISO string, so `order.placedAt.getTime()` fails, and any `Map`/`Set`/`undefined` fields are lost too.
+
+</details>

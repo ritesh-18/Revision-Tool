@@ -1,0 +1,888 @@
+---
+title: "11.2 Food Ordering (Swiggy / Zomato)"
+---
+
+## Problem & where it's asked
+
+Build the core of a food-delivery app: restaurants with menus, a cart, checkout with coupons, an **order lifecycle** that restaurants and delivery partners drive forward, delivery partner assignment, and ratings that feed "top restaurants" search.
+
+| Company | What was reported | Confidence |
+|---|---|---|
+| Salesforce (2026) | Food items across restaurants, place an order, rate it, top-rated restaurants and items | reported |
+| Walmart (2026) | Restaurant food ordering; follow-ups on selection strategy and order states | reported |
+| Flipkart, Uber, Zepto | Listed as food-ordering/delivery LLD askers | reported (lists, less detail) |
+| Swiggy, Zomato | Natural fit, but little public LLD-specific data (Zomato especially) | uncertain |
+
+Graders look for **order state transitions that can't be skipped**, a **Strategy** for partner assignment and pricing, **Observer** for status updates, and sensible **indexing/sorting** for "top rated".
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Can a cart hold items from two restaurants? | No. Swiggy asks you to clear the cart first, so we throw `CartConflictError`. |
+| What does the bill contain? | Item total, delivery fee (distance-based, free above ₹499), coupon discount, and 5% GST on (items − discount). Everything in paise. |
+| Which coupons? | Flat (₹X off above a minimum) and percentage (Y% capped at ₹Z above a minimum). One coupon per order. |
+| When is a delivery partner assigned? | When the restaurant accepts. If nobody is free, the order waits in a FIFO queue and gets the next freed partner. |
+| How do we pick the partner? | The nearest available partner to the restaurant, behind a strategy interface. |
+| Who can cancel, and when? | Customer or restaurant, only before preparation starts (`PLACED` / `ACCEPTED`). |
+| Ratings? | 1–5 stars for the restaurant and optionally per item, once per delivered order. |
+| Location model? | 2-D km grid coordinates. Real systems use lat/long with geohash, which is out of scope. |
+
+## Requirements
+
+**Functional**
+1. Onboard restaurants, menu items (price, veg flag, availability) and delivery partners.
+2. Cart: add/remove/clear items (single restaurant only).
+3. Place an order with an optional coupon. Re-validate availability and freeze prices on the order.
+4. Order lifecycle: `PLACED → ACCEPTED → PREPARING → READY → PICKED_UP → DELIVERED`, plus `REJECTED` / `CANCELLED`.
+5. Assign a delivery partner via a pluggable strategy, and queue the order when none is free.
+6. Rate a delivered order. Search for top-rated restaurants and each restaurant's best item.
+7. Notify observers (customer app, restaurant dashboard) on every status change.
+
+**Non-functional**
+- Illegal transitions are impossible, not merely discouraged.
+- Money is integer paise with explicit rounding.
+- New coupon types and assignment strategies can be added without editing `OrderService`.
+
+**Out of scope**
+- Payments (see 11.6), real geo-indexing, ETA prediction, restaurant search by text, multiple addresses.
+
+## Entities & relationships
+
+| Entity | Key fields | Relationships |
+|---|---|---|
+| `Restaurant` | id, name, location, open, rating | has many `MenuItem`s |
+| `MenuItem` | id, name, pricePaise, veg, available, rating | belongs to one restaurant |
+| `Customer` | id, name, location | has one `Cart`, many `Order`s |
+| `Cart` | userId, restaurantId?, lines | lines reference menu items (live prices) |
+| `Order` | id, lines (frozen), bill, status, history, partnerId? | one restaurant, one customer, 0..1 partner |
+| `Bill` | itemTotal, deliveryFee, discount, tax, total | value object inside `Order` |
+| `DeliveryPartner` | id, location, activeOrderId? | 0..1 active order |
+| `Coupon` (interface) | code, discountFor(itemTotal) | Flat / Percent implementations |
+| `PartnerAssignmentStrategy` | pick(partners, restaurant) | Nearest (and more) |
+| `OrderObserver` | onStatusChange(order, from, to) | notified by `OrderService` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Restaurant {
+        +id
+        +name
+        +location
+        +isOpen
+        +rating
+    }
+    class MenuItem {
+        +id
+        +pricePaise
+        +veg
+        +available
+    }
+    class Cart {
+        +add(restaurant, item, qty)
+        +remove(itemId)
+        +clear()
+    }
+    class Order {
+        +status
+        +bill
+        +partnerId
+        +transition(to, at)
+    }
+    class DeliveryPartner {
+        +location
+        +activeOrderId
+    }
+    class Coupon {
+        <<interface>>
+        +discountFor(itemTotal)
+    }
+    class PartnerAssignmentStrategy {
+        <<interface>>
+        +pick(partners, restaurant)
+    }
+    class OrderObserver {
+        <<interface>>
+        +onStatusChange(order, from, to)
+    }
+    class PricingService
+    class OrderService
+    Restaurant "1" *-- "many" MenuItem
+    Cart --> MenuItem
+    Order --> Restaurant
+    Order --> DeliveryPartner
+    Coupon <|.. FlatCoupon
+    Coupon <|.. PercentCoupon
+    PartnerAssignmentStrategy <|.. NearestPartnerStrategy
+    PricingService --> Coupon
+    OrderService --> PricingService
+    OrderService --> PartnerAssignmentStrategy
+    OrderService --> OrderObserver
+    OrderService --> Order`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> PLACED
+    PLACED --> ACCEPTED : restaurant accepts
+    PLACED --> REJECTED : restaurant rejects
+    PLACED --> CANCELLED : customer cancels
+    ACCEPTED --> PREPARING
+    ACCEPTED --> CANCELLED
+    PREPARING --> READY
+    READY --> PICKED_UP : assigned partner
+    PICKED_UP --> DELIVERED
+    DELIVERED --> [*]
+    CANCELLED --> [*]
+    REJECTED --> [*]`} />
+
+## Design decisions & patterns
+
+- **State machine as a transition table** (`Record<OrderStatus, OrderStatus[]>`): one data structure answers "is this legal?", and the diagram above is generated from it in your head. With 8 states and no per-state behaviour, the full **State pattern** (a class per state) is overkill. Switch to it if states start owning logic, such as "PREPARING has a timer that auto-escalates".
+- **Strategy for partner assignment**: nearest-first today. Tomorrow it might be "best rated within 3 km" or "batch two orders on one bike". `OrderService` only calls `pick()`.
+- **Strategy for coupons and delivery fee**: marketing invents coupon types weekly. Each coupon validates itself (minimum order) and computes its own discount.
+- **Observer for status updates**: the customer app, restaurant dashboard and analytics subscribe. `OrderService` just announces.
+- **Prices frozen on the order**: the cart holds a *reference* to the menu. At checkout we copy prices into the order, so a later menu price change doesn't rewrite history.
+- **Pending-assignment queue**: "no partner free" is a normal business situation, not an exception. Orders wait FIFO and are assigned as soon as a partner is freed.
+- **Ratings as a running aggregate** (`sum`, `count`): O(1) update, O(1) average. *Rejected:* storing every rating and averaging on each search.
+
+## Implementation
+
+**Part 1 — enums, errors, value objects and models.**
+
+```ts
+type OrderStatus = 'PLACED' | 'ACCEPTED' | 'PREPARING' | 'READY' | 'PICKED_UP' | 'DELIVERED' | 'CANCELLED' | 'REJECTED';
+
+const TRANSITIONS: Readonly<Record<OrderStatus, readonly OrderStatus[]>> = {
+  PLACED: ['ACCEPTED', 'REJECTED', 'CANCELLED'],
+  ACCEPTED: ['PREPARING', 'CANCELLED'],
+  PREPARING: ['READY'],
+  READY: ['PICKED_UP'],
+  PICKED_UP: ['DELIVERED'],
+  DELIVERED: [],
+  CANCELLED: [],
+  REJECTED: [],
+};
+
+class FoodError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class ValidationError extends FoodError {}
+class NotFoundError extends FoodError {}
+class CartConflictError extends FoodError {}
+class InvalidTransitionError extends FoodError {}
+class CouponError extends FoodError {}
+
+interface Clock { now(): number; }
+class FakeClock implements Clock {
+  constructor(private t: number) {}
+  now(): number { return this.t; }
+  advance(ms: number): void { this.t += ms; }
+}
+interface IdGenerator { next(prefix: string): string; }
+class SeqIds implements IdGenerator {
+  private readonly counters = new Map<string, number>();
+  next(prefix: string): string {
+    const n = (this.counters.get(prefix) ?? 0) + 1;
+    this.counters.set(prefix, n);
+    return `${prefix}${n}`;
+  }
+}
+
+interface Location { x: number; y: number; } // km on a grid
+const distanceKm = (a: Location, b: Location): number => Math.hypot(a.x - b.x, a.y - b.y);
+const rupees = (paise: number): string => `Rs ${(paise / 100).toFixed(2)}`;
+
+class RatingAggregate {
+  private sum = 0;
+  private count = 0;
+  add(stars: number): void {
+    if (!Number.isInteger(stars) || stars < 1 || stars > 5) throw new ValidationError(`stars must be 1..5, got ${stars}`);
+    this.sum += stars;
+    this.count += 1;
+  }
+  get average(): number { return this.count === 0 ? 0 : this.sum / this.count; }
+  get votes(): number { return this.count; }
+}
+
+class MenuItem {
+  readonly rating = new RatingAggregate();
+  available = true;
+  constructor(readonly id: string, readonly restaurantId: string, readonly name: string,
+              public pricePaise: number, readonly veg: boolean) {
+    if (!Number.isInteger(pricePaise) || pricePaise <= 0) throw new ValidationError(`bad price for ${name}`);
+  }
+}
+
+class Restaurant {
+  readonly menu = new Map<string, MenuItem>();
+  readonly rating = new RatingAggregate();
+  isOpen = true;
+  constructor(readonly id: string, readonly name: string, readonly location: Location) {}
+}
+
+interface Customer { id: string; name: string; location: Location; }
+
+class DeliveryPartner {
+  activeOrderId: string | undefined = undefined;
+  constructor(readonly id: string, readonly name: string, public location: Location) {}
+  get isFree(): boolean { return this.activeOrderId === undefined; }
+}
+
+interface CartLine { itemId: string; name: string; qty: number; }
+
+class Cart {
+  restaurantId: string | undefined = undefined;
+  readonly lines = new Map<string, CartLine>();
+  constructor(readonly userId: string) {}
+
+  add(item: MenuItem, qty: number): void {
+    if (!Number.isInteger(qty) || qty <= 0) throw new ValidationError('qty must be a positive integer');
+    if (this.restaurantId && this.restaurantId !== item.restaurantId) {
+      throw new CartConflictError('cart has items from another restaurant; clear it first');
+    }
+    if (!item.available) throw new ValidationError(`${item.name} is unavailable`);
+    this.restaurantId = item.restaurantId;
+    const line = this.lines.get(item.id);
+    this.lines.set(item.id, { itemId: item.id, name: item.name, qty: (line?.qty ?? 0) + qty });
+  }
+  remove(itemId: string): void {
+    this.lines.delete(itemId);
+    if (this.lines.size === 0) this.restaurantId = undefined;
+  }
+  clear(): void { this.lines.clear(); this.restaurantId = undefined; }
+}
+
+interface OrderLine { itemId: string; name: string; qty: number; unitPricePaise: number; }
+interface Bill { itemTotal: number; deliveryFee: number; discount: number; tax: number; total: number; }
+
+class Order {
+  status: OrderStatus = 'PLACED';
+  partnerId: string | undefined = undefined;
+  rated = false;
+  readonly history: { status: OrderStatus; at: number }[];
+  constructor(readonly id: string, readonly customerId: string, readonly restaurantId: string,
+              readonly lines: readonly OrderLine[], readonly bill: Bill, placedAt: number) {
+    this.history = [{ status: 'PLACED', at: placedAt }];
+  }
+  canTransition(to: OrderStatus): boolean { return TRANSITIONS[this.status].includes(to); }
+  transition(to: OrderStatus, at: number): OrderStatus {
+    if (!this.canTransition(to)) throw new InvalidTransitionError(`order ${this.id}: ${this.status} -> ${to} not allowed`);
+    const from = this.status;
+    this.status = to;
+    this.history.push({ status: to, at });
+    return from;
+  }
+}
+```
+
+**Part 2 — repositories.** One small generic repository is enough. It throws `NotFoundError` so callers never juggle `undefined`.
+
+```ts
+class Repo<T extends { id: string }> {
+  private readonly items = new Map<string, T>();
+  constructor(private readonly kind: string) {}
+  save(item: T): T { this.items.set(item.id, item); return item; }
+  get(id: string): T {
+    const item = this.items.get(id);
+    if (!item) throw new NotFoundError(`${this.kind} ${id} not found`);
+    return item;
+  }
+  all(): T[] { return [...this.items.values()]; }
+}
+```
+
+**Part 3 — strategies: coupons, delivery fee, partner assignment.**
+
+```ts
+interface Coupon {
+  readonly code: string;
+  discountFor(itemTotalPaise: number): number; // throws CouponError if not applicable
+}
+
+class FlatCoupon implements Coupon {
+  constructor(readonly code: string, private readonly offPaise: number, private readonly minOrderPaise: number) {}
+  discountFor(itemTotal: number): number {
+    if (itemTotal < this.minOrderPaise) throw new CouponError(`${this.code} needs a minimum order of ${rupees(this.minOrderPaise)}`);
+    return Math.min(this.offPaise, itemTotal);
+  }
+}
+
+class PercentCoupon implements Coupon {
+  constructor(readonly code: string, private readonly percent: number,
+              private readonly capPaise: number, private readonly minOrderPaise: number) {
+    if (percent <= 0 || percent > 100) throw new ValidationError('percent must be in (0, 100]');
+  }
+  discountFor(itemTotal: number): number {
+    if (itemTotal < this.minOrderPaise) throw new CouponError(`${this.code} needs a minimum order of ${rupees(this.minOrderPaise)}`);
+    return Math.min(Math.floor((itemTotal * this.percent) / 100), this.capPaise);
+  }
+}
+
+interface DeliveryFeeStrategy { feeFor(distanceKm: number, itemTotalPaise: number): number; }
+
+class DistanceSlabFee implements DeliveryFeeStrategy {
+  constructor(private readonly basePaise: number, private readonly perKmPaise: number,
+              private readonly freeKm: number, private readonly freeAbovePaise: number) {}
+  feeFor(distance: number, itemTotal: number): number {
+    if (itemTotal >= this.freeAbovePaise) return 0;
+    const extraKm = Math.max(0, Math.ceil(distance - this.freeKm));
+    return this.basePaise + extraKm * this.perKmPaise;
+  }
+}
+
+interface PartnerAssignmentStrategy {
+  pick(freePartners: readonly DeliveryPartner[], restaurant: Restaurant): DeliveryPartner | undefined;
+}
+
+class NearestPartnerStrategy implements PartnerAssignmentStrategy {
+  constructor(private readonly maxKm: number) {}
+  pick(free: readonly DeliveryPartner[], restaurant: Restaurant): DeliveryPartner | undefined {
+    return free
+      .map((p) => ({ p, d: distanceKm(p.location, restaurant.location) }))
+      .filter(({ d }) => d <= this.maxKm)
+      .sort((a, b) => a.d - b.d || a.p.id.localeCompare(b.p.id))[0]?.p;
+  }
+}
+```
+
+**Part 4 — services: pricing, catalogue and orders.**
+
+```ts
+const GST_PERCENT = 5;
+
+class PricingService {
+  private readonly coupons = new Map<string, Coupon>();
+  constructor(private readonly feeStrategy: DeliveryFeeStrategy) {}
+  addCoupon(c: Coupon): void { this.coupons.set(c.code, c); }
+
+  quote(lines: readonly OrderLine[], distance: number, couponCode?: string): Bill {
+    const itemTotal = lines.reduce((sum, l) => sum + l.unitPricePaise * l.qty, 0);
+    let discount = 0;
+    if (couponCode !== undefined) {
+      const coupon = this.coupons.get(couponCode);
+      if (!coupon) throw new CouponError(`unknown coupon ${couponCode}`);
+      discount = coupon.discountFor(itemTotal);
+    }
+    const deliveryFee = this.feeStrategy.feeFor(distance, itemTotal);
+    const tax = Math.round(((itemTotal - discount) * GST_PERCENT) / 100);
+    return { itemTotal, deliveryFee, discount, tax, total: itemTotal - discount + deliveryFee + tax };
+  }
+}
+
+class CatalogService {
+  constructor(private readonly restaurants: Repo<Restaurant>, private readonly ids: IdGenerator) {}
+
+  addRestaurant(name: string, location: Location): Restaurant {
+    return this.restaurants.save(new Restaurant(this.ids.next('R'), name, location));
+  }
+  addItem(restaurantId: string, name: string, pricePaise: number, veg: boolean): MenuItem {
+    const r = this.restaurants.get(restaurantId);
+    const item = new MenuItem(this.ids.next('I'), r.id, name, pricePaise, veg);
+    r.menu.set(item.id, item);
+    return item;
+  }
+  item(restaurantId: string, itemId: string): MenuItem {
+    const item = this.restaurants.get(restaurantId).menu.get(itemId);
+    if (!item) throw new NotFoundError(`item ${itemId} not found`);
+    return item;
+  }
+  topRestaurants(limit: number, minVotes = 1): Restaurant[] {
+    return this.restaurants.all()
+      .filter((r) => r.rating.votes >= minVotes)
+      .sort((a, b) => b.rating.average - a.rating.average || a.name.localeCompare(b.name))
+      .slice(0, limit);
+  }
+  bestItem(restaurantId: string): MenuItem | undefined {
+    return [...this.restaurants.get(restaurantId).menu.values()]
+      .filter((i) => i.rating.votes > 0)
+      .sort((a, b) => b.rating.average - a.rating.average)[0];
+  }
+}
+
+interface OrderObserver { onStatusChange(order: Order, from: OrderStatus | 'NEW', to: OrderStatus): void; }
+
+class OrderService {
+  private readonly carts = new Map<string, Cart>();
+  private readonly waitingForPartner: string[] = []; // FIFO of order ids
+  private readonly observers: OrderObserver[] = [];
+
+  constructor(
+    private readonly customers: Repo<Customer>,
+    private readonly restaurants: Repo<Restaurant>,
+    private readonly partners: Repo<DeliveryPartner>,
+    private readonly orders: Repo<Order>,
+    private readonly catalog: CatalogService,
+    private readonly pricing: PricingService,
+    private readonly assignment: PartnerAssignmentStrategy,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+  ) {}
+
+  subscribe(o: OrderObserver): void { this.observers.push(o); }
+
+  cartOf(customerId: string): Cart {
+    this.customers.get(customerId);
+    let cart = this.carts.get(customerId);
+    if (!cart) { cart = new Cart(customerId); this.carts.set(customerId, cart); }
+    return cart;
+  }
+
+  addToCart(customerId: string, restaurantId: string, itemId: string, qty: number): void {
+    this.cartOf(customerId).add(this.catalog.item(restaurantId, itemId), qty);
+  }
+
+  placeOrder(customerId: string, couponCode?: string): Order {
+    const customer = this.customers.get(customerId);
+    const cart = this.cartOf(customerId);
+    if (!cart.restaurantId || cart.lines.size === 0) throw new ValidationError('cart is empty');
+    const restaurant = this.restaurants.get(cart.restaurantId);
+    if (!restaurant.isOpen) throw new ValidationError(`${restaurant.name} is closed`);
+
+    // Re-validate and freeze prices at checkout time.
+    const lines: OrderLine[] = [...cart.lines.values()].map((l) => {
+      const item = this.catalog.item(restaurant.id, l.itemId);
+      if (!item.available) throw new ValidationError(`${item.name} went out of stock`);
+      return { itemId: item.id, name: item.name, qty: l.qty, unitPricePaise: item.pricePaise };
+    });
+    const bill = this.pricing.quote(lines, distanceKm(restaurant.location, customer.location), couponCode);
+    const order = this.orders.save(new Order(this.ids.next('O'), customer.id, restaurant.id, lines, bill, this.clock.now()));
+    cart.clear();
+    this.emit(order, 'NEW', 'PLACED');
+    return order;
+  }
+
+  accept(orderId: string): void {
+    const order = this.move(orderId, 'ACCEPTED');
+    this.waitingForPartner.push(order.id);
+    this.assignWaitingOrders();
+  }
+  reject(orderId: string): void { this.move(orderId, 'REJECTED'); }
+  startPreparing(orderId: string): void { this.move(orderId, 'PREPARING'); }
+  markReady(orderId: string): void { this.move(orderId, 'READY'); }
+
+  pickUp(orderId: string, partnerId: string): void {
+    const order = this.orders.get(orderId);
+    if (order.partnerId !== partnerId) throw new ValidationError(`partner ${partnerId} is not assigned to ${orderId}`);
+    this.move(orderId, 'PICKED_UP');
+  }
+
+  deliver(orderId: string): void {
+    const order = this.move(orderId, 'DELIVERED');
+    this.releasePartner(order);
+  }
+
+  cancel(orderId: string): void {
+    const order = this.move(orderId, 'CANCELLED');
+    const idx = this.waitingForPartner.indexOf(order.id);
+    if (idx >= 0) this.waitingForPartner.splice(idx, 1);
+    this.releasePartner(order);
+  }
+
+  rate(orderId: string, customerId: string, restaurantStars: number, itemStars: Record<string, number> = {}): void {
+    const order = this.orders.get(orderId);
+    if (order.customerId !== customerId) throw new ValidationError('only the customer can rate this order');
+    if (order.status !== 'DELIVERED') throw new ValidationError(`cannot rate an order in ${order.status}`);
+    if (order.rated) throw new ValidationError(`order ${orderId} already rated`);
+    const restaurant = this.restaurants.get(order.restaurantId);
+    restaurant.rating.add(restaurantStars);
+    for (const [itemId, stars] of Object.entries(itemStars)) {
+      if (!order.lines.some((l) => l.itemId === itemId)) throw new ValidationError(`item ${itemId} not in order`);
+      this.catalog.item(restaurant.id, itemId).rating.add(stars);
+    }
+    order.rated = true;
+  }
+
+  // ---- internals ----
+  private move(orderId: string, to: OrderStatus): Order {
+    const order = this.orders.get(orderId);
+    const from = order.transition(to, this.clock.now());
+    this.emit(order, from, to);
+    return order;
+  }
+
+  private releasePartner(order: Order): void {
+    if (!order.partnerId) return;
+    const partner = this.partners.get(order.partnerId);
+    partner.activeOrderId = undefined;
+    partner.location = this.restaurants.get(order.restaurantId).location; // rough: partner is near the last pickup
+    this.assignWaitingOrders();
+  }
+
+  private assignWaitingOrders(): void {
+    while (this.waitingForPartner.length > 0) {
+      const order = this.orders.get(this.waitingForPartner[0]!);
+      const restaurant = this.restaurants.get(order.restaurantId);
+      const partner = this.assignment.pick(this.partners.all().filter((p) => p.isFree), restaurant);
+      if (!partner) {
+        console.log(`  [dispatch] no partner free for ${order.id}; queued (${this.waitingForPartner.length} waiting)`);
+        return;
+      }
+      this.waitingForPartner.shift();
+      partner.activeOrderId = order.id;   // reserve synchronously
+      order.partnerId = partner.id;
+      console.log(`  [dispatch] ${partner.name} -> ${order.id}`);
+    }
+  }
+
+  private emit(order: Order, from: OrderStatus | 'NEW', to: OrderStatus): void {
+    for (const o of this.observers) o.onStatusChange(order, from, to);
+  }
+}
+```
+
+**Part 5 — observers and demo.**
+
+```ts
+class CustomerAppNotifier implements OrderObserver {
+  onStatusChange(order: Order, from: OrderStatus | 'NEW', to: OrderStatus): void {
+    if (to === 'PREPARING' || to === 'READY') return; // customers don't need every hop
+    console.log(`  [app:${order.customerId}] ${order.id} ${from} -> ${to}`);
+  }
+}
+
+const clock = new FakeClock(0);
+const ids = new SeqIds();
+const restaurants = new Repo<Restaurant>('restaurant');
+const customers = new Repo<Customer>('customer');
+const partners = new Repo<DeliveryPartner>('partner');
+const orders = new Repo<Order>('order');
+const catalog = new CatalogService(restaurants, ids);
+const pricing = new PricingService(new DistanceSlabFee(2000, 800, 2, 49900));
+pricing.addCoupon(new FlatCoupon('FLAT100', 10000, 29900));
+pricing.addCoupon(new PercentCoupon('PCT20', 20, 12000, 19900));
+const svc = new OrderService(customers, restaurants, partners, orders, catalog, pricing,
+  new NearestPartnerStrategy(6), clock, ids);
+svc.subscribe(new CustomerAppNotifier());
+
+const run = (label: string, fn: () => void): void => {
+  try { fn(); } catch (err) {
+    console.log(`  ✗ ${label}: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+  }
+};
+const showBill = (o: Order): string =>
+  `items ${rupees(o.bill.itemTotal)} - disc ${rupees(o.bill.discount)} + fee ${rupees(o.bill.deliveryFee)} + gst ${rupees(o.bill.tax)} = ${rupees(o.bill.total)}`;
+
+const meghana = catalog.addRestaurant('Meghana Biryani', { x: 0, y: 0 });
+const biryani = catalog.addItem(meghana.id, 'Chicken Biryani', 34900, false);
+const raita = catalog.addItem(meghana.id, 'Raita', 4900, true);
+const pizzaHub = catalog.addRestaurant('Pizza Hub', { x: 5, y: 5 });
+const margherita = catalog.addItem(pizzaHub.id, 'Margherita', 24900, true);
+const dosaCorner = catalog.addRestaurant('Dosa Corner', { x: 1, y: 1 });
+const dosa = catalog.addItem(dosaCorner.id, 'Masala Dosa', 9900, true);
+
+customers.save({ id: 'C1', name: 'Asha', location: { x: 2, y: 1 } });
+customers.save({ id: 'C2', name: 'Ravi', location: { x: 6, y: 5 } });
+customers.save({ id: 'C3', name: 'Neha', location: { x: 1, y: 3 } });
+partners.save(new DeliveryPartner('P1', 'Imran', { x: 1, y: 0 }));
+partners.save(new DeliveryPartner('P2', 'Kiran', { x: 4, y: 4 }));
+
+console.log('# Cart rules');
+svc.addToCart('C1', meghana.id, biryani.id, 2);
+svc.addToCart('C1', meghana.id, raita.id, 1);
+run('add pizza to biryani cart', () => svc.addToCart('C1', pizzaHub.id, margherita.id, 1));
+
+console.log('# Checkout');
+const o1 = svc.placeOrder('C1', 'FLAT100');
+console.log(`  ${o1.id}: ${showBill(o1)}`);
+svc.addToCart('C2', pizzaHub.id, margherita.id, 1);
+run('place C2 order with PCT20', () => {
+  const o = svc.placeOrder('C2', 'PCT20');
+  console.log(`  ${o.id}: ${showBill(o)}`);
+});
+svc.addToCart('C3', dosaCorner.id, dosa.id, 1);
+run('FLAT100 on a Rs 99 order', () => svc.placeOrder('C3', 'FLAT100'));
+const o3 = svc.placeOrder('C3');
+console.log(`  ${o3.id}: ${showBill(o3)}`);
+
+console.log('# Restaurants accept; partners assigned nearest-first');
+svc.accept('O1');
+svc.accept('O2');
+svc.accept('O3');
+
+console.log('# O1 lifecycle');
+run('pick up before ready', () => svc.pickUp('O1', 'P1'));
+clock.advance(60_000);
+svc.startPreparing('O1');
+svc.markReady('O1');
+run('wrong partner picks up', () => svc.pickUp('O1', 'P2'));
+svc.pickUp('O1', 'P1');
+svc.deliver('O1');
+
+console.log('# Cancellations');
+run('cancel delivered O1', () => svc.cancel('O1'));
+svc.cancel('O2');
+console.log(`  O3 partner: ${orders.get('O3').partnerId}, P2 free: ${partners.get('P2').isFree}`);
+
+console.log('# Ratings and search');
+run('rate cancelled O2', () => svc.rate('O2', 'C2', 5));
+svc.rate('O1', 'C1', 4, { [biryani.id]: 5, [raita.id]: 3 });
+run('rate O1 twice', () => svc.rate('O1', 'C1', 5));
+for (const id of ['O3']) {
+  svc.startPreparing(id); svc.markReady(id); svc.pickUp(id, 'P1'); svc.deliver(id);
+}
+svc.rate('O3', 'C3', 5, { [dosa.id]: 4 });
+const top = catalog.topRestaurants(3).map((r) => `${r.name} (${r.rating.average.toFixed(1)})`);
+console.log(`  top: ${top.join(', ')}`);
+console.log(`  best at ${meghana.name}: ${catalog.bestItem(meghana.id)?.name ?? 'n/a'}`);
+console.log(`  O1 timeline: ${o1.history.map((h) => `${h.status}@${h.at / 1000}s`).join(' > ')}`);
+```
+
+## Demo output
+
+```text
+# Cart rules
+  ✗ add pizza to biryani cart: CartConflictError: cart has items from another restaurant; clear it first
+# Checkout
+  [app:C1] O1 NEW -> PLACED
+  O1: items Rs 747.00 - disc Rs 100.00 + fee Rs 0.00 + gst Rs 32.35 = Rs 679.35
+  [app:C2] O2 NEW -> PLACED
+  O2: items Rs 249.00 - disc Rs 49.80 + fee Rs 20.00 + gst Rs 9.96 = Rs 229.16
+  ✗ FLAT100 on a Rs 99 order: CouponError: FLAT100 needs a minimum order of Rs 299.00
+  [app:C3] O3 NEW -> PLACED
+  O3: items Rs 99.00 - disc Rs 0.00 + fee Rs 20.00 + gst Rs 4.95 = Rs 123.95
+# Restaurants accept; partners assigned nearest-first
+  [app:C1] O1 PLACED -> ACCEPTED
+  [dispatch] Imran -> O1
+  [app:C2] O2 PLACED -> ACCEPTED
+  [dispatch] Kiran -> O2
+  [app:C3] O3 PLACED -> ACCEPTED
+  [dispatch] no partner free for O3; queued (1 waiting)
+# O1 lifecycle
+  ✗ pick up before ready: InvalidTransitionError: order O1: ACCEPTED -> PICKED_UP not allowed
+  ✗ wrong partner picks up: ValidationError: partner P2 is not assigned to O1
+  [app:C1] O1 READY -> PICKED_UP
+  [app:C1] O1 PICKED_UP -> DELIVERED
+  [dispatch] Imran -> O3
+# Cancellations
+  ✗ cancel delivered O1: InvalidTransitionError: order O1: DELIVERED -> CANCELLED not allowed
+  [app:C2] O2 ACCEPTED -> CANCELLED
+  O3 partner: P1, P2 free: true
+# Ratings and search
+  ✗ rate cancelled O2: ValidationError: cannot rate an order in CANCELLED
+  ✗ rate O1 twice: ValidationError: order O1 already rated
+  [app:C3] O3 READY -> PICKED_UP
+  [app:C3] O3 PICKED_UP -> DELIVERED
+  top: Dosa Corner (5.0), Meghana Biryani (4.0)
+  best at Meghana Biryani: Chicken Biryani
+  O1 timeline: PLACED@0s > ACCEPTED@0s > PREPARING@60s > READY@60s > PICKED_UP@60s > DELIVERED@60s
+```
+
+A few details are worth pointing at in an interview. The Rs 99 order failed the coupon but could still be placed without it. `O2` went to Kiran because Imran was already busy. `O3` waited in the queue, then got Imran the moment `O1` was delivered. Cancelling `O2` freed Kiran, and the "P2 free: true" line confirms no stale reservation was left behind.
+
+## Concurrency
+
+**The race.** In a real system, "assign a partner" isn't instant. We *offer* the order to the partner's app and wait for a response. If the code picks a partner, `await`s the offer, and only then marks the partner busy, two orders accepted at the same moment both pick the nearest partner:
+
+```ts
+// ❌ pick -> await -> mark busy
+const p = strategy.pick(freePartners(), restaurant);   // both requests get Imran
+await partnerApp.offer(p, order);                      // both offers go out
+p.activeOrderId = order.id;                            // last writer wins; one order is orphaned
+```
+
+**The fix.** **Reserve synchronously before the first `await`** (compare-and-set). If the partner declines or times out, release the reservation and try the next candidate.
+
+```ts
+interface Partner { id: string; km: number; activeOrderId?: string; acceptsOffers: boolean; }
+
+const partners: Partner[] = [
+  { id: 'Imran', km: 0.5, acceptsOffers: true },
+  { id: 'Kiran', km: 1.2, acceptsOffers: false }, // will decline
+  { id: 'Sunil', km: 2.0, acceptsOffers: true },
+];
+
+const offer = async (p: Partner, orderId: string): Promise<boolean> => {
+  await new Promise((r) => setTimeout(r, 5)); // network round-trip to the partner app
+  return p.acceptsOffers;
+};
+const nearestFree = (exclude: Set<string>): Partner | undefined =>
+  partners.filter((p) => !p.activeOrderId && !exclude.has(p.id)).sort((a, b) => a.km - b.km)[0];
+
+async function assignNaive(orderId: string): Promise<string> {
+  const p = nearestFree(new Set());
+  if (!p) return 'none';
+  if (!(await offer(p, orderId))) return 'declined';
+  p.activeOrderId = orderId;
+  return p.id;
+}
+
+/** Atomic compare-and-set: no await between the check and the write. */
+function tryReserve(p: Partner, orderId: string): boolean {
+  if (p.activeOrderId) return false;
+  p.activeOrderId = orderId;
+  return true;
+}
+
+async function assignSafe(orderId: string): Promise<string> {
+  const tried = new Set<string>();
+  for (let p = nearestFree(tried); p; p = nearestFree(tried)) {
+    tried.add(p.id);
+    if (!tryReserve(p, orderId)) continue;
+    if (await offer(p, orderId)) return p.id;
+    p.activeOrderId = undefined; // declined: release and try the next one
+  }
+  return 'none';
+}
+
+const naive = await Promise.all(['O1', 'O2'].map(assignNaive));
+console.log(`naive: O1->${naive[0]}, O2->${naive[1]}, Imran holds ${partners[0]!.activeOrderId}`);
+
+for (const p of partners) p.activeOrderId = undefined;
+const safe = await Promise.all(['O1', 'O2', 'O3'].map(assignSafe));
+console.log(`safe : O1->${safe[0]}, O2->${safe[1]}, O3->${safe[2]}`);
+console.log(`holds: ${partners.map((p) => `${p.id}=${p.activeOrderId ?? '-'}`).join(' ')}`);
+```
+
+```text
+naive: O1->Imran, O2->Imran, Imran holds O2
+safe : O1->Imran, O2->none, O3->Sunil
+holds: Imran=O1 Kiran=- Sunil=O3
+```
+
+The naive version gave Imran to both orders, and `O1` believes it has a partner who is actually carrying `O2`. The safe version never double-books. Kiran declined `O2` and his reservation was released, but by then Imran and Sunil were both reserved, so `O2` correctly got `none` (in the full design it goes back into the waiting queue). Across multiple servers, the same compare-and-set becomes `UPDATE partners SET active_order = ? WHERE id = ? AND active_order IS NULL` (check that exactly one row was affected), or a Redis `SET NX` lock with a TTL.
+
+## Extensions & follow-ups
+
+| Follow-up | How the design changes |
+|---|---|
+| "Highest-rated item per restaurant" (reported) | Already `bestItem()`. For speed, keep a per-restaurant max updated on each rating. |
+| "Top restaurants fast with 1M restaurants" | Keep a sorted index (a heap or sorted set keyed by rating), updated on rating. Filter by city or geohash first. |
+| "Restaurant selection strategy" (reported) | `RestaurantRankingStrategy` (rating, distance, delivery time, promoted) used by search. |
+| Refund on cancellation | A `RefundPolicy` strategy keyed by state and actor. Implemented below. |
+| Order batching | The assignment strategy returns a partner who already has one order from the same restaurant heading the same way. `activeOrderId` becomes `activeOrderIds` with a capacity. |
+| Scheduled orders | Add a `SCHEDULED` state before `PLACED`, and have a scheduler move it forward. |
+| Surge delivery fee on rain | Decorate `DeliveryFeeStrategy` with a multiplier source, as in Cab Booking (11.3). |
+
+**Extension implemented: cancellation with a refund policy.** Allow cancellation during `PREPARING` too, but refund only part of the food cost, since the kitchen already spent it. A restaurant-initiated cancellation always refunds in full.
+
+```ts
+type OrderStatus = 'PLACED' | 'ACCEPTED' | 'PREPARING' | 'READY' | 'PICKED_UP' | 'DELIVERED' | 'CANCELLED';
+type Actor = 'CUSTOMER' | 'RESTAURANT' | 'SUPPORT';
+interface Bill { food: number; deliveryFee: number; tax: number; }
+class RefundError extends Error { override name = 'RefundError'; }
+
+interface RefundPolicy { refundFor(status: OrderStatus, actor: Actor, bill: Bill): number; }
+
+class StandardRefundPolicy implements RefundPolicy {
+  refundFor(status: OrderStatus, actor: Actor, bill: Bill): number {
+    const full = bill.food + bill.deliveryFee + bill.tax;
+    if (actor !== 'CUSTOMER') return full;                       // not the customer's fault
+    switch (status) {
+      case 'PLACED':
+      case 'ACCEPTED':
+        return full;
+      case 'PREPARING':
+        return bill.deliveryFee + Math.floor((bill.food + bill.tax) / 2); // kitchen cost shared 50/50
+      default:
+        throw new RefundError(`customer cannot cancel in ${status}`);
+    }
+  }
+}
+
+const bill: Bill = { food: 69800, deliveryFee: 2000, tax: 3490 };
+const policy: RefundPolicy = new StandardRefundPolicy();
+const cases: [OrderStatus, Actor][] = [
+  ['ACCEPTED', 'CUSTOMER'], ['PREPARING', 'CUSTOMER'], ['PREPARING', 'RESTAURANT'], ['PICKED_UP', 'CUSTOMER'], ['PICKED_UP', 'SUPPORT'],
+];
+for (const [status, actor] of cases) {
+  try {
+    console.log(`${actor} cancels in ${status}: refund Rs ${(policy.refundFor(status, actor, bill) / 100).toFixed(2)}`);
+  } catch (err) {
+    console.log(`${actor} cancels in ${status}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+```
+
+```text
+CUSTOMER cancels in ACCEPTED: refund Rs 752.90
+CUSTOMER cancels in PREPARING: refund Rs 386.45
+RESTAURANT cancels in PREPARING: refund Rs 752.90
+CUSTOMER cancels in PICKED_UP: customer cannot cancel in PICKED_UP
+SUPPORT cancels in PICKED_UP: refund Rs 752.90
+```
+
+In the main design, `OrderService.cancel(orderId, actor)` would call `policy.refundFor(...)`, then ask the payment service (11.6) to refund with the idempotency key `refund:<orderId>`, and the transition table would gain `PREPARING → CANCELLED`.
+
+## Edge cases
+
+- A menu price changes between add-to-cart and checkout. Prices are read at checkout and frozen on the order. Optionally tell the user "price changed".
+- An item goes out of stock after it was added to the cart. Checkout fails with a clear message.
+- The restaurant closes while the cart is full. Checkout fails.
+- A coupon exceeds the item total. Flat discount is capped at the item total, so the total never goes negative.
+- The wrong partner tries to pick up. It's rejected.
+- A cancel races with an accept. With single-threaded, synchronous transitions, whichever runs first wins and the second gets `InvalidTransitionError`.
+- A queued order is cancelled. It must be removed from the waiting queue, or it would later grab a partner.
+- A rating is submitted twice, or for a cancelled order. Both are rejected.
+- Rounding: GST is rounded once at bill level, not per line (state which one you chose).
+
+## Complexity
+
+| Operation | Time |
+|---|---|
+| add to cart | O(1) |
+| placeOrder | O(L), L = lines |
+| state transition | O(1) (transition list ≤ 3) |
+| assign partner (linear scan) | O(P log P) for P free partners. A geo-grid index makes it about O(k), see 11.3. |
+| rate | O(L) |
+| topRestaurants | O(R log R). O(k log R) with a maintained heap or sorted set. |
+
+## What graders look for / common mistakes
+
+- ✅ A single place that decides legal transitions.
+- ✅ Prices frozen on the order, and money in integer paise.
+- ✅ Strategies for coupons, fees and assignment, with observers for notifications.
+- ✅ "No partner" treated as a queue, not a crash.
+- ❌ `order.status = 'DELIVERED'` assignments scattered around the code.
+- ❌ Floating-point rupees (`0.1 + 0.2`).
+- ❌ Cart allowed to mix restaurants, or a cart that stores prices (they go stale).
+- ❌ Partner marked busy *after* an async call.
+- ❌ God class `FoodApp` holding every map and every rule.
+
+## 90-minute plan
+
+| Minutes | Work |
+|---|---|
+| 0–10 | Clarify cart, coupon, cancellation and assignment rules. Draw the state diagram. |
+| 10–25 | Models, transition table, errors, repos. |
+| 25–40 | Coupons, delivery fee, pricing service. |
+| 40–60 | Order service: place, accept/assign, transitions, cancel, deliver releasing the partner. |
+| 60–70 | Ratings and top-restaurant search. |
+| 70–85 | Driver scenarios, including the negative ones. |
+| 85–90 | Explain the concurrency fix and scaling (geo-index, sorted sets). |
+
+## Interview Q&A
+
+**Q1. Why a transition table instead of the State pattern?**
+
+<details>
+<summary>Answer</summary>
+
+Here the states have no behaviour of their own. They only restrict what comes next, so a table is the smallest correct model and is easy to print and test. If states start carrying logic (timeouts, different pricing, different allowed actors), I'd move to a `State` class per status, with the table still acting as the whitelist.
+
+</details>
+
+**Q2. The nearest partner is 200 m away but has a 2.1 rating. How would you change assignment without touching `OrderService`?**
+
+<details>
+<summary>Answer</summary>
+
+Write `ScoredPartnerStrategy`, which scores each candidate as `w1·distance + w2·(5 − rating) + w3·idleTime` and picks the minimum, then inject it. `OrderService` depends only on `PartnerAssignmentStrategy.pick()`, so nothing else changes (OCP + DIP).
+
+</details>
+
+**Q3. How do you prevent a coupon from being used twice by the same user when they tap "Place order" twice?**
+
+<details>
+<summary>Answer</summary>
+
+There are two layers. The client sends an idempotency key per checkout, so the second tap returns the first order. The coupon service records `(couponCode, userId)` redemptions with a unique constraint and redeems atomically as part of placing the order. It releases the redemption if the order is cancelled before payment.
+
+</details>
+
+**Q4. How would you make `topRestaurants` fast?**
+
+<details>
+<summary>Answer</summary>
+
+Maintain a sorted structure keyed by `(rating desc, id)` that is updated whenever a rating arrives: a Redis sorted set per city, or a balanced tree in memory. The query then costs O(k log n) instead of sorting everything. Also use a Bayesian average (blend in a global mean) so a restaurant with a single 5-star vote doesn't top the list. The `minVotes` filter is a crude version of that.
+
+</details>

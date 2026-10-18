@@ -1,0 +1,895 @@
+---
+title: "7.8 Concurrency in JavaScript/TypeScript"
+---
+
+## The mental model: one thread, many interleavings
+
+"Node is single-threaded, so there are no race conditions" is the most common wrong answer in this part of an interview. The truth has two halves:
+
+1. **Synchronous code is never interrupted.** Between two `await`s, your function runs to completion, and no other JS code on that thread can see a half-updated Map. A synchronous block is effectively **atomic**.
+2. **Every `await` is a yield point.** While you wait for the DB, Redis or an HTTP call, the event loop runs *other* requests. When you resume, the world may have changed. Any **check → await → act** sequence is a race.
+
+On top of that, production runs **many Node processes** (cluster, pods, workers), so in-process locks only protect one process. Anything shared across processes needs the database, Redis, or a queue to coordinate.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as withdraw(80k) #1
+  participant DB as balances
+  participant B as withdraw(80k) #2
+  A->>DB: read balance (100k)
+  B->>DB: read balance (100k)
+  Note over A,B: both checks pass: 100k >= 80k
+  A->>DB: write 20k
+  B->>DB: write 20k
+  Note over DB: paid out 160k, balance says 20k (lost update)`} />
+
+## 7.8.1 Race demo: double spending
+
+```ts
+const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+// Simulated DB with latency: each call is an await point
+class AccountStore {
+  private readonly balances = new Map<string, number>([['acc1', 100_000]]);
+  async getBalance(id: string): Promise<number> {
+    await delay(5);
+    return this.balances.get(id) ?? 0;
+  }
+  async setBalance(id: string, value: number): Promise<void> {
+    await delay(5);
+    this.balances.set(id, value);
+  }
+}
+
+class NaiveWallet {
+  paidOut = 0;
+  constructor(private readonly store: AccountStore) {}
+  async withdraw(id: string, amount: number): Promise<string> {
+    const balance = await this.store.getBalance(id); // (1) check
+    if (balance < amount) return `rejected ${amount}`;
+    // another withdraw() can run right here
+    await this.store.setBalance(id, balance - amount); // (2) act on a stale read
+    this.paidOut += amount;
+    return `paid ${amount}`;
+  }
+}
+
+const store = new AccountStore();
+const naive = new NaiveWallet(store);
+const results = await Promise.all([naive.withdraw('acc1', 80_000), naive.withdraw('acc1', 80_000)]);
+console.log(`naive: ${results.join(', ')} | paidOut=${naive.paidOut} balance=${await store.getBalance('acc1')}`);
+```
+
+The double withdrawal went through: ₹1,600 paid out of a ₹1,000 account. Now let's look at the fixes, starting with the simplest.
+
+## 7.8.2 Fix 1: atomic check-and-reserve in one synchronous section
+
+If the state lives in this process, do the **check and the reservation with no `await` between them**. The slow part (calling the bank) happens *after* the money is reserved. It's the same idea as a hold or authorization on a card.
+
+```ts
+class ReservingWallet {
+  private readonly balances = new Map<string, number>([['acc1', 100_000]]);
+  private readonly reserved = new Map<string, number>();
+
+  available(id: string): number {
+    return (this.balances.get(id) ?? 0) - (this.reserved.get(id) ?? 0);
+  }
+
+  async withdraw(id: string, amount: number, payout: () => Promise<void>): Promise<string> {
+    // ---- synchronous critical section: nothing can interleave here ----
+    if (this.available(id) < amount) return `rejected ${amount}`;
+    this.reserved.set(id, (this.reserved.get(id) ?? 0) + amount);
+    // ---- end of critical section ----
+    try {
+      await payout(); // slow external call, safely outside the check
+      this.balances.set(id, (this.balances.get(id) ?? 0) - amount); // commit
+      return `paid ${amount}`;
+    } catch (err) {
+      return `payout failed for ${amount}: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      this.reserved.set(id, (this.reserved.get(id) ?? 0) - amount); // release the hold either way
+    }
+  }
+}
+
+const wallet = new ReservingWallet();
+const bank = async () => delay(5);
+const failingBank = async () => {
+  await delay(5);
+  throw new Error('bank timeout');
+};
+const r2 = await Promise.all([
+  wallet.withdraw('acc1', 80_000, bank),
+  wallet.withdraw('acc1', 80_000, bank),
+  wallet.withdraw('acc1', 15_000, failingBank),
+]);
+console.log(`reserving: ${r2.join(', ')} | available=${wallet.available('acc1')}`);
+```
+
+```text
+naive: paid 80000, paid 80000 | paidOut=160000 balance=20000
+reserving: paid 80000, rejected 80000, payout failed for 15000: bank timeout | available=20000
+```
+
+> **Rule:** if a decision and its effect can sit in one synchronous block, put them there. This is the cheapest lock you'll ever write, and it is exactly what "atomic check-and-reserve" means in JS.
+
+When the state lives somewhere else (a DB, Redis), the synchronous trick doesn't help, because the read itself is an `await`. Then you need one of the tools below.
+
+## 7.8.3 Fix 2: write an async Mutex
+
+A mutex turns "many concurrent callers" into "one at a time" for a critical section that contains `await`s. The design:
+
+- `locked` flag plus a FIFO queue of waiters (fairness: no starvation).
+- `acquire()` resolves with a **release function**. Releasing hands the lock **directly** to the next waiter (the flag stays `true`), so nobody can barge in between.
+- `runExclusive(fn)` wraps acquire/try/finally, so a thrown error can't leak the lock.
+
+```ts
+class Mutex {
+  private locked = false;
+  private readonly waiters: Array<() => void> = [];
+
+  async acquire(): Promise<() => void> {
+    if (!this.locked) {
+      this.locked = true;
+      return this.releaser();
+    }
+    await new Promise<void>(resolve => this.waiters.push(resolve));
+    return this.releaser(); // ownership was handed to us by the previous holder
+  }
+
+  private releaser(): () => void {
+    let released = false;
+    return () => {
+      if (released) return; // double release is a no-op, not a corruption
+      released = true;
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.locked = false;
+    };
+  }
+
+  async runExclusive<T>(fn: () => Promise<T> | T): Promise<T> {
+    const release = await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  get isLocked(): boolean {
+    return this.locked;
+  }
+  get queueLength(): number {
+    return this.waiters.length;
+  }
+}
+
+const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+class LockedWallet {
+  private balance = 100_000;
+  private readonly mutex = new Mutex();
+  readonly log: string[] = [];
+
+  withdraw(amount: number, tag: string): Promise<string> {
+    return this.mutex.runExclusive(async () => {
+      this.log.push(`${tag}:enter`);
+      const current = this.balance; // pretend: await db.read()
+      await delay(5);
+      if (current < amount) {
+        this.log.push(`${tag}:exit`);
+        throw new Error(`${tag} rejected: balance ${current} < ${amount}`);
+      }
+      await delay(5); // pretend: await db.write()
+      this.balance = current - amount;
+      this.log.push(`${tag}:exit`);
+      return `${tag} paid ${amount}, left ${this.balance}`;
+    });
+  }
+  get lockState(): string {
+    return `locked=${this.mutex.isLocked} waiting=${this.mutex.queueLength}`;
+  }
+}
+
+const w = new LockedWallet();
+const pending = [w.withdraw(80_000, 'A'), w.withdraw(80_000, 'B'), w.withdraw(20_000, 'C')];
+console.log(`while running: ${w.lockState}`);
+const settled = await Promise.allSettled(pending);
+for (const s of settled) {
+  console.log(s.status === 'fulfilled' ? s.value : s.reason instanceof Error ? s.reason.message : String(s.reason));
+}
+console.log(`critical sections never overlapped: ${w.log.join(' ')}`);
+console.log(`after: ${w.lockState}`);
+```
+
+```text
+while running: locked=true waiting=2
+A paid 80000, left 20000
+B rejected: balance 20000 < 80000
+C paid 20000, left 0
+critical sections never overlapped: A:enter A:exit B:enter B:exit C:enter C:exit
+after: locked=false waiting=0
+```
+
+Pitfalls to mention:
+
+```ts
+// ❌ Not re-entrant: calling runExclusive from inside itself deadlocks forever
+await mutex.runExclusive(async () => {
+  await mutex.runExclusive(async () => { /* never runs */ });
+});
+
+// ❌ Forgetting to release on the error path
+const release = await mutex.acquire();
+await riskyCall(); // throws -> lock held forever. Always use try/finally.
+```
+
+- A production mutex should support an **acquire timeout** (an `AbortSignal`) so a stuck holder can't freeze every caller.
+- An in-process mutex protects **one process only**. With 4 pods you need a DB row lock or a distributed lock (section 7.8.9).
+
+## 7.8.4 Fix 3: Semaphore (limit concurrency)
+
+A semaphore is a mutex with N permits. Use it to **cap** concurrency rather than serialize it: at most 5 concurrent calls to the exchange API, at most 10 DB connections, at most 3 PDF renders.
+
+```ts
+class Semaphore {
+  private readonly waiters: Array<() => void> = [];
+  constructor(private permits: number) {
+    if (!Number.isInteger(permits) || permits < 1) throw new Error('permits must be a positive integer');
+  }
+
+  async acquire(): Promise<() => void> {
+    if (this.permits > 0) {
+      this.permits--;
+      return this.releaser();
+    }
+    await new Promise<void>(resolve => this.waiters.push(resolve));
+    return this.releaser(); // permit handed over directly
+  }
+
+  private releaser(): () => void {
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.permits++;
+    };
+  }
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    const release = await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+/** Like p-limit / Promise.all with a concurrency cap; keeps result order. */
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const sem = new Semaphore(limit);
+  return Promise.all(items.map(item => sem.run(() => fn(item))));
+}
+
+const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+let inFlight = 0;
+let maxInFlight = 0;
+const started: string[] = [];
+
+async function fetchLtp(symbol: string): Promise<string> {
+  inFlight++;
+  maxInFlight = Math.max(maxInFlight, inFlight);
+  started.push(symbol);
+  try {
+    await delay(15); // pretend: HTTP call to the exchange
+    return `${symbol}:${symbol.length * 100}`;
+  } finally {
+    inFlight--;
+  }
+}
+
+const symbols = ['INFY', 'TCS', 'SBIN', 'HDFCBANK', 'ITC', 'LT'];
+const prices = await mapWithConcurrency(symbols, 2, fetchLtp);
+console.log(`results (input order kept): ${prices.join(' ')}`);
+console.log(`start order: ${started.join(' ')}`);
+console.log(`max in flight: ${maxInFlight}`);
+
+try {
+  new Semaphore(0);
+} catch (err) {
+  console.log(err instanceof Error ? err.message : String(err));
+}
+```
+
+```text
+results (input order kept): INFY:400 TCS:300 SBIN:400 HDFCBANK:800 ITC:300 LT:200
+start order: INFY TCS SBIN HDFCBANK ITC LT
+max in flight: 2
+permits must be a positive integer
+```
+
+## 7.8.5 Fix 4: per-key locks and lock striping
+
+One global mutex around all wallets is correct but slow: user A's withdrawal waits for user B's. What we want is **serialize per account, parallelize across accounts**.
+
+- **Keyed mutex:** `Map<key, Mutex>` with reference counting, so idle keys are deleted and the Map doesn't grow forever.
+- **Lock striping:** a fixed array of N mutexes, with `hash(key) % N` picking one. Memory stays bounded and there's no cleanup, but unrelated keys sometimes share a stripe. Java's old `ConcurrentHashMap` used this idea.
+- **Deadlock avoidance for multi-key operations** (transfer A→B while another request does B→A): always acquire locks in a **global order** (for example, sorted key).
+
+```ts
+class Mutex {
+  private locked = false;
+  private readonly waiters: Array<() => void> = [];
+  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.locked) await new Promise<void>(resolve => this.waiters.push(resolve));
+    else this.locked = true;
+    try {
+      return await fn();
+    } finally {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.locked = false;
+    }
+  }
+}
+
+class KeyedMutex {
+  private readonly entries = new Map<string, { mutex: Mutex; refs: number }>();
+
+  async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    let entry = this.entries.get(key);
+    if (!entry) {
+      entry = { mutex: new Mutex(), refs: 0 };
+      this.entries.set(key, entry);
+    }
+    entry.refs++;
+    try {
+      return await entry.mutex.runExclusive(fn);
+    } finally {
+      entry.refs--;
+      if (entry.refs === 0) this.entries.delete(key); // no memory leak for idle keys
+    }
+  }
+
+  /** Lock several keys in a global (sorted) order to avoid deadlock. */
+  async runExclusiveMany<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+    const ordered = [...new Set(keys)].sort();
+    const acquire = (i: number): Promise<T> =>
+      i === ordered.length ? fn() : this.runExclusive(ordered[i], () => acquire(i + 1));
+    return acquire(0);
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+}
+
+class StripedMutex {
+  private readonly stripes: Mutex[];
+  constructor(count: number) {
+    this.stripes = Array.from({ length: count }, () => new Mutex());
+  }
+  private indexFor(key: string): number {
+    let h = 0;
+    for (const ch of key) h = (h * 31 + ch.charCodeAt(0)) | 0;
+    return Math.abs(h) % this.stripes.length;
+  }
+  runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    return this.stripes[this.indexFor(key)].runExclusive(fn);
+  }
+  describe(keys: string[]): string {
+    return keys.map(k => `${k}->stripe${this.indexFor(k)}`).join(' ');
+  }
+}
+
+const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+const locks = new KeyedMutex();
+const inFlightByKey = new Map<string, number>();
+const maxByKey = new Map<string, number>();
+let inFlight = 0;
+let maxOverall = 0;
+
+async function op(key: string): Promise<void> {
+  await locks.runExclusive(key, async () => {
+    const n = (inFlightByKey.get(key) ?? 0) + 1;
+    inFlightByKey.set(key, n);
+    maxByKey.set(key, Math.max(maxByKey.get(key) ?? 0, n));
+    maxOverall = Math.max(maxOverall, ++inFlight);
+    await delay(10);
+    inFlightByKey.set(key, n - 1);
+    inFlight--;
+  });
+}
+
+await Promise.all([op('acc-A'), op('acc-A'), op('acc-A'), op('acc-B'), op('acc-B')]);
+console.log(`max concurrent per key: A=${maxByKey.get('acc-A')} B=${maxByKey.get('acc-B')}; overall=${maxOverall}`);
+console.log(`lock entries after completion: ${locks.size}`);
+
+// Transfers in opposite directions at the same time: no deadlock thanks to ordering
+const balances = new Map<string, number>([['acc-A', 1_000], ['acc-B', 1_000]]);
+async function transfer(from: string, to: string, amount: number): Promise<string> {
+  return locks.runExclusiveMany([from, to], async () => {
+    const src = balances.get(from) ?? 0;
+    await delay(5);
+    if (src < amount) return `${from}->${to} ${amount}: insufficient`;
+    balances.set(from, src - amount);
+    balances.set(to, (balances.get(to) ?? 0) + amount);
+    return `${from}->${to} ${amount}: ok`;
+  });
+}
+const transfers = await Promise.all([
+  transfer('acc-A', 'acc-B', 700),
+  transfer('acc-B', 'acc-A', 300),
+  transfer('acc-A', 'acc-B', 500),
+]);
+console.log(transfers.join(' | '));
+console.log(`A=${balances.get('acc-A')} B=${balances.get('acc-B')} total=${(balances.get('acc-A') ?? 0) + (balances.get('acc-B') ?? 0)}`);
+
+const striped = new StripedMutex(4);
+console.log(striped.describe(['acc-A', 'acc-B', 'acc-C', 'acc-D']));
+```
+
+```text
+max concurrent per key: A=1 B=1; overall=2
+lock entries after completion: 0
+acc-A->acc-B 700: ok | acc-B->acc-A 300: ok | acc-A->acc-B 500: ok
+A=100 B=1900 total=2000
+acc-A->stripe1 acc-B->stripe2 acc-C->stripe3 acc-D->stripe0
+```
+
+Notice that the third transfer succeeded only because the second one (B→A 300) ran first and topped A back up from 300 to 600. The locks force a clear serial order, and the total is conserved.
+
+## 7.8.6 Fix 5: optimistic locking (compare-and-set with versions) plus retry
+
+Locks are **pessimistic**: they assume a conflict will happen and make everyone wait. **Optimistic** concurrency assumes conflicts are rare. Read the row with its `version`, compute the new state, then write **only if the version is unchanged**:
+
+```sql
+UPDATE accounts SET balance = :newBalance, version = version + 1
+WHERE id = :id AND version = :expectedVersion;   -- 0 rows updated => someone else won, retry
+```
+
+No lock is held while you think, so it scales well when conflicts are rare. Under heavy contention, retries pile up, and then pessimistic locking wins.
+
+```ts
+interface Versioned<T> {
+  value: T;
+  version: number;
+}
+
+const tick = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+
+class VersionedStore<T> {
+  private readonly rows = new Map<string, Versioned<T>>();
+  seed(id: string, value: T): void {
+    this.rows.set(id, { value, version: 0 });
+  }
+  async get(id: string): Promise<Versioned<T> | undefined> {
+    await tick(); // network hop
+    const row = this.rows.get(id);
+    return row && structuredClone(row);
+  }
+  async compareAndSet(id: string, expectedVersion: number, value: T): Promise<boolean> {
+    await tick(); // network hop
+    // The check and the write below are synchronous: atomic, like the SQL above.
+    const current = this.rows.get(id);
+    if (!current || current.version !== expectedVersion) return false;
+    this.rows.set(id, { value, version: expectedVersion + 1 });
+    return true;
+  }
+}
+
+class ConcurrencyError extends Error {}
+class InsufficientFunds extends Error {}
+
+class OptimisticWallet {
+  conflicts = 0;
+  constructor(private readonly store: VersionedStore<{ balance: number }>, private readonly maxAttempts = 5) {}
+
+  async debit(id: string, amount: number): Promise<number> {
+    for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+      const row = await this.store.get(id);
+      if (!row) throw new Error(`no account ${id}`);
+      if (row.value.balance < amount) throw new InsufficientFunds(`balance ${row.value.balance} < ${amount}`);
+      const ok = await this.store.compareAndSet(id, row.version, { balance: row.value.balance - amount });
+      if (ok) return row.version + 1;
+      this.conflicts++; // lost the race: re-read and re-validate
+    }
+    throw new ConcurrencyError(`gave up after ${this.maxAttempts} attempts`);
+  }
+}
+
+const store = new VersionedStore<{ balance: number }>();
+store.seed('acc1', { balance: 100_000 });
+const wallet = new OptimisticWallet(store);
+
+const versions = await Promise.all([wallet.debit('acc1', 30_000), wallet.debit('acc1', 30_000), wallet.debit('acc1', 30_000)]);
+const after = await store.get('acc1');
+console.log(`3 x 30k: committed versions ${versions.join(',')} | balance=${after?.value.balance} v${after?.version} | conflicts=${wallet.conflicts}`);
+
+store.seed('acc2', { balance: 100_000 });
+const outcomes = await Promise.allSettled([wallet.debit('acc2', 60_000), wallet.debit('acc2', 60_000)]);
+console.log(
+  `2 x 60k: ${outcomes.map(o => (o.status === 'fulfilled' ? `ok(v${o.value})` : `${o.reason instanceof Error ? o.reason.constructor.name : 'error'}`)).join(', ')}`,
+);
+
+const impatient = new OptimisticWallet(store, 1);
+store.seed('acc3', { balance: 100_000 });
+const r = await Promise.allSettled([impatient.debit('acc3', 1), impatient.debit('acc3', 1)]);
+console.log(`maxAttempts=1: ${r.map(o => (o.status === 'fulfilled' ? 'ok' : o.reason instanceof Error ? o.reason.message : 'error')).join(' | ')}`);
+```
+
+```text
+3 x 30k: committed versions 1,2,3 | balance=10000 v3 | conflicts=3
+2 x 60k: ok(v1), InsufficientFunds
+maxAttempts=1: ok | gave up after 1 attempts
+```
+
+Key points:
+
+- **Re-validate after every re-read.** The second 60k debit didn't just retry the write: it re-read, saw 40k, and failed the business check.
+- Add **backoff with jitter** between retries (section 7.10) so that competing retries spread out instead of colliding again.
+- This is what JPA's `@Version`, DynamoDB conditional writes, and Redis `WATCH/MULTI/EXEC` do under the hood. HTTP has the same idea with `ETag` and `If-Match`.
+
+## 7.8.7 Fix 6: pessimistic holds with TTL (seat booking)
+
+In BookMyShow-style flows, a user **holds** seats while they pay. The hold is a lock with an **expiry**: if the user closes the tab, the seats must free up by themselves. Design:
+
+- The hold is **all-or-nothing** across seats, in one synchronous section.
+- **Lazy expiry:** a HELD seat whose `expiresAt <= now` counts as AVAILABLE. You don't need a timer per seat.
+- `confirm` must present the **hold id** (a fencing token). An expired hold can't confirm, even if the seat is still marked HELD by that holdId, and even if someone else now holds it.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> AVAILABLE
+  AVAILABLE --> HELD: hold(user)
+  HELD --> BOOKED: confirm(holdId) before expiry
+  HELD --> AVAILABLE: release(holdId)
+  HELD --> AVAILABLE: expiresAt reached (lazy)
+  BOOKED --> [*]`} />
+
+```ts
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number {
+    return this.t;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+  }
+}
+
+type SeatState =
+  | { status: 'AVAILABLE' }
+  | { status: 'HELD'; holdId: string; userId: string; expiresAt: number }
+  | { status: 'BOOKED'; userId: string; bookingId: string };
+
+class SeatUnavailableError extends Error {}
+class HoldInvalidError extends Error {}
+
+class SeatHoldService {
+  private readonly seats = new Map<string, SeatState>();
+  private seq = 0;
+
+  constructor(
+    private readonly clock: Clock,
+    seatIds: string[],
+    private readonly holdMs = 5 * 60_000,
+  ) {
+    seatIds.forEach(id => this.seats.set(id, { status: 'AVAILABLE' }));
+  }
+
+  private stateOf(seatId: string, now: number): SeatState {
+    const s = this.seats.get(seatId);
+    if (!s) throw new SeatUnavailableError(`no seat ${seatId}`);
+    return s.status === 'HELD' && s.expiresAt <= now ? { status: 'AVAILABLE' } : s; // lazy expiry
+  }
+
+  /** All-or-nothing, synchronous: no interleaving possible. */
+  hold(userId: string, seatIds: string[]): { holdId: string; expiresAt: number } {
+    const now = this.clock.now();
+    const taken = seatIds.filter(id => this.stateOf(id, now).status !== 'AVAILABLE');
+    if (taken.length) throw new SeatUnavailableError(`${userId}: seats ${taken.join(',')} unavailable`);
+    const holdId = `H${++this.seq}`;
+    const expiresAt = now + this.holdMs;
+    for (const id of seatIds) this.seats.set(id, { status: 'HELD', holdId, userId, expiresAt });
+    return { holdId, expiresAt };
+  }
+
+  confirm(holdId: string, userId: string): string {
+    const now = this.clock.now();
+    const mine = [...this.seats.entries()].filter(([, s]) => s.status === 'HELD' && s.holdId === holdId);
+    if (mine.length === 0) throw new HoldInvalidError(`${holdId}: no seats under this hold`);
+    for (const [id] of mine) {
+      const s = this.stateOf(id, now);
+      if (s.status !== 'HELD' || s.userId !== userId) throw new HoldInvalidError(`${holdId}: hold expired or not yours`);
+    }
+    const bookingId = `B-${holdId}`;
+    for (const [id] of mine) this.seats.set(id, { status: 'BOOKED', userId, bookingId });
+    return `${bookingId} confirmed ${mine.map(([id]) => id).join(',')} for ${userId}`;
+  }
+
+  release(holdId: string): number {
+    let n = 0;
+    for (const [id, s] of this.seats) {
+      if (s.status === 'HELD' && s.holdId === holdId) {
+        this.seats.set(id, { status: 'AVAILABLE' });
+        n++;
+      }
+    }
+    return n;
+  }
+
+  snapshot(): string {
+    const now = this.clock.now();
+    return [...this.seats.keys()]
+      .map(id => {
+        const s = this.stateOf(id, now);
+        return `${id}=${s.status === 'AVAILABLE' ? 'free' : s.status === 'HELD' ? `held(${s.userId})` : `booked(${s.userId})`}`;
+      })
+      .join(' ');
+  }
+}
+
+const attempt = (label: string, fn: () => unknown): void => {
+  try {
+    const r = fn();
+    console.log(`${label}: ${typeof r === 'string' ? r : JSON.stringify(r)}`);
+  } catch (err) {
+    console.log(`${label}: ${err instanceof Error ? `${err.constructor.name} - ${err.message}` : String(err)}`);
+  }
+};
+
+const clock = new FakeClock(0);
+const svc = new SeatHoldService(clock, ['A1', 'A2', 'A3']);
+attempt('u1 hold A1,A2', () => svc.hold('u1', ['A1', 'A2']));
+attempt('u2 hold A2,A3', () => svc.hold('u2', ['A2', 'A3']));
+console.log(`t=0     ${svc.snapshot()}`);
+clock.advance(4 * 60_000);
+console.log(`t=4m    ${svc.snapshot()}`);
+clock.advance(60_000); // exactly 5 minutes: expired (expiresAt <= now)
+console.log(`t=5m    ${svc.snapshot()}`);
+attempt('u2 hold A2,A3', () => svc.hold('u2', ['A2', 'A3']));
+attempt('u1 confirm H1', () => svc.confirm('H1', 'u1'));
+attempt('u1 confirm H2', () => svc.confirm('H2', 'u1'));
+attempt('u2 confirm H2', () => svc.confirm('H2', 'u2'));
+console.log(`final   ${svc.snapshot()}`);
+attempt('release H1', () => svc.release('H1'));
+console.log(`after   ${svc.snapshot()}`);
+```
+
+```text
+u1 hold A1,A2: {"holdId":"H1","expiresAt":300000}
+u2 hold A2,A3: SeatUnavailableError - u2: seats A2 unavailable
+t=0     A1=held(u1) A2=held(u1) A3=free
+t=4m    A1=held(u1) A2=held(u1) A3=free
+t=5m    A1=free A2=free A3=free
+u2 hold A2,A3: {"holdId":"H2","expiresAt":600000}
+u1 confirm H1: HoldInvalidError - H1: hold expired or not yours
+u1 confirm H2: HoldInvalidError - H2: hold expired or not yours
+u2 confirm H2: B-H2 confirmed A2,A3 for u2
+final   A1=free A2=booked(u2) A3=booked(u2)
+release H1: 1
+after   A1=free A2=booked(u2) A3=booked(u2)
+```
+
+Look closely at `release H1: 1`. Seat A1 was still physically stored as `HELD by H1` (expired, but never cleaned up), so release freed it. That's harmless here, and it's why lazy expiry is safe: every read goes through `stateOf`. In the database version, the same idea is `UPDATE seats SET status='HELD', hold_id=?, expires_at=? WHERE id IN (...) AND (status='AVAILABLE' OR (status='HELD' AND expires_at <= now()))`, checking that the affected row count equals the number of seats. A periodic sweeper can then clean up expired rows for reporting.
+
+## 7.8.8 Fix 7: an idempotency-key store
+
+Clients retry: mobile networks drop, users double-tap "Pay", and load balancers time out and resend. The client sends an `Idempotency-Key` header, and the server guarantees **at most one execution per key**:
+
+- **First request:** record `IN_PROGRESS` (in the same synchronous step as the check), execute, and store the result.
+- **Concurrent duplicate:** await the **same in-flight promise**. Don't execute twice. (Across processes, return `409 Conflict` or poll.)
+- **Later retry:** replay the stored response.
+- **Same key, different payload:** reject it (`422`). That's a client bug, and replaying the old result would be wrong.
+- **Failure:** delete the record so a retry can try again (or store it, if the failure is final, like "card declined").
+- **TTL:** keys expire (for example, after 24 h).
+
+```ts
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number {
+    return this.t;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+  }
+}
+
+type IdemRecord<R> =
+  | { state: 'IN_PROGRESS'; fingerprint: string; promise: Promise<R> }
+  | { state: 'DONE'; fingerprint: string; result: R; expiresAt: number };
+
+class IdempotencyMismatchError extends Error {}
+
+class IdempotencyStore<R> {
+  private readonly records = new Map<string, IdemRecord<R>>();
+  constructor(private readonly clock: Clock, private readonly ttlMs: number) {}
+
+  async execute(key: string, fingerprint: string, fn: () => Promise<R>): Promise<{ result: R; replayed: boolean }> {
+    const existing = this.records.get(key);
+    if (existing && existing.state === 'DONE' && existing.expiresAt <= this.clock.now()) {
+      this.records.delete(key); // expired: treat as new
+    } else if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        throw new IdempotencyMismatchError(`key ${key} was used with a different request`);
+      }
+      return existing.state === 'DONE'
+        ? { result: existing.result, replayed: true }
+        : { result: await existing.promise, replayed: true };
+    }
+    // check + mark IN_PROGRESS happen synchronously above/below: atomic
+    const promise = fn();
+    this.records.set(key, { state: 'IN_PROGRESS', fingerprint, promise });
+    try {
+      const result = await promise;
+      this.records.set(key, { state: 'DONE', fingerprint, result, expiresAt: this.clock.now() + this.ttlMs });
+      return { result, replayed: false };
+    } catch (err) {
+      this.records.delete(key); // allow a retry
+      throw err;
+    }
+  }
+}
+
+interface PayRequest {
+  userId: string;
+  amountPaise: number;
+}
+
+const fingerprintOf = (req: PayRequest): string => JSON.stringify([req.userId, req.amountPaise]);
+
+class PaymentService {
+  charges = 0;
+  private failNext = false;
+  constructor(private readonly idem: IdempotencyStore<string>) {}
+  breakGatewayOnce(): void {
+    this.failNext = true;
+  }
+  async pay(key: string, req: PayRequest): Promise<string> {
+    const { result, replayed } = await this.idem.execute(key, fingerprintOf(req), async () => {
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+      if (this.failNext) {
+        this.failNext = false;
+        throw new Error('gateway 502');
+      }
+      return `txn_${++this.charges} (${req.amountPaise} paise)`;
+    });
+    return `${result}${replayed ? ' [replayed]' : ''}`;
+  }
+}
+
+const clock = new FakeClock();
+const payments = new PaymentService(new IdempotencyStore<string>(clock, 24 * 3_600_000));
+const show = async (label: string, p: Promise<string>): Promise<void> => {
+  try {
+    console.log(`${label}: ${await p}`);
+  } catch (err) {
+    console.log(`${label}: ${err instanceof Error ? `${err.constructor.name} - ${err.message}` : String(err)}`);
+  }
+};
+
+const req: PayRequest = { userId: 'u1', amountPaise: 50_000 };
+// double-tap: two concurrent requests, same key
+await Promise.all([show('tap 1', payments.pay('k-1', req)), show('tap 2', payments.pay('k-1', req))]);
+await show('retry later', payments.pay('k-1', req));
+await show('same key, new amount', payments.pay('k-1', { userId: 'u1', amountPaise: 99_999 }));
+
+payments.breakGatewayOnce();
+await show('k-2 first try', payments.pay('k-2', req));
+await show('k-2 retry', payments.pay('k-2', req));
+
+clock.advance(24 * 3_600_000);
+await show('k-1 after TTL', payments.pay('k-1', req));
+console.log(`gateway charged ${payments.charges} times`);
+```
+
+```text
+tap 1: txn_1 (50000 paise)
+tap 2: txn_1 (50000 paise) [replayed]
+retry later: txn_1 (50000 paise) [replayed]
+same key, new amount: IdempotencyMismatchError - key k-1 was used with a different request
+k-2 first try: Error - gateway 502
+k-2 retry: txn_2 (50000 paise)
+k-1 after TTL: txn_3 (50000 paise)
+gateway charged 3 times
+```
+
+In production the store is Redis or Postgres. The atomic "claim" becomes `SET idem:{key} IN_PROGRESS NX PX 30000` or `INSERT ... ON CONFLICT DO NOTHING`, and the result is written in the **same DB transaction** as the payment row, so a crash can't leave a charge without its record.
+
+## 7.8.9 Talking points: how Java and Go solve the same problems
+
+Interviewers often ask TS candidates "how would you do this in a multi-threaded language?" or "what if you have 10 pods?". Have these ready.
+
+**In-process, multi-threaded (Java):**
+
+```java
+// 1. Intrinsic lock: simplest, re-entrant
+public synchronized void withdraw(long amount) { if (balance >= amount) balance -= amount; }
+
+// 2. Explicit lock: tryLock with timeout, fairness, interruptible
+private final ReentrantLock lock = new ReentrantLock(true);
+if (lock.tryLock(200, TimeUnit.MILLISECONDS)) {
+  try { /* critical section */ } finally { lock.unlock(); }
+}
+
+// 3. Lock-free atomics: CAS in a loop
+AtomicLong balance = new AtomicLong(100_000);
+balance.updateAndGet(b -> b >= amount ? b - amount : b);
+
+// 4. Per-key atomic update without a global lock
+ConcurrentHashMap<String, Long> balances = new ConcurrentHashMap<>();
+balances.compute(accountId, (k, b) -> b >= amount ? b - amount : b);
+
+// 5. Concurrency cap
+Semaphore permits = new Semaphore(5);
+
+// 6. Read-heavy data: ReadWriteLock / StampedLock; also ExecutorService pools
+```
+
+**Go:**
+
+```go
+// Mutex
+var mu sync.Mutex
+mu.Lock(); defer mu.Unlock()
+
+// "Don't communicate by sharing memory; share memory by communicating":
+// one goroutine owns the balance, others send requests over a channel.
+type withdrawReq struct{ amount int64; reply chan bool }
+go func() {
+  for r := range reqs { ok := balance >= r.amount; if ok { balance -= r.amount }; r.reply <- ok }
+}()
+
+// Semaphore = buffered channel
+sem := make(chan struct{}, 5); sem <- struct{}{}; defer func() { <-sem }()
+
+// sync/atomic for counters, sync.Map for concurrent maps, singleflight for cache stampedes
+```
+
+**Across processes and pods (applies to Node too):**
+
+```sql
+-- Pessimistic row lock: the second transaction waits until the first commits
+BEGIN;
+SELECT balance FROM accounts WHERE id = $1 FOR UPDATE;
+UPDATE accounts SET balance = balance - $2 WHERE id = $1;
+COMMIT;
+
+-- Or skip the read entirely: a conditional atomic update
+UPDATE accounts SET balance = balance - $2 WHERE id = $1 AND balance >= $2;  -- check rowCount
+
+-- Job/seat pickers: SELECT ... FOR UPDATE SKIP LOCKED
+```
+
+```text
+Redis lock:   SET lock:seat:A1 <random-token> NX PX 30000
+Unlock:       Lua script: if GET == token then DEL   (never DEL someone else's lock)
+```
+
+**Redis lock and Redlock caveats (say these unprompted for bonus points):**
+
+- A lock with a TTL can **expire while the holder is still working** (a GC pause or a slow network). Two holders then believe they own it. Mitigations: **fencing tokens** (a monotonically increasing number checked by the storage layer on every write), keeping work well under the TTL, and renewing the lease (a watchdog, as in Redisson).
+- **Redlock** (majority of N independent Redis nodes) depends on bounded clock drift and process pauses. Martin Kleppmann's critique: it's fine for *efficiency* locks (avoid duplicate work), but not for *correctness* locks. For correctness, use a DB transaction or a consensus system (ZooKeeper/etcd) with fencing.
+- Prefer designs that **don't need a distributed lock**: conditional updates, unique constraints, idempotency keys, or partitioning work by key (a Kafka partition per account gives you ordering per key for free).
+
+| Problem | Node (single process) | Java/Go (threads) | Multiple instances |
+|---|---|---|---|
+| Check-then-act on shared state | Synchronous section / async mutex | `synchronized`, `ReentrantLock`, `sync.Mutex` | `SELECT … FOR UPDATE`, conditional `UPDATE` |
+| Lost update | Version check | `AtomicLong` CAS, `@Version` | Version column, Redis `WATCH` |
+| Per-key serialization | Keyed mutex | `ConcurrentHashMap.compute`, striped locks | Kafka partition key, advisory locks |
+| Limit concurrency | Semaphore / p-limit | `Semaphore`, buffered channel | Worker pool size, distributed rate limiter |
+| Duplicate requests | Idempotency map | same | Unique constraint / Redis `SET NX` |
+| Expiring holds | Lazy expiry + clock | `ScheduledExecutorService` | TTL column / Redis `PX` + fencing |
+
+## How to say it in an interview
+
+> "Node won't interleave synchronous code, but every `await` is a yield point, so check-then-act across an `await` is a race. Inside one process I'd either keep the check and reservation synchronous or use a keyed async mutex. Across pods I'd push atomicity into the database with a conditional update or a version column, and put an idempotency key on the API so retries are safe. I'd use Redis locks only as an optimization, with fencing tokens if correctness depends on them."

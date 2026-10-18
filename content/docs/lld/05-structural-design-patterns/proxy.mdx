@@ -1,0 +1,356 @@
+---
+title: "5.7 Proxy"
+---
+
+## Intent
+
+Provide a stand-in object with the **same interface** as the real one, so you can control access to it: delay its creation, cache its results, check permissions, or add remote/async plumbing.
+
+## Problem
+
+Three related situations in a broker's backend:
+
+1. **Caching proxy**: the instrument master comes from a slow reference-data service; most lookups repeat.
+2. **Protection proxy**: `AccountService.withdraw()` must be callable only by the account owner or an admin, but you don't want permission checks inside the account logic.
+3. **Virtual (lazy) proxy**: a P&L report object loads a year of trades when constructed; most screens never open it.
+
+In all three, clients should keep using the same interface and not care whether they hold the real object or the stand-in.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class AccountService {
+        <<interface>>
+        +balance(accountId) number
+        +withdraw(accountId, amount) number
+    }
+    class RealAccountService
+    class ProtectedAccountService {
+        -RealAccountService real
+        -User user
+        +balance(accountId) number
+        +withdraw(accountId, amount) number
+    }
+    AccountService <|.. RealAccountService
+    AccountService <|.. ProtectedAccountService
+    ProtectedAccountService --> RealAccountService : controls access
+    Client --> AccountService`} />
+
+## TypeScript implementation
+
+**1. Caching proxy** (sometimes called a "smart proxy"; the proxy owns the cache and the subject):
+
+```ts
+interface ReferenceData {
+  getLotSize(symbol: string): Promise<number>;
+}
+
+class RemoteReferenceData implements ReferenceData {
+  calls = 0;
+  async getLotSize(symbol: string): Promise<number> {
+    this.calls++;
+    await new Promise((r) => setTimeout(r, 10)); // slow network
+    return symbol.endsWith('FUT') ? 25 : 1;
+  }
+}
+
+class CachingReferenceDataProxy implements ReferenceData {
+  private readonly cache = new Map<string, Promise<number>>();
+  constructor(private readonly real: ReferenceData) {}
+
+  getLotSize(symbol: string): Promise<number> {
+    let p = this.cache.get(symbol);
+    if (!p) {
+      // cache the promise so concurrent callers share one request
+      p = this.real.getLotSize(symbol).catch((err: unknown) => {
+        this.cache.delete(symbol); // don't cache failures
+        throw err;
+      });
+      this.cache.set(symbol, p);
+    }
+    return p;
+  }
+}
+
+const remote = new RemoteReferenceData();
+const refData: ReferenceData = new CachingReferenceDataProxy(remote);
+
+const lots = await Promise.all(['INFY', 'NIFTYFUT', 'INFY', 'INFY', 'NIFTYFUT'].map((s) => refData.getLotSize(s)));
+console.log(`lot sizes: ${lots.join(',')}`);
+console.log(`remote calls: ${remote.calls}`);
+```
+
+```text
+lot sizes: 1,25,1,1,25
+remote calls: 2
+```
+
+**2. Protection proxy:**
+
+```ts
+type Role = 'customer' | 'support' | 'admin';
+
+interface User {
+  id: string;
+  role: Role;
+}
+
+interface AccountService {
+  balance(accountId: string): number;
+  withdraw(accountId: string, amount: number): number;
+}
+
+class RealAccountService implements AccountService {
+  private readonly balances = new Map([
+    ['acc-ritesh', 50_000],
+    ['acc-amit', 20_000],
+  ]);
+  private readonly owners = new Map([
+    ['acc-ritesh', 'ritesh'],
+    ['acc-amit', 'amit'],
+  ]);
+
+  ownerOf(accountId: string): string | undefined {
+    return this.owners.get(accountId);
+  }
+
+  balance(accountId: string): number {
+    return this.balances.get(accountId) ?? 0;
+  }
+
+  withdraw(accountId: string, amount: number): number {
+    const bal = this.balance(accountId);
+    if (amount > bal) throw new Error('insufficient balance');
+    this.balances.set(accountId, bal - amount);
+    return bal - amount;
+  }
+}
+
+class ProtectedAccountService implements AccountService {
+  constructor(
+    private readonly real: RealAccountService,
+    private readonly user: User,
+  ) {}
+
+  balance(accountId: string): number {
+    // support staff can view, but only their customers' data would be allowed in real life
+    this.assert(this.isOwner(accountId) || this.user.role !== 'customer', 'view', accountId);
+    return this.real.balance(accountId);
+  }
+
+  withdraw(accountId: string, amount: number): number {
+    // support can never move money; admins can, owners can
+    this.assert(this.isOwner(accountId) || this.user.role === 'admin', 'withdraw from', accountId);
+    return this.real.withdraw(accountId, amount);
+  }
+
+  private isOwner(accountId: string): boolean {
+    return this.real.ownerOf(accountId) === this.user.id;
+  }
+
+  private assert(allowed: boolean, action: string, accountId: string): void {
+    if (!allowed) throw new Error(`403: ${this.user.id} (${this.user.role}) may not ${action} ${accountId}`);
+  }
+}
+
+const real = new RealAccountService();
+const attempts: Array<[User, string, 'balance' | 'withdraw']> = [
+  [{ id: 'ritesh', role: 'customer' }, 'acc-ritesh', 'withdraw'],
+  [{ id: 'ritesh', role: 'customer' }, 'acc-amit', 'balance'],
+  [{ id: 'priya', role: 'support' }, 'acc-amit', 'balance'],
+  [{ id: 'priya', role: 'support' }, 'acc-amit', 'withdraw'],
+  [{ id: 'root', role: 'admin' }, 'acc-amit', 'withdraw'],
+];
+
+for (const [user, acc, op] of attempts) {
+  const svc: AccountService = new ProtectedAccountService(real, user);
+  try {
+    const result = op === 'balance' ? svc.balance(acc) : svc.withdraw(acc, 5_000);
+    console.log(`${user.id} ${op} ${acc} -> ${result}`);
+  } catch (err) {
+    console.log((err as Error).message);
+  }
+}
+```
+
+```text
+ritesh withdraw acc-ritesh -> 45000
+403: ritesh (customer) may not view acc-amit
+priya balance acc-amit -> 20000
+403: priya (support) may not withdraw from acc-amit
+root withdraw acc-amit -> 15000
+```
+
+**3. Virtual (lazy) proxy:**
+
+```ts
+interface PnlReport {
+  title(): string;
+  totalPnl(): number;
+}
+
+class HeavyPnlReport implements PnlReport {
+  private readonly trades: number[];
+  constructor(private readonly year: number) {
+    console.log(`  (loading ${year} trades from warehouse...)`);
+    this.trades = Array.from({ length: 1_000 }, (_, i) => ((i % 10) - 4) * 10); // expensive in real life
+  }
+  title(): string {
+    return `P&L ${this.year}`;
+  }
+  totalPnl(): number {
+    return this.trades.reduce((a, b) => a + b, 0);
+  }
+}
+
+class LazyPnlReport implements PnlReport {
+  private real: HeavyPnlReport | undefined;
+  constructor(private readonly year: number) {}
+
+  title(): string {
+    return `P&L ${this.year}`; // cheap: answered without loading
+  }
+
+  totalPnl(): number {
+    this.real ??= new HeavyPnlReport(this.year); // load on first real need
+    return this.real.totalPnl();
+  }
+}
+
+const reports: PnlReport[] = [new LazyPnlReport(2024), new LazyPnlReport(2025)];
+console.log(`menu: ${reports.map((r) => r.title()).join(', ')}`);
+console.log(`user opens 2025`);
+console.log(`total: ${reports[1].totalPnl()}`);
+console.log(`again: ${reports[1].totalPnl()}`);
+```
+
+```text
+menu: P&L 2024, P&L 2025
+user opens 2025
+  (loading 2025 trades from warehouse...)
+total: 5000
+again: 5000
+```
+
+**4. JavaScript's built-in `Proxy`.** ES2015 `Proxy` intercepts *any* property access on *any* object, so you can write one generic proxy instead of one class per interface. Vue 3's reactivity, MobX and Immer are built on it.
+
+```ts
+// (a) Generic logging + read-only proxy for any object
+function readonlyAudited<T extends object>(target: T, label: string, log: string[]): T {
+  return new Proxy(target, {
+    get(obj, prop, receiver) {
+      const value: unknown = Reflect.get(obj, prop, receiver);
+      if (typeof value === 'function') {
+        return (...args: unknown[]) => {
+          log.push(`${label}.${String(prop)}(${args.join(', ')})`);
+          return Reflect.apply(value, obj, args);
+        };
+      }
+      return value;
+    },
+    set(_obj, prop) {
+      throw new Error(`${label} is read-only (tried to set ${String(prop)})`);
+    },
+  });
+}
+
+class RiskLimits {
+  maxOrderValue = 500_000;
+  allows(value: number): boolean {
+    return value <= this.maxOrderValue;
+  }
+}
+
+const log: string[] = [];
+const limits = readonlyAudited(new RiskLimits(), 'limits', log);
+console.log(`allows 100000: ${limits.allows(100_000)}`);
+console.log(`allows 900000: ${limits.allows(900_000)}`);
+try {
+  limits.maxOrderValue = 10_000_000;
+} catch (err) {
+  console.log((err as Error).message);
+}
+console.log(`audit: ${log.join(' | ')}`);
+
+// (b) Validation proxy on a plain settings object
+interface OrderSettings {
+  defaultQty: number;
+  product: 'CNC' | 'MIS';
+}
+
+const settings = new Proxy<OrderSettings>(
+  { defaultQty: 1, product: 'CNC' },
+  {
+    set(obj, prop, value: unknown) {
+      if (prop === 'defaultQty' && (typeof value !== 'number' || value < 1 || !Number.isInteger(value))) {
+        throw new RangeError(`defaultQty must be a positive integer, got ${String(value)}`);
+      }
+      return Reflect.set(obj, prop, value);
+    },
+  },
+);
+
+settings.defaultQty = 5;
+try {
+  settings.defaultQty = 2.5;
+} catch (err) {
+  console.log(`${(err as Error).name}: ${(err as Error).message}`);
+}
+console.log(`settings: ${JSON.stringify(settings)}`);
+```
+
+```text
+allows 100000: true
+allows 900000: false
+limits is read-only (tried to set maxOrderValue)
+audit: limits.allows(100000) | limits.allows(900000)
+RangeError: defaultQty must be a positive integer, got 2.5
+settings: {"defaultQty":5,"product":"CNC"}
+```
+
+Note the `set` trap throws for the read-only proxy. In strict mode, a trap that just returns `false` also causes a `TypeError`, but with a generic message; throwing your own error is clearer. JS `Proxy` is powerful but "magic": it hides behaviour from readers and the type system, and adds overhead on hot paths. Prefer explicit proxy classes in domain code; use `Proxy` for generic infrastructure.
+
+## When to use / when NOT to use
+
+- **Use** when you need to control access to an object without changing it or its clients: lazy initialisation of heavy objects, caching of expensive or remote calls, authorization, rate limiting per caller, remote proxies (gRPC/HTTP client stubs look like local objects), copy-on-write, or change tracking.
+- **Don't use** when the extra indirection adds nothing, or when access control belongs in a clear boundary (an HTTP guard / middleware in NestJS is often the better home for auth).
+
+## Pitfalls
+
+- **Stale caches**: a caching proxy needs an invalidation or TTL story.
+- **Caching failures**: cache only successes (we delete rejected promises).
+- **Security by proxy only**: if other code can reach the real object directly, the protection proxy is bypassed. Don't export the real one.
+- **Lazy proxy surprises**: the first call is slow and may throw loading errors at an unexpected place.
+- **`this` binding with JS `Proxy`**: methods called through a proxy get the proxy as `this`; private `#fields` then throw `TypeError`. Bind to the target (`Reflect.apply(value, obj, args)`) as shown.
+- **Identity**: `proxy !== target`, which breaks `Set`/`Map` lookups keyed by the original object.
+
+## Related patterns
+
+- **Decorator** vs **Proxy**: same structure, different intent. A decorator *adds* features and is stacked by the client; a proxy *controls access* to its subject and often creates or manages it (lazy proxy, remote proxy). A caching wrapper can be described either way; say "proxy" if its main job is to avoid touching the subject.
+- **Adapter** changes the interface; Proxy keeps it identical.
+- **Facade** simplifies many objects; Proxy stands in for one.
+- **Flyweight factory** and caching proxy both cache, but a flyweight factory hands out shared *objects*, while a caching proxy caches *results* of calls.
+
+## Where it shows up in LLD interview problems
+
+- Caching layer in front of a DB/remote service (design a cache, design a rate-limited API client).
+- Access control for documents in Google-Docs-like designs, or account operations in banking.
+- Lazy loading of images in a photo gallery / heavy reports in dashboards.
+- ORM lazy relations (`order.items` loading on first access) and remote service stubs.
+
+Interview line: *"The real account service stays pure. Callers get a proxy with the same interface that checks the user's role and ownership first, and the real object is never exposed directly."*
+
+## Quick check
+
+1. The same "cache results" wrapper: when would you call it a proxy, and when a decorator?
+2. Why does the lazy proxy answer `title()` without loading the report?
+3. What problem can a JS `Proxy` have with classes that use `#private` fields?
+
+<details>
+<summary>Answers</summary>
+
+1. Call it a proxy when its role is to stand in for the subject and control access to it (avoid remote calls, manage its lifecycle). Call it a decorator when it's one of several stackable add-ons the client composes. The code can be identical; the intent and how it's wired differ.
+2. `title()` only needs data the proxy already has (the year). Loading is deferred until an operation actually needs the heavy object.
+3. If a method is called with the proxy as `this`, accessing `this.#field` throws a `TypeError` because the proxy isn't the object that owns the private field. The fix is to call methods with the target as `this`.
+
+</details>

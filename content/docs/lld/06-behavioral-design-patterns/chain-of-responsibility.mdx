@@ -1,0 +1,304 @@
+---
+title: "6.5 Chain of Responsibility"
+---
+
+## Intent
+
+Pass a request along a chain of handlers. Each handler either deals with it (stops, rejects, or answers) or passes it to the next one. The sender doesn't know which handler will act.
+
+## Problem
+
+Before an order reaches the exchange, a broker must check several things, in order:
+
+1. **KYC** is complete for the user.
+2. The **market is open** (NSE equity: 09:15–15:30).
+3. The user has enough **margin**.
+4. **Risk** limits are respected (max order value, banned scrips).
+
+Putting everything in one 200-line `validateOrder()` makes it hard to reorder checks, turn one off for a segment, or test them separately. Compliance will also add a new check every quarter.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class OrderValidator {
+        <<abstract>>
+        -next OrderValidator
+        +setNext(v) OrderValidator
+        +handle(req, ctx) Result
+        #check(req, ctx) string
+    }
+    class KycValidator
+    class MarketHoursValidator
+    class MarginValidator
+    class RiskValidator
+    OrderValidator <|-- KycValidator
+    OrderValidator <|-- MarketHoursValidator
+    OrderValidator <|-- MarginValidator
+    OrderValidator <|-- RiskValidator
+    OrderValidator o-- OrderValidator : next`} />
+
+## TypeScript implementation (classic linked handlers)
+
+```ts
+interface OrderRequest {
+  tag: string;
+  userId: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  qty: number;
+  price: number;
+  minuteOfDay: number; // IST minutes since midnight, passed in to keep things deterministic
+}
+
+interface RiskContext {
+  kycDone: Set<string>;
+  margin: Map<string, number>;
+  maxOrderValue: number;
+}
+
+type ValidationResult = { ok: true } | { ok: false; by: string; reason: string };
+
+abstract class OrderValidator {
+  private next: OrderValidator | undefined;
+  abstract readonly name: string;
+
+  /** Returns the next handler so calls can be chained fluently. */
+  setNext(v: OrderValidator): OrderValidator {
+    this.next = v;
+    return v;
+  }
+
+  handle(req: OrderRequest, ctx: RiskContext): ValidationResult {
+    const reason = this.check(req, ctx);
+    if (reason) return { ok: false, by: this.name, reason };
+    return this.next ? this.next.handle(req, ctx) : { ok: true };
+  }
+
+  /** Return an error message to stop the chain, or null to pass it on. */
+  protected abstract check(req: OrderRequest, ctx: RiskContext): string | null;
+}
+
+class KycValidator extends OrderValidator {
+  readonly name = 'KYC';
+  protected check(req: OrderRequest, ctx: RiskContext): string | null {
+    return ctx.kycDone.has(req.userId) ? null : `KYC not completed for ${req.userId}`;
+  }
+}
+
+class MarketHoursValidator extends OrderValidator {
+  readonly name = 'MarketHours';
+  protected check(req: OrderRequest): string | null {
+    const open = 9 * 60 + 15;
+    const close = 15 * 60 + 30;
+    return req.minuteOfDay >= open && req.minuteOfDay < close ? null : 'market is closed';
+  }
+}
+
+class MarginValidator extends OrderValidator {
+  readonly name = 'Margin';
+  protected check(req: OrderRequest, ctx: RiskContext): string | null {
+    if (req.side === 'SELL') return null;
+    const need = req.qty * req.price;
+    const have = ctx.margin.get(req.userId) ?? 0;
+    return have >= need ? null : `insufficient margin: need ${need}, have ${have}`;
+  }
+}
+
+class RiskValidator extends OrderValidator {
+  readonly name = 'Risk';
+  protected check(req: OrderRequest, ctx: RiskContext): string | null {
+    const value = req.qty * req.price;
+    return value <= ctx.maxOrderValue ? null : `order value ${value} exceeds limit ${ctx.maxOrderValue}`;
+  }
+}
+
+// Build the chain in one place. Reordering means changing only these lines.
+const chain = new KycValidator();
+chain.setNext(new MarketHoursValidator()).setNext(new MarginValidator()).setNext(new RiskValidator());
+
+const ctx: RiskContext = {
+  kycDone: new Set(['u1', 'u3']),
+  margin: new Map([
+    ['u1', 100_000],
+    ['u3', 1_000_000],
+  ]),
+  maxOrderValue: 500_000,
+};
+
+const base = { symbol: 'INFY', side: 'BUY', price: 1500, minuteOfDay: 600 } as const;
+const requests: OrderRequest[] = [
+  { ...base, tag: 'A', userId: 'u1', qty: 10 },
+  { ...base, tag: 'B', userId: 'u2', qty: 10 },
+  { ...base, tag: 'C', userId: 'u1', qty: 10, minuteOfDay: 950 },
+  { ...base, tag: 'D', userId: 'u1', qty: 100 },
+  { ...base, tag: 'E', userId: 'u3', qty: 400 },
+  { ...base, tag: 'F', userId: 'u1', qty: 100, side: 'SELL' },
+];
+
+for (const req of requests) {
+  const r = chain.handle(req, ctx);
+  console.log(r.ok ? `${req.tag}: ACCEPTED` : `${req.tag}: REJECTED by ${r.by} - ${r.reason}`);
+}
+```
+
+```text
+A: ACCEPTED
+B: REJECTED by KYC - KYC not completed for u2
+C: REJECTED by MarketHours - market is closed
+D: REJECTED by Margin - insufficient margin: need 150000, have 100000
+E: REJECTED by Risk - order value 600000 exceeds limit 500000
+F: ACCEPTED
+```
+
+Notice that the discriminated union `ValidationResult` lets TypeScript narrow `r.by` and `r.reason` only in the failure branch.
+
+## Variant: "everyone gets a look" (logger levels)
+
+In the classic chain, the first handler that acts **stops** the request. In the logging variant, every handler decides for itself whether to act, and the request **always moves on**:
+
+```ts
+type Level = 'DEBUG' | 'INFO' | 'ERROR';
+const rank: Record<Level, number> = { DEBUG: 0, INFO: 1, ERROR: 2 };
+
+class LogHandler {
+  constructor(private readonly minLevel: Level, private readonly sink: string, private readonly next?: LogHandler) {}
+
+  log(level: Level, msg: string): void {
+    if (rank[level] >= rank[this.minLevel]) console.log(`  [${this.sink}] ${level} ${msg}`);
+    this.next?.log(level, msg);
+  }
+}
+
+// console gets everything, file gets INFO+, pager gets only ERROR
+const logger = new LogHandler('DEBUG', 'console', new LogHandler('INFO', 'file', new LogHandler('ERROR', 'pager')));
+
+for (const [level, msg] of [
+  ['DEBUG', 'quote cache miss for INFY'],
+  ['INFO', 'order O1 placed'],
+  ['ERROR', 'exchange gateway timeout'],
+] as const) {
+  console.log(`${level}:`);
+  logger.log(level, msg);
+}
+```
+
+```text
+DEBUG:
+  [console] DEBUG quote cache miss for INFY
+INFO:
+  [console] INFO order O1 placed
+  [file] INFO order O1 placed
+ERROR:
+  [console] ERROR exchange gateway timeout
+  [file] ERROR exchange gateway timeout
+  [pager] ERROR exchange gateway timeout
+```
+
+## Variant: middleware (what Express, Koa, and NestJS actually do)
+
+In Node you use this pattern every day. A middleware receives `next` and decides whether (and when) to call it. Because `await next()` returns, each middleware also gets to run code **after** the rest of the chain. This is often called the "onion" model.
+
+```ts
+interface HttpCtx {
+  path: string;
+  user?: string;
+  status: number;
+  body: string;
+}
+
+type Middleware = (ctx: HttpCtx, next: () => Promise<void>) => Promise<void>;
+
+function compose(middlewares: Middleware[]): (ctx: HttpCtx) => Promise<void> {
+  return (ctx) => {
+    const dispatch = (i: number): Promise<void> => {
+      const mw = middlewares[i];
+      if (!mw) return Promise.resolve();
+      return mw(ctx, () => dispatch(i + 1));
+    };
+    return dispatch(0);
+  };
+}
+
+const accessLog: Middleware = async (ctx, next) => {
+  console.log(`-> ${ctx.path} user=${ctx.user ?? 'anonymous'}`);
+  await next();
+  console.log(`<- ${ctx.status} ${ctx.body}`);
+};
+
+const auth: Middleware = async (ctx, next) => {
+  if (!ctx.user) {
+    ctx.status = 401;
+    ctx.body = 'login required';
+    return; // short-circuit: the handler never runs
+  }
+  await next();
+};
+
+const ordersHandler: Middleware = async (ctx) => {
+  ctx.status = 200;
+  ctx.body = `3 open orders for ${ctx.user}`;
+};
+
+const app = compose([accessLog, auth, ordersHandler]);
+await app({ path: '/orders', user: 'ritesh', status: 404, body: '' });
+await app({ path: '/orders', status: 404, body: '' });
+```
+
+```text
+-> /orders user=ritesh
+<- 200 3 open orders for ritesh
+-> /orders user=anonymous
+<- 401 login required
+```
+
+NestJS formalizes the same pipeline with Middleware → Guards → Interceptors → Pipes → Handler. Guards are exactly "handlers that may stop the chain".
+
+## When to use / when NOT to use
+
+**Use it when**
+- A request goes through a sequence of independent checks or processors, and their order or membership changes.
+- You want each check testable and reusable (the same `KycValidator` for equity and F&O chains).
+
+**Don't use it when**
+- There is one check, or the checks are tightly coupled and share lots of intermediate data.
+- You need *all* results aggregated (for example, showing every form error at once). A simple list of validators run in a loop is clearer for that.
+
+## Pitfalls
+
+- **Request falls off the end.** Decide explicitly what "no handler acted" means (here, `ok: true`).
+- **Order matters.** Put cheap checks before expensive ones (market hours before a margin DB call) and make the order visible in one place.
+- **Broken chain.** A middleware that forgets to call `next()` (and doesn't respond) hangs the request.
+- **Calling `next()` twice** in middleware runs downstream twice. Koa guards against this, and a hand-written `compose` should too in production.
+- **Debuggability.** Log which handler rejected a request, as done above with `by`.
+
+## Related patterns
+
+- **CoR vs Decorator.** Both wrap or link objects. A decorator *always* delegates and adds behavior. A chain handler *may stop* the request.
+- **CoR vs Command.** A command is the request object. The chain decides who handles it.
+- **CoR + Composite.** In UI trees, events bubble up the parent chain (DOM event bubbling is CoR).
+
+## Where it shows up in LLD interview problems
+
+- **Order validation / risk management** in a trading system.
+- **ATM cash dispenser:** a ₹2000 → ₹500 → ₹100 handler chain dispenses notes.
+- **Logging framework** with levels.
+- **Approval workflows:** leave or expense approval goes manager → director → CFO by amount.
+- **Customer support escalation:** bot → L1 → L2.
+- **HTTP middleware / API gateway filters.**
+
+*How to say it:* "Pre-trade checks are a chain of `OrderValidator`s: KYC, then market hours, then margin, then risk. Each check either returns a rejection reason or passes to the next. The chain is assembled in one place, so compliance can add a check without touching the others."
+
+## Quick check
+
+1. What's the key difference between the classic chain and the logger-levels variant?
+2. Why is the "onion" model useful in middleware?
+3. How would you implement an ATM that dispenses ₹2000/₹500/₹100 notes with this pattern?
+
+<details>
+<summary>Answer</summary>
+
+1. In the classic chain, a handler that acts stops propagation. In the logger variant, every handler decides for itself and the request always continues.
+2. Code after `await next()` runs once the downstream handlers finish, so one middleware can do both before and after work (timing, logging, error mapping).
+3. Chain `NoteDispenser(2000) → NoteDispenser(500) → NoteDispenser(100)`. Each one dispenses `Math.floor(amount / note)` notes (limited by its stock) and passes the remainder to the next. If anything is left at the end, the amount can't be dispensed.
+
+</details>

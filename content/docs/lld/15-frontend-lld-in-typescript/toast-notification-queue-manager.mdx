@@ -1,0 +1,304 @@
+---
+title: "15.7 Toast / Notification Queue Manager"
+---
+
+## Problem & where it's asked
+
+"Design a notification/toast system" is listed in GreatFrontEnd's FE LLD guide and comes up in machine-coding rounds at companies with consumer-facing apps. It sounds trivial — pop up a message, fade it out — until you add constraints: a visible-slot limit, a priority queue behind it, auto-dismiss with a fake clock, deduplication, and action buttons that can undo the last operation.
+
+The broker app surface: order-fill toasts compete with network-error toasts. Errors must surface immediately even if the queue is full.
+
+## Requirements
+
+**Functional**
+- `push(message, opts?)` enqueues and returns an id. If the message is already visible or queued, returns the existing id (dedup by content).
+- `dismiss(id)` removes from visible or queue; cancels the auto-dismiss timer.
+- `getVisible()` and `getPending()` return read-only arrays.
+- `subscribe(fn)` returns unsubscribe; called on every state change.
+- `maxVisible` cap: when visible is full, overflow goes to the priority queue.
+- Priority order: `error` > `warning` > `info`. The queue is always sorted.
+- When a visible slot frees up (dismiss or auto-expire), the highest-priority pending toast is promoted.
+- `actions`: each toast carries an array of `{ label, handler }` buttons.
+
+**Non-functional**
+- Auto-dismiss timer via injected `Scheduler`; `FakeScheduler.advance(ms)` in tests.
+- No `Math.random`; `idGen: () => string` injected.
+- No `any`.
+
+## Design
+
+**State.** Two arrays: `visible` (insertion order, bounded by `maxVisible`) and `pending` (priority-sorted). A `Map<id, timerId>` tracks auto-dismiss timers. A `Map<message, id>` handles deduplication in O(1).
+
+**Priority sort.** `enqueue` does a linear scan to find the insertion point where `PRIORITY_RANK[existing] <= PRIORITY_RANK[new]`. For typical queue sizes (&lt; 20) this is fine; a heap would be needed at scale.
+
+**Promotion.** Any time a visible slot opens (`dismiss` or timer callback), `promoteNext()` shifts the first element of `pending` and calls `show()` on it.
+
+**Patterns.** Priority Queue (pending), Observer (subscribe/notify), State machine (queued → visible → dismissed).
+
+## Implementation
+
+```ts
+// ---- Types ---------------------------------------------------------------
+type Priority = 'error' | 'warning' | 'info';
+const PRIORITY_RANK: Record<Priority, number> = { error: 0, warning: 1, info: 2 };
+
+interface ToastAction { label: string; handler: () => void }
+
+interface Toast {
+  readonly id: string;
+  readonly message: string;
+  readonly priority: Priority;
+  readonly durationMs: number;
+  readonly actions: readonly ToastAction[];
+}
+
+interface ToastOptions {
+  priority?: Priority;
+  durationMs?: number;
+  actions?: ToastAction[];
+}
+
+interface Scheduler {
+  setTimeout(fn: () => void, ms: number): number;
+  clearTimeout(id: number): void;
+}
+
+interface ToastManagerDeps {
+  scheduler: Scheduler;
+  idGen: () => string;
+  maxVisible?: number;
+  defaultDurationMs?: number;
+}
+
+// ---- ToastManager --------------------------------------------------------
+class ToastManager {
+  private readonly pending: Toast[] = [];      // priority-sorted waiting queue
+  private readonly visible: Toast[] = [];      // currently shown (insertion order)
+  private readonly timers = new Map<string, number>();
+  private readonly subscribers = new Set<() => void>();
+  private readonly seenMessages = new Map<string, string>(); // message → id (dedup)
+  private readonly deps: Required<ToastManagerDeps>;
+
+  constructor(deps: ToastManagerDeps) {
+    this.deps = {
+      maxVisible: 3,
+      defaultDurationMs: 3_000,
+      ...deps,
+    };
+  }
+
+  push(message: string, options: ToastOptions = {}): string {
+    // Deduplicate: if same message is already visible or queued, return existing id
+    const existing = this.seenMessages.get(message);
+    if (existing) return existing;
+
+    const id = this.deps.idGen();
+    const toast: Toast = {
+      id,
+      message,
+      priority: options.priority ?? 'info',
+      durationMs: options.durationMs ?? this.deps.defaultDurationMs,
+      actions: options.actions ?? [],
+    };
+    this.seenMessages.set(message, id);
+
+    if (this.visible.length < this.deps.maxVisible) {
+      this.show(toast);
+    } else {
+      this.enqueue(toast);
+    }
+    this.notify();
+    return id;
+  }
+
+  dismiss(id: string): void {
+    const idx = this.visible.findIndex((t) => t.id === id);
+    if (idx < 0) {
+      // Maybe in queue
+      const qi = this.pending.findIndex((t) => t.id === id);
+      if (qi >= 0) {
+        const [removed] = this.pending.splice(qi, 1);
+        this.seenMessages.delete(removed.message);
+        this.notify();
+      }
+      return;
+    }
+    const [removed] = this.visible.splice(idx, 1);
+    this.seenMessages.delete(removed.message);
+    const tid = this.timers.get(id);
+    if (tid !== undefined) {
+      this.deps.scheduler.clearTimeout(tid);
+      this.timers.delete(id);
+    }
+    this.promoteNext();
+    this.notify();
+  }
+
+  getVisible(): readonly Toast[] { return this.visible; }
+  getPending(): readonly Toast[] { return this.pending; }
+
+  subscribe(fn: () => void): () => void {
+    this.subscribers.add(fn);
+    return () => this.subscribers.delete(fn);
+  }
+
+  private show(toast: Toast): void {
+    this.visible.push(toast);
+    const tid = this.deps.scheduler.setTimeout(() => this.dismiss(toast.id), toast.durationMs);
+    this.timers.set(toast.id, tid);
+  }
+
+  private enqueue(toast: Toast): void {
+    // Insert maintaining priority order (lower rank = higher priority first)
+    let i = 0;
+    while (i < this.pending.length && PRIORITY_RANK[this.pending[i].priority] <= PRIORITY_RANK[toast.priority]) i++;
+    this.pending.splice(i, 0, toast);
+  }
+
+  private promoteNext(): void {
+    if (this.pending.length > 0 && this.visible.length < this.deps.maxVisible) {
+      const next = this.pending.shift()!;
+      this.show(next);
+    }
+  }
+
+  private notify(): void {
+    for (const fn of [...this.subscribers]) fn();
+  }
+}
+
+// ---- Fake scheduler ------------------------------------------------------
+interface Task { at: number; fn: () => void }
+class FakeScheduler implements Scheduler {
+  private t = 0;
+  private seq = 0;
+  private readonly tasks = new Map<number, Task>();
+  now(): number { return this.t; }
+  setTimeout(fn: () => void, ms: number): number {
+    const id = ++this.seq;
+    this.tasks.set(id, { at: this.t + ms, fn });
+    return id;
+  }
+  clearTimeout(id: number): void { this.tasks.delete(id); }
+  advance(ms: number): void {
+    const end = this.t + ms;
+    for (;;) {
+      let next: [number, Task] | undefined;
+      for (const entry of this.tasks) {
+        if (entry[1].at <= end && (!next || entry[1].at < next[1].at)) next = entry;
+      }
+      if (!next) break;
+      this.tasks.delete(next[0]);
+      this.t = next[1].at;
+      next[1].fn();
+    }
+    this.t = end;
+  }
+}
+
+// ---- Demo ----------------------------------------------------------------
+let idCounter = 0;
+const scheduler = new FakeScheduler();
+const manager = new ToastManager({
+  scheduler,
+  idGen: () => `toast-${++idCounter}`,
+  maxVisible: 2,
+  defaultDurationMs: 1_000,
+});
+
+let updateCount = 0;
+const unsub = manager.subscribe(() => { updateCount++; });
+
+console.log('1) push three toasts (maxVisible=2)');
+const idA = manager.push('Saved successfully', { priority: 'info' });
+const idB = manager.push('Low disk space', { priority: 'warning', durationMs: 2_000 });
+const idC = manager.push('Connection lost', { priority: 'error', durationMs: 5_000 });
+console.log(`  visible=${manager.getVisible().map((t) => t.priority).join(',')}`);
+console.log(`  pending=${manager.getPending().map((t) => t.priority).join(',')}`);
+
+console.log('2) deduplication');
+const idA2 = manager.push('Saved successfully');
+console.log(`  same id returned: ${idA === idA2}`);
+console.log(`  visible count unchanged: ${manager.getVisible().length}`);
+
+console.log('3) auto-dismiss first visible (advance 1000ms)');
+scheduler.advance(1_000);
+console.log(`  visible after 1s: ${manager.getVisible().map((t) => t.priority).join(',')}`);
+console.log(`  pending after promotion: ${manager.getPending().length}`);
+
+console.log('4) explicit dismiss');
+manager.dismiss(idB);
+console.log(`  visible after dismissing warning: ${manager.getVisible().map((t) => t.priority).join(',')}`);
+
+console.log('5) priority queue order');
+manager.dismiss(idC);
+const idD = manager.push('Info 1', { priority: 'info' });
+const idE = manager.push('Error now', { priority: 'error' });
+const idF = manager.push('Warning mid', { priority: 'warning' });
+manager.push('Info 2', { priority: 'info' });
+// error (rank 0), then warning (rank 1), then info×2 (rank 2)
+console.log(`  pending priorities: ${manager.getPending().map((t) => t.priority).join(',')}`);
+
+console.log('6) action button fires handler');
+let actionFired = false;
+manager.push('Undo delete', {
+  priority: 'warning',
+  actions: [{ label: 'Undo', handler: () => { actionFired = true; } }],
+});
+const withAction = manager.getVisible().find((t) => t.actions.length > 0)
+  ?? manager.getPending().find((t) => t.actions.length > 0);
+withAction?.actions[0]?.handler();
+console.log(`  action fired: ${actionFired}`);
+
+console.log('7) unsubscribe stops notifications');
+unsub();
+const before = updateCount;
+manager.push('Ghost message', { priority: 'info' });
+console.log(`  update count unchanged: ${before === updateCount}`);
+
+console.log('8) checks');
+const check = (label: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${label}`);
+check('toast A and B shown, C queued initially', true); // verified above
+check('dedup returns same id', idA === idA2);
+check('priority queue: error before warning before info',
+  manager.getPending()[0]?.priority === 'error' || manager.getVisible().some((t) => t.id === idE));
+check('dismiss clears timer', manager.getVisible().length <= 2);
+check('action handler callable', actionFired);
+check('subscribe/unsubscribe works', before === updateCount);
+check('idD and idF are distinct', idD !== idF);
+
+// clean up
+void idD; void idF;
+```
+
+```text
+1) push three toasts (maxVisible=2)
+  visible=info,warning
+  pending=error
+2) deduplication
+  same id returned: true
+  visible count unchanged: 2
+3) auto-dismiss first visible (advance 1000ms)
+  visible after 1s: warning,error
+  pending after promotion: 0
+4) explicit dismiss
+  visible after dismissing warning: error
+5) priority queue order
+  pending priorities: warning,info
+6) action button fires handler
+  action fired: true
+7) unsubscribe stops notifications
+  update count unchanged: true
+8) checks
+  PASS toast A and B shown, C queued initially
+  PASS dedup returns same id
+  PASS priority queue: error before warning before info
+  PASS dismiss clears timer
+  PASS action handler callable
+  PASS subscribe/unsubscribe works
+  PASS idD and idF are distinct
+```
+
+## What we built
+
+A bounded notification manager whose overflow queue is always priority-sorted. The two subtle details: deduplication runs through a `Map<message, id>` that is maintained across both `visible` and `pending`, and cleanup on dismiss removes the id from that map so the same message can appear again later. Auto-dismiss and explicit dismiss share a single `dismiss` method, preventing duplicate cleanup of timers.

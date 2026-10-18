@@ -1,0 +1,196 @@
+---
+title: "7.1 Layered structure for machine-coding rounds"
+---
+
+## Intuition
+
+In a 90-minute machine-coding round, most people who fail don't fail on the algorithm. They fail because by minute 60 all their logic sits in one 400-line `main.ts`, and adding the "now support cancellation" requirement breaks three things. Layers are how you **keep each change in one place**.
+
+## The rule
+
+| Layer | Holds | Knows about | Never does |
+|---|---|---|---|
+| **models** | Entities, value objects, enums, invariants | Nothing else | I/O, printing |
+| **repositories** | Storage behind an interface (in-memory for the round) | models | Business rules |
+| **strategies** | Swappable policies (pricing, fees, matching, allocation) | models | Storage |
+| **services** | Use cases: validate, orchestrate, enforce rules | interfaces of repos/strategies | `console.log`, parsing input |
+| **controllers / driver** | Parse commands, call services, format output | services | Business rules |
+
+Dependencies point **inward**: the driver knows services, services know interfaces, and models know nothing. That one rule gives you testability and extensibility for free.
+
+A folder layout you can type out in the first two minutes:
+
+```text
+src/
+  models/          order.ts, user.ts, enums.ts
+  repositories/    order-repository.ts (interface), in-memory-order-repository.ts
+  strategies/      brokerage-strategy.ts, flat-brokerage.ts, percent-capped-brokerage.ts
+  services/        order-service.ts
+  errors/          app-errors.ts
+  infra/           clock.ts, id-generator.ts, event-bus.ts
+  controllers/     cli-controller.ts   (or driver.ts)
+  main.ts          composition root: wires everything together
+```
+
+<Mermaid chart={`classDiagram
+  class Driver
+  class OrderService {
+    +place(userId, symbol, side, qty, price)
+    +cancel(orderId)
+  }
+  class OrderRepository {
+    <<interface>>
+    +save(order)
+    +findById(id)
+  }
+  class BrokerageStrategy {
+    <<interface>>
+    +feePaise(turnover)
+  }
+  class InMemoryOrderRepository
+  class PercentCappedBrokerage
+  Driver --> OrderService
+  OrderService --> OrderRepository
+  OrderService --> BrokerageStrategy
+  InMemoryOrderRepository ..|> OrderRepository
+  PercentCappedBrokerage ..|> BrokerageStrategy`} />
+
+## A tiny end-to-end example
+
+In a real round these would be separate files. Here they sit in one block, with comment banners standing in for the files.
+
+```ts
+// ---------- models/order.ts ----------
+type Side = 'BUY' | 'SELL';
+type OrderStatus = 'OPEN' | 'FILLED' | 'CANCELLED';
+
+interface Order {
+  readonly id: string;
+  readonly userId: string;
+  readonly symbol: string;
+  readonly side: Side;
+  readonly qty: number;
+  readonly pricePaise: number;
+  readonly status: OrderStatus;
+}
+
+// ---------- repositories/order-repository.ts ----------
+interface OrderRepository {
+  save(order: Order): void;
+  findById(id: string): Order | undefined;
+  findByUser(userId: string): Order[];
+}
+
+class InMemoryOrderRepository implements OrderRepository {
+  private readonly rows = new Map<string, Order>();
+  save(order: Order): void {
+    this.rows.set(order.id, { ...order }); // store a copy: callers can't mutate our "DB"
+  }
+  findById(id: string): Order | undefined {
+    const row = this.rows.get(id);
+    return row ? { ...row } : undefined;
+  }
+  findByUser(userId: string): Order[] {
+    return [...this.rows.values()].filter(o => o.userId === userId).map(o => ({ ...o }));
+  }
+}
+
+// ---------- strategies/brokerage.ts ----------
+interface BrokerageStrategy {
+  feePaise(turnoverPaise: number): number;
+}
+
+class FlatBrokerage implements BrokerageStrategy {
+  constructor(private readonly flatPaise: number) {}
+  feePaise(): number {
+    return this.flatPaise;
+  }
+}
+
+class PercentCappedBrokerage implements BrokerageStrategy {
+  constructor(private readonly basisPoints: number, private readonly capPaise: number) {}
+  feePaise(turnoverPaise: number): number {
+    const pct = Math.round((turnoverPaise * this.basisPoints) / 10_000);
+    return Math.min(pct, this.capPaise);
+  }
+}
+
+// ---------- services/order-service.ts ----------
+class OrderService {
+  private seq = 0; // section 7.6 replaces this with an injected IdGenerator
+  constructor(
+    private readonly repo: OrderRepository,
+    private readonly brokerage: BrokerageStrategy,
+  ) {}
+
+  place(userId: string, symbol: string, side: Side, qty: number, pricePaise: number): { order: Order; feePaise: number } {
+    if (!Number.isInteger(qty) || qty <= 0) throw new Error('qty must be a positive integer');
+    if (pricePaise <= 0) throw new Error('price must be positive');
+    const order: Order = { id: `ORD-${++this.seq}`, userId, symbol, side, qty, pricePaise, status: 'OPEN' };
+    this.repo.save(order);
+    return { order, feePaise: this.brokerage.feePaise(qty * pricePaise) };
+  }
+
+  cancel(orderId: string): Order {
+    const order = this.repo.findById(orderId);
+    if (!order) throw new Error(`order ${orderId} not found`);
+    if (order.status !== 'OPEN') throw new Error(`cannot cancel a ${order.status} order`);
+    const updated: Order = { ...order, status: 'CANCELLED' };
+    this.repo.save(updated);
+    return updated;
+  }
+
+  listFor(userId: string): Order[] {
+    return this.repo.findByUser(userId);
+  }
+}
+
+// ---------- main.ts (composition root + driver) ----------
+const errorMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+const service = new OrderService(new InMemoryOrderRepository(), new PercentCappedBrokerage(3, 2_000));
+const a = service.place('u1', 'INFY', 'BUY', 10, 150_000);
+console.log(`${a.order.id} placed, fee=${a.feePaise} paise`);
+const b = service.place('u1', 'TCS', 'SELL', 100, 400_000);
+console.log(`${b.order.id} placed, fee=${b.feePaise} paise (capped)`);
+service.cancel(a.order.id);
+
+const commands: Array<[string, () => unknown]> = [
+  ['cancel again', () => service.cancel(a.order.id)],
+  ['zero qty', () => service.place('u1', 'SBIN', 'BUY', 0, 80_000)],
+  ['unknown order', () => service.cancel('ORD-99')],
+];
+for (const [label, run] of commands) {
+  try {
+    run();
+  } catch (err) {
+    console.log(`${label} -> error: ${errorMessage(err)}`);
+  }
+}
+console.log(service.listFor('u1').map(o => `${o.id}:${o.status}`).join(', '));
+
+const flat = new OrderService(new InMemoryOrderRepository(), new FlatBrokerage(2_000));
+console.log(`flat fee = ${flat.place('u2', 'INFY', 'BUY', 1, 150_000).feePaise} paise`);
+```
+
+```text
+ORD-1 placed, fee=450 paise
+ORD-2 placed, fee=2000 paise (capped)
+cancel again -> error: cannot cancel a CANCELLED order
+zero qty -> error: qty must be a positive integer
+unknown order -> error: order ORD-99 not found
+ORD-1:CANCELLED, ORD-2:OPEN
+flat fee = 2000 paise
+```
+
+Swapping the fee policy took one line in the composition root, and `OrderService` didn't change. That's the whole point of the layering.
+
+## Pitfalls
+
+- **Printing inside services.** The driver formats output. Services return data or throw.
+- **Leaking mutable references out of the repository.** If `findById` returns the stored object, a caller can change "the database" without calling `save`. Return copies.
+- **Over-layering.** Don't add a `DTO → Mapper → Entity` pipeline in a 90-minute round. Five layers is enough.
+
+## How to say it in an interview
+
+> "I'll split this into models, repositories behind interfaces, strategies for the swappable policies, and a service per use case. `main` is the composition root. The service only talks to interfaces, so when you add a new fee rule or swap the in-memory store for Postgres, only the wiring changes."

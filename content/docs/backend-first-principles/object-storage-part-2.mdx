@@ -1,0 +1,1290 @@
+---
+title: "Object Storage: Part 2"
+description: Large files with multipart upload, the production upload architecture, downloads, CDNs, range requests, video streaming and pricing, solved at the engineering level.
+---
+
+<Callout type="info">
+  Notes for [Object Storage: Everything You Need to Know, Part 2](https://youtu.be/iWrVCxexUWY) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+Part 1 got small and medium files working: presigned URLs, verifying uploads, keys and metadata. Everything there works for a few hundred MB. **This part starts where that design breaks: large files.** It then covers the other half of the story, getting files **back out**.
+
+<Mermaid chart={`flowchart LR
+  A["Why a single PUT breaks"] --> B["Multipart protocol"]
+  B --> C["Part size math"]
+  C --> D["ETag trap + checksums"]
+  D --> E["Abort + hidden cost"]
+  E --> F["Production upload architecture"]
+  F --> X1["➕ Idempotent processing"]
+  X1 --> X2["➕ Malware scanning"]
+  X2 --> G["Downloads: 3 patterns"]
+  G --> X3["➕ Image variants"]
+  X3 --> H["Range requests"]
+  H --> I["Video: HLS / DASH"]
+  I --> J["Pricing"]
+  J --> X4["➕ Storage classes"]
+  X4 --> X5["➕ Cost + access monitoring"]`} />
+
+---
+
+## 1. Why a single PUT stops working for large files 🎓
+
+There are four independent reasons. Each one points to part of the solution.
+
+### Reason 1: a hard size limit
+- **Problem:** one `PUT` request can carry **at most 5 GB**. The **object storage API itself** enforces this, not HTTP and not your backend.
+- **Who hits it:** products that accept videos, CAD files, database dumps, wedding or drone footage.
+- **Consequence:** if you accept files like these, a single PUT can't work. You are **architecturally required** to use a different upload mechanism.
+
+### Reason 2: all or nothing
+- **Problem:** a single PUT either completes fully or fails fully. If you're at 4.8 GB of 5 GB and the Wi-Fi drops for a second (for example, the router switches to a backup connection), **the whole request is cancelled**. There's no resume; the next attempt starts from byte 0.
+- **Why it matters in practice:** on typical **mobile data**, not a 100–200 Mbps office line, a large upload takes **20–30 minutes**. A brief network glitch somewhere in a 30-minute window is very likely on mobile.
+- **First-principles view:** the longer one request lasts, the more likely it is to be interrupted, and the more work you lose when it is. **You need a smaller unit of failure.**
+
+### Reason 3: throughput (networking)
+- **Problem:** one TCP connection (the transport under HTTP) **can't fill a fast link**.
+- **Why:** a TCP stream's throughput is roughly bounded by **window size ÷ round-trip time**. It's also very sensitive to **packet loss**: one lost packet collapses the congestion window, which then has to grow back slowly.
+- **Result:** you might have a 200–500 Mbps connection and still see a **single-stream upload stuck around 30 Mbps**.
+- **The fix at the network level is more connections.** Parallel streams each get **their own congestion window**, and one stalling doesn't slow the others.
+- **Real-world proof:** download managers (IDM, Free Download Manager) don't make your connection physically faster. They open about **8 connections** to the same file and download pieces in parallel.
+
+<Mermaid chart={`flowchart LR
+  subgraph One["1 TCP stream"]
+    direction TB
+    L1["window / RTT caps speed"] --> L2["1 packet lost: window collapses"] --> L3["~30 Mbps on a 500 Mbps link"]
+  end
+  subgraph Many["N parallel streams"]
+    direction TB
+    M1["each stream has its own window"] --> M2["one stalls, others continue"] --> M3["throughput adds up until the link is full"]
+  end`} />
+
+### Reason 4: user experience
+- **Problem:** with one PUT, progress reporting is coarse and imprecise, and you **can't pause** or **survive a closed tab or network error**.
+
+### How the solution maps to the problems
+
+| Problem | What the solution must provide | Multipart's mechanism |
+|---|---|---|
+| 5 GB cap | Objects larger than one request | Up to 10,000 parts per object |
+| All or nothing | A small unit of failure | Each part is its own request, retried alone |
+| Single-stream throughput | Many connections | Parts upload **in parallel**, in any order |
+| Poor UX | Precise progress, pause/resume | Progress = finished parts; resume = upload only the missing parts |
+
+---
+
+## 2. The multipart upload protocol 🎓
+
+The whole protocol is **three calls**, plus a fourth to cancel.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant C as Uploader
+  participant S as Object storage
+  C->>S: CreateMultipartUpload(bucket, key, contentType)
+  S-->>C: uploadId (staging area opened)
+  Note over S: GET key now returns 404, nothing committed yet
+  par independent requests, any order
+    C->>S: UploadPart(uploadId, partNumber 7, bytes)
+    S-->>C: ETag for part 7
+  and
+    C->>S: UploadPart(uploadId, partNumber 2, bytes)
+    S-->>C: ETag for part 2
+  end
+  C->>S: CompleteMultipartUpload(uploadId, [partNumber, ETag] in order)
+  S-->>C: object committed (metadata operation)
+  Note over C,S: or AbortMultipartUpload(uploadId) discards all parts`} />
+
+### Step 1: `CreateMultipartUpload`
+- You send the bucket, the key and the content type. You get back an **`uploadId`**.
+- **Mental model: the `uploadId` is a staging area, like git's staging area.** Parts collect there, uncommitted, and you can still throw them away.
+- **Nothing exists at the key yet.** A `GET` on that key returns **404** until you commit. Readers never see a half-uploaded object.
+
+### Step 2: `UploadPart`, once per chunk
+- You send the `uploadId`, a **part number** and that part's bytes.
+- **Key property: every part is a completely independent HTTP request.** So parts can:
+  - go **in parallel** (this solves throughput),
+  - arrive **in any order** (part 7 may land before part 2),
+  - be **retried individually** without affecting the others (this solves all-or-nothing).
+- Every successful part returns an **ETag**. **Keep every ETag**; you need them in step 3. (Part 1 used ETags for conditional writes; this is their second job.)
+
+### Step 3: `CompleteMultipartUpload`
+- You send the `uploadId` + the **full ordered list of `(partNumber, ETag)`**. Storage turns them into one object.
+- **The surprising part:** this call takes about the **same time whether the object is 50 MB or 50 GB**, and no matter how many parts it has.
+- **Why:** storage doesn't physically copy the parts into one blob. It **records the object's structure** ("this object = these parts in this order"). That's a **metadata-plane** operation, not a data-plane one. This is the metadata plane vs data plane split from Part 1.
+
+### Step 4: `AbortMultipartUpload`
+Discards the staging area and every part in it. Section 5 explains why you can't skip this.
+
+---
+
+## 3. Choosing the part size: the 10,000-part trap 🎓
+
+### Problem
+There's a **hard cap of 10,000 parts** per upload, so the part size sets the **maximum file size**:
+
+> `max file size = part size × 10,000`
+
+If you hard-code **5 MB parts**, the maximum is **5 MB × 10,000 = 50 GB**. Upload a **60 GB** file and it fails at **part 10,001**, *after* 50 GB has already been transferred. That's the most expensive possible way to fail.
+
+### Solution: compute the part size from the file size
+1. **Dynamic size:** `fileSize ÷ 10,000`, the smallest part size that fits.
+2. That alone is wrong for small files (a 20 MB file doesn't need 10,000 tiny parts). So also pick a **floor**, a default for your app's typical files.
+3. **Use whichever is larger:** `partSize = max(floor, ceil(fileSize / 10,000))`.
+
+The lesson's recommendation: a floor of **16 or 32 MB**. That covers files up to about **160 GB or 320 GB** before the dynamic part ever matters.
+
+### Why not just use huge parts?
+**A part is your retry unit.** If a 500 MB part fails on a mobile connection, you resend 500 MB. If a 16–32 MB part fails, the retry is cheap. The sweet spot is **16 MB to about 64 MB**.
+
+```ts title="part-size.ts"
+const MB = 1024 * 1024;
+const MAX_PARTS = 10_000;
+
+export function choosePartSize(fileSize: number, floor = 16 * MB) {
+  const dynamic = Math.ceil(fileSize / MAX_PARTS);
+  const size = Math.max(floor, dynamic, 5 * MB);   // storage minimum: 5 MiB (except the last part)
+  return Math.ceil(size / MB) * MB;               // round up to a whole MiB
+}
+```
+
+| File | Floor 16 MB → part size | Parts |
+|---|---|---|
+| 2 GB | 16 MB | 128 |
+| 100 GB | 16 MB | 6,400 |
+| 200 GB | 21 MB (dynamic wins) | 9,754 |
+| 1 TB | 105 MB (dynamic wins) | 9,989 |
+
+🔧 **Storage-side limits** (S3 docs): each part must be **5 MiB – 5 GiB** (only the last part can be smaller), **1–10,000 parts**, and the maximum object size via multipart is **48.8 TiB**.
+
+---
+
+## 4. The ETag integrity trap 🎓
+
+### Problem
+For a **single PUT**, the ETag is the **MD5 of the content**. So a common, reasonable-looking integrity check is: hash the file locally, compare it with the ETag, and if they match the upload was clean.
+
+That check **breaks for multipart objects**. Their ETag is **not** the MD5 of the file. It's the MD5 of the concatenated per-part MD5s, followed by a hyphen and the **number of parts**:
+
+```text
+"d41d8cd98f00b204e9800998ecf8427e"      ← single PUT: MD5 of the bytes
+"3858f62230ac3c915f300c664312c11f-42"   ← multipart: md5(md5(p1)‖md5(p2)‖…)  + "-42" (42 parts)
+```
+
+If you see `-N` at the end, **don't treat it as a content hash.**
+
+### Solution A: the storage checksum feature
+Modern S3 SDKs compute **CRC32C or SHA-256 per part**, can request a **full-object checksum**, and the service **verifies it for you**. A corrupted part is rejected at upload time.
+
+### Solution B (the lesson author's own practice): your own SHA-256 as metadata
+1. The client computes **SHA-256 of the whole file**.
+2. It sends that as **user metadata** on the object (e.g. `x-amz-meta-sha256`).
+3. A **background job** re-hashes the stored object after upload and compares the two.
+
+**Bonus: deduplication for free.** Once every file has a trusted content hash in your DB, you can detect that two uploads are the **same bytes**. Store the object once and point both rows at it.
+
+🔧 Implementation sketch:
+
+```ts title="verify-hash.job.ts"
+import { createHash } from 'node:crypto';
+
+export async function verifyFileHash(fileId: string) {
+  const file = await db.file.findUniqueOrThrow({ where: { id: fileId } });
+  const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: file.key }));
+
+  const hash = createHash('sha256');
+  for await (const chunk of obj.Body as AsyncIterable<Uint8Array>) hash.update(chunk); // streamed, constant memory
+  const actual = hash.digest('hex');
+
+  if (actual !== obj.Metadata?.sha256) return db.file.update({ where: { id: fileId }, data: { status: 'CORRUPT' } });
+
+  // dedup: is there already a READY file with these exact bytes?
+  const twin = await db.file.findFirst({ where: { sha256: actual, status: 'READY', NOT: { id: fileId } } });
+  if (twin) {
+    await db.file.update({ where: { id: fileId }, data: { key: twin.key, sha256: actual, status: 'READY' } });
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: file.key })); // drop the duplicate bytes
+  } else {
+    await db.file.update({ where: { id: fileId }, data: { sha256: actual, status: 'READY' } });
+  }
+}
+```
+
+Before deleting shared bytes later, check that **no other row points to the same key** (keep a reference count).
+
+---
+
+## 5. Abort and the invisible bill 🎓
+
+### Problem
+Say a user uploads **300 parts × 32 MB ≈ 10 GB**, then closes the tab. Neither `Complete` nor `Abort` is ever called.
+
+- That 10 GB **stays in the staging area**, and you're **billed for it every month, indefinitely**.
+- It's **invisible**: `LIST` shows only *objects*, and an uncommitted upload isn't an object yet. The console doesn't show it either.
+
+**The lesson's demo:** the bucket console shows **one object of 184 MB**. The CLI command that lists **started-but-unfinished** multipart uploads shows **three** of them, started days earlier, holding about **460 MB** of parts. That's more than double the visible data, and all of it billed.
+
+🔧 How to look for it yourself:
+
+```bash
+aws s3api list-multipart-uploads --bucket my-bucket
+aws s3api list-parts --bucket my-bucket --key <key> --upload-id <uploadId>   # what's inside one
+```
+
+### Solution: a lifecycle rule on every bucket, from day one
+Add a rule that **aborts incomplete multipart uploads after 7 days**. Set it up **before you write any feature code**. It costs nothing and closes the leak permanently; 7 days is a good default.
+
+```json title="lifecycle.json"
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-multipart",
+      "Filter": {},
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+```
+
+🔧 Also call `AbortMultipartUpload` **explicitly** when the user presses *Cancel*. The lifecycle rule is the safety net, not the main path.
+
+---
+
+## 6. The production architecture: presigned URLs + multipart 🎓
+
+Part 1 introduced presigned URLs and this part introduced multipart. Production combines them for **large uploads straight from the browser**.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant API as Backend
+  participant DB as Postgres
+  participant S3 as Bucket
+  participant Q as Queue
+
+  B->>API: POST /uploads/init {fileName, size, type}
+  API->>API: authN + authZ, compute part size
+  API->>S3: CreateMultipartUpload
+  S3-->>API: uploadId
+  API->>DB: INSERT file row (status PENDING, uploadId, partSize)
+  API-->>B: {uploadId, partSize, first batch of part URLs}
+  loop 4-6 parallel PUTs at a time
+    B->>S3: PUT part n (presigned URL)
+    S3-->>B: ETag n
+  end
+  B->>API: POST /uploads/complete {uploadId, [partNumber, ETag]}
+  API->>S3: CompleteMultipartUpload
+  API->>S3: HEAD object (type, size, part count match the claim?)
+  API->>DB: UPDATE status READY
+  API->>Q: emit file.uploaded
+  Q-->>B: (via websocket) UI confirmation, audit log, etc.`} />
+
+**Flow:**
+1. **Init:** the browser sends the file name, size and type. The backend runs **authN/authZ**, **computes the part size** (section 3), calls **CreateMultipartUpload**, **inserts a PENDING row** (recording intent before any bytes move, as in Part 1), and presigns part URLs. It returns the `uploadId`, the part size and the URLs.
+2. **Upload:** the browser sends **N parallel PUTs** (4–6) **directly to the bucket**.
+3. **Complete:** the browser calls the backend with the `uploadId` and every `(partNumber, ETag)`.
+4. **Commit + verify:** the backend calls **CompleteMultipartUpload**, then **HEAD**s the object to check that the content type and size match what the browser claimed, then marks the row **READY** (or COMPLETED).
+5. **Notify:** in a queue-based system, the backend emits a **`file.uploaded`** event. Consumers can write audit logs, start processing, or push a **websocket** message so the UI shows a confirmation.
+
+### Four implementation rules (each solves a specific problem)
+
+| # | Rule | Problem it prevents | Mechanism |
+|---|---|---|---|
+| 1 | **Don't presign all 10,000 URLs up front**; presign in **batches of about 100** as the browser works through them | The init response grows to **megabytes of JSON**, and URLs could expire before they're used | The browser asks for the next batch when its local queue runs low |
+| 2 | **Concurrency 4–6** | Beyond that, your uploads compete for bandwidth with each other, other processes and other devices on the network | A bounded worker pool |
+| 3 | **Read parts with `File.slice()`** | Loading a 20 GB file into memory crashes the tab | `slice()` returns a **lazy `Blob`**; bytes load only when sent. **Memory ≈ part size × concurrency**, not the file size |
+| 4 | **Expose the `ETag` header in the bucket's CORS config** | JavaScript can't read `ETag` from a cross-origin response, so you **can't complete** the upload | CORS `ExposeHeaders: ["ETag"]` |
+
+```json title="cors.json"
+[
+  {
+    "AllowedOrigins": ["https://app.example.com"],
+    "AllowedMethods": ["PUT", "POST", "GET"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+### Resumable uploads come almost for free 🎓
+Because **parts persist in the staging area** and the **DB row records the `uploadId`**, resuming is a lookup:
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser (after refresh)
+  participant API as Backend
+  participant DB as Postgres
+  participant S3 as Bucket
+  B->>API: Do I have an upload in progress for this file?
+  API->>DB: find PENDING row (owner + file fingerprint)
+  DB-->>API: uploadId, partSize
+  API->>S3: ListParts(uploadId)
+  S3-->>API: parts 1..340 already stored
+  API-->>B: fresh presigned URLs for the MISSING parts only
+  B->>S3: continue from part 341
+  B->>API: complete`} />
+
+**Why `ListParts`, and not the browser's memory?** The browser may have crashed **after** storage accepted a part but **before** it recorded that part's ETag. **The bucket is the source of truth** for what's in the staging area.
+
+### What the demo shows 🎓
+A **2 GB** file → the server plans **16 MB parts × 125 parts**, with **5 in flight** at a time.
+- A grid shows each part's state: grey = waiting, blue = in flight (always 5 blinking), green = done.
+- The network panel shows **about 125 separate PUTs**, all going to the **bucket's own domain**, never to the backend.
+- **Progress and ETA are computed in the browser** from finished vs waiting parts, not reported by the server. Because finished parts are a stable number, the progress bar **moves steadily instead of jumping around**.
+- When the last part lands, the browser sends **one `complete` call to the API** (not to S3) with the parts and ETags.
+
+### 🔧 Going deeper: the browser uploader
+
+```ts title="multipart-uploader.ts"
+type Done = Map<number, string>; // partNumber → ETag
+
+export async function uploadFile(file: File, init: { uploadId: string; partSize: number }, done: Done = new Map()) {
+  const { uploadId, partSize } = init;
+  const total = Math.ceil(file.size / partSize);
+  const pending = Array.from({ length: total }, (_, i) => i + 1).filter(n => !done.has(n)); // resume: skip done parts
+  const urls = new Map<number, string>();
+  const started = performance.now();
+  const CONCURRENCY = 5;
+
+  // Rule 1: fetch URLs in batches of ~100, only when we need them
+  async function urlFor(n: number) {
+    if (!urls.has(n)) {
+      const batch = [n, ...pending.slice(0, 99)];
+      const res = await api.post(`/uploads/${uploadId}/part-urls`, { partNumbers: batch });
+      for (const { partNumber, url } of res.urls) urls.set(partNumber, url);
+    }
+    const url = urls.get(n)!;
+    urls.delete(n);
+    return url;
+  }
+
+  async function worker() {
+    while (pending.length) {
+      const n = pending.shift()!;
+      const blob = file.slice((n - 1) * partSize, Math.min(n * partSize, file.size)); // Rule 3: lazy
+      const etag = await withRetry(async () => {
+        const res = await fetch(await urlFor(n), { method: 'PUT', body: blob });
+        if (!res.ok) throw new Error(`part ${n}: ${res.status}`);  // 403 (expired URL) → retry fetches a fresh one
+        return res.headers.get('ETag')!;                           // Rule 4: needs CORS ExposeHeaders
+      });
+      done.set(n, etag);
+      reportProgress(done.size, total, partSize, file.size, started);
+    }
+  }
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker)); // Rule 2: bounded pool
+
+  const parts = [...done].map(([partNumber, etag]) => ({ partNumber, etag })).sort((a, b) => a.partNumber - b.partNumber);
+  return api.post('/uploads/complete', { uploadId, parts });
+}
+
+function reportProgress(doneParts: number, total: number, partSize: number, size: number, started: number) {
+  const bytesDone = Math.min(doneParts * partSize, size);
+  const seconds = (performance.now() - started) / 1000;
+  const rate = bytesDone / seconds;                     // bytes/s from FINISHED parts only, so it's stable
+  const eta = rate > 0 ? (size - bytesDone) / rate : Infinity;
+  onProgress({ percent: (doneParts / total) * 100, rateMBps: rate / 1e6, etaSeconds: Math.round(eta) });
+}
+
+async function withRetry<T>(fn: () => Promise<T>, max = 5): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(); }
+    catch (e) {
+      if (attempt >= max) throw e;
+      await new Promise(r => setTimeout(r, Math.min(30_000, 500 * 2 ** attempt) * (0.5 + Math.random()))); // backoff + jitter
+    }
+  }
+}
+```
+
+### 🔧 Going deeper: the backend endpoints
+
+```ts title="uploads.controller.ts"
+// POST /uploads/init
+async init(user: User, body: { fileName: string; size: number; type: string }) {
+  assertAllowed(user, body);                                   // authZ + size and type allow-list
+  const partSize = choosePartSize(body.size);
+  const key = `users/${user.id}/${randomUUID()}`;               // server-generated key (Part 1)
+  const { UploadId } = await s3.send(new CreateMultipartUploadCommand({ Bucket, Key: key, ContentType: body.type }));
+  const file = await db.file.create({
+    data: { ownerId: user.id, key, uploadId: UploadId, partSize, size: body.size, type: body.type,
+            originalName: body.fileName, status: 'PENDING' },
+  });
+  const totalParts = Math.ceil(body.size / partSize);
+  const first = Array.from({ length: Math.min(100, totalParts) }, (_, i) => i + 1);
+  return { fileId: file.id, uploadId: UploadId, partSize, urls: await signParts(key, UploadId!, first) };
+}
+
+// POST /uploads/:uploadId/part-urls   { partNumbers: number[] }  (max 100)
+async partUrls(user: User, uploadId: string, partNumbers: number[]) {
+  const file = await db.file.findFirstOrThrow({ where: { uploadId, ownerId: user.id, status: 'PENDING' } });
+  return { urls: await signParts(file.key, uploadId, partNumbers.slice(0, 100)) };
+}
+
+// GET /uploads/:uploadId/parts   (resume)
+async listDone(user: User, uploadId: string) {
+  const file = await db.file.findFirstOrThrow({ where: { uploadId, ownerId: user.id, status: 'PENDING' } });
+  const done: { partNumber: number; etag: string }[] = [];
+  let marker: string | undefined;
+  do {                                                          // ListParts is paginated (1,000 per page)
+    const page = await s3.send(new ListPartsCommand({ Bucket, Key: file.key, UploadId: uploadId, PartNumberMarker: marker }));
+    for (const p of page.Parts ?? []) done.push({ partNumber: p.PartNumber!, etag: p.ETag! });
+    marker = page.IsTruncated ? page.NextPartNumberMarker : undefined;
+  } while (marker);
+  return { partSize: file.partSize, done };
+}
+
+// POST /uploads/complete   { uploadId, parts }
+async complete(user: User, uploadId: string, parts: { partNumber: number; etag: string }[]) {
+  const file = await db.file.findFirstOrThrow({ where: { uploadId, ownerId: user.id } });
+  if (file.status !== 'PENDING') return file;                  // idempotent: a double click is harmless
+  await s3.send(new CompleteMultipartUploadCommand({
+    Bucket, Key: file.key, UploadId: uploadId,
+    MultipartUpload: { Parts: parts.map(p => ({ PartNumber: p.partNumber, ETag: p.etag })) },
+  }));
+  const head = await s3.send(new HeadObjectCommand({ Bucket, Key: file.key }));
+  if (head.ContentLength !== file.size || head.ContentType !== file.type) {
+    await markRejected(file);                                  // the claim didn't match reality
+    throw new BadRequest('upload mismatch');
+  }
+  const ready = await db.file.update({ where: { id: file.id }, data: { status: 'READY' } });
+  await queue.publish('file.uploaded', { fileId: file.id }); // audit, processing, websocket notification
+  return ready;
+}
+
+const signParts = (Key: string, UploadId: string, nums: number[]) =>
+  Promise.all(nums.map(async PartNumber => ({
+    partNumber: PartNumber,
+    url: await getSignedUrl(s3, new UploadPartCommand({ Bucket, Key, UploadId, PartNumber }), { expiresIn: 3600 }),
+  })));
+```
+
+🔧 **If `CompleteMultipartUpload` times out:** don't blindly retry. `HEAD` the key first. If the object exists, the commit already succeeded.
+
+### Bounding the size of a multipart upload ➕
+
+The architecture above trusts the size the browser declared at init, but nothing in a presigned part URL enforces it, so the size limit that [Part 1, section 18](/docs/backend-first-principles/24-object-storage-part-1) gets from a POST policy has to be rebuilt by hand for multipart.
+
+#### Why each part URL is an oversized write capability ➕
+**Problem.** A user declares a 100 MB file, receives part URLs, and uploads **5 GiB into every part**. You pay to store it, and the HEAD check after `complete` only catches it after the bytes are already in your bucket.
+
+**First principles.** The signature on an `UploadPart` URL covers the method, key, `uploadId` and `partNumber`, not the body length. Presigned POST's `content-length-range` has no equivalent for parts. So the limit must come from **which part numbers you're willing to sign** and **what you verify before committing**.
+
+#### Mechanism: cap the parts you sign, verify the parts before you commit ➕
+1. At init, compute `totalParts = ceil(size ÷ partSize)` and store it. Reject sizes above your product limit **before** calling `CreateMultipartUpload`.
+2. Sign **only** part numbers from 1 to `totalParts`, with short expiry.
+3. Before `CompleteMultipartUpload`, call **`ListParts`** (the bucket is the source of truth) and check that every part except the last is exactly `partSize` and the sum equals the declared size. Otherwise **abort**.
+
+```ts title="multipart-guards.ts"
+// in partUrls(): never sign beyond what was declared
+const allowed = partNumbers.filter(n => Number.isInteger(n) && n >= 1 && n <= file.totalParts).slice(0, 100);
+
+// in complete(), BEFORE CompleteMultipartUpload
+async function assertPartsMatch(file: { key: string; uploadId: string; partSize: number; size: number; totalParts: number }) {
+  const parts: { PartNumber?: number; Size?: number }[] = [];
+  let marker: string | undefined;
+  do {
+    const page = await s3.send(new ListPartsCommand({ Bucket, Key: file.key, UploadId: file.uploadId, PartNumberMarker: marker }));
+    parts.push(...(page.Parts ?? []));
+    marker = page.IsTruncated ? page.NextPartNumberMarker : undefined;
+  } while (marker);
+
+  const total = parts.reduce((sum, p) => sum + (p.Size ?? 0), 0);
+  const badPart = parts.find(p => p.PartNumber! < file.totalParts && p.Size !== file.partSize);
+  if (parts.length !== file.totalParts || total !== file.size || badPart) {
+    await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: file.key, UploadId: file.uploadId }));
+    await markRejected(file);
+    throw new BadRequest('parts do not match the declared size');
+  }
+}
+```
+
+**Edge cases.**
+- Re-uploading the same part number **replaces** that part, so a client can't exceed `totalParts × 5 GiB` of staged data. The cap on signed part numbers bounds your worst case; short URL expiry bounds the time window.
+- Keep the **HEAD check after commit** as well. It also verifies the content type and catches bugs in your own math.
+
+### Sweeping abandoned multipart uploads from the database side ➕
+
+The abort-incomplete lifecycle rule (section 5) cleans the **bucket**, but the database still holds `PENDING` rows for those uploads, and a 20 GB upload on a slow connection can legitimately take longer than a naive "older than one day" cutoff.
+
+#### Problem: two systems, two cleanups, one consistent answer ➕
+**Why it happens.** The bucket and the DB have independent lifecycles (Part 1, problem 6). The lifecycle rule aborts parts after 7 days; nothing updates the row. Users then see "uploading…" forever, and resume logic (above) calls `ListParts` on an upload that no longer exists and gets `NoSuchUpload`.
+
+#### Mechanism: expire by inactivity, claim rows safely, abort idempotently ➕
+- Track **last activity** (`last_part_url_at`, updated whenever the browser asks for part URLs), not creation time, so an active slow upload isn't killed.
+- Run the sweeper on several workers safely with **`FOR UPDATE SKIP LOCKED`**: each worker claims a different batch, and no row is processed twice concurrently.
+- Commit the state change first, then abort. If the process crashes between the two, the lifecycle rule is the safety net.
+
+```sql title="sweep-abandoned.sql (safe with many workers)"
+WITH batch AS (
+  SELECT id, object_key, upload_id FROM files
+  WHERE status = 'PENDING' AND last_part_url_at < now() - interval '1 day'
+  ORDER BY last_part_url_at LIMIT 500
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE files f SET status = 'EXPIRED' FROM batch WHERE f.id = batch.id
+RETURNING batch.object_key, batch.upload_id;   -- then AbortMultipartUpload / DeleteObject for each
+```
+
+```ts title="sweeper.job.ts"
+for (const row of expiredRows) {
+  await s3.send(new AbortMultipartUploadCommand({ Bucket, Key: row.object_key, UploadId: row.upload_id }))
+    .catch(e => { if ((e as S3ServiceException).name !== 'NoSuchUpload') throw e; }); // already aborted: fine
+}
+```
+
+**Edge cases.**
+- A client that resumes after its row became `EXPIRED` must start a **new** upload. Return a clear 410 so the UI says so instead of retrying.
+- Before aborting, a cautious sweeper can `HEAD` the final key: if the object exists, `complete` succeeded and only the DB update was lost, so mark it `READY` instead.
+
+### Users far from the bucket: S3 Transfer Acceleration ➕
+
+Parallel parts (section 1, reason 3) work around per-connection TCP limits, but when the user is on another continent the long round-trip time and lossy public-internet path still cap throughput; **Transfer Acceleration** shortens the part of the trip that runs over the public internet.
+
+#### Mechanism ➕
+The client uploads to the **nearest CloudFront edge location** (`bucket.s3-accelerate.amazonaws.com`); AWS carries the bytes from there to the bucket's region over its own network. TCP throughput is bounded by window ÷ RTT, so terminating the connection close to the user (short RTT, fewer losses) raises per-connection speed, and parallel parts multiply it.
+
+#### Implementation ➕
+Enable it on the bucket, then create a separate client that presigns against the accelerate endpoint. The browser code doesn't change: it just receives different URLs.
+
+```ts title="accelerated presigning"
+// once: aws s3api put-bucket-accelerate-configuration --bucket my-uploads --accelerate-configuration Status=Enabled
+const s3Accel = new S3Client({ region: 'us-east-1', useAccelerateEndpoint: true });
+
+const url = await getSignedUrl(s3Accel, new UploadPartCommand({ Bucket, Key, UploadId, PartNumber }), { expiresIn: 3600 });
+// https://my-uploads.s3-accelerate.amazonaws.com/...?partNumber=7&uploadId=...
+```
+
+#### Edge cases ➕
+- The bucket name must be **DNS-compliant with no dots**, and only **virtual-hosted-style** requests are accelerated. Renaming a bucket is impossible, so check before you need it.
+- It can take **up to 20 minutes** after enabling before speeds improve, and it's available only in some regions.
+- It adds a **per-GB charge** on top of normal pricing. Measure first with AWS's speed comparison tool from where your users are, and enable it only when it helps (often for users on other continents, rarely for users near the region).
+- The bucket's **CORS rules** apply to the accelerate endpoint too; the browser sees a different hostname, so check your CSP `connect-src`.
+
+---
+
+## 7. Processing uploads: idempotent workers ➕
+
+Section 6 ends by emitting `file.uploaded`, and almost every product consumes it (thumbnails, transcodes, text extraction, scanning); because that event is delivered **at least once**, every consumer must be safe to run twice. Generic queue mechanics are in [lesson 14](/docs/backend-first-principles/14-task-queues-background-jobs); this section covers the object-storage-specific parts.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> READY_FOR_PROCESSING : upload verified
+  READY_FOR_PROCESSING --> PROCESSING : worker claims (atomic UPDATE)
+  PROCESSING --> PROCESSED : outputs written to processed/ prefix
+  PROCESSING --> READY_FOR_PROCESSING : worker crashed, claim timed out
+  PROCESSING --> FAILED : N attempts, sent to DLQ
+  PROCESSED --> [*]`} />
+
+#### Claim work atomically ➕
+**Problem.** The same event arrives twice (a retry, a redelivery after a visibility timeout), and two workers transcode the same 4 GB video in parallel.
+
+**Mechanism.** Use the database row as the lock: a conditional `UPDATE` that only one worker can win. Zero rows means someone else has it or it's done.
+
+```ts title="process-file.worker.ts"
+export async function handle(event: { fileId: string }) {
+  const claimed = await db.$queryRaw<{ id: string }[]>`
+    UPDATE files SET status = 'PROCESSING', claimed_at = now(), attempts = attempts + 1
+    WHERE id = ${event.fileId}
+      AND (status = 'READY_FOR_PROCESSING'
+           OR (status = 'PROCESSING' AND claimed_at < now() - interval '30 minutes'))  -- reclaim from a dead worker
+    RETURNING id`;
+  if (claimed.length === 0) return;                    // duplicate delivery: ack and move on
+
+  await transcodeAll(event.fileId);                    // writes deterministic keys (below)
+  await db.$executeRaw`UPDATE files SET status = 'PROCESSED' WHERE id = ${event.fileId} AND status = 'PROCESSING'`;
+}
+```
+
+**Edge case.** The reclaim timeout must exceed the longest legitimate job, or a slow worker and a reclaiming worker run at once. For long jobs, have the worker refresh `claimed_at` periodically (a heartbeat).
+
+#### Deterministic output keys ➕
+**Problem.** A re-run writes `processed/<random uuid>.mp4`, leaving the first run's output as an orphan you pay for, with two rows pointing at different copies.
+
+**Mechanism.** Derive output keys **only from the input**: `processed/<fileId>/720p/seg_0001.ts`. A re-run overwrites the same objects, so retries converge instead of accumulating. Write the manifest **last**, so a reader never sees a manifest pointing at segments that don't exist yet.
+
+#### The recursive-trigger trap ➕
+**Problem.** A bucket event on `ObjectCreated` triggers the worker, the worker writes a thumbnail to the same bucket, which fires another event, which runs the worker again: an infinite loop that bills you for every iteration.
+
+**Mechanism.** Scope the trigger to the **input prefix** (`uploads/`) and write outputs to a **different prefix or bucket** (`processed/`). Also make the worker ignore keys outside its input prefix, as a second guard in case someone widens the rule.
+
+#### Failure handling ➕
+- After N attempts, send the message to a **dead-letter queue** and mark the row `FAILED`, so the UI can show "processing failed" instead of spinning forever. Alert on DLQ depth.
+- Distinguish **poison input** (a corrupt file that will never transcode: fail fast, don't retry) from **transient errors** (a throttled API: retry with backoff).
+
+---
+
+## 8. Malware scanning and real-type checks before READY ➕
+
+Section 6 marks a file `READY` after checking size and declared type, but if other users will download it (attachments, shared documents, marketplace files), your bucket becomes a distribution channel for malware, and your own image or document processors become an attack surface for crafted files.
+
+#### Quarantine first, promote after a verdict ➕
+**Problem.** If a file is readable the moment it lands, there's always a window where an unscanned file can be downloaded.
+
+**First principles.** Make "readable" a consequence of "scanned clean", enforced by **storage**, not by remembering to check a flag in every code path.
+
+**Mechanism.** Uploads land in a **quarantine** location (the `pending/` prefix from Part 1, or a separate bucket) that no reader role can access. The scanner's verdict decides the next step: promote (copy to the final key) or delete and mark `INFECTED`.
+
+<Mermaid chart={`flowchart LR
+  U["Browser upload"] --> Q[("Quarantine prefix<br/>no read access")]
+  Q --> S{"Scanner verdict"}
+  S -->|"clean"| P["Copy to final key<br/>row READY"]
+  S -->|"infected"| X["Delete or move to evidence bucket<br/>row INFECTED, alert"]
+  S -->|"unsupported, failed, too big"| H["Fail closed:<br/>row NEEDS_REVIEW"]`} />
+
+#### Option A: GuardDuty Malware Protection for S3 ➕
+**Mechanism.** You enable a protection plan on a bucket (optionally limited to a few prefixes). Every new object (`PutObject`, POST, `CopyObject`, `CompleteMultipartUpload`) is scanned in an isolated AWS environment. Results are published to **EventBridge**, and, if you enable it at setup, the object gets a tag `GuardDutyMalwareScanStatus` with `NO_THREATS_FOUND`, `THREATS_FOUND`, `UNSUPPORTED`, `ACCESS_DENIED` or `FAILED`. It can be used without enabling the rest of GuardDuty.
+
+**Implementation: let the tag gate reads.** A bucket policy denies `GetObject` on any object whose tag isn't `NO_THREATS_FOUND`. Untagged objects (not scanned yet) are denied too, because the condition is true when the tag is missing: the policy **fails closed**.
+
+```json title="tag-based access: only clean objects are readable"
+{
+  "Sid": "DenyUnscannedOrInfected",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::my-app-uploads/*",
+  "Condition": {
+    "StringNotEquals": { "s3:ExistingObjectTag/GuardDutyMalwareScanStatus": "NO_THREATS_FOUND" },
+    "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::111122223333:role/GuardDutyS3MalwareScan" }
+  }
+}
+```
+
+An EventBridge rule on the scan-result event drives a small consumer that updates the DB row (READY, INFECTED or NEEDS_REVIEW), using the same conditional-update pattern as section 7.
+
+**Limits to design around.** Objects over **100 GB** aren't scanned, archives have extraction limits (file count and nesting depth), and scan results are delivered **at least once**, so the consumer must be idempotent. Tagging only works for objects uploaded **after** you enabled it.
+
+#### Option B: a self-hosted ClamAV worker ➕
+**When.** Other clouds, S3-compatible stores, or a need for custom signatures.
+
+**Mechanism.** Run `clamd` as a sidecar or service, stream the object from storage into its **`INSTREAM`** command (length-prefixed chunks, terminated by a zero-length chunk) so the file is never fully buffered, and parse the reply.
+
+```ts title="clamd-scan.ts"
+import net from 'node:net';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+
+export async function scanObject(Key: string): Promise<'clean' | 'infected'> {
+  const obj = await s3.send(new GetObjectCommand({ Bucket: QUARANTINE, Key }));
+  const sock = net.connect(3310, CLAMD_HOST);
+  const reply = new Promise<string>((resolve, reject) => {
+    let out = '';
+    sock.on('data', d => (out += d.toString()));
+    sock.on('end', () => resolve(out));
+    sock.on('error', reject);
+  });
+
+  sock.write('zINSTREAM\0');
+  for await (const chunk of obj.Body as AsyncIterable<Uint8Array>) {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(chunk.length);
+    if (!sock.write(Buffer.concat([len, chunk]))) await new Promise(r => sock.once('drain', r)); // back-pressure
+  }
+  sock.end(Buffer.alloc(4));                       // zero-length chunk = end of stream
+
+  const result = await reply;                      // "stream: OK" or "stream: <name> FOUND"
+  if (result.includes('FOUND')) return 'infected';
+  if (result.includes('OK')) return 'clean';
+  throw new Error(`clamd error: ${result}`);       // e.g. size limit exceeded: fail closed
+}
+```
+
+**Edge cases.** `clamd` has a configurable maximum stream size and closes the stream when it's exceeded; treat that as **not scanned**, never as clean. Keep signatures updated (`freshclam`), and consider **rescanning** recent files after signature updates, since a file clean today may be detected tomorrow.
+
+#### Checking the real file type from its first bytes ➕
+**Problem.** The `Content-Type` the browser sent is just a claim. A `.png` can be an HTML page (stored XSS if served inline) or a crafted file aimed at your image library.
+
+**Mechanism.** Read the first bytes with a **range GET** (section 11) and compare the **magic bytes** with the allowed types. Only the first few KB cross the network.
+
+```ts title="sniff-type.ts"
+const SIGNATURES: Array<{ type: string; bytes: number[] }> = [
+  { type: 'image/png',  bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] },
+  { type: 'image/jpeg', bytes: [0xff, 0xd8, 0xff] },
+  { type: 'application/pdf', bytes: [0x25, 0x50, 0x44, 0x46, 0x2d] },          // "%PDF-"
+];
+
+export async function sniff(Key: string) {
+  const res = await s3.send(new GetObjectCommand({ Bucket: QUARANTINE, Key, Range: 'bytes=0-15' }));
+  const head = Buffer.from(await res.Body!.transformToByteArray());
+  return SIGNATURES.find(s => s.bytes.every((b, i) => head[i] === b))?.type ?? 'unknown';
+}
+// if (await sniff(key) !== file.declaredType) reject the upload
+```
+
+**Edge cases.**
+- Formats like SVG, HTML and some Office files are text or ZIP-based and have no reliable magic bytes. **Don't accept SVG from users** unless you sanitize it; serve such files only as downloads (section 9).
+- Re-encoding images (decode and re-save with your image library) strips embedded payloads and metadata, which is a stronger guarantee than sniffing. Run it in an **isolated worker** (child process or separate service), because decoders are where exploits land.
+- **Encrypted archives** can't be scanned. Decide on a policy (reject, or mark NEEDS_REVIEW) rather than letting them through as clean.
+
+---
+
+## 9. Downloads 🎓
+
+Uploads happen once; **downloads happen over and over**. Most bandwidth, and most cost, is on the download side.
+
+### Rule zero: never relay downloads through your backend
+If your handler calls `GetObject` and copies the bytes into the response:
+- **A worker is busy for the whole download** (a goroutine, event-loop time or a thread per download).
+- **You pay for bandwidth.** Clouds and PaaS providers bill for data transfer, not just CPU and memory.
+- **It's slow.** Your server sits in one or two regions, whereas a CDN serves from edge locations all over the world, and cache hits don't cost you origin bandwidth.
+
+**Bytes should flow from the bucket, or from a CDN in front of it, directly to the user.** The lesson gives three patterns.
+
+<Mermaid chart={`flowchart TD
+  Q{What kind of content?}
+  Q -->|"Objectively public: site images, CSS bundles, product photos"| P1["Pattern 1<br/>Private bucket + CDN<br/>long Cache-Control + content-addressed keys"]
+  Q -->|"Private, per-user: invoices, resumes"| P2["Pattern 2<br/>Presigned GET (5-15 min)<br/>after an authZ check"]
+  Q -->|"Private at scale / video"| P3["Pattern 3<br/>CDN signed URLs or signed cookies<br/>authZ at the edge"]
+  P2 -. "problem: every URL is unique, so the CDN never gets a cache hit" .-> P3`} />
+
+### Pattern 1: public content → CDN + content-addressed keys
+- You can simply make the bucket public. **Better:** keep it **private**, put a **CDN** in front, and let **only the CDN** read the bucket (🔧 on AWS, CloudFront **origin access control**).
+- Set a **very long `Cache-Control`** and use **content-addressed keys**, where the key is a **hash of the file's content**.
+- **Why that solves cache staleness:** when the content changes, **the key changes, so the URL changes**. The old cached copy is never asked for again, and you never need to purge the CDN.
+- It's the **cheapest and fastest** option, and it's widely used.
+
+```ts
+// 🔧 content-addressed key
+const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+const key = `assets/${hash}.webp`;
+await s3.send(new PutObjectCommand({
+  Bucket, Key: key, Body: bytes, ContentType: 'image/webp',
+  CacheControl: 'public, max-age=31536000, immutable',
+}));
+```
+
+### When you can't change the URL: CDN invalidation ➕
+
+Content-addressed keys avoid purging, but some URLs must stay stable while their content changes (a user's avatar at `/avatars/u7.webp` embedded in emails, a legal document link, a corrected product photo), so you'll eventually need to tell the CDN to forget a cached copy.
+
+#### Why purging is slow and not free ➕
+**First principles.** A CDN keeps independent copies in hundreds of edge locations. An invalidation is a **distributed operation** to all of them: it completes asynchronously (seconds to minutes), and until it does, some users still see the old version. The edges then refetch from your origin, so a broad purge creates a burst of **origin traffic** and egress.
+
+**Cost model (CloudFront).** The first **1,000 invalidation paths per month** across the account are free, then each path is billed. A path with a wildcard (`/avatars/*`) counts as **one** path however many files it matches, but it also drops every matching object from cache, causing a refetch storm.
+
+#### Mechanism: purge precisely, or don't need to ➕
+Prefer, in order:
+1. **Change the URL** by adding a version: store `avatarVersion` in the DB and serve `/avatars/u7.webp?v=12` (with the query string in the cache key) or `/avatars/u7/12.webp`. The old copy simply ages out. No invalidation at all.
+2. **Short TTL for mutable URLs**: `Cache-Control: max-age=60, stale-while-revalidate=300` for the few URLs that must stay stable, and long TTLs everywhere else.
+3. **Targeted invalidation** of exact paths when something must disappear now (a takedown, a privacy request):
+
+```ts title="invalidate.ts"
+import { CloudFrontClient, CreateInvalidationCommand } from '@aws-sdk/client-cloudfront';
+const cf = new CloudFrontClient({});
+
+export async function purge(paths: string[], reason: string) {
+  await cf.send(new CreateInvalidationCommand({
+    DistributionId: process.env.CDN_DISTRIBUTION_ID,
+    InvalidationBatch: {
+      CallerReference: `${reason}-${Date.now()}`,   // must be unique per request; reusing one is idempotent
+      Paths: { Quantity: paths.length, Items: paths },
+    },
+  }));
+}
+// await purge(['/avatars/u7.webp'], 'avatar-update');
+```
+
+#### Edge cases ➕
+- **Invalidation doesn't reach browsers.** A file cached by the user's browser with `max-age=31536000` stays there; only a new URL fixes that. That's why `immutable` must be used only with content-addressed or versioned URLs.
+- For **takedowns** (illegal content, a leaked file), delete or overwrite the origin object **first**, then invalidate. Otherwise an edge that misses the cache before the invalidation completes may re-cache the old bytes.
+- Batch paths. Invalidating one path per user action can exceed the free tier quickly on a busy app, and there are limits on how many invalidations can be in progress at once.
+
+### Pattern 2: private content → presigned GET
+Same flow as presigned PUT, but for `GET`:
+1. The browser asks your backend for the file.
+2. The backend **authorizes** (does this user have access to this object?).
+3. It returns a **presigned GET** valid for about **5–15 minutes**, and the browser downloads directly.
+
+**The problem:** a presigned URL contains a **timestamp and a signature**, so **every request for the same file gets a different URL**. To a CDN, each one is a different resource → **cache hit rate ≈ 0%**. You put a CDN in front for caching, it can't cache anything, and you still pay full **egress** (data leaving the cloud).
+
+**Fix A (cheap): align the expiry to a time bucket.** Instead of "valid 15 minutes from now", sign so the URL is valid **until the top of the next hour**. Everyone who asks for that file **within the same hour gets the identical URL**, so the CDN can cache it. You trade **expiry precision** for **cache hits**.
+
+🔧 Implementation: the URL is identical only if **every signed input** is identical, including the **signing time**, not just the expiry. Pin the signing date to the start of the window:
+
+```ts
+const now = new Date();
+const windowStart = new Date(now);
+windowStart.setUTCMinutes(0, 0, 0);                       // top of the current hour
+
+const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket, Key: file.key }), {
+  signingDate: windowStart,                               // same X-Amz-Date for everyone in this hour
+  expiresIn: 2 * 3600,                                    // valid until the end of the NEXT hour (at least 1 h left)
+});
+```
+
+🔧 Caveats:
+- If you sign with **temporary role credentials**, the URL also changes whenever those credentials rotate, and it can't outlive them.
+- Anyone holding the URL can use it until the window ends.
+
+### Why the URL changes: how a presigned URL is signed (SigV4) ➕
+
+Fix A only works if you know exactly which inputs go into the signature, and the same knowledge explains every "SignatureDoesNotMatch" 403 you'll debug with presigned uploads (Part 1, section 17).
+
+<Mermaid chart={`flowchart TD
+  A["Canonical request<br/>METHOD + path + sorted query + signed headers + payload hash"] --> B["SHA-256"]
+  B --> C["String to sign<br/>algorithm + timestamp + scope + hash"]
+  K0["secret key"] --> K1["kDate = HMAC('AWS4'+secret, date)"]
+  K1 --> K2["kRegion = HMAC(kDate, region)"]
+  K2 --> K3["kService = HMAC(kRegion, 's3')"]
+  K3 --> K4["kSigning = HMAC(kService, 'aws4_request')"]
+  C --> S["signature = HEX(HMAC(kSigning, stringToSign))"]
+  K4 --> S
+  S --> U["URL + X-Amz-Signature"]`} />
+
+#### What is inside the signed text ➕
+**Mechanism.** The signer builds a **canonical request**: the HTTP method, the URI path (the key), every query parameter sorted (including `X-Amz-Date`, `X-Amz-Expires`, `X-Amz-Credential`, and for parts `partNumber` and `uploadId`), the **signed headers** with their values, and a payload hash (for presigned URLs, the literal `UNSIGNED-PAYLOAD`, which is why the body size isn't covered). It hashes that, wraps it with the timestamp and scope into a **string to sign**, and computes an HMAC with a key derived from the secret.
+
+**Consequences.**
+- Change the method, key, expiry, signing time or any signed header and S3's recomputed signature differs → **403**. That's why Fix A must pin `signingDate`: the timestamp is a signed input.
+- If you sign `Content-Type: image/png`, the browser must send **exactly** that header. Sign with no content type and send one, or vice versa, and it fails. Most presigned-upload bugs are header mismatches.
+- `UNSIGNED-PAYLOAD` means the URL constrains *where* and *how*, never *how much* (hence section 6's part-size checks and Part 1's POST policy).
+
+#### The derived key and why it limits damage ➕
+**Mechanism.** The signing key is a chain of HMACs over date, region and service. A derived key is valid only for **that day, region and service**, and S3 can recompute it from the secret it holds. Your secret itself never appears in the URL.
+
+#### Expiry rules ➕
+- The maximum `X-Amz-Expires` is **7 days**.
+- A URL can't outlive the **credentials** that signed it. Signed with temporary credentials (an ECS task or Lambda role), it dies when the session does, even if `expiresIn` is longer.
+- Presigning is **pure local computation**: no network call, so you can sign thousands of part URLs cheaply (but see rule 1 in section 6 about batching).
+
+**Fix B (proper, at scale): the CDN's own signed URLs or signed cookies.**
+- **Authorization moves to the edge**: the small servers spread across the world at network nodes.
+- The **CDN validates the signature** and **fully controls caching**; your backend isn't in the loop for each request.
+- 🔧 Mechanism: you register a **public key** with the CDN and sign a short **policy** (path or wildcard, expiry) with your **private key**. The CDN verifies it and keeps the signature **out of the cache key**, so authorized users share one cached copy.
+- **Signed cookies are ideal for video.** One viewing session fetches **hundreds or thousands of segment files**. Signing a URL for every segment through your backend would be heavy, whereas one cookie covering `/videos/123/*` handles them all at the edge.
+
+### 🔧 Pattern 2 implementation: friendly download names
+
+```ts
+// GET /files/:id/download
+await authorize(user, file);
+const url = await getSignedUrl(s3, new GetObjectCommand({
+  Bucket, Key: file.key,
+  ResponseContentDisposition: `attachment; filename="${safeName(file.originalName)}"`, // UUID key, human file name
+}), { expiresIn: 600 });
+return res.redirect(302, url);
+```
+
+### Serving user uploads without turning them into attacks ➕
+
+Every pattern above serves bytes that **users** chose, and a browser decides what to do with a response from its headers and its origin, so a file served with the wrong headers or from the wrong domain can run script with your site's privileges.
+
+#### Problem: stored XSS through "files" ➕
+**Why it happens.** If a user uploads `invoice.html` (or an SVG with a `script` element, or a "PNG" that's really HTML) and you serve it **inline** from `app.example.com`, the browser renders it as a page on **your origin**. Its JavaScript can read your cookies (unless `HttpOnly`), call your API with the victim's session and read the responses. Browsers may also **sniff** a type different from the one you declared.
+
+#### Mechanism: separate origin, forced download, no sniffing ➕
+- **Serve user content from a separate registrable domain** (`usercontent-example.net`, not a subdomain of `example.com`, so cookies scoped to `.example.com` aren't sent and the same-site rules treat it as foreign).
+- **`Content-Disposition: attachment`** for anything that isn't an image or video you've verified, so the browser downloads instead of rendering.
+- **`X-Content-Type-Options: nosniff`** so the declared type is final.
+- A restrictive **`Content-Security-Policy: sandbox`** on the user-content domain as a last line of defence for anything rendered inline.
+
+```ts title="set safe response headers at signing time"
+const url = await getSignedUrl(s3, new GetObjectCommand({
+  Bucket, Key: file.key,
+  ResponseContentType: file.verifiedType,                                  // from the magic-byte check (section 8)
+  ResponseContentDisposition: isInlineSafe(file.verifiedType)              // e.g. image/png, image/jpeg, video/mp4
+    ? 'inline'
+    : `attachment; filename="${safeName(file.originalName)}"`,
+}), { expiresIn: 600 });
+// nosniff and CSP sandbox are added by a CDN response-headers policy on the user-content domain
+```
+
+#### Edge cases ➕
+- The `response-*` overrides only work on **signed** requests. For CDN-served public files, set the headers on the object at upload time or with a CDN response-headers policy.
+- Sanitize the `filename` (strip quotes, control characters and path separators) and use the RFC 6266 `filename*` form for non-ASCII names, or the header itself becomes an injection point.
+- Keep **Block Public Access** on and the bucket private ([Part 1, section 7](/docs/backend-first-principles/24-object-storage-part-1)); the CDN reads through origin access control, and your app role has only the actions it needs.
+
+---
+
+## 10. Image variants: precomputed vs on the fly ➕
+
+Downloads so far serve the stored bytes as they are, but nearly every product shows the same image at several sizes (avatar 48 px, card 320 px, full screen 1600 px), and sending a 6 MB phone photo to render a 48 px avatar wastes bandwidth, egress and the user's time.
+
+#### Problem: one original, many display sizes ➕
+**First principles.** Image bytes grow roughly with pixel count, so a 1600 px-wide image is around 100× the pixels of a 160 px one. Resizing is CPU-heavy (decode, resample, encode), which makes it a bad fit for the API's event loop ([lesson 23](/docs/backend-first-principles/23-concurrency-parallelism)) and a natural fit for workers or the edge.
+
+#### Option A: precompute a fixed set of variants on upload ➕
+**Mechanism.** The `file.uploaded` consumer (section 7) generates every size you use, writes them under deterministic keys, and records them in the DB.
+
+```ts title="make-variants.worker.ts"
+import sharp from 'sharp';
+
+const WIDTHS = [160, 320, 800, 1600] as const;
+
+export async function makeVariants(fileId: string, sourceKey: string) {
+  const src = await s3.send(new GetObjectCommand({ Bucket, Key: sourceKey }));
+  const input = Buffer.from(await src.Body!.transformToByteArray());   // images only; size-capped at upload
+  for (const w of WIDTHS) {
+    const out = await sharp(input, { limitInputPixels: 50_000_000 })   // refuse decompression bombs
+      .rotate()                                                        // honour EXIF orientation, then strip it
+      .resize({ width: w, withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toBuffer();
+    await s3.send(new PutObjectCommand({
+      Bucket, Key: `processed/${fileId}/w${w}.webp`, Body: out, ContentType: 'image/webp',
+      CacheControl: 'public, max-age=31536000, immutable',
+    }));
+  }
+}
+```
+
+**Trade-offs.** Predictable cost and latency (every request is a cache-friendly static file) and the CPU work happens once. But you pay to store every variant for every image, including ones never viewed, and adding a new size means **backfilling** millions of images.
+
+#### Option B: resize on the fly at the edge or in a service ➕
+**Mechanism.** URLs carry the transformation (`/img/<fileId>?w=320&fmt=webp`). On a CDN miss, a resize service (or an edge function) fetches the original, transforms it and returns it with a long cache lifetime; the CDN serves every later request.
+
+**Trade-offs.** No storage for unused variants and no backfills, but the first request per variant is slow, and the resizer is exposed to the internet.
+
+**Failure modes you must design for.**
+- **Cache-busting attacks**: anyone can request `w=1`, `w=2`, … `w=5000`, each a cache miss that costs CPU. **Allow-list** the widths and formats, and reject anything else with 400.
+- **Origin overload** on a cold cache (after a deploy or CDN purge). Put the resizer behind a concurrency limit and keep the CDN TTL long.
+- Decoders are an attack surface: run the resizer **isolated** from the API, with input pixel limits.
+
+#### Choosing, and serving the right size ➕
+| Situation | Prefer |
+|---|---|
+| A handful of sizes, high traffic, predictable layout | Precomputed variants |
+| Many sizes or layouts that change often, long tail of rarely viewed images | On the fly + CDN, with an allow-list |
+| Hosted option acceptable | A managed image CDN, as with video (section 12) |
+
+Either way, let the **browser choose** with `srcset` and `sizes`, so a phone downloads the 320 px file and a desktop the 1600 px one, and use modern formats (WebP or AVIF) with a fallback.
+
+---
+
+## 11. Range requests 🎓
+
+### The idea
+The client asks: *don't send me the whole thing, send bytes 1,000,000–2,999,999.*
+
+| | HTTP semantics |
+|---|---|
+| Request | `Range: bytes=1000000-2999999` |
+| Success | **`206 Partial Content`** + **`Content-Range: bytes 1000000-2999999/5368709120`** (which bytes these are, and the total size) |
+| Bad range | **`416 Range Not Satisfiable`** |
+
+This is **plain HTTP**, not something object storage invented. Part 1 argued that object storage is powerful **because it speaks HTTP**, which nearly every device implements. Range reads are a direct payoff: storage supports HTTP ranges natively, so **partial reads of any object** work everywhere.
+
+### What it unlocks
+
+<Mermaid chart={`flowchart LR
+  R["HTTP Range + object storage"] --> S["Video seeking"]
+  R --> D["Resumable downloads"]
+  R --> P["Parallel downloads"]
+  R --> T["File-type sniffing from a few bytes"]
+  S --> S1["drag to 30:00: compute byte offset from the file index, request from there"]
+  D --> D1["dropped at byte 400M: re-request from 400M"]
+  P --> P1["6 connections, each fetching a different range"]
+  T --> T1["first 8 bytes: PNG signature"]`} />
+
+1. **Seeking in a video:** drag the scrubber from 0:00 to 30:00, and the player **doesn't download the first 30 minutes**. It uses the file's **index** to compute the **byte offset** for that timestamp, sends a range request from there (usually to the CDN), and starts playing almost instantly.
+2. **Resumable downloads:** the connection drops at byte 400,000,000. When it comes back, the client re-requests **from byte 400,000,000** with a `Range` header instead of starting over.
+3. **Parallel downloads:** this builds on the throughput point from section 1. Open about **6 connections to the same object, each fetching a different range**. That's exactly how download managers speed things up.
+4. **Inspect a file without downloading it**, as the demo shows.
+
+### What the demo shows 🎓
+The demo runs against a **local MinIO** instance in Docker. The client–storage interaction is the same on any S3-compatible store.
+
+🔧 Equivalent commands:
+
+```bash
+# 1. First 100 bytes → status 206 Partial Content
+curl -s -o /dev/null -w "%{http_code}\n" -r 0-99 "$URL"
+
+# 2. First 8 bytes → hex dump → a PNG signature, without downloading the image
+curl -s -r 0-7 "$URL" | xxd
+# 00000000: 8950 4e47 0d0a 1a0a                      .PNG....
+
+# 3. Start a big download, kill it, then resume: curl requests only the missing range
+curl -o big.bin "$URL"        # Ctrl+C halfway
+curl -C - -o big.bin "$URL"   # continues from the current file size
+```
+
+Tricks like (2) save latency, bandwidth and processing. It's the same **magic-byte check** you'd use to verify an upload's real type.
+
+### 🔧 Going deeper: a parallel range downloader (Node)
+
+```ts title="parallel-download.ts"
+import { open } from 'node:fs/promises';
+
+export async function parallelDownload(url: string, dest: string, connections = 6) {
+  const head = await fetch(url, { method: 'HEAD' });
+  const size = Number(head.headers.get('content-length'));
+  if (head.headers.get('accept-ranges') !== 'bytes') throw new Error('server does not support ranges');
+
+  const fh = await open(dest, 'w');
+  const chunk = Math.ceil(size / connections);
+  await Promise.all(Array.from({ length: connections }, async (_, i) => {
+    const start = i * chunk;
+    const end = Math.min(size - 1, start + chunk - 1);
+    if (start > end) return;
+    const res = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
+    if (res.status !== 206) throw new Error(`expected 206, got ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    await fh.write(buf, 0, buf.length, start);   // write at the right offset; order doesn't matter
+  }));
+  await fh.close();
+}
+```
+
+---
+
+## 12. Video: when one file isn't enough 🎓
+
+### Problem
+Range-based progressive download works up to a point, but there's **exactly one version of the file**. A user on a weak 3G connection and a user on fibre get **the same bitrate**: one buffers constantly, the other gets worse quality than their connection allows.
+
+### Solution: segmented, adaptive streaming (HLS / DASH)
+This is the core idea behind Netflix, YouTube, Prime Video, Hotstar and others (their full architectures are far more complex): **don't serve every user the same file.**
+
+<Mermaid chart={`flowchart LR
+  U["Upload original.mp4"] --> E["file.uploaded event"]
+  E --> Q[[Queue]]
+  Q --> T["Transcode workers"]
+  T --> R1["240p"] & R2["480p"] & R3["720p"] & R4["1080p / 4K"]
+  R1 & R2 & R3 & R4 --> SEG["Chop each into segments of a few seconds"]
+  SEG --> M["Write manifest (lists qualities + segments)"]
+  M --> B[(Bucket: segments + manifests are just objects)]
+  B --> CDN[CDN]
+  CDN --> P["Player: fetch manifest, then segments,<br/>measure speed, switch quality"]`} />
+
+1. **Transcode** the original into several qualities (re-encode the video into different resolutions and bitrates).
+2. **Segment** each quality into chunks of a few seconds.
+3. Write a **manifest**, an index of the qualities and which segment files make up each one.
+4. The **player** downloads the manifest first, then fetches segments **one at a time**. After each one it **measures its own download speed** and picks the **next segment's quality**: higher if the last one arrived quickly, lower if it was slow. This is **adaptive bitrate (ABR)**.
+
+**From the storage side, nothing changes.** Segments are objects, and the manifest is an object. **Object storage + a CDN is everything you need to serve a streaming platform.**
+
+🔧 What a manifest looks like (HLS master playlist):
+
+```text title="master.m3u8"
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/index.m3u8
+```
+
+🔧 One rendition with ffmpeg (a worker would run one per quality):
+
+```bash
+ffmpeg -i original.mp4 -vf scale=-2:720 -c:v libx264 -b:v 2800k -c:a aac \
+  -hls_time 6 -hls_playlist_type vod -hls_segment_filename "720p/seg_%04d.ts" 720p/index.m3u8
+```
+
+### Where the real engineering is
+**Serving** is solved by storage providers and CDNs. The hard part is the **transcoding pipeline**: the background job triggered on every upload, plus the queues and workers around it.
+
+**Build vs buy (the lesson's advice):**
+- Video is a **small feature** of your product → use a **hosted video service** (the lesson mentions **Mux** and **Bunny**) and let them handle transcoding.
+- Video **is** the product (90% of the platform) → **build the pipeline yourself**, because at that scale it's the only way the cost makes sense.
+
+---
+
+## 13. Pricing shapes architecture 🎓
+
+You pay for three things:
+
+| Cost | Unit | Architecture lever |
+|---|---|---|
+| **Storage** | per GB per month | Delete what you don't need; 🔧 lifecycle rules to cheaper storage classes; the abort-incomplete-multipart rule |
+| **Operations** | per request. **Writes/mutations cost roughly 10× more than reads** | Sensible part sizes (not millions of tiny parts); don't `LIST` to answer product questions (use the DB); 🔧 batch deletes |
+| **Egress** | per GB **leaving** the provider | Never relay through your server; put a CDN in front; content-addressed caching |
+
+- **Cloudflare R2** became popular because it has **free egress**: no charge however much data you serve. That's a big deal for download-heavy apps.
+- **Prices change every few years**, so check the provider's pricing page instead of memorising numbers. The **three-part model** is what matters for design.
+
+---
+
+## 14. Storage classes and lifecycle transitions ➕
+
+The pricing model above treats storage as one price per GB, but S3 sells several **storage classes** with very different storage, retrieval and minimum-duration charges, and moving data between them with lifecycle rules is usually the largest storage saving available.
+
+#### The trade every class makes ➕
+**First principles.** Cheaper classes are cheaper to **keep** and more expensive to **touch**: lower per-GB storage, but a per-GB **retrieval fee**, a **minimum storage duration** (deleting early is billed as if you'd kept it) and a **minimum billable size**. The archive classes go further and make objects **unavailable until restored**.
+
+| Class | Access | Min duration | Min billable size | Fits |
+|---|---|---|---|---|
+| Standard | milliseconds | none | none | Hot data, anything recent |
+| Intelligent-Tiering | milliseconds (optional archive tiers are async) | none | none (objects under 128 KB are never moved down) | Unknown or changing access patterns; small per-object monitoring fee |
+| Standard-IA | milliseconds, retrieval fee | 30 days | 128 KB | Accessed about monthly, must survive an AZ loss |
+| One Zone-IA | milliseconds, retrieval fee, one AZ | 30 days | 128 KB | Re-creatable data (thumbnails you can regenerate) |
+| Glacier Instant Retrieval | milliseconds, higher retrieval fee | 90 days | 128 KB | Accessed about quarterly, still needs instant reads |
+| Glacier Flexible Retrieval | restore first: minutes to hours | 90 days | 40 KB of overhead per object | Archives, rarely read |
+| Glacier Deep Archive | restore first: hours | 180 days | 40 KB of overhead per object | Compliance archives read almost never |
+
+#### Lifecycle transitions: moving data down automatically ➕
+**Mechanism.** A lifecycle rule moves objects to cheaper classes as they age, and expires them at the end. Rules filter by prefix, tag and object size.
+
+```json title="lifecycle.json: uploads age into cheaper classes, processed variants expire"
+{
+  "Rules": [
+    {
+      "ID": "originals-age-down",
+      "Filter": { "And": { "Prefix": "tenants/", "ObjectSizeGreaterThan": 131072 } },
+      "Status": "Enabled",
+      "Transitions": [
+        { "Days": 30,  "StorageClass": "STANDARD_IA" },
+        { "Days": 180, "StorageClass": "GLACIER_IR" }
+      ],
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 }
+    },
+    {
+      "ID": "regenerable-variants",
+      "Filter": { "Prefix": "processed/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 365 }
+    },
+    {
+      "ID": "abort-incomplete-multipart",
+      "Filter": {},
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+```
+
+#### Traps that turn savings into a bigger bill ➕
+- **Small objects.** Every transition is a billed request **per object**, and IA classes bill at least 128 KB. Moving millions of 10 KB thumbnails costs more than it saves. Since September 2024, lifecycle rules by default **don't transition objects under 128 KB**; keep the size filter explicit anyway.
+- **Minimum durations stack.** Transitioning to Glacier Instant Retrieval and then deleting after 20 days is billed as 90 days. You also can't chain transitions faster than the minimum durations in one rule.
+- **Archive overhead.** Each object in Glacier Flexible Retrieval or Deep Archive carries about **40 KB** of extra billed metadata. Archiving many small files: bundle them (tar or zip) first.
+- **Restores are slow and separate.** An object in Flexible Retrieval or Deep Archive returns an error on `GET` until you call `RestoreObject` and wait. Your download code must handle that state (show "being retrieved", poll, or notify), and the restored copy is billed while it exists.
+- **Lifecycle runs asynchronously.** Transitions and expirations happen some time after the rule is satisfied, though billing at the new class can start at the rule date.
+
+#### Choosing with data, not guesses ➕
+**Implementation.** Before writing transition rules, measure access patterns: **Storage Class Analysis** on a prefix observes reads over time and suggests when data becomes infrequently accessed. If access is genuinely unpredictable (user files that may go viral years later), **Intelligent-Tiering** moves each object based on its own accesses, at the cost of a small monitoring fee per object above 128 KB.
+
+---
+
+## 15. Seeing where the money and requests go: cost monitoring and access logs ➕
+
+Pricing and storage classes only help if you can see which buckets, prefixes and operations drive the bill, and the same telemetry answers the security question "who read this object?", so the last operational piece is instrumenting the bucket.
+
+#### Problem: the bill arrives as one number ➕
+**Why.** S3 bills per bucket for storage, requests and transfer, but your product thinks in **tenants, features and prefixes**. A bucket shared by uploads, exports and processed variants shows one growing line, and the hidden costs from this page (incomplete multipart uploads, noncurrent versions, archive restores, KMS requests) don't appear as objects at all.
+
+#### Mechanism 1: Storage Lens and cost allocation ➕
+- **S3 Storage Lens** gives organization-wide dashboards of storage and activity per account, bucket and (in the advanced tier) prefix, including **incomplete multipart upload bytes** and **noncurrent version bytes**, the two silent cost leaks from section 5 and Part 1, section 11.
+- **Cost allocation tags** on buckets (`team`, `feature`) let Cost Explorer split the bill. Tags are per **bucket**, which is one reason to separate data with different lifecycles into separate buckets.
+- **Budgets with alerts** on S3 spend, with a forecast threshold, catch runaway growth (a loop that re-uploads, a missing expiration rule) within days instead of at month end.
+
+#### Mechanism 2: knowing who accessed what ➕
+Two independent logs, with different guarantees:
+
+| | CloudTrail data events | S3 server access logs |
+|---|---|---|
+| What | Object-level API calls (GetObject, PutObject, DeleteObject) as JSON | Every request as a text record, including authentication failures and lifecycle actions |
+| Delivery | Typically within about 5 minutes, with integrity validation | Within a few hours, **best effort** (records can be missing or late) |
+| Cost | Charged per data event recorded, plus storage | No charge for delivery to a bucket, only storage |
+| Use it for | Security audits, incident response, alerting | Traffic analysis, cost attribution, troubleshooting |
+
+**Implementation guidance.**
+- Enable **CloudTrail data events** for buckets holding sensitive data (scope with advanced event selectors to the bucket, and to write-only events if reads are too voluminous). Send them to a **separate, locked-down log bucket** in another account, so whoever compromises the app can't erase the trail.
+- If you enable server access logs, the destination bucket must **not** be the source bucket (that creates a logging loop), can't have Object Lock enabled, and needs its own expiration rule.
+- In your own app, log the **authorization decision** when you sign a URL (user, file ID, action, expiry). CloudTrail sees the signer's role, not your end user, so only your logs connect a download to a person.
+
+#### Edge cases ➕
+- Data events on a busy public bucket can cost more than the storage. Log what you need to answer real questions.
+- Logs contain object keys. If keys encode tenant and user IDs (Part 1, section 6), the logs are personal data with retention obligations.
+- Alert on anomalies, not just totals: a spike in `GetObject` from one principal, `DeleteObject` bursts, or `AccessDenied` storms often mean a leaked credential or a bug.
+
+---
+
+## 16. Series recap (Parts 1 + 2) 🎓
+
+**Why object storage exists**
+- A local file system doesn't scale. Object storage scales by **giving up mutability**: no edits in place, no rename, no real folders, no locks.
+- In exchange you get effectively **unlimited capacity**, **very high durability** ("eleven nines" on AWS) and a **plain HTTP interface**.
+
+**The model**
+- An object = **key + bytes + metadata** in a flat namespace (the bucket). "Folders" are just **grouping keys by a string prefix**.
+- **Generate keys yourself.** Put **high-entropy** parts early, encode **ownership** in the key, and set **metadata at write time**, because changing it later means rewriting the object.
+- Internally there's a **metadata plane** and a **data plane**. Durability comes from **erasure coding**, which is cheaper and stronger than plain replication.
+- **Durability is not a backup.** Backups need **versioning and replication**, which you must turn on yourself.
+- **Never use `LIST` as your index.** The **database** records which files exist and who owns them; storage just returns the exact file you ask for.
+
+**Uploads**
+- Small files can pass through your server **if you stream them and cap the body size**.
+- Larger files go **straight from the browser** via presigned URLs. Prefer **presigned POST with `content-length-range`** over plain presigned PUT.
+- **Record intent in the DB first**, verify with **HEAD** on complete, and **clean up abandoned uploads** in the background.
+- **Large files → multipart:** create, upload parts in parallel, complete.
+  - Compute the **part size dynamically**.
+  - **Don't trust multipart ETags** for integrity.
+  - Add the **abort-incomplete-multipart lifecycle rule** to every bucket from day one.
+
+**Downloads**
+- Never relay through your server. Use **presigned GET**, and the **private bucket + CDN** pattern where it fits.
+- **Range requests** handle seeking, resuming and parallel downloads, natively.
+- **Video:** segment it, and let **adaptive players** pick the quality per segment.
+
+**➕ Beyond the lesson**
+- **Bound multipart uploads yourself:** sign only the declared part numbers and verify `ListParts` sizes before committing. Expire abandoned rows by inactivity with `SKIP LOCKED` sweepers. Transfer Acceleration helps far-away users, at a per-GB fee.
+- **Processing is at-least-once:** claim rows atomically, write deterministic output keys to a different prefix, and dead-letter poison input.
+- **Quarantine until scanned:** GuardDuty tags or a ClamAV worker, a bucket policy that only allows reading clean objects, fail closed on unscannable files, and check magic bytes.
+- **SigV4** signs method, key, query, signed headers and time, but not the body (`UNSIGNED-PAYLOAD`), with a 7-day maximum and the signer's credential lifetime as a ceiling.
+- **Serve user files from a separate domain** with `nosniff`, `attachment` for anything not verified as inline-safe, and a sandbox CSP.
+- **Avoid CDN purges** with versioned URLs; invalidate exact paths only for takedowns, after fixing the origin.
+- **Image variants:** precompute a few sizes, or resize on the fly with an allow-list of sizes and an isolated resizer; let `srcset` pick.
+- **Storage classes** trade storage price for retrieval fees, minimum durations and minimum sizes; transition only large objects, measure access first.
+- **Observe the bucket:** Storage Lens for hidden bytes, tags and budgets for attribution, CloudTrail data events for audit, best-effort access logs for traffic.
+
+---
+
+## Interview questions
+
+1. **Give four reasons a single PUT fails for large files.** The 5 GB cap; it's all or nothing; one TCP stream's throughput is limited by window ÷ RTT and packet loss; and poor UX (no precise progress, no pause or resume).
+2. **Why does `CompleteMultipartUpload` take the same time for 50 MB and 50 GB?** It's a metadata operation: storage records which parts make up the object, in order, without copying any bytes.
+3. **What goes wrong with 5 MB parts on a 60 GB file?** 5 MB × 10,000 = 50 GB, so it fails at part 10,001 after 50 GB has been sent. Use `max(floor, size ÷ 10,000)`.
+4. **Why not use 500 MB parts?** A part is the retry unit. 16–64 MB keeps retries cheap.
+5. **How can you verify integrity for multipart uploads?** Not with the ETag (it's `md5-of-md5s-N`). Use SDK checksums (CRC32C/SHA-256), or your own SHA-256 in metadata checked by a background job, which also gives you dedup.
+6. **Where does hidden storage cost come from?** Incomplete multipart uploads: invisible in listings but billed. Fix it with the abort-incomplete lifecycle rule (7 days).
+7. **Why presign part URLs in batches?** Presigning 10,000 up front makes a multi-megabyte JSON response, and URLs may expire before they're used.
+8. **How do you resume after a refresh?** Find the PENDING row → `ListParts` → issue fresh URLs for the missing parts only.
+9. **Why do presigned GETs kill CDN caching, and what are the two fixes?** Every URL is unique (timestamp + signature). Fix A: sign aligned to an hourly window. Fix B: CDN signed URLs or cookies, verified at the edge.
+10. **How does seeking in a video work at the HTTP level?** The index gives a byte offset → `Range` request → `206 Partial Content`.
+11. **How does adaptive bitrate work?** Transcode into several qualities → segments + manifest → the player measures segment download speed and switches quality.
+12. **Which three things do you pay for, and how does each change the design?** Storage (lifecycle rules, cleanup), operations (writes ~10× reads; avoid LIST and tiny parts), egress (CDN; never relay; R2's free egress).
+13. ➕ **A user declared 100 MB but presigned part URLs let them upload far more. How do you stop it?** Store `totalParts` at init, sign only part numbers 1 to `totalParts`, and before `CompleteMultipartUpload` check `ListParts` sizes against the declared size; abort on mismatch, then still HEAD after commit.
+14. ➕ **When does S3 Transfer Acceleration help, and what are its constraints?** For users far from the bucket's region: uploads enter at the nearest edge and cross AWS's network. It needs a DNS-compliant bucket name without dots, virtual-hosted requests, and adds a per-GB fee.
+15. ➕ **How do you make a post-upload worker safe against duplicate events?** Claim the row with a conditional UPDATE (zero rows means skip), derive output keys from the input ID, write outputs to a prefix the trigger doesn't watch, and send repeated failures to a DLQ.
+16. ➕ **How do you make sure nobody downloads a file before it's scanned for malware?** Upload into quarantine and gate reads in storage: with GuardDuty, a bucket policy denies GetObject unless the scan tag is `NO_THREATS_FOUND` (which also denies untagged objects); treat unsupported or failed scans as not clean.
+17. ➕ **Why does a presigned URL break if the client sends a different Content-Type, but not if it sends a bigger body?** Signed headers are part of the canonical request; the payload is signed as `UNSIGNED-PAYLOAD`, so its size isn't covered.
+18. ➕ **Why serve user uploads from a separate domain?** An HTML or SVG upload rendered inline on your origin runs script with your users' sessions (stored XSS); a separate registrable domain, `nosniff`, `attachment` and a sandbox CSP contain it.
+19. ➕ **What does a CDN invalidation cost, and how do you avoid needing one?** CloudFront gives 1,000 free paths a month then bills per path (a wildcard is one path but refetches everything it matches); version the URL instead, and purge exact paths only for takedowns.
+20. ➕ **Precomputed image variants or on-the-fly resizing?** Precompute for a few hot sizes (predictable, but storage and backfills); resize on the fly for many sizes or a long tail, with an allow-list against cache-busting and an isolated resizer.
+21. ➕ **Why can moving objects to Standard-IA or Glacier increase your bill?** Per-object transition requests, a 128 KB minimum billable size, minimum storage durations (30/90/180 days), retrieval fees and 40 KB per-object archive overhead.
+22. ➕ **CloudTrail data events vs S3 server access logs?** CloudTrail: JSON, delivered within minutes, integrity-validated, billed per event, for audit. Access logs: best-effort, delivered within hours, free apart from storage, include auth failures and lifecycle actions.
+
+## Sources
+
+- [Lesson video: Object Storage, Part 2 (Sriniously)](https://youtu.be/iWrVCxexUWY)
+- [AWS: Multipart upload limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html)
+- [AWS: CompleteMultipartUpload API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_CompleteMultipartUpload.html)
+- [AWS: Uploading large objects with multipart upload and transfer acceleration](https://aws.amazon.com/blogs/compute/uploading-large-objects-to-amazon-s3-using-multipart-upload-and-transfer-acceleration/)
+- [AWS: Presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)
+- [AWS: Presigned URL expiry rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html)
+- [AWS: SigV4 query-string authentication](https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html)
+- [AWS: CloudFront signed URLs and cookies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PrivateContent.html)
+- [AWS: Restrict access with origin access control](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-overview.html)
+- [AWS: S3 strong consistency](https://aws.amazon.com/s3/consistency/)
+- [AWS: ListParts API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListParts.html)
+- [AWS: S3 Transfer Acceleration (requirements, 20-minute activation)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/transfer-acceleration.html)
+- [AWS: Amazon S3 pricing (transfer acceleration, storage classes, requests)](https://aws.amazon.com/s3/pricing/)
+- [PostgreSQL: SELECT ... FOR UPDATE SKIP LOCKED](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)
+- [AWS: S3 Event Notifications (at-least-once, recursion warning)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)
+- [AWS: GuardDuty Malware Protection for S3](https://docs.aws.amazon.com/guardduty/latest/ug/gdu-malware-protection-s3.html)
+- [AWS: How Malware Protection for S3 works (scan tags, at-least-once results)](https://docs.aws.amazon.com/guardduty/latest/ug/how-malware-protection-for-s3-gdu-works.html)
+- [AWS: Malware Protection for S3 quotas (100 GB, archive limits)](https://docs.aws.amazon.com/guardduty/latest/ug/malware-protection-s3-quotas-guardduty.html)
+- [ClamAV: clamd man page (INSTREAM chunk format, StreamMaxLength)](https://github.com/Cisco-Talos/clamav/blob/main/docs/man/clamd.8.in)
+- [AWS: CloudFront invalidation pricing (1,000 free paths per month)](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/PayingForInvalidation.html)
+- [MDN: X-Content-Type-Options](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options)
+- [RFC 6266: Content-Disposition in HTTP](https://www.rfc-editor.org/rfc/rfc6266)
+- [sharp: resize and input limits](https://sharp.pixelplumbing.com/api-constructor)
+- [AWS: Comparing S3 storage classes (minimum durations and sizes)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html)
+- [AWS: Lifecycle transitions (128 KB default, minimum durations, archive overhead)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html)
+- [AWS: Logging options for S3 (CloudTrail vs server access logs)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/logging-with-S3.html)
+- [AWS: S3 Storage Lens](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage_lens.html)

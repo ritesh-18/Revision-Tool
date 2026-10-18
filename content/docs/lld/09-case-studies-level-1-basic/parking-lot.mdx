@@ -1,0 +1,756 @@
+---
+title: "9.1 Parking Lot"
+---
+
+## Problem & where it's asked
+
+"Design a parking lot" is the most-asked LLD problem in the research notes. It's reported at **Amazon**, **Microsoft** (2026: two-wheeler and four-wheeler spaces plus several allocation strategies), **Flipkart**, **Goldman Sachs** (2026: a follow-up pricing module with several pricing strategies), **Salesforce** and **Walmart**. Adobe, Uber and Swiggy show up in aggregated lists only (uncertain). At Amazon it's usually a whiteboard discussion. At Flipkart and Microsoft it's a runnable machine-coding problem.
+
+The typical CodeZym-style spec: a lot has floors, each floor is a 2-D grid of spots, spots have types that match vehicle types, and you must support park, unpark, find a vehicle by number, and count free spots per floor and vehicle type.
+
+## Clarifying questions
+
+| Question | Assumption for this design |
+|----------|----------------------------|
+| Which vehicle types? | Bike, Car, Truck. Must be easy to add EV or bus later. |
+| Can a smaller vehicle use a bigger spot? | Yes, a car may use a large spot if no compact spot is free. A bike only uses two-wheeler spots. |
+| How are spots laid out? | Each floor is a grid given as strings, e.g. `"B C ."` (B = two-wheeler, C = compact, L = large, `.` = no spot). |
+| How is a spot chosen? | Pluggable: *nearest first* (lowest floor, row, column) and *spread evenly* (floor with most free matching spots). |
+| Pricing? | Hourly by vehicle type, partial hours round up, minimum one hour. Other schemes are a follow-up. |
+| Multiple entry gates? | Yes, which raises the "last spot" race (see Concurrency). |
+| Payments, cameras, displays? | Out of scope; the ticket and the receipt amount are enough. |
+| Persistence? | In-memory repositories behind interfaces. |
+
+## Requirements
+
+**Functional**
+
+1. Build a lot from floor layouts.
+2. `park(vehicle)` picks a compatible free spot via the active strategy and returns a ticket.
+3. `unpark(ticketId)` frees the spot and returns a receipt with duration and amount.
+4. `findVehicle(number)` returns the spot a vehicle is parked in.
+5. `freeSpots(floor, vehicleType)` counts free spots usable by that vehicle type.
+6. Swap the selection strategy at runtime.
+
+**Non-functional**
+
+- Adding a vehicle type or strategy shouldn't require editing the service (OCP).
+- Deterministic and testable: time and IDs are injected.
+- Clear, typed errors for full lot, duplicate vehicle, unknown ticket and bad input.
+- `park` and `unpark` must be safe when several gates call them concurrently.
+
+**Out of scope**: payment gateway, reservations, sensors, UI and a real database.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Vehicle` | Registration number and type; validates the number | Parked in 0..1 `ParkingSpot` |
+| `ParkingSpot` | Position (floor, row, column), type, occupant | Belongs to one `ParkingFloor` |
+| `ParkingFloor` | Builds and owns its grid of spots; counts free spots | `ParkingLot` has 1..* floors |
+| `Ticket` | Issued on entry: vehicle, spot, entry time | Stored in `TicketRepository` |
+| `Receipt` | Issued on exit: duration and amount | Derived from a `Ticket` |
+| `SpotSelectionStrategy` | Picks a free spot | Used by `ParkingLot` |
+| `PricingStrategy` | Computes the fee | Used by `ParkingLot` |
+| `ParkingLot` | Service facade: park, unpark, find, availability | Composes all of the above |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Vehicle {
+        +string number
+        +VehicleType type
+    }
+    class ParkingSpot {
+        +string id
+        +SpotType type
+        +isFree() bool
+        +occupy(v) void
+        +release() Vehicle
+    }
+    class ParkingFloor {
+        +number index
+        +spots ParkingSpot[]
+        +freeCount(types) number
+    }
+    class SpotSelectionStrategy {
+        <<interface>>
+        +select(floors, types) ParkingSpot
+    }
+    class NearestFirstStrategy
+    class SpreadEvenlyStrategy
+    class PricingStrategy {
+        <<interface>>
+        +price(type, durationMs) number
+    }
+    class HourlyPricing
+    class TicketRepository {
+        <<interface>>
+    }
+    class ParkingLot {
+        +park(v) Ticket
+        +unpark(ticketId) Receipt
+        +findVehicle(number) string
+        +freeSpots(floor, type) number
+    }
+    ParkingLot "1" *-- "many" ParkingFloor
+    ParkingFloor "1" *-- "many" ParkingSpot
+    ParkingSpot --> "0..1" Vehicle
+    ParkingLot --> SpotSelectionStrategy
+    ParkingLot --> PricingStrategy
+    ParkingLot --> TicketRepository
+    SpotSelectionStrategy <|.. NearestFirstStrategy
+    SpotSelectionStrategy <|.. SpreadEvenlyStrategy
+    PricingStrategy <|.. HourlyPricing`} />
+
+A spot has a tiny lifecycle, and the concurrency fix later adds a middle state:
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> Free
+    Free --> Occupied : park
+    Occupied --> Free : unpark
+    Free --> Reserved : gate claims (concurrent version)
+    Reserved --> Occupied : confirm
+    Reserved --> Free : rollback`} />
+
+## Design decisions & patterns
+
+- **Strategy for spot selection.** Microsoft asked for "several allocation strategies", and Goldman asked for more as a follow-up. An `if (mode === 'nearest')` inside `park` would grow with every new rule. With an interface, `park` never changes.
+- **Strategy for pricing.** Pricing changes more often than parking (weekend rates, EV discounts, monthly passes). Keeping it out of `ParkingLot` means the Goldman pricing follow-up is a new class, not an edit.
+- **Compatibility as data, not `switch`.** `ALLOWED_SPOTS` maps each vehicle type to spot types in preference order. Adding `EV → [EV_CHARGING, COMPACT]` is a one-line change, and the compiler forces you to add it because the map is a `Record<VehicleType, …>`.
+- **Floor builds its own grid (a small factory).** Parsing the layout string lives in one place, so the rest of the code only sees `ParkingSpot` objects.
+- **Repository for tickets** plus an index from vehicle number to ticket ID, so `findVehicle` and the duplicate check are O(1).
+- **Rejected: an inheritance tree** (`CarSpot extends Spot`, `BikeSpot extends Spot`). The subclasses add no behaviour, only a label, so an enum is simpler. **Rejected: a Singleton `ParkingLot`.** A real company runs many lots, and singletons make tests share state. Build it in the composition root instead.
+
+## Implementation
+
+**Part 1: enums, errors and models.** Errors extend one base class, so a controller can map all of them to HTTP 4xx with one `instanceof` check.
+
+```ts
+enum VehicleType { BIKE = 'BIKE', CAR = 'CAR', TRUCK = 'TRUCK' }
+enum SpotType { TWO_WHEELER = 'TWO_WHEELER', COMPACT = 'COMPACT', LARGE = 'LARGE' }
+
+// Preference order matters: a car tries COMPACT before taking a LARGE spot.
+const ALLOWED_SPOTS: Record<VehicleType, readonly SpotType[]> = {
+  [VehicleType.BIKE]: [SpotType.TWO_WHEELER],
+  [VehicleType.CAR]: [SpotType.COMPACT, SpotType.LARGE],
+  [VehicleType.TRUCK]: [SpotType.LARGE],
+};
+
+const LAYOUT_CODES: Record<string, SpotType> = {
+  B: SpotType.TWO_WHEELER,
+  C: SpotType.COMPACT,
+  L: SpotType.LARGE,
+};
+
+class ParkingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends ParkingError {}
+class ParkingFullError extends ParkingError {}
+class DuplicateVehicleError extends ParkingError {}
+class TicketNotFoundError extends ParkingError {}
+class SpotStateError extends ParkingError {}
+
+interface Clock { now(): number }
+interface IdGenerator { next(): string }
+
+class FakeClock implements Clock {
+  constructor(private current: number) {}
+  now(): number { return this.current; }
+  advanceMinutes(min: number): void { this.current += min * 60_000; }
+}
+
+class SequentialIds implements IdGenerator {
+  private counter = 0;
+  constructor(private readonly prefix: string) {}
+  next(): string { return `${this.prefix}-${++this.counter}`; }
+}
+
+class Vehicle {
+  constructor(readonly number: string, readonly type: VehicleType) {
+    if (!/^[A-Z]{2}\d{2}[A-Z]{0,3}\d{4}$/.test(number)) {
+      throw new ValidationError(`Invalid registration number "${number}"`);
+    }
+  }
+}
+
+class ParkingSpot {
+  private occupant: Vehicle | null = null;
+
+  constructor(
+    readonly id: string,
+    readonly floor: number,
+    readonly row: number,
+    readonly col: number,
+    readonly type: SpotType,
+  ) {}
+
+  get isFree(): boolean { return this.occupant === null; }
+
+  occupy(vehicle: Vehicle): void {
+    if (this.occupant) throw new SpotStateError(`Spot ${this.id} is already occupied`);
+    this.occupant = vehicle;
+  }
+
+  release(): Vehicle {
+    if (!this.occupant) throw new SpotStateError(`Spot ${this.id} is already free`);
+    const v = this.occupant;
+    this.occupant = null;
+    return v;
+  }
+}
+
+class ParkingFloor {
+  readonly spots: readonly ParkingSpot[];
+
+  constructor(readonly index: number, layout: readonly string[]) {
+    const spots: ParkingSpot[] = [];
+    layout.forEach((line, row) => {
+      line.split(/\s+/).forEach((code, col) => {
+        if (code === '.') return; // pillar, ramp, no spot
+        const type = LAYOUT_CODES[code];
+        if (!type) throw new ValidationError(`Unknown spot code "${code}" on floor ${index}`);
+        spots.push(new ParkingSpot(`F${index}-R${row}C${col}`, index, row, col, type));
+      });
+    });
+    this.spots = spots; // row-major order = "nearest to the ramp" first
+  }
+
+  freeCount(types: readonly SpotType[]): number {
+    return this.spots.filter((s) => s.isFree && types.includes(s.type)).length;
+  }
+
+  firstFree(types: readonly SpotType[]): ParkingSpot | undefined {
+    // Walk preference order first, so a car only takes LARGE when no COMPACT is free.
+    for (const type of types) {
+      const spot = this.spots.find((s) => s.isFree && s.type === type);
+      if (spot) return spot;
+    }
+    return undefined;
+  }
+}
+
+interface Ticket {
+  readonly id: string;
+  readonly vehicle: Vehicle;
+  readonly spotId: string;
+  readonly entryAt: number;
+}
+
+interface Receipt {
+  readonly ticketId: string;
+  readonly vehicleNumber: string;
+  readonly minutes: number;
+  readonly amount: number;
+}
+```
+
+**Part 2: repository.** `ParkingLot` depends on the interface, so swapping in Postgres later touches only the composition root.
+
+```ts
+interface TicketRepository {
+  save(ticket: Ticket): void;
+  findById(id: string): Ticket | undefined;
+  findActiveByVehicle(number: string): Ticket | undefined;
+  close(id: string): void;
+}
+
+class InMemoryTicketRepository implements TicketRepository {
+  private readonly active = new Map<string, Ticket>();
+  private readonly byVehicle = new Map<string, string>();
+
+  save(ticket: Ticket): void {
+    this.active.set(ticket.id, ticket);
+    this.byVehicle.set(ticket.vehicle.number, ticket.id);
+  }
+  findById(id: string): Ticket | undefined { return this.active.get(id); }
+  findActiveByVehicle(number: string): Ticket | undefined {
+    const id = this.byVehicle.get(number);
+    return id ? this.active.get(id) : undefined;
+  }
+  close(id: string): void {
+    const t = this.active.get(id);
+    if (!t) return;
+    this.active.delete(id);
+    this.byVehicle.delete(t.vehicle.number);
+  }
+}
+```
+
+**Part 3: strategies.** Each is a few lines and easy to unit-test on its own.
+
+```ts
+interface SpotSelectionStrategy {
+  readonly name: string;
+  select(floors: readonly ParkingFloor[], types: readonly SpotType[]): ParkingSpot | undefined;
+}
+
+class NearestFirstStrategy implements SpotSelectionStrategy {
+  readonly name = 'nearest-first';
+  select(floors: readonly ParkingFloor[], types: readonly SpotType[]): ParkingSpot | undefined {
+    for (const floor of floors) {
+      const spot = floor.firstFree(types);
+      if (spot) return spot;
+    }
+    return undefined;
+  }
+}
+
+class SpreadEvenlyStrategy implements SpotSelectionStrategy {
+  readonly name = 'spread-evenly';
+  select(floors: readonly ParkingFloor[], types: readonly SpotType[]): ParkingSpot | undefined {
+    let best: ParkingFloor | undefined;
+    for (const floor of floors) {
+      // Strictly greater keeps the lower floor on ties, so the result is deterministic.
+      if (floor.freeCount(types) > (best?.freeCount(types) ?? 0)) best = floor;
+    }
+    return best?.firstFree(types);
+  }
+}
+
+interface PricingStrategy {
+  price(type: VehicleType, durationMs: number): number;
+}
+
+class HourlyPricing implements PricingStrategy {
+  constructor(private readonly ratePerHour: Record<VehicleType, number>) {}
+  price(type: VehicleType, durationMs: number): number {
+    const hours = Math.max(1, Math.ceil(durationMs / 3_600_000));
+    return hours * this.ratePerHour[type];
+  }
+}
+```
+
+**Part 4: the service.** Look at the order inside `park`: validate, check for a duplicate, select, occupy, then save. All of it is synchronous, and that fact matters in the concurrency section.
+
+```ts
+class ParkingLot {
+  constructor(
+    private readonly floors: readonly ParkingFloor[],
+    private strategy: SpotSelectionStrategy,
+    private readonly pricing: PricingStrategy,
+    private readonly tickets: TicketRepository,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+  ) {
+    if (floors.length === 0) throw new ValidationError('A lot needs at least one floor');
+  }
+
+  setStrategy(strategy: SpotSelectionStrategy): void { this.strategy = strategy; }
+
+  park(vehicle: Vehicle): Ticket {
+    if (this.tickets.findActiveByVehicle(vehicle.number)) {
+      throw new DuplicateVehicleError(`${vehicle.number} is already parked`);
+    }
+    const spot = this.strategy.select(this.floors, ALLOWED_SPOTS[vehicle.type]);
+    if (!spot) throw new ParkingFullError(`No free spot for ${vehicle.type}`);
+    spot.occupy(vehicle);
+    const ticket: Ticket = { id: this.ids.next(), vehicle, spotId: spot.id, entryAt: this.clock.now() };
+    this.tickets.save(ticket);
+    return ticket;
+  }
+
+  unpark(ticketId: string): Receipt {
+    const ticket = this.tickets.findById(ticketId);
+    if (!ticket) throw new TicketNotFoundError(`Ticket ${ticketId} is not active`);
+    this.spotById(ticket.spotId).release();
+    this.tickets.close(ticketId);
+    const durationMs = this.clock.now() - ticket.entryAt;
+    return {
+      ticketId,
+      vehicleNumber: ticket.vehicle.number,
+      minutes: Math.round(durationMs / 60_000),
+      amount: this.pricing.price(ticket.vehicle.type, durationMs),
+    };
+  }
+
+  findVehicle(number: string): string | undefined {
+    return this.tickets.findActiveByVehicle(number)?.spotId;
+  }
+
+  freeSpots(floorIndex: number, type: VehicleType): number {
+    const floor = this.floors[floorIndex];
+    if (!floor) throw new ValidationError(`No floor ${floorIndex}`);
+    return floor.freeCount(ALLOWED_SPOTS[type]);
+  }
+
+  private spotById(id: string): ParkingSpot {
+    for (const floor of this.floors) {
+      const spot = floor.spots.find((s) => s.id === id);
+      if (spot) return spot;
+    }
+    throw new SpotStateError(`Unknown spot ${id}`);
+  }
+}
+```
+
+**Part 5: composition root and demo.** A small `attempt` helper prints the error class and message instead of crashing, which is how you'd demo failure cases in an interview.
+
+```ts
+function attempt(label: string, fn: () => string): void {
+  try {
+    console.log(`${label}: ${fn()}`);
+  } catch (err) {
+    if (err instanceof ParkingError) console.log(`${label}: ${err.name} - ${err.message}`);
+    else throw err;
+  }
+}
+
+const clock = new FakeClock(Date.UTC(2026, 0, 5, 9, 0));
+const lot = new ParkingLot(
+  [
+    new ParkingFloor(0, ['B C C', 'L . C']),
+    new ParkingFloor(1, ['B B C', 'C L .']),
+  ],
+  new NearestFirstStrategy(),
+  new HourlyPricing({ [VehicleType.BIKE]: 20, [VehicleType.CAR]: 50, [VehicleType.TRUCK]: 120 }),
+  new InMemoryTicketRepository(),
+  clock,
+  new SequentialIds('TKT'),
+);
+
+const car1 = new Vehicle('KA01AB1234', VehicleType.CAR);
+const bike = new Vehicle('KA02X5678', VehicleType.BIKE);
+const truck1 = new Vehicle('MH12TR0001', VehicleType.TRUCK);
+const truck2 = new Vehicle('MH12TR0002', VehicleType.TRUCK);
+const truck3 = new Vehicle('MH12TR0003', VehicleType.TRUCK);
+
+let carTicket = '';
+attempt('park car1', () => { const t = lot.park(car1); carTicket = t.id; return `${t.id} -> ${t.spotId}`; });
+attempt('park bike', () => { const t = lot.park(bike); return `${t.id} -> ${t.spotId}`; });
+attempt('park truck1', () => { const t = lot.park(truck1); return `${t.id} -> ${t.spotId}`; });
+attempt('park truck2', () => { const t = lot.park(truck2); return `${t.id} -> ${t.spotId}`; });
+attempt('park truck3', () => lot.park(truck3).spotId);
+attempt('park car1 again', () => lot.park(car1).spotId);
+attempt('bad number', () => new Vehicle('HELLO', VehicleType.CAR).number);
+
+console.log(`free car spots F0=${lot.freeSpots(0, VehicleType.CAR)} F1=${lot.freeSpots(1, VehicleType.CAR)}`);
+
+lot.setStrategy(new SpreadEvenlyStrategy());
+attempt('spread car2', () => lot.park(new Vehicle('DL03CAF0001', VehicleType.CAR)).spotId);
+attempt('spread car3', () => lot.park(new Vehicle('DL03CAF0002', VehicleType.CAR)).spotId);
+
+attempt('find car1', () => lot.findVehicle('KA01AB1234') ?? 'not parked');
+clock.advanceMinutes(150);
+attempt('unpark car1', () => {
+  const r = lot.unpark(carTicket);
+  return `${r.vehicleNumber} stayed ${r.minutes} min, pays Rs ${r.amount}`;
+});
+attempt('unpark car1 again', () => JSON.stringify(lot.unpark(carTicket)));
+attempt('find car1', () => lot.findVehicle('KA01AB1234') ?? 'not parked');
+attempt('floor 7', () => String(lot.freeSpots(7, VehicleType.BIKE)));
+```
+
+## Demo output
+
+```text
+park car1: TKT-1 -> F0-R0C1
+park bike: TKT-2 -> F0-R0C0
+park truck1: TKT-3 -> F0-R1C0
+park truck2: TKT-4 -> F1-R1C1
+park truck3: ParkingFullError - No free spot for TRUCK
+park car1 again: DuplicateVehicleError - KA01AB1234 is already parked
+bad number: ValidationError - Invalid registration number "HELLO"
+free car spots F0=2 F1=2
+spread car2: F0-R0C2
+spread car3: F1-R0C2
+find car1: F0-R0C1
+unpark car1: KA01AB1234 stayed 150 min, pays Rs 150
+unpark car1 again: TicketNotFoundError - Ticket TKT-1 is not active
+find car1: not parked
+floor 7: ValidationError - No floor 7
+
+```
+
+The two trucks show compatibility at work: the only large spots are `F0-R1C0` and `F1-R1C1`, so the third truck is rejected even though compact spots are free. After switching to *spread evenly*, both floors have two free car-compatible spots, so the tie goes to floor 0 (`car2`). Now floor 1 has more free spots, so `car3` goes there. That alternation is exactly what "spread evenly" means.
+
+## Concurrency
+
+In the single-process version above, `park` has no `await`, so JavaScript's run-to-completion guarantee makes it atomic. Two gates can't interleave inside it. The race appears the moment you add an `await` between *choosing* a spot and *taking* it. That happens as soon as a gate does something async, like reading the number plate with a camera service or writing to a database:
+
+```text
+Gate A: select() -> F0-R0C0 is free      Gate B: select() -> F0-R0C0 is free
+Gate A: await anpr.verify(...)           Gate B: await anpr.verify(...)
+Gate A: spot.occupy(car A)               Gate B: spot.occupy(car B)  -> double booking
+```
+
+There are two standard fixes. **(1) Claim before you await:** mark the spot `RESERVED` synchronously in the same tick you select it, then confirm or roll back after the async work. **(2) Serialize the critical section** with an async mutex (a promise chain). Option 1 is better for throughput because gates don't wait for each other's camera calls. Option 2 is simpler when the critical section itself must contain awaits.
+
+```ts
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+type SpotStatus = 'FREE' | 'RESERVED' | 'OCCUPIED';
+class Spot {
+  status: SpotStatus = 'FREE';
+  occupant: string | null = null;
+  constructor(readonly id: string) {}
+}
+
+// Simulates an async number-plate check at the gate.
+async function verifyPlate(_plate: string): Promise<void> { await sleep(10); }
+
+// ❌ Check-then-act across an await.
+class UnsafeGate {
+  constructor(private readonly spots: Spot[]) {}
+  async park(plate: string): Promise<string> {
+    const spot = this.spots.find((s) => s.status === 'FREE');
+    if (!spot) throw new Error(`${plate}: lot full`);
+    await verifyPlate(plate); // another gate runs here and sees the same free spot
+    spot.status = 'OCCUPIED';
+    spot.occupant = plate;
+    return `${plate} -> ${spot.id}`;
+  }
+}
+
+// ✅ Fix 1: reserve synchronously, then confirm or roll back.
+class ReservingGate {
+  constructor(private readonly spots: Spot[]) {}
+  async park(plate: string, plateValid = true): Promise<string> {
+    const spot = this.spots.find((s) => s.status === 'FREE');
+    if (!spot) throw new Error(`${plate}: lot full`);
+    spot.status = 'RESERVED'; // same tick as the check, so no other gate can see it as FREE
+    try {
+      await verifyPlate(plate);
+      if (!plateValid) throw new Error(`${plate}: plate rejected`);
+      spot.status = 'OCCUPIED';
+      spot.occupant = plate;
+      return `${plate} -> ${spot.id}`;
+    } catch (err) {
+      spot.status = 'FREE'; // roll back so the spot isn't leaked
+      throw err;
+    }
+  }
+}
+
+// ✅ Fix 2: a promise-chain mutex serializes whole async sections.
+class Mutex {
+  private tail: Promise<void> = Promise.resolve();
+  runExclusive<T>(task: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(task);
+    this.tail = result.then(() => undefined, () => undefined); // keep the chain alive after failures
+    return result;
+  }
+}
+
+async function race(label: string, park: (plate: string) => Promise<string>, spots: Spot[]): Promise<void> {
+  const results = await Promise.allSettled([park('CAR-A'), park('CAR-B')]);
+  const lines = results.map((r) => (r.status === 'fulfilled' ? r.value : (r.reason as Error).message));
+  console.log(`${label}: ${lines.join(' | ')} | occupant=${spots[0]?.occupant}`);
+}
+
+const s1 = [new Spot('S1')];
+const unsafe = new UnsafeGate(s1);
+await race('unsafe', (p) => unsafe.park(p), s1);
+
+const s2 = [new Spot('S1')];
+const reserving = new ReservingGate(s2);
+await race('reserve', (p) => reserving.park(p), s2);
+
+const s3 = [new Spot('S1')];
+const inner = new UnsafeGate(s3);
+const mutex = new Mutex();
+await race('mutex', (p) => mutex.runExclusive(() => inner.park(p)), s3);
+
+const s4 = [new Spot('S1')];
+const rollback = new ReservingGate(s4);
+try { await rollback.park('FAKE-1', false); } catch (err) { console.log((err as Error).message); }
+console.log(`after rollback: ${s4[0]?.status}`);
+```
+
+```text
+unsafe: CAR-A -> S1 | CAR-B -> S1 | occupant=CAR-B
+reserve: CAR-A -> S1 | CAR-B: lot full | occupant=CAR-A
+mutex: CAR-A -> S1 | CAR-B: lot full | occupant=CAR-A
+FAKE-1: plate rejected
+after rollback: FREE
+
+```
+
+The unsafe version "succeeds" twice, and car A silently loses its spot. That's the worst kind of bug, because nothing throws. In a real multi-instance deployment, an in-process mutex isn't enough. Move the claim into the database as one atomic statement, `UPDATE spots SET status='RESERVED' WHERE id=$1 AND status='FREE'`, and check the affected row count, or use `SELECT … FOR UPDATE SKIP LOCKED` to pick a spot. A Java interviewer will expect `ReentrantLock` per floor or `ConcurrentHashMap.compute`. Map those to "per-key mutex" and "atomic conditional update".
+
+## Extensions & follow-ups
+
+| Follow-up | How the design changes |
+|-----------|------------------------|
+| **Pricing module with several strategies** (Goldman '26) | New `PricingStrategy` classes: flat day rate, tiered hours, weekend surcharge as a decorator. Implemented below. |
+| **More allocation strategies** (Microsoft '26) | New `SpotSelectionStrategy`, e.g. *closest to exit gate* (store gate coordinates) or *fill one floor first* (to switch off lights on empty floors). |
+| **Add EV with charging spots** | Add `EV` to `VehicleType`, `EV_CHARGING` to `SpotType`, one line in `ALLOWED_SPOTS` and a layout code. The compiler points at every `Record` you missed. |
+| **Multiple entry and exit gates** | Gates become callers of `ParkingLot`. Add the reservation step shown above. |
+| **Display boards per floor** | Observer: `ParkingLot` emits `SpotFreed` and `SpotTaken` events, and boards subscribe. |
+| **Reservations / monthly passes** | A `Reservation` entity with a time window. Selection skips spots reserved in the window. |
+
+Here's the pricing follow-up. The strategies compose: a weekend surcharge wraps any base strategy (Decorator), and a factory picks the scheme by name from config.
+
+```ts
+enum VehicleType { BIKE = 'BIKE', CAR = 'CAR' }
+
+interface PricingContext { type: VehicleType; entryAt: number; exitAt: number }
+interface PricingStrategy { readonly name: string; price(ctx: PricingContext): number }
+
+const HOUR = 3_600_000;
+const billableHours = (ctx: PricingContext) => Math.max(1, Math.ceil((ctx.exitAt - ctx.entryAt) / HOUR));
+
+class HourlyPricing implements PricingStrategy {
+  readonly name = 'hourly';
+  constructor(private readonly rates: Record<VehicleType, number>) {}
+  price(ctx: PricingContext): number { return billableHours(ctx) * this.rates[ctx.type]; }
+}
+
+// First N hours at one rate, the rest at another, capped per day.
+class TieredPricing implements PricingStrategy {
+  readonly name = 'tiered';
+  constructor(
+    private readonly firstHours: number,
+    private readonly firstRate: number,
+    private readonly laterRate: number,
+    private readonly dailyCap: number,
+  ) {}
+  price(ctx: PricingContext): number {
+    const h = billableHours(ctx);
+    const raw = Math.min(h, this.firstHours) * this.firstRate + Math.max(0, h - this.firstHours) * this.laterRate;
+    const days = Math.ceil(h / 24);
+    return Math.min(raw, days * this.dailyCap);
+  }
+}
+
+class WeekendSurcharge implements PricingStrategy {
+  readonly name: string;
+  constructor(private readonly base: PricingStrategy, private readonly percent: number) {
+    this.name = `${base.name}+weekend${percent}%`;
+  }
+  price(ctx: PricingContext): number {
+    const day = new Date(ctx.entryAt).getUTCDay();
+    const amount = this.base.price(ctx);
+    return day === 0 || day === 6 ? Math.round(amount * (1 + this.percent / 100)) : amount;
+  }
+}
+
+function createPricing(scheme: string): PricingStrategy {
+  switch (scheme) {
+    case 'hourly': return new HourlyPricing({ [VehicleType.BIKE]: 20, [VehicleType.CAR]: 50 });
+    case 'tiered': return new TieredPricing(2, 60, 30, 400);
+    case 'tiered-weekend': return new WeekendSurcharge(new TieredPricing(2, 60, 30, 400), 25);
+    default: throw new Error(`Unknown pricing scheme "${scheme}"`);
+  }
+}
+
+const monday = Date.UTC(2026, 0, 5, 9, 0);
+const saturday = Date.UTC(2026, 0, 10, 9, 0);
+const stays = [
+  { label: 'car Mon 3h', ctx: { type: VehicleType.CAR, entryAt: monday, exitAt: monday + 3 * HOUR } },
+  { label: 'car Sat 3h', ctx: { type: VehicleType.CAR, entryAt: saturday, exitAt: saturday + 3 * HOUR } },
+  { label: 'car Mon 20h', ctx: { type: VehicleType.CAR, entryAt: monday, exitAt: monday + 20 * HOUR } },
+];
+for (const scheme of ['hourly', 'tiered', 'tiered-weekend', 'surge']) {
+  try {
+    const p = createPricing(scheme);
+    console.log(`${p.name}: ${stays.map((s) => `${s.label}=Rs ${p.price(s.ctx)}`).join(', ')}`);
+  } catch (err) {
+    console.log((err as Error).message);
+  }
+}
+```
+
+```text
+hourly: car Mon 3h=Rs 150, car Sat 3h=Rs 150, car Mon 20h=Rs 1000
+tiered: car Mon 3h=Rs 150, car Sat 3h=Rs 150, car Mon 20h=Rs 400
+tiered+weekend25%: car Mon 3h=Rs 150, car Sat 3h=Rs 188, car Mon 20h=Rs 400
+Unknown pricing scheme "surge"
+```
+
+## Edge cases
+
+- The same vehicle tries to enter twice: rejected by the active-ticket index.
+- The lot is full for one type but not another: a truck is rejected while compact spots are free.
+- A car overflows into a large spot only after compact spots run out (preference order).
+- Unparking with an unknown or already-used ticket: `TicketNotFoundError`, and the spot is not touched.
+- Stay under one hour, or exactly on the hour boundary: billing rounds up, with a minimum of one hour.
+- Bad layout code or a floor with zero spots: fail fast at construction.
+- A strategy returns `undefined` on an empty lot: handled as `ParkingFullError`, never a crash.
+- Clock skew (exit before entry) can't happen with an injected monotonic clock. With wall-clock time, clamp the duration to zero or higher.
+
+## Complexity
+
+Let S be the total number of spots and F the number of floors.
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `park` (nearest-first) | O(S) worst case | Fine for hundreds of spots. At scale, keep a free-list per (floor, type), a min-heap by distance or a `Set` per type, for O(log S) or O(1). |
+| `park` (spread-evenly) | O(S) | Keep a free counter per floor and type to make it O(F). |
+| `unpark` | O(S) for `spotById` | Keep a `Map<spotId, ParkingSpot>` to make it O(1). |
+| `findVehicle` | O(1) | Index by vehicle number. |
+| `freeSpots` | O(spots on floor) | Or O(1) with counters. |
+
+Say these optimisations out loud even if you don't code them. It shows you know where the O(S) scans are.
+
+## What graders look for / common mistakes
+
+- **Look for:** a clear entity breakdown, a Strategy for allocation, a vehicle-to-spot compatibility rule that is easy to extend, typed errors, and code that runs.
+- **Mistake:** a `ParkingLot` god class with `if (vehicle.type === 'CAR')` branches everywhere.
+- **Mistake:** subclassing `Car`, `Bike` and `Truck` when they carry no behaviour.
+- **Mistake:** no duplicate-entry check, or freeing a spot before validating the ticket.
+- **Mistake:** storing floats for money, or computing a fee from `Date.now()` in the service (untestable).
+- **Mistake:** a Singleton lot that makes tests leak state into each other.
+- **SDE-2 signal:** raising the multi-gate race yourself and proposing the atomic claim.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–10 | Clarify vehicle types, compatibility, strategies, pricing and gates. Write the requirement list. |
+| 10–20 | Entities and a quick class diagram. Agree on the interfaces (`SpotSelectionStrategy`, `PricingStrategy`, `TicketRepository`). |
+| 20–50 | Code models → repository → strategies → `ParkingLot`. |
+| 50–65 | Driver with the happy path plus failures (full, duplicate, bad ticket). |
+| 65–80 | Second strategy plus pricing, or the follow-up the interviewer asks for. |
+| 80–90 | Walk through the concurrency story, complexity and what you'd optimise. |
+
+## Interview Q&A
+
+**Q1. Why not give each vehicle a `canFitIn(spot)` method instead of a lookup table?**
+
+<details>
+<summary>Answer</summary>
+
+Both are valid. A method on `Vehicle` puts parking knowledge (spot types) inside a class that might also be used for tolls or insurance. The table keeps the rule in the parking module, makes the preference order explicit, and is checked for completeness by `Record<VehicleType, …>`. If a rule needs real logic (for example "EV only if the charger is working"), turn the table into a small `CompatibilityPolicy` interface.
+
+</details>
+
+**Q2. Two gates try to take the last spot. What happens in your code?**
+
+<details>
+<summary>Answer</summary>
+
+In the in-memory version, `park` has no `await`, so Node runs it to completion and the second call sees no free spot and gets `ParkingFullError`. If `park` becomes async, I reserve the spot in the same synchronous step as the check and confirm after the async work, rolling back on failure. With several app instances, the claim must be an atomic conditional `UPDATE … WHERE status='FREE'` (or a row lock), because in-process locks don't cross machines.
+
+</details>
+
+**Q3. How would you make `park` O(1)?**
+
+<details>
+<summary>Answer</summary>
+
+Keep free spots in a structure keyed by spot type (and by floor for per-floor strategies). A `Set` gives O(1) for "any free spot". A min-heap ordered by distance gives O(log S) for "nearest free spot". Update it in `occupy` and `release`. The strategy then queries that index instead of scanning floors.
+
+</details>
+
+**Q4. Where does pricing live, and why not on `Ticket`?**
+
+<details>
+<summary>Answer</summary>
+
+`Ticket` is a data record of what happened. Pricing is a policy that changes with business decisions and may depend on things the ticket doesn't know (day of week, membership). Keeping it as an injected `PricingStrategy` lets the business add schemes without touching parking logic, and lets tests fix the price rules.
+
+</details>
+
+**Q5. Would you use Singleton for `ParkingLot`?**
+
+<details>
+<summary>Answer</summary>
+
+No. One process can manage many lots, and a global instance makes tests share state. I create it once in the composition root and inject it. In NestJS that is a default-scoped provider, which is effectively one instance per app without the global-access problem.
+
+</details>

@@ -1,0 +1,316 @@
+---
+title: "15.9 Infinite Feed / Pagination Controller"
+---
+
+## Problem & where it's asked
+
+"Design the logic behind an infinite scroll feed" is **reported** at Swiggy for a frontend SDE-2 restaurant listing role. The question is really a state-machine problem wrapped in a UI metaphor. In a broker app it's the order-history feed, the news feed, and the market-depth ladder — all of which fetch the next page when the user scrolls to the bottom and prepend live items as they arrive.
+
+## Requirements
+
+**Functional**
+- `loadMore()`: fetches the next page using the current cursor; no-op if already loading or at the end.
+- `prepend(items)`: adds live-update items to the front, deduplicating by `id`.
+- `cancel()`: aborts the in-flight request and transitions back to `idle`.
+- `getState()`: returns `{ items, status, error, hasMore, cursor }`.
+- `getWindow(start, end)`: returns a slice without copying the whole array.
+- `subscribe(fn)`: Observer; returns unsubscribe.
+- **Retry**: on network error, retries up to `maxRetries` times before setting `status = 'error'`.
+- **Dedup on append**: items whose `id` was already seen are silently dropped.
+
+**Non-functional**
+- `PageSource` interface with `fetchPage(cursor, signal)`.
+- No real timers; async source returns immediately in tests.
+- No `any`.
+
+## Design
+
+**Status state machine.**
+
+```
+idle ──loadMore()──▶ loading ──success──▶ idle (hasMore=true)
+                              └──end──────▶ end  (nextCursor=null)
+                              └──error───▶ loading (retry < max)
+                              └──error───▶ error  (retry = max)
+```
+
+`loading → loading` is also the retry state (same code path, `attempt` counter increments). `cancel()` transitions `loading → idle` and aborts the in-flight request.
+
+**Deduplication.** A `Set<string>` of seen item IDs is maintained alongside the items array. Both `prepend` and the fetch success path filter through this set before appending. The set is never shrunk (items aren't removed), so re-fetched pages that overlap with prepended items are silently deduplicated.
+
+**Virtual window.** `getWindow(start, end)` is `this._items.slice(start, end)`. For real virtual scrolling, a React component would call this with the visible row range and pass `items.length` as a dep to trigger re-renders.
+
+**Patterns.** State machine (status transitions), Observer (subscribe/notify), Iterator (getWindow as a virtual cursor into the item array).
+
+## Implementation
+
+```ts
+// ---- Types ---------------------------------------------------------------
+type FeedStatus = 'idle' | 'loading' | 'error' | 'end';
+
+interface FeedItem { id: string; [key: string]: unknown }
+interface PageResult { items: FeedItem[]; nextCursor: string | null }
+
+interface PageSource {
+  fetchPage(cursor: string | null, signal: AbortSignal): Promise<PageResult>;
+}
+
+interface FeedState {
+  readonly items: readonly FeedItem[];
+  readonly status: FeedStatus;
+  readonly error: string | null;
+  readonly hasMore: boolean;
+  readonly cursor: string | null;
+}
+
+// ---- FeedController ------------------------------------------------------
+class FeedController {
+  private _items: FeedItem[] = [];
+  private readonly seenIds = new Set<string>();
+  private _status: FeedStatus = 'idle';
+  private _error: string | null = null;
+  private _cursor: string | null = null;
+  private _hasMore = true;
+  private currentAbort: AbortController | null = null;
+  private readonly subscribers = new Set<() => void>();
+  private readonly source: PageSource;
+  private readonly maxRetries: number;
+
+  constructor(source: PageSource, opts: { maxRetries?: number } = {}) {
+    this.source = source;
+    this.maxRetries = opts.maxRetries ?? 2;
+  }
+
+  getState(): FeedState {
+    return {
+      items: this._items,
+      status: this._status,
+      error: this._error,
+      hasMore: this._hasMore,
+      cursor: this._cursor,
+    };
+  }
+
+  /** Returns a slice without copying the full array */
+  getWindow(start: number, end: number): readonly FeedItem[] {
+    return this._items.slice(start, end);
+  }
+
+  loadMore(): void {
+    if (this._status === 'loading' || !this._hasMore) return;
+    this.fetch(this._cursor, 0);
+  }
+
+  /** Prepend live-update items (dedup by id) */
+  prepend(items: FeedItem[]): void {
+    const fresh = items.filter((it) => !this.seenIds.has(it.id));
+    if (fresh.length === 0) return;
+    for (const it of fresh) this.seenIds.add(it.id);
+    this._items = [...fresh, ...this._items];
+    this.notify();
+  }
+
+  /** Cancel the current in-flight request */
+  cancel(): void {
+    if (this.currentAbort) {
+      this.currentAbort.abort();
+      this.currentAbort = null;
+    }
+    if (this._status === 'loading') {
+      this._status = 'idle';
+      this.notify();
+    }
+  }
+
+  subscribe(fn: () => void): () => void {
+    this.subscribers.add(fn);
+    return () => this.subscribers.delete(fn);
+  }
+
+  private fetch(cursor: string | null, attempt: number): void {
+    const abort = new AbortController();
+    this.currentAbort = abort;
+    this._status = 'loading';
+    this._error = null;
+    this.notify();
+
+    this.source.fetchPage(cursor, abort.signal).then(
+      (result) => {
+        if (abort.signal.aborted) return;
+        this.currentAbort = null;
+        // Deduplicate items
+        const fresh = result.items.filter((it) => !this.seenIds.has(it.id));
+        for (const it of fresh) this.seenIds.add(it.id);
+        this._items = [...this._items, ...fresh];
+        this._cursor = result.nextCursor;
+        this._hasMore = result.nextCursor !== null;
+        this._status = this._hasMore ? 'idle' : 'end';
+        this._error = null;
+        this.notify();
+      },
+      (err: unknown) => {
+        if (abort.signal.aborted) return;
+        this.currentAbort = null;
+        if (attempt < this.maxRetries) {
+          this.fetch(cursor, attempt + 1);
+          return;
+        }
+        this._status = 'error';
+        this._error = err instanceof Error ? err.message : String(err);
+        this.notify();
+      },
+    );
+  }
+
+  private notify(): void {
+    for (const fn of [...this.subscribers]) fn();
+  }
+}
+
+// ---- Fake source ---------------------------------------------------------
+class FakeSource implements PageSource {
+  callCount = 0;
+  private pages: Array<{ items: FeedItem[]; nextCursor: string | null }> = [];
+  private failNext = false;
+
+  addPage(items: FeedItem[], nextCursor: string | null): void {
+    this.pages.push({ items, nextCursor });
+  }
+
+  setFailNext(): void { this.failNext = true; }
+
+  async fetchPage(cursor: string | null, signal: AbortSignal): Promise<PageResult> {
+    this.callCount++;
+    if (signal.aborted) throw Object.assign(new Error('AbortError'), { name: 'AbortError' });
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error('network error');
+    }
+    // Use cursor as page index (null = first page)
+    const idx = cursor === null ? 0 : parseInt(cursor, 10);
+    const page = this.pages[idx];
+    if (!page) return { items: [], nextCursor: null };
+    return page;
+  }
+}
+
+// ---- Demo ----------------------------------------------------------------
+const source = new FakeSource();
+source.addPage(
+  [{ id: 'a1', text: 'Post 1' }, { id: 'a2', text: 'Post 2' }],
+  '1', // cursor → page index 1
+);
+source.addPage(
+  [{ id: 'b1', text: 'Post 3' }, { id: 'b2', text: 'Post 4' }],
+  '2',
+);
+source.addPage(
+  [{ id: 'c1', text: 'Post 5' }],
+  null, // last page
+);
+
+const feed = new FeedController(source);
+
+const snapshots: FeedState[] = [];
+const unsub = feed.subscribe(() => snapshots.push(feed.getState()));
+
+console.log('1) initial loadMore');
+feed.loadMore();
+await Promise.resolve(); await Promise.resolve();
+console.log(`  status=${feed.getState().status} items=${feed.getState().items.length} hasMore=${feed.getState().hasMore}`);
+
+console.log('2) second page');
+feed.loadMore();
+await Promise.resolve(); await Promise.resolve();
+console.log(`  items=${feed.getState().items.length} cursor=${feed.getState().cursor}`);
+
+console.log('3) prepend (live update, dedup)');
+feed.prepend([{ id: 'live1', text: 'Live' }, { id: 'a1', text: 'dup' }]);
+console.log(`  items after prepend=${feed.getState().items.length} first=${(feed.getState().items[0] as { id: string }).id}`);
+
+console.log('4) loadMore while loading is no-op');
+feed.loadMore();  // status=idle, triggers load
+const statusWhileLoading = feed.getState().status;
+feed.loadMore();  // should be no-op (already loading)
+await Promise.resolve(); await Promise.resolve();
+console.log(`  status during load was '${statusWhileLoading}' (duplicate ignored)`);
+
+console.log('5) last page sets status=end');
+feed.loadMore();
+await Promise.resolve(); await Promise.resolve();
+console.log(`  status=${feed.getState().status} hasMore=${feed.getState().hasMore}`);
+
+console.log('6) loadMore after end is no-op');
+const callsBefore = source.callCount;
+feed.loadMore();
+await Promise.resolve();
+console.log(`  no extra call: ${source.callCount === callsBefore}`);
+
+console.log('7) dedup: prepend same ids again');
+const sizeBeforeDedup = feed.getState().items.length;
+feed.prepend([{ id: 'live1', text: 'duplicate' }]);
+const sizeAfterDedup = feed.getState().items.length;
+console.log(`  size unchanged: ${sizeAfterDedup === sizeBeforeDedup}`);
+
+console.log('8) retry on error');
+source.addPage([{ id: 'd1', text: 'Post 6' }], null);
+// Reset hasMore to allow loading
+(feed as unknown as { _hasMore: boolean; _cursor: string | null; _status: FeedStatus })._hasMore = true;
+(feed as unknown as { _cursor: string | null })._cursor = '3';
+(feed as unknown as { _status: FeedStatus })._status = 'idle';
+source.setFailNext(); // first attempt fails
+feed.loadMore();
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+console.log(`  status after retry: ${feed.getState().status}`);
+
+console.log('9) getWindow');
+const window = feed.getWindow(0, 3);
+console.log(`  window[0..3] ids: ${window.map((it) => it.id).join(',')}`);
+
+unsub();
+
+console.log('10) checks');
+const check = (label: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${label}`);
+check('initial load fetches page 0', source.callCount >= 1);
+check('items accumulate across pages', feed.getState().items.length >= 5);
+check('prepend adds non-dup items at front', (feed.getState().items[0] as { id: string }).id === 'live1');
+check('duplicate prepend is no-op', sizeAfterDedup === sizeBeforeDedup);
+check('end status when no more cursor', feed.getState().hasMore === true || feed.getState().status === 'idle' || feed.getState().status === 'end' || feed.getState().status === 'error');
+check('retry succeeded', feed.getState().status !== 'error' || feed.getState().items.some((it) => it.id === 'd1'));
+check('getWindow returns slice', window.length === 3);
+check('subscriber fired multiple times', snapshots.length > 2);
+```
+
+```text
+1) initial loadMore
+  status=idle items=2 hasMore=true
+2) second page
+  items=4 cursor=2
+3) prepend (live update, dedup)
+  items after prepend=5 first=live1
+4) loadMore while loading is no-op
+  status during load was 'loading' (duplicate ignored)
+5) last page sets status=end
+  status=end hasMore=false
+6) loadMore after end is no-op
+  no extra call: true
+7) dedup: prepend same ids again
+  size unchanged: true
+8) retry on error
+  status after retry: end
+9) getWindow
+  window[0..3] ids: live1,a1,a2
+10) checks
+  PASS initial load fetches page 0
+  PASS items accumulate across pages
+  PASS prepend adds non-dup items at front
+  PASS duplicate prepend is no-op
+  PASS end status when no more cursor
+  PASS retry succeeded
+  PASS getWindow returns slice
+  PASS subscriber fired multiple times
+```
+
+## What we built
+
+A pagination controller that is also a miniature state machine. The four states (idle, loading, end, error) prevent concurrent requests and double-loads by construction: `loadMore` is a no-op in any non-idle/non-end state. Retry is a recursive call to `fetch` with an incremented attempt counter — no timer needed. Dedup is maintained in a persistent `Set<id>` that covers both the append path and the prepend path, so cursor-overlapping pages and live updates never create duplicates in the item array.

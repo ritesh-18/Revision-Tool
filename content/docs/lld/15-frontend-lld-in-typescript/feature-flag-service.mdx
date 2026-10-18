@@ -1,0 +1,637 @@
+---
+title: "15.3 Feature Flag Service"
+---
+
+## Problem & where it's asked
+
+"Implement feature flags / A/B testing" is **reported** in **Atlassian** frontend interview write-ups (devtools.tech). Every product company with trunk-based development uses flags: LaunchDarkly, Statsig, Unleash and GrowthBook. A broker uses them to roll out a new order ticket to 5 % of Android users, to run an A/B test on the chart engine, or to switch off F&O basket orders during an incident.
+
+The interviewer usually wants to see three things:
+
+1. **Targeting rules** evaluated in order, the first match wins.
+2. **Deterministic percentage rollouts**. The same user must get the same answer on every reload, and raising 20 % to 50 % must not kick out anyone who was already in.
+3. **A typed client API**, so `flags.get('max-watchlists')` is a `number` and a typo in a flag name is a compile error.
+
+## Requirements
+
+**Functional**
+
+- Flag definitions with `defaultValue` (used when the flag isn't loaded or evaluation fails), an `enabled` kill switch (`offValue`), and an ordered `rules` list.
+- Rule conditions on user attributes: `eq`, `neq`, `in`, `notIn`, `gte`, `lte`, `semverGte`.
+- A rule serves either a fixed value or a **weighted rollout** (a percentage rollout, or A/B/n variants).
+- **Overrides** for QA and dev (for example from a `?ff.flag=value` URL), which always win.
+- `subscribe(key, listener)` fires only when that flag's *evaluated value* changes (new config, new user context, override).
+- `evaluate(key)` returns the value **and a reason**, which helps with debugging.
+- **Typed getters**: `get`, and `isEnabled`, which only accepts boolean flags.
+
+**Non-functional**
+
+- Reads are synchronous and O(1), because they are called during render. Evaluation happens when inputs change, not on every read.
+- A server config with the wrong type must never crash the app. The client falls back to the default.
+- No `Math.random`. Bucketing comes from a hash of `flagKey + salt + userId`.
+
+**Public API (written first)**
+
+```ts
+type FlagValue = boolean | number | string;
+type FlagSchema = Record<string, FlagValue>;
+type AttrValue = string | number | boolean;
+interface UserContext { userId: string; attributes: Record<string, AttrValue> }
+
+type Condition =
+  | { attribute: string; op: 'eq' | 'neq'; value: AttrValue }
+  | { attribute: string; op: 'in' | 'notIn'; values: readonly AttrValue[] }
+  | { attribute: string; op: 'gte' | 'lte'; value: number }
+  | { attribute: string; op: 'semverGte'; value: string };
+
+type Serve<V> =
+  | { kind: 'value'; value: V }
+  | { kind: 'rollout'; buckets: ReadonlyArray<{ value: V; weight: number }> }; // weights in %, total <= 100
+
+interface Rule<V> { id: string; conditions: readonly Condition[]; serve: Serve<V> }
+interface FlagConfig<V> { enabled: boolean; offValue?: V; salt?: string; rules: readonly Rule<V>[] }
+type FlagConfigs<F extends FlagSchema> = { [K in keyof F]?: FlagConfig<F[K]> };
+
+type Reason = 'OVERRIDE' | 'DISABLED' | 'RULE_MATCH' | 'DEFAULT' | 'NOT_LOADED' | 'TYPE_MISMATCH';
+interface Evaluation<V> { value: V; reason: Reason; ruleId?: string }
+
+type BooleanKeys<F> = { [K in keyof F]: F[K] extends boolean ? K : never }[keyof F];
+
+interface FlagClient<F extends FlagSchema> {
+  get<K extends keyof F>(key: K): F[K];
+  isEnabled(key: BooleanKeys<F>): boolean;
+  evaluate<K extends keyof F>(key: K): Evaluation<F[K]>;
+  load(configs: FlagConfigs<F>): void;
+  setContext(context: UserContext): void;
+  setOverride<K extends keyof F>(key: K, value: F[K] | undefined): void;
+  subscribe<K extends keyof F>(key: K, listener: (value: F[K], previous: F[K]) => void): () => void;
+  subscribeAll(listener: () => void): () => void;
+  getSnapshot(): Readonly<F>; // stable reference until something changes
+}
+```
+
+The **schema is the defaults object**. `new FeatureFlagClient({ 'new-order-ticket': false, 'max-watchlists': 5 })` infers `F`, so the flag names, their types and their safe fallbacks are all declared in one place.
+
+## Design
+
+**State model**
+
+- `defaults: F`, which is fixed and doubles as the schema.
+- `configs`: the latest server payload.
+- `context`: the current user.
+- `overrides: Partial<F>`.
+- `evaluations: Map<key, Evaluation>`, a **cache** recomputed whenever any of the three inputs changes. `get` reads from it.
+- `snapshot`: a frozen object of the values, replaced only when at least one value changed.
+
+**Bucketing.** `bucket = fnv1a(key + '.' + salt + '.' + userId) % 10000 / 100` gives a number in `[0, 100)`. A rollout walks the buckets cumulatively. With `[{ true, 20 }]`, users in `[0, 20)` get `true` and the rest **fall through** to the next rule. Raising the weight to 50 only *adds* users, because each user's bucket never changes. Changing the `salt` reshuffles everyone, which you want for a new experiment.
+
+<Mermaid chart={`classDiagram
+    class FlagClient~F~ {
+        <<interface>>
+        +get(key) value
+        +isEnabled(key) boolean
+        +evaluate(key) Evaluation
+        +load(configs)
+        +setContext(ctx)
+        +setOverride(key, value)
+        +subscribe(key, fn)
+    }
+    class FeatureFlagClient~F~ {
+        -defaults F
+        -configs FlagConfigs
+        -overrides Partial
+        -evaluations Map
+        -snapshot F
+        -recompute()
+    }
+    class RuleEvaluator {
+        +evaluateFlag(config, ctx, hash)
+        +matches(condition, attrs)
+        +bucketOf(key, salt, userId)
+    }
+    FlagClient <|.. FeatureFlagClient
+    FeatureFlagClient ..> RuleEvaluator`} />
+
+**Patterns**
+
+- **Strategy / Specification**: each `Condition` is a small predicate, and rules are composed from them.
+- **Observer**, with per-key subscriptions and **change detection**, so a component using `new-order-ticket` doesn't re-render when `chart-engine` changes.
+- **Memoization / snapshot**: the same idea as a Redux selector, and exactly what `useSyncExternalStore` needs.
+- The evaluator is a **pure function** of `(config, context, hash)`, so you can test it with a table of inputs and expected outputs.
+
+## Implementation
+
+Part 1 is the pure evaluator.
+
+```ts
+type FlagValue = boolean | number | string;
+type FlagSchema = Record<string, FlagValue>;
+type AttrValue = string | number | boolean;
+interface UserContext { userId: string; attributes: Record<string, AttrValue> }
+
+type Condition =
+  | { attribute: string; op: 'eq' | 'neq'; value: AttrValue }
+  | { attribute: string; op: 'in' | 'notIn'; values: readonly AttrValue[] }
+  | { attribute: string; op: 'gte' | 'lte'; value: number }
+  | { attribute: string; op: 'semverGte'; value: string };
+
+type Serve<V> =
+  | { kind: 'value'; value: V }
+  | { kind: 'rollout'; buckets: ReadonlyArray<{ value: V; weight: number }> };
+
+interface Rule<V> { id: string; conditions: readonly Condition[]; serve: Serve<V> }
+interface FlagConfig<V> { enabled: boolean; offValue?: V; salt?: string; rules: readonly Rule<V>[] }
+type FlagConfigs<F extends FlagSchema> = { [K in keyof F]?: FlagConfig<F[K]> };
+
+type Reason = 'OVERRIDE' | 'DISABLED' | 'RULE_MATCH' | 'DEFAULT' | 'NOT_LOADED' | 'TYPE_MISMATCH';
+interface Evaluation<V> { value: V; reason: Reason; ruleId?: string }
+type BooleanKeys<F> = { [K in keyof F]: F[K] extends boolean ? K : never }[keyof F];
+type HashFn = (input: string) => number;
+
+function fnv1a(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return Math.sign(diff);
+  }
+  return 0;
+}
+
+function matches(condition: Condition, attributes: Record<string, AttrValue>): boolean {
+  const actual = attributes[condition.attribute];
+  if (actual === undefined) return false; // missing attribute never matches (even for neq)
+  switch (condition.op) {
+    case 'eq':
+      return actual === condition.value;
+    case 'neq':
+      return actual !== condition.value;
+    case 'in':
+      return condition.values.includes(actual);
+    case 'notIn':
+      return !condition.values.includes(actual);
+    case 'gte':
+      return typeof actual === 'number' && actual >= condition.value;
+    case 'lte':
+      return typeof actual === 'number' && actual <= condition.value;
+    case 'semverGte':
+      return typeof actual === 'string' && compareSemver(actual, condition.value) >= 0;
+  }
+}
+
+/** Stable bucket in [0, 100) with 0.01% resolution. */
+function bucketOf(hash: HashFn, key: string, salt: string, userId: string): number {
+  return (hash(`${key}.${salt}.${userId}`) % 10_000) / 100;
+}
+
+function evaluateFlag<V extends FlagValue>(
+  key: string,
+  config: FlagConfig<V>,
+  context: UserContext | null,
+  fallback: V,
+  hash: HashFn,
+): Evaluation<V> {
+  if (!config.enabled) return { value: config.offValue ?? fallback, reason: 'DISABLED' };
+  for (const rule of config.rules) {
+    if (!rule.conditions.every((c) => context !== null && matches(c, context.attributes))) continue;
+    if (rule.serve.kind === 'value') return { value: rule.serve.value, reason: 'RULE_MATCH', ruleId: rule.id };
+    if (!context) continue; // rollouts need a stable id
+    const bucket = bucketOf(hash, key, config.salt ?? '', context.userId);
+    let upper = 0;
+    for (const option of rule.serve.buckets) {
+      upper += option.weight;
+      if (bucket < upper) return { value: option.value, reason: 'RULE_MATCH', ruleId: rule.id };
+    }
+    // bucket beyond the rollout: fall through to the next rule
+  }
+  return { value: fallback, reason: 'DEFAULT' };
+}
+```
+
+Part 2 is the client: caching, change detection, overrides and subscriptions. The **exposure hook** is the extension. It reports "user X saw variant Y of flag Z" exactly once, which is what an A/B analysis needs.
+
+```ts
+interface FlagClientOptions {
+  hash?: HashFn;
+  onExposure?: (key: string, value: FlagValue, userId: string | null) => void;
+  onError?: (message: string) => void;
+}
+
+class FeatureFlagClient<F extends FlagSchema> {
+  private readonly defaults: F;
+  private configs: FlagConfigs<F> = {};
+  private context: UserContext | null = null;
+  private overrides: Partial<F> = {};
+  private readonly evaluations = new Map<keyof F, Evaluation<F[keyof F]>>();
+  private snapshot: Readonly<F>;
+  private readonly keyListeners = new Map<keyof F, Set<(value: never, previous: never) => void>>();
+  private readonly allListeners = new Set<() => void>();
+  private readonly exposed = new Set<string>();
+  private readonly hash: HashFn;
+  private readonly options: FlagClientOptions;
+
+  constructor(defaults: F, options: FlagClientOptions = {}) {
+    this.defaults = defaults;
+    this.options = options;
+    this.hash = options.hash ?? fnv1a;
+    this.snapshot = Object.freeze({ ...defaults });
+    this.recompute();
+  }
+
+  // --- reads (render path: O(1)) ---------------------------------------------
+  get<K extends keyof F>(key: K): F[K] {
+    return this.evaluate(key).value;
+  }
+
+  isEnabled(key: BooleanKeys<F>): boolean {
+    return this.get(key) === true;
+  }
+
+  evaluate<K extends keyof F>(key: K): Evaluation<F[K]> {
+    const evaluation = (this.evaluations.get(key) ?? { value: this.defaults[key], reason: 'NOT_LOADED' }) as Evaluation<F[K]>;
+    this.trackExposure(String(key), evaluation);
+    return evaluation;
+  }
+
+  getSnapshot(): Readonly<F> {
+    return this.snapshot;
+  }
+
+  // --- inputs ---------------------------------------------------------------------
+  load(configs: FlagConfigs<F>): void {
+    this.configs = configs;
+    this.recompute();
+  }
+
+  setContext(context: UserContext): void {
+    if (this.context?.userId !== context.userId) this.exposed.clear(); // new user, new exposures
+    this.context = context;
+    this.recompute();
+  }
+
+  setOverride<K extends keyof F>(key: K, value: F[K] | undefined): void {
+    const next = { ...this.overrides };
+    if (value === undefined) delete next[key];
+    else next[key] = value;
+    this.overrides = next;
+    this.recompute();
+  }
+
+  // --- subscriptions --------------------------------------------------------------
+  subscribe<K extends keyof F>(key: K, listener: (value: F[K], previous: F[K]) => void): () => void {
+    const set = this.keyListeners.get(key) ?? new Set();
+    const stored = listener as (value: never, previous: never) => void;
+    set.add(stored);
+    this.keyListeners.set(key, set);
+    return () => {
+      set.delete(stored);
+      if (set.size === 0) this.keyListeners.delete(key);
+    };
+  }
+
+  subscribeAll(listener: () => void): () => void {
+    this.allListeners.add(listener);
+    return () => this.allListeners.delete(listener);
+  }
+
+  // --- core -----------------------------------------------------------------------
+  private recompute(): void {
+    const changed: Array<[keyof F, FlagValue, FlagValue]> = [];
+    for (const key of Object.keys(this.defaults) as Array<keyof F>) {
+      const next = this.evaluateKey(key);
+      const prev = this.evaluations.get(key);
+      this.evaluations.set(key, next);
+      if (prev && prev.value !== next.value) changed.push([key, next.value, prev.value]);
+    }
+    if (changed.length === 0) return;
+    const values = { ...this.snapshot } as Record<keyof F, FlagValue>;
+    for (const [key, value] of changed) values[key] = value;
+    this.snapshot = Object.freeze(values as F);
+    for (const [key, value, previous] of changed) {
+      for (const listener of [...(this.keyListeners.get(key) ?? [])]) {
+        (listener as (v: FlagValue, p: FlagValue) => void)(value, previous);
+      }
+    }
+    for (const listener of [...this.allListeners]) listener();
+  }
+
+  private evaluateKey<K extends keyof F>(key: K): Evaluation<F[K]> {
+    const fallback = this.defaults[key];
+    const override = this.overrides[key];
+    if (override !== undefined) return { value: override as F[K], reason: 'OVERRIDE' };
+    const config = this.configs[key];
+    if (!config) return { value: fallback, reason: 'NOT_LOADED' };
+    const result = evaluateFlag<F[K]>(String(key), config as FlagConfig<F[K]>, this.context, fallback, this.hash);
+    // Server JSON is not trusted: the served type must match the default's type.
+    if (typeof result.value !== typeof fallback) {
+      this.options.onError?.(`flag "${String(key)}" served ${typeof result.value}, expected ${typeof fallback}`);
+      return { value: fallback, reason: 'TYPE_MISMATCH' };
+    }
+    return result;
+  }
+
+  private trackExposure(key: string, evaluation: Evaluation<FlagValue>): void {
+    if (!this.options.onExposure || evaluation.reason !== 'RULE_MATCH') return;
+    const id = `${key}=${String(evaluation.value)}`;
+    if (this.exposed.has(id)) return;
+    this.exposed.add(id);
+    this.options.onExposure(key, evaluation.value, this.context?.userId ?? null);
+  }
+}
+
+/** Extension: `?ff.new-order-ticket=true&ff.max-watchlists=12` into typed overrides. */
+function parseOverrides<F extends FlagSchema>(query: string, defaults: F): Partial<F> {
+  const result: Partial<Record<keyof F, FlagValue>> = {};
+  for (const pair of query.replace(/^\?/, '').split('&')) {
+    const [rawKey = '', raw = ''] = pair.split('=');
+    const key = decodeURIComponent(rawKey).replace(/^ff\./, '');
+    if (!rawKey.startsWith('ff.') || !(key in defaults)) continue;
+    const kind = typeof defaults[key];
+    const value = decodeURIComponent(raw);
+    if (kind === 'boolean' && (value === 'true' || value === 'false')) result[key as keyof F] = value === 'true';
+    else if (kind === 'number' && value !== '' && !Number.isNaN(Number(value))) result[key as keyof F] = Number(value);
+    else if (kind === 'string') result[key as keyof F] = value;
+  }
+  return result as Partial<F>;
+}
+```
+
+Part 3 is the demo: a broker app's flags, targeting, a rollout ramp, an A/B split, overrides and a bad server payload.
+
+```ts
+const defaults = {
+  'new-order-ticket': false,
+  'chart-engine': 'inhouse' as 'inhouse' | 'tradingview',
+  'max-watchlists': 5,
+  'fno-basket-orders': true,
+};
+type AppFlags = typeof defaults;
+
+const exposures: string[] = [];
+const flags = new FeatureFlagClient<AppFlags>(defaults, {
+  onExposure: (key, value, userId) => exposures.push(`${userId}/${key}=${String(value)}`),
+  onError: (message) => console.log(`  [flag error] ${message}`),
+});
+
+const orderTicketConfig = (rolloutPercent: number): FlagConfig<boolean> => ({
+  enabled: true,
+  salt: 'v1',
+  rules: [
+    { id: 'employees', conditions: [{ attribute: 'segment', op: 'eq', value: 'employee' }], serve: { kind: 'value', value: true } },
+    {
+      id: 'android-ramp',
+      conditions: [
+        { attribute: 'platform', op: 'eq', value: 'android' },
+        { attribute: 'appVersion', op: 'semverGte', value: '5.2.0' },
+      ],
+      serve: { kind: 'rollout', buckets: [{ value: true, weight: rolloutPercent }] },
+    },
+  ],
+});
+
+const configs: FlagConfigs<AppFlags> = {
+  'new-order-ticket': orderTicketConfig(20),
+  'chart-engine': {
+    enabled: true,
+    salt: 'exp-42',
+    rules: [{
+      id: 'ab-test',
+      conditions: [],
+      serve: { kind: 'rollout', buckets: [{ value: 'inhouse', weight: 50 }, { value: 'tradingview', weight: 50 }] },
+    }],
+  },
+  'max-watchlists': {
+    enabled: true,
+    rules: [{ id: 'pro-plan', conditions: [{ attribute: 'plan', op: 'in', values: ['pro', 'elite'] }], serve: { kind: 'value', value: 10 } }],
+  },
+  'fno-basket-orders': { enabled: true, rules: [] },
+};
+
+const describe = (key: keyof AppFlags): string => {
+  const e = flags.evaluate(key);
+  return `${key}=${String(e.value)} (${e.reason}${e.ruleId ? `:${e.ruleId}` : ''})`;
+};
+
+console.log('1) before load: defaults');
+console.log(`  ${describe('new-order-ticket')}`);
+
+let ticketNotifications = 0;
+const stopTicket = flags.subscribe('new-order-ticket', (value, prev) => {
+  ticketNotifications++;
+  console.log(`  [subscriber] new-order-ticket ${String(prev)} -> ${String(value)}`);
+});
+let renders = 0;
+flags.subscribeAll(() => renders++);
+
+console.log('2) load config + set context (pro user on android 5.3.1)');
+flags.load(configs);
+flags.setContext({ userId: 'U1001', attributes: { platform: 'android', appVersion: '5.3.1', plan: 'pro' } });
+for (const key of Object.keys(defaults) as Array<keyof AppFlags>) console.log(`  ${describe(key)}`);
+console.log(`  isEnabled(new-order-ticket) = ${flags.isEnabled('new-order-ticket')}`);
+
+console.log('3) employee always gets the new ticket');
+flags.setContext({ userId: 'E7', attributes: { segment: 'employee', platform: 'ios' } });
+console.log(`  ${describe('new-order-ticket')}`);
+
+console.log('4) rollout distribution over 10,000 android users');
+const inAt = (percent: number): Set<string> => {
+  const set = new Set<string>();
+  const cfg = orderTicketConfig(percent);
+  for (let i = 0; i < 10_000; i++) {
+    const ctx: UserContext = { userId: `U${i}`, attributes: { platform: 'android', appVersion: '5.2.0' } };
+    if (evaluateFlag('new-order-ticket', cfg, ctx, false, fnv1a).value) set.add(ctx.userId);
+  }
+  return set;
+};
+const at20 = inAt(20);
+const at50 = inAt(50);
+console.log(`  20% ramp -> ${at20.size} users, 50% ramp -> ${at50.size} users`);
+const variantCounts = new Map<string, number>();
+for (let i = 0; i < 10_000; i++) {
+  const v = evaluateFlag('chart-engine', configs['chart-engine']!, { userId: `U${i}`, attributes: {} }, 'inhouse', fnv1a).value;
+  variantCounts.set(v, (variantCounts.get(v) ?? 0) + 1);
+}
+console.log(`  A/B split: ${[...variantCounts].map(([k, n]) => `${k}=${n}`).join(', ')}`);
+
+console.log('5) QA override from the URL, then clear it');
+const fromUrl = parseOverrides('?ff.max-watchlists=25&ff.new-order-ticket=false&ff.unknown=1&utm=x', defaults);
+console.log(`  parsed overrides: ${JSON.stringify(fromUrl)}`);
+flags.setOverride('max-watchlists', fromUrl['max-watchlists']);
+flags.setOverride('new-order-ticket', fromUrl['new-order-ticket']);
+console.log(`  ${describe('max-watchlists')}`);
+flags.setOverride('new-order-ticket', undefined);
+flags.setOverride('max-watchlists', undefined);
+console.log(`  after clearing: ${describe('max-watchlists')}`);
+
+console.log('6) incident: kill switch for F&O baskets');
+flags.load({ ...configs, 'fno-basket-orders': { enabled: false, offValue: false, rules: [] } });
+console.log(`  ${describe('fno-basket-orders')}`);
+
+console.log('7) bad payload from the server is contained');
+const badPayload = JSON.parse('{"enabled":true,"rules":[{"id":"oops","conditions":[],"serve":{"kind":"value","value":"ten"}}]}') as FlagConfig<number>;
+flags.load({ ...configs, 'max-watchlists': badPayload });
+console.log(`  ${describe('max-watchlists')}`);
+
+console.log('8) checks');
+const check = (name: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${name}`);
+check('rollout is monotonic (everyone in at 20% is in at 50%)', [...at20].every((id) => at50.has(id)));
+check('rollout within 1% of target', Math.abs(at20.size - 2000) < 100 && Math.abs(at50.size - 5000) < 100);
+const snap1 = flags.getSnapshot();
+flags.get('chart-engine');
+check('snapshot reference stable without changes', snap1 === flags.getSnapshot());
+check('snapshot is frozen', Object.isFrozen(snap1));
+check('exposures deduplicated per user/flag/value', new Set(exposures).size === exposures.length);
+check(`subscribeAll fired on each effective change (renders=${renders})`, renders > 0);
+stopTicket();
+const before = ticketNotifications;
+flags.setContext({ userId: 'U2', attributes: { platform: 'ios' } }); // ticket flips true -> false
+check('unsubscribed listener stays silent', ticketNotifications === before && !flags.get('new-order-ticket'));
+console.log(`  exposures: ${exposures.join(', ')}`);
+
+// Compile-time checks
+function typeTests(c: FeatureFlagClient<AppFlags>): void {
+  const n: number = c.get('max-watchlists');
+  const engine: 'inhouse' | 'tradingview' = c.get('chart-engine');
+  // @ts-expect-error max-watchlists is not a boolean flag
+  c.isEnabled('max-watchlists');
+  // @ts-expect-error unknown flag
+  c.get('new-ticket');
+  // @ts-expect-error wrong override type
+  c.setOverride('max-watchlists', 'ten');
+  void n; void engine;
+}
+void typeTests;
+```
+
+## Demo output
+
+```text
+1) before load: defaults
+  new-order-ticket=false (NOT_LOADED)
+2) load config + set context (pro user on android 5.3.1)
+  new-order-ticket=false (DEFAULT)
+  chart-engine=tradingview (RULE_MATCH:ab-test)
+  max-watchlists=10 (RULE_MATCH:pro-plan)
+  fno-basket-orders=true (DEFAULT)
+  isEnabled(new-order-ticket) = false
+3) employee always gets the new ticket
+  [subscriber] new-order-ticket false -> true
+  new-order-ticket=true (RULE_MATCH:employees)
+4) rollout distribution over 10,000 android users
+  20% ramp -> 2024 users, 50% ramp -> 5013 users
+  A/B split: tradingview=5012, inhouse=4988
+5) QA override from the URL, then clear it
+  parsed overrides: {"max-watchlists":25,"new-order-ticket":false}
+  [subscriber] new-order-ticket true -> false
+  max-watchlists=25 (OVERRIDE)
+  [subscriber] new-order-ticket false -> true
+  after clearing: max-watchlists=5 (DEFAULT)
+6) incident: kill switch for F&O baskets
+  fno-basket-orders=false (DISABLED)
+7) bad payload from the server is contained
+  [flag error] flag "max-watchlists" served string, expected number
+  max-watchlists=5 (TYPE_MISMATCH)
+8) checks
+  PASS rollout is monotonic (everyone in at 20% is in at 50%)
+  PASS rollout within 1% of target
+  PASS snapshot reference stable without changes
+  PASS snapshot is frozen
+  PASS exposures deduplicated per user/flag/value
+  PASS subscribeAll fired on each effective change (renders=8)
+  [flag error] flag "max-watchlists" served string, expected number
+  PASS unsubscribed listener stays silent
+  exposures: U1001/chart-engine=tradingview, U1001/max-watchlists=10, E7/new-order-ticket=true, E7/chart-engine=tradingview
+```
+
+## Testing strategy
+
+- **Table-driven tests of `evaluateFlag`**: it is pure, so each row is `(config, context) → (value, reason, ruleId)`. Cover a missing attribute, `neq` with a missing attribute, a semver edge (`5.10.0 > 5.9.0`), a disabled flag with and without `offValue`, and an empty rules list.
+- **Statistical tests** on bucketing: 10 000 synthetic ids must land within ±1 % of the target, and a ramp must be **monotonic** (both shown above). Changing the salt should produce a different set.
+- **Change detection**: subscribers fire only for keys whose value changed, and the snapshot reference stays stable otherwise. That second property is what keeps `useSyncExternalStore` from looping.
+- **Type tests** with `@ts-expect-error`: wrong flag name, `isEnabled` on a number flag, a wrong override type.
+- **Robustness**: a type-mismatched payload falls back to the default and reports an error.
+
+## Performance & memory considerations
+
+- Evaluation cost is O(flags × rules × conditions), paid once per input change. Render-time reads are map lookups. With 200 flags and about 5 rules each, a recompute costs microseconds.
+- The snapshot is copied only when something changed, and only the changed keys are rewritten.
+- Hashing is FNV-1a over short strings: no allocations beyond the template string. For thousands of evaluations per second (server-side rendering), cache the buckets per `(key, userId)`.
+- `exposed` grows with the number of distinct flag/value pairs, which is small, and it is cleared when the user changes.
+- Payload size: send only the flags the client needs (**server-side filtering**). Also consider evaluating on the server and sending only the *results*, so the targeting rules (which may reveal unreleased features or business logic) never reach the browser.
+
+## How it plugs into React
+
+```tsx
+const FlagsContext = createContext<FeatureFlagClient<AppFlags> | null>(null);
+
+function useFeatureFlag<K extends keyof AppFlags>(key: K): AppFlags[K] {
+  const client = useContext(FlagsContext)!;
+  return useSyncExternalStore(
+    useCallback((onChange) => client.subscribe(key, onChange), [client, key]),
+    () => client.get(key), // primitive value: stable by definition
+    () => client.getSnapshot()[key], // server snapshot (SSR)
+  );
+}
+
+function OrderButton() {
+  const newTicket = useFeatureFlag('new-order-ticket');
+  return newTicket ? <NewOrderTicket /> : <LegacyOrderTicket />;
+}
+```
+
+Because each hook subscribes to one key and returns a primitive, toggling `chart-engine` doesn't re-render the order button.
+
+## Extensions & follow-ups
+
+- **Implemented:** exposure tracking (deduplicated), URL overrides parsed with type coercion, and a kill switch.
+- **Prerequisite flags**: flag B is evaluated only when flag A is true. Watch for dependency cycles and check them the way the file tree checks its moves.
+- **Streaming updates** (SSE or WebSocket) that call `load()`. Throttle them so a burst of config edits causes one recompute.
+- **Bootstrapping**: SSR sends the evaluated snapshot inside the HTML, so the first paint doesn't flicker from default to the real value.
+- **Sticky bucketing**: persist the assigned variant, so changing weights mid-experiment doesn't move existing users.
+
+## Interview Q&A
+
+**Q1. Why hash `flagKey + salt + userId` instead of just `userId`?**
+
+<details>
+<summary>Answer</summary>
+
+If you hash only `userId`, the same 10 % of users land in the first bucket of **every** flag. They become permanent guinea pigs and every experiment is correlated with every other one. Including the flag key makes the assignments independent across flags. The salt lets you re-randomize a flag, for example a new experiment iteration, without renaming it.
+
+</details>
+
+**Q2. How do you make sure a ramp from 20 % to 50 % doesn't flip existing users off?**
+
+<details>
+<summary>Answer</summary>
+
+A user's bucket depends only on the hash input, not on the percentage. A user with bucket 13.7 is below 20 and also below 50, so they stay in. Increasing the weight only adds the users in `[20, 50)`. Things that would break this: changing the salt, reordering the variant buckets, or sampling with `Math.random()`. The demo checks monotonicity over 10 000 users.
+
+</details>
+
+**Q3. Where should evaluation happen: client or server?**
+
+<details>
+<summary>Answer</summary>
+
+Client-side evaluation (as here) works offline, gives instant updates on context change and puts no load on the server, but it ships the targeting rules to the browser. Server-side evaluation hides the rules and attributes (important if targeting uses sensitive data), but needs a round trip per context change. Many SDKs do both: the server evaluates and bootstraps the results, and the client re-evaluates only non-sensitive rules. For a broker, rules that target by net worth or trading segment should be evaluated on the server.
+
+</details>
+
+**Q4. The server sends `"ten"` for a numeric flag. What happens?**
+
+<details>
+<summary>Answer</summary>
+
+The evaluator returns `"ten"`, and `evaluateKey` compares `typeof` against the default's type. They differ, so the client serves the default with reason `TYPE_MISMATCH` and calls `onError`. TypeScript types disappear at runtime, and anything that crosses a network boundary must be validated. In production you would validate the whole payload with a schema (zod or valibot) at `load()` time.
+
+</details>

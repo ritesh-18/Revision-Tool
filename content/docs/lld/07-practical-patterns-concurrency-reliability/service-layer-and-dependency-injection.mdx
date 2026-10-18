@@ -1,0 +1,179 @@
+---
+title: "7.3 Service layer and Dependency Injection"
+---
+
+## Intuition
+
+A service is a **use case**: `addFunds`, `placeOrder`, `bookSeats`. It needs collaborators like a payment gateway, a notifier or a repository. If it `new`s them itself, it's welded to them, and you can't test it without hitting Razorpay. If it **receives** them through the constructor, typed as interfaces, you can pass in real ones in production and fakes in tests.
+
+- **Port** = an interface the domain needs (`PaymentGateway`).
+- **Adapter** = a concrete implementation (`RazorpayGateway`, `FakeGateway`).
+- **Composition root** = the *one* place that picks the adapters and wires the graph (`main.ts`, or NestJS's module system).
+
+You already use this in NestJS: `@Injectable()` + constructor params is constructor injection, and the module is the composition root. Interviewers want to see that you understand it **without** the framework.
+
+```ts
+// ---- ports ----
+interface PaymentGateway {
+  charge(userId: string, amountPaise: number): Promise<string>; // returns gateway txn id
+}
+interface Notifier {
+  send(userId: string, message: string): void;
+}
+interface LedgerRepository {
+  credit(userId: string, amountPaise: number): number; // returns new balance
+}
+
+// ---- service: depends only on ports ----
+class AddFundsService {
+  constructor(
+    private readonly gateway: PaymentGateway,
+    private readonly ledger: LedgerRepository,
+    private readonly notifier: Notifier,
+  ) {}
+
+  async addFunds(userId: string, amountPaise: number): Promise<number> {
+    if (amountPaise < 100) throw new Error('minimum top-up is 100 paise');
+    const txnId = await this.gateway.charge(userId, amountPaise);
+    const balance = this.ledger.credit(userId, amountPaise);
+    this.notifier.send(userId, `Added ${amountPaise} paise (txn ${txnId}). Balance ${balance}`);
+    return balance;
+  }
+}
+
+// ---- adapters ----
+class InMemoryLedger implements LedgerRepository {
+  private readonly balances = new Map<string, number>();
+  credit(userId: string, amountPaise: number): number {
+    const next = (this.balances.get(userId) ?? 0) + amountPaise;
+    this.balances.set(userId, next);
+    return next;
+  }
+}
+class ConsoleNotifier implements Notifier {
+  send(userId: string, message: string): void {
+    console.log(`  [sms to ${userId}] ${message}`);
+  }
+}
+class SandboxGateway implements PaymentGateway {
+  private n = 0;
+  async charge(): Promise<string> {
+    return `pg_${++this.n}`;
+  }
+}
+
+// ---- a tiny DI container with typed tokens ----
+class Token<T> {
+  declare readonly __type: T; // phantom field: only exists at the type level
+  constructor(readonly name: string) {}
+}
+type Factory<T> = (c: Container) => T;
+
+class Container {
+  private readonly factories = new Map<Token<unknown>, Factory<unknown>>();
+  private readonly singletons = new Map<Token<unknown>, unknown>();
+  private readonly resolving = new Set<Token<unknown>>();
+
+  register<T>(token: Token<T>, factory: Factory<T>): this {
+    this.factories.set(token, factory);
+    return this;
+  }
+
+  resolve<T>(token: Token<T>): T {
+    if (this.singletons.has(token)) return this.singletons.get(token) as T;
+    const factory = this.factories.get(token);
+    if (!factory) throw new Error(`No provider registered for ${token.name}`);
+    if (this.resolving.has(token)) throw new Error(`Circular dependency at ${token.name}`);
+    this.resolving.add(token);
+    try {
+      const instance = factory(this) as T;
+      this.singletons.set(token, instance);
+      return instance;
+    } finally {
+      this.resolving.delete(token);
+    }
+  }
+}
+
+const TOKENS = {
+  gateway: new Token<PaymentGateway>('PaymentGateway'),
+  ledger: new Token<LedgerRepository>('LedgerRepository'),
+  notifier: new Token<Notifier>('Notifier'),
+  addFunds: new Token<AddFundsService>('AddFundsService'),
+};
+
+// ---- composition root ----
+function buildContainer(): Container {
+  return new Container()
+    .register(TOKENS.gateway, () => new SandboxGateway())
+    .register(TOKENS.ledger, () => new InMemoryLedger())
+    .register(TOKENS.notifier, () => new ConsoleNotifier())
+    .register(TOKENS.addFunds, c =>
+      new AddFundsService(c.resolve(TOKENS.gateway), c.resolve(TOKENS.ledger), c.resolve(TOKENS.notifier)),
+    );
+}
+
+const container = buildContainer();
+const svc = container.resolve(TOKENS.addFunds);
+console.log('production wiring:');
+await svc.addFunds('u1', 50_000);
+await svc.addFunds('u1', 25_000);
+console.log(`same instance on resolve: ${container.resolve(TOKENS.addFunds) === svc}`);
+
+// ---- a unit test needs no container at all: hand-built fakes ----
+class DecliningGateway implements PaymentGateway {
+  async charge(_userId: string, amountPaise: number): Promise<string> {
+    throw new Error(`card declined for ${amountPaise}`);
+  }
+}
+class RecordingNotifier implements Notifier {
+  readonly sent: string[] = [];
+  send(userId: string, message: string): void {
+    this.sent.push(`${userId}:${message}`);
+  }
+}
+
+console.log('test: declined payment must not credit or notify');
+const ledger = new InMemoryLedger();
+const notifier = new RecordingNotifier();
+const underTest = new AddFundsService(new DecliningGateway(), ledger, notifier);
+try {
+  await underTest.addFunds('u9', 1_000);
+} catch (err) {
+  console.log(`  threw: ${err instanceof Error ? err.message : String(err)}`);
+}
+console.log(`  notifications sent: ${notifier.sent.length}, ledger balance now: ${ledger.credit('u9', 0)}`);
+
+try {
+  new Container().resolve(TOKENS.gateway);
+} catch (err) {
+  console.log(`missing provider -> ${err instanceof Error ? err.message : String(err)}`);
+}
+```
+
+```text
+production wiring:
+  [sms to u1] Added 50000 paise (txn pg_1). Balance 50000
+  [sms to u1] Added 25000 paise (txn pg_2). Balance 75000
+same instance on resolve: true
+test: declined payment must not credit or notify
+  threw: card declined for 1000
+  notifications sent: 0, ledger balance now: 0
+missing provider -> No provider registered for PaymentGateway
+```
+
+## Why DI makes testing easy
+
+- Each dependency is a **seam**: you can put a fake there without monkey-patching modules or mocking `import`s.
+- Fakes are just classes implementing the interface. TypeScript checks that your fake keeps up when the port changes.
+- The container is optional. For a machine-coding round, **manual wiring in `main`** ("poor man's DI") is perfectly fine and often clearer.
+
+## Pitfalls
+
+- **Service Locator in disguise.** Passing the whole `Container` into services (`this.c.resolve(...)`) hides their dependencies. Inject the dependencies themselves.
+- **Too many constructor params** (more than 5 or 6) is a smell: the service probably does two jobs.
+- **Interfaces for everything.** Value objects and pure helpers don't need ports. Put ports around I/O, time, randomness and third parties.
+
+## How to say it in an interview
+
+> "Every I/O dependency is a port injected through the constructor. `main` is the composition root. In Nest that's the module; here I wire it by hand. In tests I pass fakes, so I can check that a declined card doesn't credit the ledger without any mocking library."

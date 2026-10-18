@@ -1,0 +1,1250 @@
+---
+title: "13.1 BookMyShow / Movie Ticket Booking"
+---
+
+## Problem & where it's asked
+
+Design the backend for a movie ticket booking platform. Users browse cities, movies, theatres and shows, pick seats from a seat map, hold them for a few minutes while they pay, and receive a confirmed booking. Two users must never end up with the same seat.
+
+**Where it's asked:**
+
+- **Reported:** Amazon SDE-2 (the interviewer wanted all the classes and their relationships). Salesforce 2026: cinemas across cities, add shows, list by city and movie, book seats. Walmart 2026: the follow-up was explicitly "stop two concurrent requests from booking the same seat, using locks". It also appears in Microsoft, Uber and Swiggy question lists.
+- **Uncertain:** Angel One, Flipkart and PhonePe don't list it publicly. It is still one of the most common "Level 2 → Level 3" prompts, because its concurrency follow-up is so natural. Graders mostly look at the data model, the concurrency reasoning, and an Observer for notifications.
+
+The problem starts at intermediate level (the catalogue and booking CRUD) and becomes SDE-2 once the interviewer asks: *"What happens when two people click Pay on seat C1 at the same instant?"*
+
+## Clarifying questions
+
+| Question | Assumption for this design |
+|---|---|
+| Do we need search (city → movie → shows)? | Yes, a basic `findShows(cityId, movieId)`. No full-text search |
+| Seat categories and pricing? | Each seat belongs to a category (SILVER, GOLD, RECLINER). Each show sets a price per category, in paise |
+| Is there a hold step before payment? | Yes. Seats are **held** for a TTL (10 minutes) and become available again when the hold expires |
+| How is payment done? | Through a `PaymentGateway` interface. It can fail. The client retries a confirm with the same idempotency key |
+| Max seats per booking? | 6 (configurable) |
+| Can a booking be partial (some seats OK, some taken)? | No. A hold is **all-or-nothing** |
+| Cancellation and refunds? | Allowed before the show starts. The refund depends on time left: 100% at ≥ 24h, 50% at ≥ 2h, otherwise 0 |
+| Notifications? | Emit domain events (BOOKED, CANCELLED, HOLD_EXPIRED). A notifier subscribes to them |
+| Single process or distributed? | Single process, in memory, with a clear note on how each lock maps to a DB or Redis |
+
+## Requirements
+
+**Functional**
+
+1. Add cities, movies, theatres (with screens and seat layouts) and shows (with per-category prices).
+2. List the shows for a movie in a city, and list the available seats for a show.
+3. Hold 1–6 seats for a user, all-or-nothing, with a TTL.
+4. Confirm a hold by charging the payment. The confirm is idempotent for a given idempotency key.
+5. Release the seats when payment fails, and expire stale holds (lazily on access, plus a sweeper).
+6. Cancel a booking with a time-based refund policy. The cancel is idempotent.
+7. Publish booking events to subscribers.
+
+**Non-functional**
+
+- **No double booking** under concurrent requests. This is the main invariant.
+- Holds must not leak: every hold ends as CONFIRMED, RELEASED or EXPIRED.
+- Deterministic and testable: an injected clock, ID generator and payment gateway.
+- The design should extend to dynamic pricing, offers and other payment methods without editing the core.
+
+**Out of scope:** user accounts and auth, the real payment integration, a seat-map UI, distributed deployment (discussed only), food and beverages, and coupons (touched on in the extensions).
+
+## Entities & relationships
+
+| Entity | Key fields | Relationships |
+|---|---|---|
+| `City` | id, name | has many Theatres |
+| `Movie` | id, title, durationMin | shown in many Shows |
+| `Theatre` | id, name, cityId | has many Screens |
+| `Screen` | id, name, seats | belongs to a Theatre; owns a fixed seat layout |
+| `Seat` | id (`C1`), row, number, category | belongs to a Screen |
+| `Show` | id, movieId, theatreId, screenId, startsAt, prices per category | one Screen + one Movie |
+| `ShowSeatMap` | seatId → `AVAILABLE` / `HELD(holdId, expiresAt)` / `BOOKED(bookingId)` | one per Show; **the unit of locking** |
+| `SeatHold` | id, showId, userId, seatIds, amountPaise, expiresAt, status | reserves seats in one ShowSeatMap |
+| `Booking` | id, holdId, paymentId, amountPaise, status, refundPaise | created from exactly one Hold |
+| `PaymentGateway` | `charge`, `refund` | used by BookingService |
+| `RefundPolicy` | `refundFor(booking, show, now)` | Strategy |
+| `BookingService` | orchestrates the above; owns the per-show `KeyedMutex` | Facade for the use cases |
+
+The key modelling decision is that **seat state belongs to the show, not to the seat**. `Seat` is static layout (seat C1 in Screen 1 always exists). Whether C1 is free depends on which show you ask about. Many beginners put `isBooked` on `Seat`, and then every show on that screen shares the same bookings.
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Catalog {
+        +addCity(city)
+        +addMovie(movie)
+        +addTheatre(theatre)
+        +addShow(show)
+        +findShows(cityId, movieId) Show[]
+    }
+    class Theatre {
+        +id
+        +cityId
+        +screens Screen[]
+    }
+    class Screen {
+        +id
+        +seats Map
+    }
+    class Show {
+        +id
+        +screenId
+        +startsAt
+        +prices
+    }
+    class ShowSeatMap {
+        -states Map
+        +tryHold(seatIds, holdId, expiresAt, now)
+        +book(seatIds, holdId, bookingId)
+        +release(seatIds, ownerId)
+        +available(now) string[]
+    }
+    class BookingService {
+        -locks KeyedMutex
+        +holdSeats(userId, showId, seatIds) SeatHold
+        +confirmBooking(holdId, idemKey) Booking
+        +cancelBooking(bookingId) Booking
+        +releaseExpiredHolds() number
+    }
+    class PaymentGateway {
+        <<interface>>
+        +charge(req) ChargeResult
+        +refund(paymentId, amount)
+    }
+    class RefundPolicy {
+        <<interface>>
+        +refundFor(booking, show, now) number
+    }
+    class SeatHold
+    class Booking
+    Catalog o-- Theatre
+    Theatre *-- Screen
+    Catalog o-- Show
+    Show --> Screen
+    BookingService --> Catalog
+    BookingService *-- ShowSeatMap
+    BookingService --> PaymentGateway
+    BookingService --> RefundPolicy
+    BookingService o-- SeatHold
+    BookingService o-- Booking
+    Booking --> SeatHold`} />
+
+**Main flow: hold, then confirm**
+
+<Mermaid chart={`sequenceDiagram
+    participant U as User
+    participant S as BookingService
+    participant L as KeyedMutex(show)
+    participant M as ShowSeatMap
+    participant P as PaymentGateway
+    U->>S: holdSeats(show, [C1, C2])
+    S->>L: run(showId)
+    L->>M: tryHold(all-or-nothing)
+    M-->>S: HELD until now+10m
+    S-->>U: SeatHold(HOLD-1)
+    U->>S: confirmBooking(HOLD-1, key)
+    S->>L: run(showId)
+    S->>S: check hold ACTIVE and not expired
+    S->>P: charge(amount, key)
+    P-->>S: ok(paymentId)
+    S->>M: book(seats, HOLD-1, BKG-1)
+    S-->>U: Booking(BKG-1)`} />
+
+**Seat state (per show)**
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> AVAILABLE
+    AVAILABLE --> HELD: tryHold
+    HELD --> BOOKED: confirm + payment ok
+    HELD --> AVAILABLE: payment failed
+    HELD --> AVAILABLE: TTL expired
+    BOOKED --> AVAILABLE: booking cancelled`} />
+
+**Hold lifecycle**
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> ACTIVE
+    ACTIVE --> CONFIRMED: payment ok
+    ACTIVE --> RELEASED: payment failed
+    ACTIVE --> EXPIRED: TTL passed
+    CONFIRMED --> [*]
+    RELEASED --> [*]
+    EXPIRED --> [*]`} />
+
+## Design decisions & patterns
+
+1. **Seat state is a tagged union**, `AVAILABLE | HELD | BOOKED`. A `HELD` seat carries its `holdId` and `expiresAt`, so the ownership check ("is this seat still held *by me*?") is a single comparison. A separate `Map<seatId, holdId>` would be one more structure to keep in sync.
+2. **Lock granularity: one lock per show.** A global lock would serialise every booking in the country. A per-seat lock needs care for multi-seat holds, because you must take the locks in sorted order to avoid deadlock. Per-show is the sweet spot: contention only happens between users of the *same* show, and a multi-seat hold is one critical section. The per-seat alternative, and when it is worth it, is covered in the deep-dive.
+3. **Atomic all-or-nothing `tryHold`.** Inside the map, the check ("are all these seats free?") and the set ("mark them HELD") run in one synchronous method. No `await` means no interleaving. The mutex protects the *longer* flows (confirm awaits the payment gateway).
+4. **Lazy expiry plus a sweeper.** A HELD seat whose `expiresAt <= now` counts as free for anyone who asks, so users never wait for a background job. The sweeper (`releaseExpiredHolds`) cleans up the records and emits `HOLD_EXPIRED` events. Rejected alternative: one `setTimeout` per hold. It doesn't survive a restart, is hard to test, and leaks timers.
+5. **Idempotent confirm.** The client sends an idempotency key, and we store `key → bookingId`. A retried confirm (the user double-clicks, or the network times out) returns the same booking and **does not charge again**. The key also goes to the gateway, so the gateway can dedupe too.
+6. **Strategy** for `RefundPolicy` and (in the extensions) pricing. **Observer** for booking events. **Facade**: `BookingService` is the one entry point for the use cases.
+7. **Holding the show lock across the payment call** is a deliberate simplification. It is correct, but a slow gateway blocks other users of that show. The production alternative is described under failure handling: move the hold to `CONFIRMING`, release the lock, call payment, then do a conditional update.
+
+## Implementation
+
+**Part 1: foundations.** Errors, the clock, IDs, money formatting, and a keyed async mutex. The mutex chains promises per key, so callers with the same key run strictly one after another, and different keys run in parallel.
+
+```ts
+class DomainError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends DomainError {}
+class NotFoundError extends DomainError {}
+class SeatUnavailableError extends DomainError {}
+class HoldExpiredError extends DomainError {}
+class PaymentFailedError extends DomainError {}
+class InvalidStateError extends DomainError {}
+
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  constructor(private current = 0) {}
+  now(): number {
+    return this.current;
+  }
+  advance(ms: number): void {
+    this.current += ms;
+  }
+}
+
+interface IdGenerator {
+  next(prefix: string): string;
+}
+class SequentialIds implements IdGenerator {
+  private readonly counters = new Map<string, number>();
+  next(prefix: string): string {
+    const n = (this.counters.get(prefix) ?? 0) + 1;
+    this.counters.set(prefix, n);
+    return `${prefix}-${n}`;
+  }
+}
+
+const MINUTE = 60_000;
+const HOUR = 60 * MINUTE;
+const rupees = (paise: number): string => `Rs ${(paise / 100).toFixed(2)}`;
+const errMsg = (e: unknown): string => (e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+
+/** Serialises async critical sections per key (e.g. per showId). */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => (release = resolve));
+    const tail = previous.then(() => current);
+    this.tails.set(key, tail);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+```
+
+The `finally` both releases the lock and removes the map entry when nobody else is queued, so the map doesn't grow without bound as shows accumulate.
+
+**Part 2: the catalogue.** Static data: cities, movies, theatres, screens with seat layouts, and shows with prices. Validation happens at the boundary, so the rest of the code can trust these objects.
+
+```ts
+type SeatCategory = 'SILVER' | 'GOLD' | 'RECLINER';
+
+interface Seat {
+  readonly id: string;
+  readonly row: string;
+  readonly number: number;
+  readonly category: SeatCategory;
+}
+interface City {
+  readonly id: string;
+  readonly name: string;
+}
+interface Movie {
+  readonly id: string;
+  readonly title: string;
+  readonly durationMin: number;
+}
+interface RowSpec {
+  readonly row: string;
+  readonly count: number;
+  readonly category: SeatCategory;
+}
+
+class Screen {
+  readonly seats: ReadonlyMap<string, Seat>;
+  constructor(readonly id: string, readonly name: string, layout: readonly RowSpec[]) {
+    const seats = new Map<string, Seat>();
+    for (const { row, count, category } of layout) {
+      if (!Number.isInteger(count) || count <= 0) throw new ValidationError(`row ${row} needs a positive seat count`);
+      for (let n = 1; n <= count; n++) seats.set(`${row}${n}`, { id: `${row}${n}`, row, number: n, category });
+    }
+    if (seats.size === 0) throw new ValidationError(`screen ${id} has no seats`);
+    this.seats = seats;
+  }
+}
+
+class Theatre {
+  constructor(
+    readonly id: string,
+    readonly name: string,
+    readonly cityId: string,
+    readonly screens: readonly Screen[],
+  ) {}
+}
+
+interface Show {
+  readonly id: string;
+  readonly movieId: string;
+  readonly theatreId: string;
+  readonly screenId: string;
+  readonly startsAt: number;
+  readonly prices: Readonly<Record<SeatCategory, number>>;
+}
+
+class Catalog {
+  private readonly cities = new Map<string, City>();
+  private readonly movies = new Map<string, Movie>();
+  private readonly theatres = new Map<string, Theatre>();
+  private readonly shows = new Map<string, Show>();
+
+  constructor(private readonly clock: Clock) {}
+
+  addCity(city: City): void {
+    this.cities.set(city.id, city);
+  }
+  addMovie(movie: Movie): void {
+    this.movies.set(movie.id, movie);
+  }
+  addTheatre(theatre: Theatre): void {
+    if (!this.cities.has(theatre.cityId)) throw new NotFoundError(`city ${theatre.cityId}`);
+    this.theatres.set(theatre.id, theatre);
+  }
+  addShow(show: Show): void {
+    if (!this.movies.has(show.movieId)) throw new NotFoundError(`movie ${show.movieId}`);
+    this.screenOf(show); // validates theatre + screen
+    if (show.startsAt <= this.clock.now()) throw new ValidationError('show must start in the future');
+    for (const [category, paise] of Object.entries(show.prices)) {
+      if (!Number.isInteger(paise) || paise <= 0) throw new ValidationError(`bad price for ${category}`);
+    }
+    this.shows.set(show.id, show);
+  }
+
+  getShow(showId: string): Show {
+    const show = this.shows.get(showId);
+    if (!show) throw new NotFoundError(`show ${showId}`);
+    return show;
+  }
+  movieTitle(movieId: string): string {
+    return this.movies.get(movieId)?.title ?? movieId;
+  }
+  theatreName(theatreId: string): string {
+    return this.theatres.get(theatreId)?.name ?? theatreId;
+  }
+  screenOf(show: Show): Screen {
+    const theatre = this.theatres.get(show.theatreId);
+    if (!theatre) throw new NotFoundError(`theatre ${show.theatreId}`);
+    const screen = theatre.screens.find((s) => s.id === show.screenId);
+    if (!screen) throw new NotFoundError(`screen ${show.screenId} in ${theatre.id}`);
+    return screen;
+  }
+
+  findShows(cityId: string, movieId: string): Show[] {
+    return [...this.shows.values()]
+      .filter((s) => s.movieId === movieId && this.theatres.get(s.theatreId)?.cityId === cityId)
+      .sort((a, b) => a.startsAt - b.startsAt);
+  }
+}
+```
+
+**Part 3: the per-show seat map.** This is the heart of the invariant. Every method is synchronous, so each call is atomic on the event loop. `release` takes an `ownerId` (a hold ID or a booking ID) and only frees seats that the owner still holds. That stops a late, stale release from freeing a seat someone else has since grabbed.
+
+```ts
+type SeatState =
+  | { readonly kind: 'AVAILABLE' }
+  | { readonly kind: 'HELD'; readonly holdId: string; readonly expiresAt: number }
+  | { readonly kind: 'BOOKED'; readonly bookingId: string };
+
+const AVAILABLE: SeatState = { kind: 'AVAILABLE' };
+
+class ShowSeatMap {
+  private readonly states = new Map<string, SeatState>();
+
+  constructor(seatIds: Iterable<string>) {
+    for (const id of seatIds) this.states.set(id, AVAILABLE);
+  }
+
+  /** All-or-nothing check-and-set. No await inside => atomic. */
+  tryHold(seatIds: readonly string[], holdId: string, expiresAt: number, now: number): void {
+    const taken = seatIds.filter((id) => !this.isFree(this.stateOf(id), now));
+    if (taken.length > 0) throw new SeatUnavailableError(`seats not available: ${taken.join(', ')}`);
+    for (const id of seatIds) this.states.set(id, { kind: 'HELD', holdId, expiresAt });
+  }
+
+  isHeldBy(seatIds: readonly string[], holdId: string, now: number): boolean {
+    return seatIds.every((id) => {
+      const s = this.stateOf(id);
+      return s.kind === 'HELD' && s.holdId === holdId && s.expiresAt > now;
+    });
+  }
+
+  book(seatIds: readonly string[], holdId: string, bookingId: string): void {
+    for (const id of seatIds) {
+      const s = this.stateOf(id);
+      if (s.kind !== 'HELD' || s.holdId !== holdId) throw new InvalidStateError(`seat ${id} is not held by ${holdId}`);
+    }
+    for (const id of seatIds) this.states.set(id, { kind: 'BOOKED', bookingId });
+  }
+
+  /** Frees seats only if they still belong to ownerId (a holdId or bookingId). */
+  release(seatIds: readonly string[], ownerId: string): number {
+    let freed = 0;
+    for (const id of seatIds) {
+      const s = this.stateOf(id);
+      const owned = (s.kind === 'HELD' && s.holdId === ownerId) || (s.kind === 'BOOKED' && s.bookingId === ownerId);
+      if (owned) {
+        this.states.set(id, AVAILABLE);
+        freed++;
+      }
+    }
+    return freed;
+  }
+
+  available(now: number): string[] {
+    return [...this.states].filter(([, s]) => this.isFree(s, now)).map(([id]) => id);
+  }
+
+  private isFree(s: SeatState, now: number): boolean {
+    return s.kind === 'AVAILABLE' || (s.kind === 'HELD' && s.expiresAt <= now);
+  }
+
+  private stateOf(seatId: string): SeatState {
+    const s = this.states.get(seatId);
+    if (!s) throw new NotFoundError(`seat ${seatId}`);
+    return s;
+  }
+}
+```
+
+**Part 4: holds, bookings, payments, refunds and events.** The fake gateway dedupes by idempotency key the way Razorpay or Stripe do, and it can be told to fail the next charge.
+
+```ts
+type HoldStatus = 'ACTIVE' | 'CONFIRMED' | 'RELEASED' | 'EXPIRED';
+interface SeatHold {
+  readonly id: string;
+  readonly showId: string;
+  readonly userId: string;
+  readonly seatIds: readonly string[];
+  readonly amountPaise: number;
+  readonly expiresAt: number;
+  status: HoldStatus;
+}
+
+type BookingStatus = 'CONFIRMED' | 'CANCELLED';
+interface Booking {
+  readonly id: string;
+  readonly holdId: string;
+  readonly showId: string;
+  readonly userId: string;
+  readonly seatIds: readonly string[];
+  readonly amountPaise: number;
+  readonly paymentId: string;
+  status: BookingStatus;
+  refundPaise: number;
+}
+
+interface ChargeRequest {
+  readonly userId: string;
+  readonly amountPaise: number;
+  readonly idempotencyKey: string;
+}
+type ChargeResult = { readonly ok: true; readonly paymentId: string } | { readonly ok: false; readonly reason: string };
+
+interface PaymentGateway {
+  charge(req: ChargeRequest): Promise<ChargeResult>;
+  refund(paymentId: string, amountPaise: number): Promise<void>;
+}
+
+class FakePaymentGateway implements PaymentGateway {
+  chargeCalls = 0;
+  readonly refunds: string[] = [];
+  private failNext = false;
+  private readonly byKey = new Map<string, ChargeResult>();
+
+  constructor(private readonly ids: IdGenerator) {}
+
+  failNextCharge(): void {
+    this.failNext = true;
+  }
+
+  async charge(req: ChargeRequest): Promise<ChargeResult> {
+    const seen = this.byKey.get(req.idempotencyKey);
+    if (seen) return seen;
+    this.chargeCalls++;
+    let result: ChargeResult;
+    if (this.failNext) {
+      this.failNext = false;
+      result = { ok: false, reason: 'card declined' };
+    } else {
+      result = { ok: true, paymentId: this.ids.next('PAY') };
+    }
+    this.byKey.set(req.idempotencyKey, result);
+    return result;
+  }
+
+  async refund(paymentId: string, amountPaise: number): Promise<void> {
+    this.refunds.push(`${paymentId}:${rupees(amountPaise)}`);
+  }
+}
+
+interface RefundPolicy {
+  refundFor(booking: Booking, show: Show, now: number): number;
+}
+class TimeBasedRefundPolicy implements RefundPolicy {
+  refundFor(booking: Booking, show: Show, now: number): number {
+    const left = show.startsAt - now;
+    if (left >= 24 * HOUR) return booking.amountPaise;
+    if (left >= 2 * HOUR) return Math.floor(booking.amountPaise / 2);
+    return 0;
+  }
+}
+
+type BookingEvent =
+  | { readonly type: 'BOOKED'; readonly booking: Booking }
+  | { readonly type: 'CANCELLED'; readonly booking: Booking }
+  | { readonly type: 'HOLD_EXPIRED'; readonly hold: SeatHold };
+type BookingListener = (event: BookingEvent) => void;
+```
+
+**Part 5: the booking service.** Every method that touches seat state runs inside `locks.run(showId, …)`. Note the **double-check of the idempotency key**: once before taking the lock (the fast path), and again inside the lock, because two retries with the same key might both pass the first check.
+
+```ts
+interface BookingConfig {
+  readonly holdTtlMs: number;
+  readonly maxSeatsPerBooking: number;
+}
+
+class BookingService {
+  private readonly seatMaps = new Map<string, ShowSeatMap>();
+  private readonly holds = new Map<string, SeatHold>();
+  private readonly bookings = new Map<string, Booking>();
+  private readonly bookingByKey = new Map<string, string>();
+  private readonly locks = new KeyedMutex();
+  private readonly listeners: BookingListener[] = [];
+
+  constructor(
+    private readonly catalog: Catalog,
+    private readonly payments: PaymentGateway,
+    private readonly refundPolicy: RefundPolicy,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+    private readonly config: BookingConfig,
+  ) {}
+
+  onEvent(listener: BookingListener): void {
+    this.listeners.push(listener);
+  }
+
+  availableSeats(showId: string): string[] {
+    return this.seatMapFor(this.catalog.getShow(showId)).available(this.clock.now());
+  }
+
+  async holdSeats(userId: string, showId: string, seatIds: readonly string[]): Promise<SeatHold> {
+    if (seatIds.length === 0) throw new ValidationError('select at least one seat');
+    if (seatIds.length > this.config.maxSeatsPerBooking) {
+      throw new ValidationError(`at most ${this.config.maxSeatsPerBooking} seats per booking`);
+    }
+    if (new Set(seatIds).size !== seatIds.length) throw new ValidationError('duplicate seats in request');
+    const show = this.catalog.getShow(showId);
+
+    return this.locks.run(showId, async () => {
+      const now = this.clock.now();
+      if (now >= show.startsAt) throw new InvalidStateError('show has already started');
+      const screen = this.catalog.screenOf(show);
+      const holdId = this.ids.next('HOLD');
+      const expiresAt = now + this.config.holdTtlMs;
+      this.seatMapFor(show).tryHold(seatIds, holdId, expiresAt, now); // throws if any seat is taken/unknown
+      const amountPaise = seatIds.reduce((sum, id) => {
+        const seat = screen.seats.get(id);
+        return seat ? sum + show.prices[seat.category] : sum;
+      }, 0);
+      const hold: SeatHold = { id: holdId, showId, userId, seatIds: [...seatIds], amountPaise, expiresAt, status: 'ACTIVE' };
+      this.holds.set(holdId, hold);
+      return hold;
+    });
+  }
+
+  async confirmBooking(holdId: string, idempotencyKey: string): Promise<Booking> {
+    const fast = this.bookingForKey(idempotencyKey, holdId);
+    if (fast) return fast;
+    const hold = this.getHold(holdId);
+    const show = this.catalog.getShow(hold.showId);
+
+    return this.locks.run(hold.showId, async () => {
+      const again = this.bookingForKey(idempotencyKey, holdId); // re-check under the lock
+      if (again) return again;
+      if (hold.status !== 'ACTIVE') throw new InvalidStateError(`hold ${hold.id} is ${hold.status}`);
+      const map = this.seatMapFor(show);
+      if (!map.isHeldBy(hold.seatIds, hold.id, this.clock.now())) {
+        this.expire(hold, map);
+        throw new HoldExpiredError(`hold ${hold.id} expired; please select seats again`);
+      }
+
+      const result = await this.payments.charge({ userId: hold.userId, amountPaise: hold.amountPaise, idempotencyKey });
+      if (!result.ok) {
+        map.release(hold.seatIds, hold.id);
+        hold.status = 'RELEASED';
+        throw new PaymentFailedError(`${result.reason}; seats ${hold.seatIds.join(', ')} released`);
+      }
+
+      const booking: Booking = {
+        id: this.ids.next('BKG'),
+        holdId: hold.id,
+        showId: hold.showId,
+        userId: hold.userId,
+        seatIds: hold.seatIds,
+        amountPaise: hold.amountPaise,
+        paymentId: result.paymentId,
+        status: 'CONFIRMED',
+        refundPaise: 0,
+      };
+      map.book(hold.seatIds, hold.id, booking.id);
+      hold.status = 'CONFIRMED';
+      this.bookings.set(booking.id, booking);
+      this.bookingByKey.set(idempotencyKey, booking.id);
+      this.emit({ type: 'BOOKED', booking });
+      return booking;
+    });
+  }
+
+  async cancelBooking(bookingId: string): Promise<Booking> {
+    const booking = this.bookings.get(bookingId);
+    if (!booking) throw new NotFoundError(`booking ${bookingId}`);
+    const show = this.catalog.getShow(booking.showId);
+
+    return this.locks.run(show.id, async () => {
+      if (booking.status === 'CANCELLED') return booking; // idempotent
+      const now = this.clock.now();
+      if (now >= show.startsAt) throw new InvalidStateError('cannot cancel after the show has started');
+      const refund = this.refundPolicy.refundFor(booking, show, now);
+      if (refund > 0) await this.payments.refund(booking.paymentId, refund);
+      this.seatMapFor(show).release(booking.seatIds, booking.id);
+      booking.status = 'CANCELLED';
+      booking.refundPaise = refund;
+      this.emit({ type: 'CANCELLED', booking });
+      return booking;
+    });
+  }
+
+  /** Sweeper: call periodically (cron / setInterval / BullMQ repeatable job). */
+  async releaseExpiredHolds(): Promise<number> {
+    const now = this.clock.now();
+    const stale = [...this.holds.values()].filter((h) => h.status === 'ACTIVE' && h.expiresAt <= now);
+    let count = 0;
+    for (const hold of stale) {
+      await this.locks.run(hold.showId, async () => {
+        if (hold.status !== 'ACTIVE') return; // confirmed/released meanwhile
+        this.expire(hold, this.seatMapFor(this.catalog.getShow(hold.showId)));
+        count++;
+      });
+    }
+    return count;
+  }
+
+  private expire(hold: SeatHold, map: ShowSeatMap): void {
+    map.release(hold.seatIds, hold.id);
+    hold.status = 'EXPIRED';
+    this.emit({ type: 'HOLD_EXPIRED', hold });
+  }
+
+  private bookingForKey(key: string, holdId: string): Booking | undefined {
+    const id = this.bookingByKey.get(key);
+    if (!id) return undefined;
+    const booking = this.bookings.get(id);
+    if (!booking) return undefined;
+    if (booking.holdId !== holdId) throw new ValidationError(`idempotency key ${key} was used for another hold`);
+    return booking;
+  }
+
+  private getHold(holdId: string): SeatHold {
+    const hold = this.holds.get(holdId);
+    if (!hold) throw new NotFoundError(`hold ${holdId}`);
+    return hold;
+  }
+
+  private seatMapFor(show: Show): ShowSeatMap {
+    let map = this.seatMaps.get(show.id);
+    if (!map) {
+      map = new ShowSeatMap(this.catalog.screenOf(show).seats.keys());
+      this.seatMaps.set(show.id, map);
+    }
+    return map;
+  }
+
+  private emit(event: BookingEvent): void {
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // a broken notifier must never roll back a booking
+      }
+    }
+  }
+}
+```
+
+**Part 6: the demo.** It walks through the whole lifecycle: search, a conflicting hold, two users racing for one seat, an idempotent confirm, an expired hold, a failed payment, the sweeper, a cancellation, and validation errors.
+
+```ts
+const clock = new FakeClock(0);
+const ids = new SequentialIds();
+const catalog = new Catalog(clock);
+const gateway = new FakePaymentGateway(ids);
+const service = new BookingService(catalog, gateway, new TimeBasedRefundPolicy(), clock, ids, {
+  holdTtlMs: 10 * MINUTE,
+  maxSeatsPerBooking: 6,
+});
+
+service.onEvent((e) => {
+  if (e.type === 'HOLD_EXPIRED') console.log(`  [event] HOLD_EXPIRED ${e.hold.id} (${e.hold.userId})`);
+  else console.log(`  [event] ${e.type} ${e.booking.id} for ${e.booking.userId} seats=${e.booking.seatIds.join(',')}`);
+});
+
+catalog.addCity({ id: 'BLR', name: 'Bengaluru' });
+catalog.addMovie({ id: 'M1', title: 'Interstellar', durationMin: 169 });
+catalog.addTheatre(
+  new Theatre('T1', 'PVR Orion', 'BLR', [
+    new Screen('S1', 'Audi 1', [
+      { row: 'A', count: 4, category: 'SILVER' },
+      { row: 'B', count: 4, category: 'SILVER' },
+      { row: 'C', count: 2, category: 'GOLD' },
+    ]),
+  ]),
+);
+catalog.addShow({
+  id: 'SH1', movieId: 'M1', theatreId: 'T1', screenId: 'S1',
+  startsAt: 48 * HOUR, prices: { SILVER: 20_000, GOLD: 35_000, RECLINER: 60_000 },
+});
+
+console.log('1) search');
+for (const s of catalog.findShows('BLR', 'M1')) {
+  console.log(`  ${s.id}: ${catalog.movieTitle(s.movieId)} @ ${catalog.theatreName(s.theatreId)} in ${s.startsAt / HOUR}h`);
+}
+
+console.log('2) alice holds A1,A2; bob wants A2,A3');
+const aliceHold = await service.holdSeats('alice', 'SH1', ['A1', 'A2']);
+console.log(`  ${aliceHold.id} amount=${rupees(aliceHold.amountPaise)} expiresAt=${aliceHold.expiresAt / MINUTE}m`);
+try {
+  await service.holdSeats('bob', 'SH1', ['A2', 'A3']);
+} catch (e) {
+  console.log(`  bob: ${errMsg(e)}`);
+}
+
+console.log('3) carol and dave race for C1');
+const race = await Promise.allSettled([
+  service.holdSeats('carol', 'SH1', ['C1']),
+  service.holdSeats('dave', 'SH1', ['C1']),
+]);
+for (const [i, r] of race.entries()) {
+  const who = i === 0 ? 'carol' : 'dave';
+  console.log(`  ${who}: ${r.status === 'fulfilled' ? `won ${r.value.id}` : errMsg(r.reason)}`);
+}
+
+console.log('4) alice confirms twice with the same key');
+const b1 = await service.confirmBooking(aliceHold.id, 'alice-key-1');
+const b1again = await service.confirmBooking(aliceHold.id, 'alice-key-1');
+console.log(`  same booking: ${b1.id === b1again.id}, gateway charges: ${gateway.chargeCalls}`);
+
+console.log('5) bob holds B1 but pays after the TTL');
+const bobHold = await service.holdSeats('bob', 'SH1', ['B1']);
+clock.advance(11 * MINUTE);
+try {
+  await service.confirmBooking(bobHold.id, 'bob-key-1');
+} catch (e) {
+  console.log(`  bob: ${errMsg(e)}`);
+}
+
+console.log('6) erin holds B1, payment is declined');
+const erinHold = await service.holdSeats('erin', 'SH1', ['B1']);
+gateway.failNextCharge();
+try {
+  await service.confirmBooking(erinHold.id, 'erin-key-1');
+} catch (e) {
+  console.log(`  erin: ${errMsg(e)}`);
+}
+console.log(`  B1 free again: ${service.availableSeats('SH1').includes('B1')}`);
+
+console.log('7) sweeper');
+console.log(`  released holds: ${await service.releaseExpiredHolds()}`);
+console.log(`  available: ${service.availableSeats('SH1').join(',')}`);
+
+console.log('8) alice cancels (47h before show), then retries the cancel');
+clock.advance(HOUR);
+const cancelled = await service.cancelBooking(b1.id);
+await service.cancelBooking(b1.id);
+console.log(`  status=${cancelled.status} refund=${rupees(cancelled.refundPaise)} refunds=${JSON.stringify(gateway.refunds)}`);
+
+console.log('9) validation');
+const bad: Array<[string, () => Promise<unknown>]> = [
+  ['empty', () => service.holdSeats('x', 'SH1', [])],
+  ['unknown seat', () => service.holdSeats('x', 'SH1', ['Z9'])],
+  ['duplicate', () => service.holdSeats('x', 'SH1', ['A1', 'A1'])],
+  ['unknown show', () => service.holdSeats('x', 'NOPE', ['A1'])],
+  ['key reuse', () => service.confirmBooking(erinHold.id, 'alice-key-1')],
+];
+for (const [label, run] of bad) {
+  try {
+    await run();
+    console.log(`  ${label}: unexpectedly succeeded`);
+  } catch (e) {
+    console.log(`  ${label}: ${errMsg(e)}`);
+  }
+}
+```
+
+## Demo output
+
+```text
+1) search
+  SH1: Interstellar @ PVR Orion in 48h
+2) alice holds A1,A2; bob wants A2,A3
+  HOLD-1 amount=Rs 400.00 expiresAt=10m
+  bob: SeatUnavailableError: seats not available: A2
+3) carol and dave race for C1
+  carol: won HOLD-3
+  dave: SeatUnavailableError: seats not available: C1
+4) alice confirms twice with the same key
+  [event] BOOKED BKG-1 for alice seats=A1,A2
+  same booking: true, gateway charges: 1
+5) bob holds B1 but pays after the TTL
+  [event] HOLD_EXPIRED HOLD-5 (bob)
+  bob: HoldExpiredError: hold HOLD-5 expired; please select seats again
+6) erin holds B1, payment is declined
+  erin: PaymentFailedError: card declined; seats B1 released
+  B1 free again: true
+7) sweeper
+  [event] HOLD_EXPIRED HOLD-3 (carol)
+  released holds: 1
+  available: A3,A4,B1,B2,B3,B4,C1,C2
+8) alice cancels (47h before show), then retries the cancel
+  [event] CANCELLED BKG-1 for alice seats=A1,A2
+  status=CANCELLED refund=Rs 400.00 refunds=["PAY-1:Rs 400.00"]
+9) validation
+  empty: ValidationError: select at least one seat
+  unknown seat: NotFoundError: seat Z9
+  duplicate: ValidationError: duplicate seats in request
+  unknown show: NotFoundError: show NOPE
+  key reuse: ValidationError: idempotency key alice-key-1 was used for another hold
+```
+
+A few details worth pointing out while walking an interviewer through this output:
+
+- **Step 3** is a real concurrent call (`Promise.allSettled`). Exactly one user wins, because both requests go through the same per-show mutex and the all-or-nothing `tryHold`.
+- **Step 5**: the confirm itself detected the expired hold, released B1 and emitted `HOLD_EXPIRED`. We never charge for an expired hold.
+- **Step 7**: Carol's hold on C1 went stale while nobody was looking. The sweeper released it, so C1 appears in the available list again.
+- Hold IDs have gaps (HOLD-2 and HOLD-4 belonged to failed attempts). That is normal and harmless. Never use IDs as counters.
+
+## Concurrency deep-dive
+
+**The race.** Most real systems keep seat state in a database, so every read and write is an `await`. Here is the classic *check-then-act* bug. Each call to the repository yields to the event loop, just as a real DB round trip would.
+
+```ts
+const tick = (): Promise<void> => new Promise((resolve) => queueMicrotask(resolve));
+
+/** Pretend every method is a DB round trip. */
+class AsyncSeatRepo {
+  private readonly owners = new Map<string, string | null>([['C1', null]]);
+  writes = 0;
+  async findOwner(seatId: string): Promise<string | null> {
+    await tick();
+    return this.owners.get(seatId) ?? null;
+  }
+  async setOwner(seatId: string, userId: string): Promise<void> {
+    await tick();
+    this.writes++;
+    this.owners.set(seatId, userId);
+  }
+}
+
+class NaiveSeatBooker {
+  constructor(private readonly repo: AsyncSeatRepo) {}
+  async book(userId: string, seatId: string): Promise<string> {
+    const owner = await this.repo.findOwner(seatId); // CHECK
+    if (owner !== null) throw new Error(`${seatId} already taken by ${owner}`);
+    await this.repo.setOwner(seatId, userId); // ACT: another request ran in between
+    return `${userId} booked ${seatId}`;
+  }
+}
+
+const repo = new AsyncSeatRepo();
+const booker = new NaiveSeatBooker(repo);
+const results = await Promise.allSettled([booker.book('carol', 'C1'), booker.book('dave', 'C1')]);
+for (const r of results) console.log(r.status === 'fulfilled' ? `OK   ${r.value}` : `FAIL ${String(r.reason)}`);
+const confirmed = results.filter((r) => r.status === 'fulfilled').length;
+console.log(`confirmations sent: ${confirmed}, DB writes: ${repo.writes}, final owner: ${await repo.findOwner('C1')}`);
+if (confirmed > 1) console.log('BUG: double booking - carol holds a ticket for a seat the DB gives to dave');
+```
+
+```text
+OK   carol booked C1
+OK   dave booked C1
+confirmations sent: 2, DB writes: 2, final owner: dave
+BUG: double booking - carol holds a ticket for a seat the DB gives to dave
+```
+
+Both requests read `null` before either one wrote. This is the bug every interviewer is fishing for. It is also why "JavaScript is single-threaded, so there are no races" is a red-flag answer.
+
+**The fix, two ways.** (A) Serialise the check-then-act per show with the keyed mutex. This only works inside a single process. (B) Make the write itself conditional, so the storage layer does the check-and-set atomically. This works across processes. Five users race for C1 in each case.
+
+```ts
+const tick = (): Promise<void> => new Promise((resolve) => queueMicrotask(resolve));
+
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => (release = resolve));
+    const tail = previous.then(() => current);
+    this.tails.set(key, tail);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+
+class AsyncSeatRepo {
+  private readonly owners = new Map<string, string | null>();
+  constructor(seatIds: readonly string[]) {
+    for (const id of seatIds) this.owners.set(id, null);
+  }
+  async findOwner(seatId: string): Promise<string | null> {
+    await tick();
+    return this.owners.get(seatId) ?? null;
+  }
+  async setOwner(seatId: string, userId: string): Promise<void> {
+    await tick();
+    this.owners.set(seatId, userId);
+  }
+  /** Like: UPDATE show_seats SET owner=$1 WHERE show=$2 AND seat=$3 AND owner IS NULL (or Redis SET NX) */
+  async claimIfFree(seatId: string, userId: string): Promise<boolean> {
+    await tick();
+    if (this.owners.get(seatId) !== null) return false; // check + set with no await in between
+    this.owners.set(seatId, userId);
+    return true;
+  }
+}
+
+class LockedSeatBooker {
+  private readonly locks = new KeyedMutex();
+  constructor(private readonly repo: AsyncSeatRepo, private readonly showId: string) {}
+  book(userId: string, seatId: string): Promise<string> {
+    return this.locks.run(this.showId, async () => {
+      const owner = await this.repo.findOwner(seatId);
+      if (owner !== null) throw new Error(`${seatId} already taken by ${owner}`);
+      await this.repo.setOwner(seatId, userId);
+      return `${userId} booked ${seatId}`;
+    });
+  }
+}
+
+class ConditionalWriteBooker {
+  constructor(private readonly repo: AsyncSeatRepo) {}
+  async book(userId: string, seatId: string): Promise<string> {
+    if (!(await this.repo.claimIfFree(seatId, userId))) throw new Error(`${seatId} already taken`);
+    return `${userId} booked ${seatId}`;
+  }
+}
+
+const users = ['carol', 'dave', 'erin', 'frank', 'gita'];
+async function contest(label: string, book: (u: string) => Promise<string>, repo: AsyncSeatRepo): Promise<void> {
+  const results = await Promise.allSettled(users.map((u) => book(u)));
+  const winners = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
+  console.log(`${label}: winners=${winners.length} [${winners.join('; ')}] owner=${await repo.findOwner('C1')}`);
+}
+
+const repoA = new AsyncSeatRepo(['C1']);
+const lockedBooker = new LockedSeatBooker(repoA, 'SH1');
+await contest('A) per-show mutex', (u) => lockedBooker.book(u, 'C1'), repoA);
+
+const repoB = new AsyncSeatRepo(['C1']);
+const casBooker = new ConditionalWriteBooker(repoB);
+await contest('B) conditional write', (u) => casBooker.book(u, 'C1'), repoB);
+```
+
+```text
+A) per-show mutex: winners=1 [carol booked C1] owner=carol
+B) conditional write: winners=1 [carol booked C1] owner=carol
+```
+
+**Which one to pick, and the talking points:**
+
+| Layer | How you guarantee "one owner per seat per show" |
+|---|---|
+| **Single Node process** | Keep the check-and-set synchronous (our `ShowSeatMap.tryHold`), or use a keyed async mutex when awaits sit in between |
+| **Java** | `ReentrantLock` per show held in a `ConcurrentHashMap<String, ReentrantLock>` (or lock striping). Alternatively `ConcurrentHashMap.compute(seatKey, …)` for per-seat atomic updates. For multi-seat holds with per-seat locks, **acquire locks in sorted seat order** to avoid deadlock, and use `tryLock(timeout)` so a stuck thread fails fast |
+| **Go** | `sync.Mutex` per show inside a sharded map, or a single goroutine per show that owns its state and receives commands on a channel (actor style) |
+| **Relational DB (pessimistic)** | `BEGIN; SELECT … FROM show_seats WHERE show_id=? AND seat_id IN (…) FOR UPDATE; check; UPDATE …; COMMIT;`. Lock rows in a consistent order. Use `NOWAIT` / `SKIP LOCKED` to fail fast |
+| **Relational DB (optimistic)** | `UPDATE show_seats SET status='HELD', hold_id=?, expires_at=?, version=version+1 WHERE show_id=? AND seat_id IN (…) AND (status='AVAILABLE' OR (status='HELD' AND expires_at < now()))`. If the affected row count doesn't equal the number of seats, roll back. Plus a **unique constraint** on `(show_id, seat_id)` in `booked_seats`, as the last line of defence |
+| **Redis** | `SET hold:{show}:{seat} holdId NX PX 600000` per seat. For multi-seat, use a Lua script that checks all keys and sets all of them atomically. The TTL gives you hold expiry for free. Include the holdId in the value so a release only deletes *your* key (compare-and-delete in Lua) |
+
+Optimistic concurrency wins when conflicts are rare (most seats, most of the time). Pessimistic locking wins for hot shows, such as a first-day-first-show release, where retries would thrash. Many real systems use Redis for the short-lived hold and the DB with a unique constraint for the durable booking.
+
+## Failure handling
+
+| Failure | What the design does |
+|---|---|
+| User abandons checkout | The hold expires lazily (the seat counts as free after `expiresAt`), and the sweeper marks it EXPIRED and emits an event |
+| Payment declined | The hold goes to RELEASED and its seats are freed immediately, so they don't stay stuck for 10 minutes |
+| Client retries a confirm (timeout, double click) | The idempotency key returns the same booking. The gateway also dedupes on the same key, so the user is never charged twice |
+| Same key used for another hold | `ValidationError`. Reusing keys this way is a client bug and must be loud |
+| Payment succeeds but our process crashes before `book()` | In production: write a `PaymentIntent(holdId, key, status=PENDING)` row **before** calling the gateway. A reconciler polls the gateway for pending intents and then books the seats, or refunds if the seats are gone. This is an outbox/saga in miniature |
+| Payment is slow | Here the show lock is held while we wait, which is simple but blocks that show. Production: move the hold to `CONFIRMING` (the sweeper skips it), release the lock, call payment with a timeout, then re-lock and finish. On timeout, **don't assume failure**. Query the payment status using the idempotency key |
+| Webhook arrives twice or late | The confirm is idempotent. A webhook for an EXPIRED hold triggers an automatic refund |
+| A notifier throws | `emit` swallows listener errors. A booking must never roll back because an SMS failed. In production, send events through an outbox to a queue |
+| Refund call fails during cancel | The seats are not released and the booking stays CONFIRMED, so the user can retry. Production: record a `REFUND_PENDING` state and retry with backoff |
+
+## Extensions & follow-ups
+
+Common follow-ups: *dynamic/surge pricing*, *coupons*, *"suggest best available adjacent seats"*, *a waitlist when a show is sold out*, *a seat-map UI that updates in real time (SSE/WebSocket driven by the events)*, *multiple payment methods*, *partner theatres with their own inventory systems (Adapter)*.
+
+Here is **pricing as a Strategy with decorators**. The key rule to say out loud: *compute the price when the hold is created and store it on the hold*, so the amount the user saw is the amount they are charged, even if surge pricing kicks in a second later.
+
+```ts
+type SeatCategory = 'SILVER' | 'GOLD' | 'RECLINER';
+
+interface PricingContext {
+  readonly category: SeatCategory;
+  readonly basePaise: number;
+  readonly occupancy: number; // 0..1
+  readonly isWeekend: boolean;
+}
+
+interface PricingStrategy {
+  price(ctx: PricingContext): number;
+  describe(): string;
+}
+
+const pct = (paise: number, percent: number): number => Math.round((paise * percent) / 100);
+const rupees = (paise: number): string => `Rs ${(paise / 100).toFixed(2)}`;
+
+class BasePricing implements PricingStrategy {
+  price(ctx: PricingContext): number {
+    return ctx.basePaise;
+  }
+  describe(): string {
+    return 'base';
+  }
+}
+
+abstract class PricingDecorator implements PricingStrategy {
+  constructor(protected readonly inner: PricingStrategy) {}
+  abstract price(ctx: PricingContext): number;
+  abstract describe(): string;
+}
+
+class SurgePricing extends PricingDecorator {
+  constructor(inner: PricingStrategy, private readonly threshold: number, private readonly surgePercent: number) {
+    super(inner);
+    if (threshold <= 0 || threshold > 1) throw new RangeError('threshold must be in (0, 1]');
+  }
+  override price(ctx: PricingContext): number {
+    const p = this.inner.price(ctx);
+    return ctx.occupancy >= this.threshold ? p + pct(p, this.surgePercent) : p;
+  }
+  override describe(): string {
+    return `${this.inner.describe()} + surge ${this.surgePercent}% at >=${this.threshold * 100}% full`;
+  }
+}
+
+class WeekendPricing extends PricingDecorator {
+  constructor(inner: PricingStrategy, private readonly extraPaise: number) {
+    super(inner);
+  }
+  override price(ctx: PricingContext): number {
+    return this.inner.price(ctx) + (ctx.isWeekend ? this.extraPaise : 0);
+  }
+  override describe(): string {
+    return `${this.inner.describe()} + weekend ${rupees(this.extraPaise)}`;
+  }
+}
+
+class CouponPricing extends PricingDecorator {
+  constructor(inner: PricingStrategy, private readonly offPaise: number, private readonly floorPaise: number) {
+    super(inner);
+  }
+  override price(ctx: PricingContext): number {
+    return Math.max(this.floorPaise, this.inner.price(ctx) - this.offPaise);
+  }
+  override describe(): string {
+    return `${this.inner.describe()} - coupon ${rupees(this.offPaise)} (floor ${rupees(this.floorPaise)})`;
+  }
+}
+
+const strategy: PricingStrategy = new CouponPricing(
+  new WeekendPricing(new SurgePricing(new BasePricing(), 0.8, 25), 3_000),
+  5_000,
+  15_000,
+);
+console.log(`strategy: ${strategy.describe()}`);
+
+const cases: PricingContext[] = [
+  { category: 'SILVER', basePaise: 20_000, occupancy: 0.3, isWeekend: false },
+  { category: 'SILVER', basePaise: 20_000, occupancy: 0.9, isWeekend: false },
+  { category: 'GOLD', basePaise: 35_000, occupancy: 0.9, isWeekend: true },
+  { category: 'SILVER', basePaise: 16_000, occupancy: 0.1, isWeekend: false },
+];
+for (const c of cases) {
+  console.log(`${c.category} base=${rupees(c.basePaise)} occ=${c.occupancy} weekend=${c.isWeekend} -> ${rupees(strategy.price(c))}`);
+}
+
+// Freeze the price at hold time: the hold stores amountPaise, so later surges don't change it.
+const quiet = cases[0];
+const heldAt = strategy.price(quiet);
+const later = strategy.price({ ...quiet, occupancy: 0.95 });
+console.log(`held price ${rupees(heldAt)} stays; a new hold would now cost ${rupees(later)}`);
+```
+
+```text
+strategy: base + surge 25% at >=80% full + weekend Rs 30.00 - coupon Rs 50.00 (floor Rs 150.00)
+SILVER base=Rs 200.00 occ=0.3 weekend=false -> Rs 150.00
+SILVER base=Rs 200.00 occ=0.9 weekend=false -> Rs 200.00
+GOLD base=Rs 350.00 occ=0.9 weekend=true -> Rs 417.50
+SILVER base=Rs 160.00 occ=0.1 weekend=false -> Rs 150.00
+held price Rs 150.00 stays; a new hold would now cost Rs 200.00
+```
+
+To wire this in, `BookingService` takes a `PricingStrategy` in its constructor and calls it inside `holdSeats` in place of `show.prices[category]`. The occupancy comes from the seat map, which we already hold the lock for.
+
+Other follow-ups, briefly:
+
+- **Best available adjacent seats:** for each row, slide a window of size `n` over the available seats, score each window by distance from the screen centre, and pick the best one. Then call `tryHold` with those seats. It's the same atomic path, so a race just means "try the next best window".
+- **Waitlist:** subscribe to `HOLD_EXPIRED` / `CANCELLED` events and offer the freed seats to the head of a FIFO waitlist with a short exclusive hold.
+- **Real-time seat map:** the events feed a pub-sub channel per show, which is exactly §13.2.
+
+## Edge cases
+
+- Hold request with zero seats, more than the maximum, duplicate seat IDs, or unknown seats: rejected before any state changes (unknown seats are caught inside `tryHold` before anything is written).
+- One seat in a multi-seat hold is taken: the whole hold fails, and the error lists *which* seats, so the UI can highlight them.
+- Hold expires exactly at `expiresAt`: treated as expired (`<=`). Pick one convention and test it.
+- Confirm after the sweeper already expired the hold: `InvalidStateError: hold is EXPIRED`.
+- Confirm after the hold expired and someone else grabbed the seat: `isHeldBy` fails, so the confirm is rejected and nobody is charged. `release(…, holdId)` does **not** free the other user's seat.
+- Cancelling twice returns the same cancelled booking. Cancelling after the show starts is rejected.
+- Hold or confirm for a show that has started: rejected.
+- Adding a show whose screen doesn't belong to the theatre, or with a zero or fractional price: rejected.
+- Refund rounding: `Math.floor` of half the amount. Say which way you round money, and why (in the user's favour vs the business's).
+
+## Complexity
+
+Let `k` be the number of seats in a request, `S` the seats in a screen, and `H` the active holds.
+
+| Operation | Time | Notes |
+|---|---|---|
+| `holdSeats` | O(k) | Map lookups per seat, plus lock-wait time under contention |
+| `confirmBooking` | O(k) + payment latency | Idempotency lookup is O(1) |
+| `cancelBooking` | O(k) + refund latency | |
+| `availableSeats` | O(S) | Cache per show if seat maps get large (bitsets work well) |
+| `findShows` | O(total shows) | Index `(cityId, movieId) → shows` in production |
+| `releaseExpiredHolds` | O(H) | Production: an index on `expires_at`, or a min-heap by expiry |
+| Space | O(total seats across shows + holds + bookings) | Seat maps are created lazily per show |
+
+## What graders look for / common mistakes
+
+**They look for:**
+
+- Seat state modelled per **show**, not per seat.
+- An explicit hold/lock step with a TTL, and a clear state machine.
+- A concrete answer to "two users, same seat", with the lock scope justified.
+- Payment failure and timeout paths that release seats, and idempotent confirms.
+- Clean separation: catalogue vs inventory vs booking orchestration vs payment.
+- Patterns used where they help: Strategy (pricing/refund), Observer (notifications), Facade (service).
+
+**Common mistakes:**
+
+- `seat.isBooked = true` on the static `Seat`.
+- Check-then-act across an `await` without a lock or conditional write.
+- A global lock "for safety", which serialises the whole platform.
+- Charging before verifying that the hold is still valid, or never releasing seats on payment failure.
+- A `setTimeout` per hold as the only expiry mechanism.
+- No idempotency, so a retried confirm double-charges.
+- Floats for money (`199.99 * 3`).
+
+## 90-minute plan
+
+| Time | What to do |
+|---|---|
+| 0–10 | Clarify: hold TTL, max seats, partial holds, refunds, payment model. Write down the invariant "one owner per (show, seat)" |
+| 10–20 | Entities table + class diagram. Point at `ShowSeatMap` as the unit of locking |
+| 20–35 | Catalogue + `ShowSeatMap` with atomic `tryHold` / `book` / `release` |
+| 35–55 | `BookingService`: hold, confirm (with payment + idempotency), cancel |
+| 55–65 | Keyed mutex. Demonstrate two concurrent holds on one seat |
+| 65–75 | Expiry: lazy + sweeper. Payment failure path. Demo script |
+| 75–85 | Walk through the output. Discuss DB/Redis equivalents and the payment-crash reconciler |
+| 85–90 | Extensions: pricing strategy, adjacent seats, waitlist |
+
+## Interview Q&A
+
+**Q1. Why lock per show instead of per seat?**
+
+<details>
+<summary>Answer</summary>
+
+Per-show locks are simple and deadlock-free, and they make a multi-seat hold a single critical section. Contention is limited to users of the same show, and the critical section is microseconds when there is no network call inside it. Per-seat locks give more parallelism for very hot shows, but a multi-seat hold then needs several locks, which must be taken in sorted order to avoid deadlock. Under partial failure you also have to release the ones you already took. I would move to per-seat locks (or Redis keys per seat) only if profiling showed per-show contention. In a database, row-level locks are effectively per-seat already.
+
+</details>
+
+**Q2. JavaScript is single-threaded. Why do you need a mutex at all?**
+
+<details>
+<summary>Answer</summary>
+
+Single-threaded means synchronous code can't be interrupted. It doesn't mean async flows can't interleave. Any `await` between reading state and writing it lets another request run in between. The naive demo shows two confirmations for one seat with a purely in-process "DB". If the check-and-set is synchronous (like `tryHold`), no lock is needed for that step. The mutex exists for flows that must await in the middle, such as confirm → payment → book. Across multiple Node instances an in-process mutex is useless, and you need DB or Redis atomicity.
+
+</details>
+
+**Q3. The payment succeeded, but the hold expired while the gateway was processing. What now?**
+
+<details>
+<summary>Answer</summary>
+
+In this design it can't happen mid-flight, because confirm holds the show lock and the sweeper needs the same lock. In a lock-free production design, move the hold to `CONFIRMING` before calling the gateway, and have the sweeper skip CONFIRMING holds (or give them a longer grace period). If a payment still ends up attached to seats we no longer own (a late webhook), try to re-hold the same seats. If they are gone, refund automatically and notify the user. The important part is to never silently keep money without a booking. A reconciler job compares payment intents with bookings.
+
+</details>
+
+**Q4. How would you make this work across 20 app servers?**
+
+<details>
+<summary>Answer</summary>
+
+Move the seat state out of the process. The options are: (1) a DB table `show_seats(show_id, seat_id, status, hold_id, expires_at, version)` with conditional updates, plus a unique constraint on booked seats; (2) Redis `SET NX PX` per seat, with a Lua script for multi-seat holds, and the DB as the durable record at confirm time. Idempotency keys go in a table with a unique index. The sweeper becomes a single scheduled job (or relies on Redis TTL). Events go through an outbox table to Kafka. Sharding by `show_id` keeps each hot show's contention local.
+
+</details>
+
+**Q5. How do you prevent a user from holding 200 seats to block a show?**
+
+<details>
+<summary>Answer</summary>
+
+Cap the seats per hold (done), cap the concurrent active holds per user and per device, rate-limit hold requests per user and IP (see the rate-limiter case study), and keep the TTL short. For hot releases, add a virtual waiting room in front of the booking API. You can also require that a user's previous hold is released before a new one is created for the same show.
+
+</details>
+
+**Q6. Where does the Observer pattern fit, and what could go wrong with it?**
+
+<details>
+<summary>Answer</summary>
+
+`BookingService.onEvent` lets notifiers (SMS, email, analytics, the waitlist) react to BOOKED, CANCELLED and HOLD_EXPIRED without the service knowing about them. The risks are a slow or throwing listener blocking or rolling back the booking, and events being lost if the process dies right after the commit. The mitigations are to catch listener errors (done), make listeners async and non-blocking, and in production use the transactional outbox pattern, so events are persisted in the same transaction as the booking and published later.
+
+</details>

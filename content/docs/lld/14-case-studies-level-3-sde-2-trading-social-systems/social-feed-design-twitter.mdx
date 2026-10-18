@@ -1,0 +1,840 @@
+---
+title: "14.3 Social Feed / \"Design Twitter\""
+---
+
+## Problem & where it's asked
+
+Design a minimal social network: users follow each other, post short messages and see a personalised news feed. According to the research notes, **Angel One** reportedly asks a simplified Twitter (post, follow, top-10 feed) in SDE-level LLD rounds (source: search snippets; the full post was not readable, so treat it as indicative, not confirmed). **Walmart (2026)** asked a version of the news-feed problem. LeetCode 355 ("Design Twitter") is a direct model: it asks for `postTweet`, `getNewsFeed` (top 10 most recent across self + followees), `follow` and `unfollow`.
+
+Why does a stockbroker ask this? Two reasons: (1) Every financial app has a social layer — watchlists, community calls, analyst feeds — and the feed problem is a clean proxy for "can you reason about scale?". (2) The k-way merge that powers a pull feed is the same data-structure move that powers the order book's depth snapshot, so the techniques transfer.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|-----------|
+| How many users, tweets, followees? | 10 M users, 10 B tweets, up to 500 followees per regular user; celebrities can have millions of followers. |
+| What goes into a tweet? | Author, timestamp, content (up to 280 chars). No media, threads or quotes in scope. |
+| Feed ordering? | Reverse chronological (newest first). A ranked or algorithmic feed is an extension. |
+| How many items per feed page? | 10–50; use cursor-based pagination (no offset). |
+| Are likes visible in the feed? | Yes (counts), but like/unlike are not a feed signal for this scope. |
+| Write consistency? | Eventual: a newly posted tweet may take up to a few seconds to appear in all followers' feeds. |
+| Celebrity problem? | Yes. Fan-out on write is too slow for a celebrity's 5 M followers; we use a hybrid strategy. |
+| Delete tweet? | Soft-delete only. Extensions cover it. |
+| Auth, media, notifications? | Out of scope. |
+
+## Requirements
+
+**Functional**
+
+1. `createUser(handle)` / `follow(followerId, followeeId)` / `unfollow(followerId, followeeId)` — idempotent.
+2. `postTweet(authorId, content)` — returns a `Tweet`.
+3. `getNewsFeed(userId, limit, cursor?)` — returns tweets newest-first from self + followees, with the next cursor.
+4. `likeTweet(tweetId, userId)` — increments like count (one per user not enforced here; flag as extension).
+5. Deterministic output under an injected clock and id generator.
+
+**Non-functional**
+
+- Read latency &lt; 100 ms for regular users; &lt; 200 ms with celebrity mixing.
+- Post latency &lt; 10 ms for regular users (fan-out async, not in the critical path).
+- Feed is paginated; clients must not load the whole history.
+
+**Out of scope:** trending topics, search, notifications, media, ranking models.
+
+## Entities & relationships
+
+| Entity | Key fields | Relationships |
+|--------|-----------|---------------|
+| `User` | id, handle, following (set of ids), followers (set of ids) | N:M self-join |
+| `Tweet` | id, authorId, content, ts, likes | Owned by one user |
+| `TweetStore` | byAuthor: userId → Tweet[] (asc ts) | Source of truth |
+| `UserStore` | id → User | Source of truth |
+| `FeedCache` | userId → Tweet[] (desc ts, bounded) | Write-side fan-out for regular users |
+| `FeedService` | hybrid `getFeed` + pull `getFeedPull` | Uses both stores and the cache |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class UserService {
+        +createUser(handle) User
+        +follow(followerId, followeeId)
+        +unfollow(followerId, followeeId)
+    }
+    class TweetService {
+        +post(authorId, content) Tweet
+        +like(tweetId, userId)
+    }
+    class FeedService {
+        +getFeedPull(userId, limit, cursor?) Tweet[]
+        +getFeed(userId, limit, cursor?) Tweet[]
+    }
+    class FeedCache {
+        +has(uid) bool
+        +get(uid) Tweet[]
+        +prepend(uid, tweet)
+        +init(uid, tweets)
+    }
+    class TweetStore {
+        +save(tweet)
+        +byUser(userId, limit, beforeTs?) Tweet[]
+    }
+    class UserStore {
+        +save(user)
+        +get(id) User
+    }
+    class BinaryHeap~T~ {
+        +push(item)
+        +pop() T
+    }
+    TweetService --> TweetStore
+    TweetService --> FeedCache
+    FeedService --> TweetStore
+    FeedService --> UserStore
+    FeedService --> FeedCache
+    FeedService --> BinaryHeap~HeapItem~
+    UserService --> UserStore
+    UserService --> FeedCache`} />
+
+**Sequence: k-way merge for a pull feed (4 followees)**
+
+<Mermaid chart={`sequenceDiagram
+    participant App
+    participant F as FeedService
+    participant TS as TweetStore
+    participant H as MaxHeap
+    App->>F: getFeedPull(alice, limit=5)
+    F->>TS: byUser(alice, 10) -> [T4,T2]
+    F->>TS: byUser(bob, 10) -> [T3]
+    F->>TS: byUser(carol, 10) -> [T5]
+    F->>TS: byUser(celeb, 10) -> [T6,T1]
+    F->>H: push head of each array
+    loop until limit or heap empty
+        H-->>F: pop max-ts tweet
+        F->>H: push next from same source
+    end
+    F-->>App: [T6, T5, T4, T3, T2]`} />
+
+## Design decisions & patterns
+
+| Decision | Pattern | Why | Trade-off |
+|----------|---------|-----|-----------|
+| Fan-out on write for regular users | Push/cache | O(1) feed read for most users | Fan-out adds write latency; stale after unfollow |
+| Pull (merge at read time) for celebrity tweets | Pull/merge | Writing to 5 M feeds is too slow | O(K log K) read per fan-out-excluded celebrity |
+| k-way merge using a binary max-heap | Priority queue | O(N log K) to get N items from K sources | Space: O(K) for the heap, O(limit) for results |
+| Cursor = last-seen timestamp (exclusive lower bound) | Opaque token | Stable pagination: new tweets don't shift pages | If two tweets share a timestamp (possible at scale), a compound key `ts:id` avoids gaps |
+| Follower graph in-memory | Sets | O(1) follow/unfollow/check | Replace with a dedicated graph service at scale |
+| Likes as a simple counter | Mutable field | Simple demo | Production: a set of user IDs prevents double-like; eventually consistent via CRDT counter |
+| Repository layer (TweetStore, UserStore) | Repository | Swap in-memory stores for Postgres/Cassandra without touching services | |
+| Service layer (UserService, TweetService, FeedService) | Service layer (Facade) | Each service has a single responsibility; controllers thin | |
+
+**Fan-out trade-off table:**
+
+| Strategy | Write cost | Read cost | When celebrity posts | Stale on unfollow |
+|----------|-----------|-----------|---------------------|-------------------|
+| Fan-out on write (push) | O(F) per tweet | O(1) | F = millions → too slow | Yes, until next follow/unfollow |
+| Fan-out on read (pull) | O(1) | O(K log limit) per read | Fine | No |
+| Hybrid (push for regulars, pull for celebrities) | O(F) for regular, O(1) for celebrity | O(1) + O(C·limit log limit) where C = celebrity followees | Fast | Partial (celebrity feed always fresh) |
+
+**Celebrity threshold:** In production, Twitter uses about 10,000 followers as the threshold (reported). We use 3 in the demo for observability.
+
+## Implementation
+
+**Part 1: infrastructure — clock, ids, errors.**
+
+```ts
+class SocialError extends Error {
+  override name = 'SocialError';
+}
+class NotFoundError extends SocialError {
+  override name = 'NotFoundError';
+}
+
+interface Clock {
+  now(): number;
+}
+class SeqClock implements Clock {
+  private t: number;
+  constructor(start = 1) {
+    this.t = start;
+  }
+  now(): number {
+    return this.t++;
+  }
+}
+
+interface IdGen {
+  next(prefix: string): string;
+}
+class SeqIdGen implements IdGen {
+  private readonly n = new Map<string, number>();
+  next(prefix: string): string {
+    const v = (this.n.get(prefix) ?? 0) + 1;
+    this.n.set(prefix, v);
+    return `${prefix}${v}`;
+  }
+}
+```
+
+**Part 2: domain entities.**
+
+```ts
+type UserId = string;
+type TweetId = string;
+
+class Tweet {
+  public likes = 0;
+  constructor(
+    readonly id: TweetId,
+    readonly authorId: UserId,
+    readonly content: string,
+    readonly ts: number,
+  ) {}
+}
+
+class User {
+  readonly following = new Set<UserId>();
+  readonly followers = new Set<UserId>();
+  constructor(
+    readonly id: UserId,
+    readonly handle: string,
+  ) {}
+}
+```
+
+**Part 3: repositories — TweetStore keeps per-author lists in ascending ts order; UserStore is a simple id map.**
+
+```ts
+class TweetStore {
+  private readonly all = new Map<TweetId, Tweet>();
+  private readonly byAuthorMap = new Map<UserId, Tweet[]>();
+
+  save(t: Tweet): void {
+    this.all.set(t.id, t);
+    const list = this.byAuthorMap.get(t.authorId) ?? [];
+    list.push(t); // monotonic clock => ascending order
+    this.byAuthorMap.set(t.authorId, list);
+  }
+
+  get(id: TweetId): Tweet {
+    const t = this.all.get(id);
+    if (!t) throw new NotFoundError(`Tweet ${id}`);
+    return t;
+  }
+
+  /**
+   * Tweets by a user in descending ts, optionally limited to ts < beforeTs.
+   * We walk the ascending list backwards to avoid a reverse copy most of the time.
+   */
+  byUser(userId: UserId, limit: number, beforeTs?: number): Tweet[] {
+    const list = this.byAuthorMap.get(userId) ?? [];
+    const result: Tweet[] = [];
+    for (let i = list.length - 1; i >= 0 && result.length < limit; i--) {
+      if (beforeTs === undefined || list[i].ts < beforeTs) {
+        result.push(list[i]);
+      }
+    }
+    return result;
+  }
+}
+
+class UserStore {
+  private readonly map = new Map<UserId, User>();
+  save(u: User): void {
+    this.map.set(u.id, u);
+  }
+  find(id: UserId): User | undefined {
+    return this.map.get(id);
+  }
+  get(id: UserId): User {
+    const u = this.map.get(id);
+    if (!u) throw new NotFoundError(`User ${id}`);
+    return u;
+  }
+}
+```
+
+**Part 4: a generic binary max-heap for the k-way merge.** The `lt` comparator returns `true` when `a` should be higher in the heap than `b` (confusingly, it checks `a > b` to get a max-heap — it is the "a is not behind b" relation).
+
+```ts
+interface HeapItem {
+  tweet: Tweet;
+  idx: number;
+  arr: readonly Tweet[];
+}
+
+class BinaryHeap {
+  private readonly items: HeapItem[] = [];
+
+  get size(): number {
+    return this.items.length;
+  }
+
+  push(item: HeapItem): void {
+    this.items.push(item);
+    let i = this.items.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (this.items[p].tweet.ts >= this.items[i].tweet.ts) break;
+      const tmp = this.items[p];
+      this.items[p] = this.items[i];
+      this.items[i] = tmp;
+      i = p;
+    }
+  }
+
+  pop(): HeapItem | undefined {
+    if (!this.items.length) return undefined;
+    const top = this.items[0];
+    const last = this.items.pop()!;
+    if (this.items.length) {
+      this.items[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let best = i;
+        if (l < this.items.length && this.items[l].tweet.ts > this.items[best].tweet.ts) best = l;
+        if (r < this.items.length && this.items[r].tweet.ts > this.items[best].tweet.ts) best = r;
+        if (best === i) break;
+        const tmp = this.items[i];
+        this.items[i] = this.items[best];
+        this.items[best] = tmp;
+        i = best;
+      }
+    }
+    return top;
+  }
+}
+```
+
+**Part 5: FeedCache, UserService, TweetService, and FeedService.** The key design choice lives in `post()` and `getFeed()`: celebrities skip fan-out on write; their tweets are merged at read time.
+
+```ts
+const CELEBRITY_THRESHOLD = 3; // low for demo; production value: ~10_000
+const FEED_CACHE_MAX = 200;
+
+class FeedCache {
+  private readonly cache = new Map<UserId, Tweet[]>();
+  has(uid: UserId): boolean {
+    return this.cache.has(uid);
+  }
+  get(uid: UserId): Tweet[] {
+    return this.cache.get(uid) ?? [];
+  }
+  prepend(uid: UserId, tweet: Tweet): void {
+    const feed = this.cache.get(uid) ?? [];
+    feed.unshift(tweet);
+    if (feed.length > FEED_CACHE_MAX) feed.length = FEED_CACHE_MAX;
+    this.cache.set(uid, feed);
+  }
+  init(uid: UserId, tweets: Tweet[]): void {
+    this.cache.set(uid, tweets.slice(0, FEED_CACHE_MAX));
+  }
+}
+
+class UserService {
+  constructor(
+    private readonly users: UserStore,
+    private readonly ids: IdGen,
+  ) {}
+
+  createUser(handle: string): User {
+    const u = new User(this.ids.next('U'), handle);
+    this.users.save(u);
+    return u;
+  }
+
+  follow(followerId: UserId, followeeId: UserId): void {
+    if (followerId === followeeId) throw new SocialError('Cannot follow yourself');
+    const follower = this.users.get(followerId);
+    const followee = this.users.get(followeeId);
+    if (follower.following.has(followeeId)) return; // idempotent
+    follower.following.add(followeeId);
+    followee.followers.add(followerId);
+  }
+
+  unfollow(followerId: UserId, followeeId: UserId): void {
+    const follower = this.users.get(followerId);
+    const followee = this.users.get(followeeId);
+    follower.following.delete(followeeId);
+    followee.followers.delete(followerId);
+    // Simplest cache strategy: let getFeed cold-build on next read.
+    // Production alternative: remove only the unfollowed user's tweets from the cached feed.
+  }
+}
+
+class TweetService {
+  constructor(
+    private readonly users: UserStore,
+    private readonly tweetStore: TweetStore,
+    private readonly cache: FeedCache,
+    private readonly clock: Clock,
+    private readonly ids: IdGen,
+  ) {}
+
+  post(authorId: UserId, content: string): Tweet {
+    const author = this.users.get(authorId);
+    const tweet = new Tweet(this.ids.next('T'), authorId, content, this.clock.now());
+    this.tweetStore.save(tweet);
+
+    // Fan-out on write: only for non-celebrities (small follower count).
+    if (author.followers.size <= CELEBRITY_THRESHOLD) {
+      for (const fid of author.followers) {
+        if (this.cache.has(fid)) this.cache.prepend(fid, tweet);
+      }
+    }
+    // Include in the author's own feed cache if warmed.
+    if (this.cache.has(authorId)) this.cache.prepend(authorId, tweet);
+    return tweet;
+  }
+
+  like(tweetId: TweetId): void {
+    this.tweetStore.get(tweetId).likes++;
+  }
+}
+
+class FeedService {
+  constructor(
+    private readonly users: UserStore,
+    private readonly tweetStore: TweetStore,
+    private readonly cache: FeedCache,
+  ) {}
+
+  /**
+   * Pull strategy: k-way merge at read time. Simple, always fresh, O(K * pageSize * log K).
+   * Cursor is a string-encoded ts value (exclusive upper bound).
+   */
+  getFeedPull(userId: UserId, limit: number, cursor?: string): Tweet[] {
+    const user = this.users.get(userId);
+    const beforeTs = cursor !== undefined ? parseInt(cursor, 10) : undefined;
+    const sources: Tweet[][] = [this.tweetStore.byUser(userId, limit * 2, beforeTs)];
+    for (const fid of user.following) {
+      sources.push(this.tweetStore.byUser(fid, limit * 2, beforeTs));
+    }
+    return this.kMerge(sources, limit);
+  }
+
+  /**
+   * Hybrid strategy: push for regular users (O(1) read from cache),
+   * pull for celebrities (merge at read time to avoid giant fan-out).
+   */
+  getFeed(userId: UserId, limit: number, cursor?: string): Tweet[] {
+    const user = this.users.get(userId);
+    const beforeTs = cursor !== undefined ? parseInt(cursor, 10) : undefined;
+
+    const celebrities: UserId[] = [];
+    for (const fid of user.following) {
+      if (this.users.get(fid).followers.size > CELEBRITY_THRESHOLD) celebrities.push(fid);
+    }
+
+    // Base feed from push cache (no celebrities).
+    let baseFeed: Tweet[];
+    if (this.cache.has(userId)) {
+      baseFeed = this.cache.get(userId);
+    } else {
+      baseFeed = this.buildCache(userId, limit * 5);
+      this.cache.init(userId, baseFeed);
+    }
+    if (beforeTs !== undefined) baseFeed = baseFeed.filter((t) => t.ts < beforeTs);
+
+    if (celebrities.length === 0) return baseFeed.slice(0, limit);
+
+    // Merge celebrity tweets in at read time.
+    const celebSources = celebrities.map((cid) =>
+      this.tweetStore.byUser(cid, limit * 2, beforeTs),
+    );
+    return this.kMerge([...celebSources, baseFeed.slice(0, limit * 2)], limit);
+  }
+
+  /** Build the initial feed for a cold-start user, excluding celebrities. */
+  private buildCache(userId: UserId, limit: number): Tweet[] {
+    const user = this.users.get(userId);
+    const sources: Tweet[][] = [this.tweetStore.byUser(userId, limit)];
+    for (const fid of user.following) {
+      if (this.users.get(fid).followers.size <= CELEBRITY_THRESHOLD) {
+        sources.push(this.tweetStore.byUser(fid, limit));
+      }
+    }
+    return this.kMerge(sources, limit);
+  }
+
+  /** k-way merge: each source is already sorted in descending ts order. */
+  private kMerge(sources: Tweet[][], limit: number): Tweet[] {
+    const heap = new BinaryHeap();
+    for (const arr of sources) {
+      if (arr.length > 0) heap.push({ tweet: arr[0], idx: 0, arr });
+    }
+    const result: Tweet[] = [];
+    while (heap.size > 0 && result.length < limit) {
+      const item = heap.pop()!;
+      result.push(item.tweet);
+      const next = item.idx + 1;
+      if (next < item.arr.length) heap.push({ tweet: item.arr[next], idx: next, arr: item.arr });
+    }
+    return result;
+  }
+}
+```
+
+**Part 6: wiring and demo.**
+
+```ts
+const clock = new SeqClock();
+const ids = new SeqIdGen();
+const tweetStore = new TweetStore();
+const userStore = new UserStore();
+const feedCache = new FeedCache();
+const userSvc = new UserService(userStore, ids);
+const tweetSvc = new TweetService(userStore, tweetStore, feedCache, clock, ids);
+const feedSvc = new FeedService(userStore, tweetStore, feedCache);
+
+const alice = userSvc.createUser('alice');
+const bob = userSvc.createUser('bob');
+const carol = userSvc.createUser('carol');
+const celebrity = userSvc.createUser('celebrity');
+const dave = userSvc.createUser('dave');
+
+userSvc.follow(alice.id, celebrity.id);
+userSvc.follow(alice.id, bob.id);
+userSvc.follow(alice.id, carol.id);
+userSvc.follow(bob.id, celebrity.id);
+userSvc.follow(carol.id, celebrity.id);
+userSvc.follow(carol.id, alice.id);
+userSvc.follow(dave.id, celebrity.id);
+
+const showTweet = (t: Tweet): string => {
+  const h = userStore.find(t.authorId)?.handle ?? t.authorId;
+  return `  ${t.id} @ts=${t.ts} ${h} "${t.content}" likes=${t.likes}`;
+};
+const printFeed = (label: string, tweets: Tweet[]): void => {
+  console.log(label);
+  for (const t of tweets) console.log(showTweet(t));
+};
+
+console.log('== 1. users ==');
+const uline = [alice, bob, carol, celebrity, dave].map((u) => `${u.id} ${u.handle}`).join('  ');
+console.log(uline);
+console.log(`celebrity followers: ${celebrity.followers.size}, is celebrity: ${celebrity.followers.size > CELEBRITY_THRESHOLD} (threshold: ${CELEBRITY_THRESHOLD})`);
+
+console.log('== 2. tweets ==');
+const T1 = tweetSvc.post(celebrity.id, 'Product launch is live!');
+const T2 = tweetSvc.post(alice.id, 'Morning from alice');
+const T3 = tweetSvc.post(bob.id, 'Bob: hello world');
+const T4 = tweetSvc.post(alice.id, 'Alice: second update');
+const T5 = tweetSvc.post(carol.id, 'Carol: checking in');
+const T6 = tweetSvc.post(celebrity.id, 'Celebrity: thank you all');
+
+tweetSvc.like(T2.id);
+tweetSvc.like(T6.id);
+tweetSvc.like(T6.id);
+
+for (const t of [T1, T2, T3, T4, T5, T6]) console.log(showTweet(t));
+
+printFeed('== 3. alice feed (pull / k-way merge, limit=5) ==', feedSvc.getFeedPull(alice.id, 5));
+printFeed('== 4. alice feed (hybrid push+pull, limit=5) ==', feedSvc.getFeed(alice.id, 5));
+
+const cursor = String(T2.ts); // "page 2": everything before alice's first tweet
+printFeed(`== 5. cursor page 2 (pull, cursor=${cursor}, limit=3) ==`, feedSvc.getFeedPull(alice.id, 3, cursor));
+
+console.log('== 6. unfollow: carol drops bob ==');
+userSvc.unfollow(carol.id, bob.id);
+printFeed('carol pull feed (limit=5):', feedSvc.getFeedPull(carol.id, 5));
+```
+
+## Demo output
+
+```text
+== 1. users ==
+U1 alice  U2 bob  U3 carol  U4 celebrity  U5 dave
+celebrity followers: 4, is celebrity: true (threshold: 3)
+== 2. tweets ==
+  T1 @ts=1 celebrity "Product launch is live!" likes=0
+  T2 @ts=2 alice "Morning from alice" likes=1
+  T3 @ts=3 bob "Bob: hello world" likes=0
+  T4 @ts=4 alice "Alice: second update" likes=0
+  T5 @ts=5 carol "Carol: checking in" likes=0
+  T6 @ts=6 celebrity "Celebrity: thank you all" likes=2
+== 3. alice feed (pull / k-way merge, limit=5) ==
+  T6 @ts=6 celebrity "Celebrity: thank you all" likes=2
+  T5 @ts=5 carol "Carol: checking in" likes=0
+  T4 @ts=4 alice "Alice: second update" likes=0
+  T3 @ts=3 bob "Bob: hello world" likes=0
+  T2 @ts=2 alice "Morning from alice" likes=1
+== 4. alice feed (hybrid push+pull, limit=5) ==
+  T6 @ts=6 celebrity "Celebrity: thank you all" likes=2
+  T5 @ts=5 carol "Carol: checking in" likes=0
+  T4 @ts=4 alice "Alice: second update" likes=0
+  T3 @ts=3 bob "Bob: hello world" likes=0
+  T2 @ts=2 alice "Morning from alice" likes=1
+== 5. cursor page 2 (pull, cursor=2, limit=3) ==
+  T1 @ts=1 celebrity "Product launch is live!" likes=0
+== 6. unfollow: carol drops bob ==
+carol pull feed (limit=5):
+  T6 @ts=6 celebrity "Celebrity: thank you all" likes=2
+  T5 @ts=5 carol "Carol: checking in" likes=0
+  T4 @ts=4 alice "Alice: second update" likes=0
+  T2 @ts=2 alice "Morning from alice" likes=1
+  T1 @ts=1 celebrity "Product launch is live!" likes=0
+```
+
+Walk through:
+
+- **Pull feed (section 3):** The heap starts with one entry per source (T4 for alice, T3 for bob, T5 for carol, T6 for celebrity). It pops T6 (highest ts), pushes T1 (celebrity's next), then pops T5, T4 (pushes T2), T3, T2 — five tweets, in exact reverse-chronological order. No sorting of the full history.
+- **Hybrid feed (section 4):** Celebrity has 4 followers > threshold 3. The cache is cold, so `buildCache` merges only non-celebrity followees (bob, carol) and alice herself into [T5, T4, T3, T2], which is stored. Then T1 and T6 (celebrity's tweets) are fetched and merged at read time. Result is identical to pull, demonstrating correctness.
+- **Cursor (section 5):** Cursor `"2"` means "only tweets with ts &lt; 2". Only T1 qualifies. This is how mobile apps load "earlier" pages without offset instability.
+- **Unfollow (section 6):** Carol drops bob. Bob's tweet (T3) disappears from carol's pull feed immediately, because pull always reads the live follower set. A push feed would need an additional cleanup step.
+
+## Concurrency deep-dive
+
+The fan-out loop in `post()` writes to multiple users' caches. If two tweets are posted concurrently and fan-out uses `await` between reading a cache entry and writing it back, one tweet can overwrite the other.
+
+```ts
+type TweetItem = { id: string; content: string };
+const cache = new Map<string, TweetItem[]>();
+cache.set('user1', []);
+
+async function naiveFanOut(tweet: TweetItem, userIds: string[]): Promise<void> {
+  for (const uid of userIds) {
+    const feed = [...(cache.get(uid) ?? [])]; // snapshot copy
+    await Promise.resolve(); // simulate async I/O (e.g., Redis pipeline flush)
+    feed.unshift(tweet); // write to stale copy
+    cache.set(uid, feed); // overwrites what the other concurrent call wrote
+  }
+}
+
+await Promise.all([
+  naiveFanOut({ id: 'T1', content: 'tweet A' }, ['user1']),
+  naiveFanOut({ id: 'T2', content: 'tweet B' }, ['user1']),
+]);
+const feed = cache.get('user1')!;
+console.log(`feed: ${feed.map((t) => t.id).join(', ')} (length ${feed.length})`);
+console.log(feed.length < 2 ? 'BUG: concurrent fan-out lost a tweet' : 'ok');
+```
+
+```text
+feed: T2 (length 1)
+BUG: concurrent fan-out lost a tweet
+```
+
+The fix: perform any async work *before* touching the cache, then do the read-modify-write synchronously (no `await` between get and set).
+
+```ts
+type TweetItem = { id: string; content: string };
+const cache = new Map<string, TweetItem[]>();
+cache.set('user1', []);
+
+async function fixedFanOut(tweet: TweetItem, userIds: string[]): Promise<void> {
+  for (const uid of userIds) {
+    await Promise.resolve(); // async work (network, DB) done BEFORE touching cache
+    // Synchronous read-modify-write: no await between get and set.
+    const feed = cache.get(uid) ?? [];
+    cache.set(uid, [tweet, ...feed]);
+  }
+}
+
+await Promise.all([
+  fixedFanOut({ id: 'T1', content: 'tweet A' }, ['user1']),
+  fixedFanOut({ id: 'T2', content: 'tweet B' }, ['user1']),
+]);
+const feed = cache.get('user1')!;
+console.log(`feed: ${feed.map((t) => t.id).join(', ')} (length ${feed.length})`);
+console.log(feed.length < 2 ? 'bug' : 'ok: both tweets present');
+```
+
+```text
+feed: T2, T1 (length 2)
+ok: both tweets present
+```
+
+T1 resolves its `await` first and writes `[T1]`. T2 resolves second and reads the now-current `[T1]`, then writes `[T2, T1]`. Both tweets are present. The order may differ from wall-clock post order, which is acceptable for social feeds.
+
+**Talking points beyond Node**
+
+- **Redis:** use `LPUSH uid tweet_json` inside a pipeline — a single atomic operation for each follower, no read-copy-update. Cap the list length with `LTRIM`. Fan-out over millions of followers runs in a background worker pool, not in the request path.
+- **Kafka:** when a user posts, publish a `tweet_created` event to a partitioned topic. Fan-out workers (one per partition) consume the event and update follower caches in Redis. This decouples post latency from fan-out latency entirely.
+- **Java:** `ConcurrentHashMap` for the cache map. A `ReentrantReadWriteLock` per user id (or per hash-bucket) guards the list mutation. Avoid `synchronized` on a global lock; it becomes a bottleneck at fan-out scale.
+- **Go:** one goroutine per user-id shard. Each shard owns its slice of the cache and reads from a channel of fan-out tasks. No locking needed within a shard.
+- **Database:** store each (follower, tweet_id) row in a `feed` table, written at post time. A `SELECT ... ORDER BY ts DESC LIMIT n WHERE follower_id = ? AND ts < ?` is the pull query. Effective with an index on `(follower_id, ts)`. Blows up for celebrities.
+
+## Failure handling
+
+| Failure | Impact | Handling |
+|---------|--------|----------|
+| Fan-out worker crash mid-loop | Some followers miss the tweet in their cache | On cold-start, `buildCache` merges from the source of truth. Partial fan-out = acceptable staleness. |
+| TweetStore write fails | Tweet is lost | Persist to durable storage (Postgres / Cassandra) before returning to the client. Return an error if the write fails; do not fan-out. |
+| Cache eviction (Redis OOM) | `has()` returns false | `getFeed` falls back to `buildCache` (pull strategy). The cache is a performance tier, not the source of truth. |
+| Unfollow with cached feed | Cache still contains the unfollowed user's tweets | Either (a) filter them out on read, or (b) invalidate the follower's cache, forcing a cold-build. (a) is cheaper if the feed is short. |
+| Network partition between fan-out service and cache | Fan-out silent failure | Mark tweet as `needs_fanout = true`, have a reconciliation job retry with idempotency key. |
+| `like` race (double-like) | Count inflated | Track `(userId, tweetId)` in a `SET`. In Redis: `SADD likes:tweetId userId`, return added count. Only increment the counter once per user. |
+
+## Extensions & follow-ups
+
+Typical follow-ups: delete tweet (soft-delete, remove from caches), ranked/algorithmic feed (add a scorer), retweets / quotes, hashtag search, trending topics, notifications (Observer + async queue), pagination by composite key `ts:id` for true stability.
+
+We implement **delete with cache invalidation** as a concrete extension, since it exercises the same cache-safety reasoning as the fan-out race:
+
+```ts
+// Minimal standalone delete demo.
+class TweetStoreD {
+  private readonly all = new Map<string, { id: string; authorId: string; ts: number; deleted: boolean }>();
+  private readonly byAuthorMap = new Map<string, Array<{ id: string; authorId: string; ts: number; deleted: boolean }>>();
+
+  save(t: { id: string; authorId: string; ts: number }): void {
+    const row = { ...t, deleted: false };
+    this.all.set(t.id, row);
+    const list = this.byAuthorMap.get(t.authorId) ?? [];
+    list.push(row);
+    this.byAuthorMap.set(t.authorId, list);
+  }
+
+  softDelete(id: string): boolean {
+    const row = this.all.get(id);
+    if (!row || row.deleted) return false;
+    row.deleted = true;
+    return true;
+  }
+
+  /** Returns live (non-deleted) tweets, desc ts. */
+  byUser(uid: string, limit: number): Array<{ id: string; ts: number }> {
+    const list = this.byAuthorMap.get(uid) ?? [];
+    const result: Array<{ id: string; ts: number }> = [];
+    for (let i = list.length - 1; i >= 0 && result.length < limit; i--) {
+      if (!list[i].deleted) result.push(list[i]);
+    }
+    return result;
+  }
+}
+
+const store = new TweetStoreD();
+for (let i = 1; i <= 5; i++) store.save({ id: `T${i}`, authorId: 'alice', ts: i });
+
+console.log('before delete:', store.byUser('alice', 5).map((t) => t.id).join(', '));
+store.softDelete('T3');
+console.log('after delete T3:', store.byUser('alice', 5).map((t) => t.id).join(', '));
+store.softDelete('T3'); // idempotent
+console.log('delete T3 again: no change:', store.byUser('alice', 5).map((t) => t.id).join(', '));
+```
+
+```text
+before delete: T5, T4, T3, T2, T1
+after delete T3: T5, T4, T2, T1
+delete T3 again: no change: T5, T4, T2, T1
+```
+
+In the full service, after `softDelete` you would scan each affected follower's in-memory cache and filter out the deleted tweet. At scale (Redis), a Lua script iterates the list and removes the entry atomically.
+
+## Edge cases
+
+- **Empty feed (new user, no follows):** returns an empty list, no error.
+- **Cursor before the oldest tweet:** returns an empty list and the next cursor is `undefined` (or omit it from the response, signalling end of history).
+- **Same timestamp on two tweets:** the SeqClock prevents this. At scale, use a composite cursor `ts:id` so that two tweets at the same logical second don't cause pagination gaps.
+- **Self-follow guard:** `follow(id, id)` throws `SocialError` rather than silently adding the user to their own following set (which would duplicate their own tweets in the feed).
+- **Double follow / double unfollow:** idempotent by Set semantics.
+- **Celebrity changes status** (crosses the threshold): the fan-out strategy switches on the next `post()`. Followers whose caches were built before the celebrity crossed the threshold will miss the first few tweets until a cold rebuild.
+- **Giant followee list (K = 500):** `getFeedPull` initialises 500 heap entries. The heap stays at O(K) space; each pop costs O(log K). With K = 500 and limit = 10, that is at most 10 pops × 9 comparisons ≈ 90 comparisons — fast.
+- **Blocking / muting:** add a `blocked` and `muted` Set to `User`. `getFeedPull` skips their sources and `getFeed` filters their tweets from the cache.
+- **Tweet not found (already deleted):** `tweetStore.get(id)` throws `NotFoundError`. The caller wraps it.
+
+## Complexity
+
+| Operation | Pull | Hybrid | Notes |
+|-----------|------|--------|-------|
+| postTweet | O(1) store | O(F) fan-out for non-celebrities | F = follower count; async background for scale |
+| getFeed cold | O(K log L) | O(C·L log C + K log L) | K followees, L = limit, C = celebrity count |
+| getFeed warm | O(K log L) | O(1) + O(C·L log C) | Cache hit for non-celebrity part |
+| follow/unfollow | O(1) | O(1) | Amortized with hash sets |
+| likeTweet | O(1) | O(1) | Map lookup |
+| Pagination | O(K·L) walk | O(K·L) walk | Walk backwards in each sorted list |
+
+Space: O(U) users + O(T) tweets + O(U × FEED_CACHE_MAX) for the push cache.
+
+## What graders look for / common mistakes
+
+**They look for:**
+
+- Naming the two strategies and explaining the celebrity threshold trade-off without prompting.
+- A correct k-way merge: heap over **pointers** (source + index), not a flat sort of all loaded tweets.
+- Cursor pagination, not offset: "give me tweets with ts &lt; X" is stable; "skip 10" is not.
+- Clean service/repository separation: services orchestrate, repositories store.
+- Explicit failure mode: what happens if a fan-out worker crashes?
+
+**Common mistakes:**
+
+- Loading all tweets from all followees into a flat array and then sorting: O(N log N) where N can be millions.
+- Using offset pagination: inserting a new tweet while the user is paging causes the feed to "skip" or repeat an entry.
+- Fan-out in the request critical path: for a celebrity's 5 million followers, this takes seconds.
+- Storing the average instead of the total for denormalised counters: the count of likes is fine as an integer, but for something like average fill price you need the total.
+- No deduplication when a user appears in both fan-out cache and the celebrity pull sources.
+- Forgetting self: a user should see their own tweets in their own feed.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–10 | Clarify scope: just post, follow, feed? Likes? What is "recent"? What scale? Write down assumptions. |
+| 10–20 | Entities (User, Tweet) and repositories. Class sketch: UserService, TweetService, FeedService. |
+| 20–40 | Implement pull feed: TweetStore.byUser, BinaryHeap, k-way merge. Run demo with 4 users. |
+| 40–55 | Fan-out cache, TweetService.post (celebrity check), FeedService.getFeed hybrid. Show identical result. |
+| 55–65 | Cursor pagination: add beforeTs to byUser, demo page 2. Follow/unfollow, show it affects the pull feed immediately. |
+| 65–75 | Concurrency: show the fan-out race, explain the fix (no await between read and write). |
+| 75–85 | Failure handling and extensions: delete, ranked feed, notifications. |
+| 85–90 | Complexity table and talking points. |
+
+## Interview Q&A
+
+**Q1. When would you choose pull over push, and when would you use the hybrid?**
+
+<details>
+<summary>Answer</summary>
+
+Pull (fan-out on read) is correct when most users are celebrities or when follower counts are wildly asymmetric. Every read is fresh and uses O(1) storage per user — there is no feed to maintain. The cost is O(K log limit) per read, which is fine for low-follower users but slow if K is 500 and the followee list includes several celebrities.
+
+Push (fan-out on write) wins when reads heavily outnumber writes and follower counts are modest. The feed is pre-built; reading is O(1). The cost is O(F) per write, paid in a background worker. For F = 1,000 and 1,000 writes/second that is 1 million cache updates per second — feasible. For a celebrity with 10 million followers it is not.
+
+The hybrid treats celebrity following as a separate read-time merge and regular following as push. Almost every production feed system at scale (Twitter, Instagram, LinkedIn) uses a version of this.
+
+</details>
+
+**Q2. Why use a binary heap for the k-way merge instead of sorting the combined list?**
+
+<details>
+<summary>Answer</summary>
+
+Sorting the combined list costs O(N log N) where N is the total number of loaded tweets (e.g., K × pageSize × some factor = 500 × 20 × 2 = 20,000 items). The heap version costs O(limit × log K) — for limit = 10 and K = 500, that is 10 × 9 = 90 heap operations. The heap never loads more than one item per source at a time, so memory is O(K) instead of O(N). At LeetCode 355 scale (each source has at most 10 tweets) this difference doesn't matter, but an interviewer at a data-scale company will notice.
+
+</details>
+
+**Q3. How do you keep pagination stable when new tweets are added while the user is scrolling?**
+
+<details>
+<summary>Answer</summary>
+
+Use a cursor that is an exclusive timestamp (or a composite `ts:tweetId`). The first page loads tweets with `ts < ∞`; the response includes the cursor `ts:id` of the last returned tweet. The next page loads tweets with `ts < cursor_ts` (and if two tweets share `cursor_ts`, also skip the known `cursor_id`). New tweets that arrive after the first page was served all have a higher ts, so they never appear inside the paged range. Offset pagination (`skip 10, take 10`) breaks because a new tweet bumps all items down one position, causing the next page to repeat an item or skip one.
+
+</details>
+
+**Q4. How would you handle the celebrity problem at database scale (no in-memory cache)?**
+
+<details>
+<summary>Answer</summary>
+
+Two standard approaches. (1) **Hybrid at the DB level:** maintain a `feeds` table with rows `(follower_id, tweet_id, ts)`, written only for non-celebrity authors. For celebrity tweets, join the `tweets` table directly in the feed query: `SELECT ... FROM feeds WHERE follower_id = ? UNION ALL SELECT ... FROM tweets WHERE author_id IN (celebrity_ids) AND ts < cursor ORDER BY ts DESC LIMIT n`. An index on `(author_id, ts)` makes the celebrity side fast. (2) **Read-only follower set sampling:** for very large celebrities, don't fan-out at all — they appear in feeds only when explicitly fetched at read time. Twitter called this the "sparse celebrity" model.
+
+</details>
+
+**Q5. Your `like` counter is a simple integer. What goes wrong at scale?**
+
+<details>
+<summary>Answer</summary>
+
+Two problems. (1) Double-like: the same user can call `like` twice and the count increments twice. Fix: store `(userId, tweetId)` in a set (Redis: `SADD likes:tweetId userId`; DB: `INSERT IGNORE INTO likes(user_id, tweet_id)`). (2) Hot key: a viral tweet can receive thousands of likes per second, and a single counter row becomes a write bottleneck. Fix: Redis sorted-set shard by bucket, or approximate the count with a probabilistic counter (HyperLogLog) for display, while writing exact records for audit.
+
+</details>
+
+**Q6. How would you add a ranked feed without rewriting the pull engine?**
+
+<details>
+<summary>Answer</summary>
+
+Separate the candidate generation step from the ranking step. The pull engine already generates the top-K candidates by recency. After the k-way merge, pass the result through a `FeedRanker` strategy that assigns a score to each tweet (e.g., `score = recencyWeight × f(age) + engagementWeight × likes`), then sort the candidates by score. Inject the ranker through the constructor, so a `ChronologicalRanker` (identity) and an `EngagementRanker` are both valid strategies. The ranker only sees the candidates (O(limit) items), so it is fast regardless of the underlying store.
+
+</details>

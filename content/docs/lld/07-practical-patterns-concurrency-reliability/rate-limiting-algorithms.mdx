@@ -1,0 +1,188 @@
+---
+title: "7.9 Rate limiting algorithms"
+---
+
+## Intuition
+
+A broker's order API must stop one runaway algo-trading script from flooding the exchange gateway (SEBI and the exchanges impose order-per-second limits too). A rate limiter answers one question per request: **"may key K do one more thing right now?"** The algorithms differ in how they remember the past:
+
+- **Fixed window:** count requests per calendar window (for example, per second). Cheap, but allows a **2× burst at window boundaries**.
+- **Sliding window log:** store every timestamp and count those in the last W ms. Exact, but uses O(limit) memory per key.
+- **Sliding window counter:** keep the current and previous window counts, and weight the previous one by how much of it still overlaps. Approximate, O(1) memory.
+- **Token bucket:** tokens refill at rate r up to capacity b, and each request spends one. Allows **controlled bursts** up to b while averaging r.
+- **Leaky bucket:** a queue (or water level) drains at a constant rate r. It **smooths** output, and a full bucket rejects. The "meter" variant below doesn't queue, it just rejects.
+
+All of them take an injected `Clock`. (Floats are fine here: these are token counts, not money.)
+
+```ts
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number {
+    return this.t;
+  }
+  set(ms: number): void {
+    this.t = ms;
+  }
+}
+
+interface RateLimiter {
+  readonly name: string;
+  tryAcquire(key: string): boolean;
+}
+
+class FixedWindowLimiter implements RateLimiter {
+  readonly name = 'fixed-window';
+  private readonly windows = new Map<string, { start: number; count: number }>();
+  constructor(private readonly limit: number, private readonly windowMs: number, private readonly clock: Clock) {}
+
+  tryAcquire(key: string): boolean {
+    const start = Math.floor(this.clock.now() / this.windowMs) * this.windowMs;
+    let w = this.windows.get(key);
+    if (!w || w.start !== start) {
+      w = { start, count: 0 };
+      this.windows.set(key, w);
+    }
+    if (w.count >= this.limit) return false;
+    w.count++;
+    return true;
+  }
+}
+
+class SlidingWindowLogLimiter implements RateLimiter {
+  readonly name = 'sliding-log';
+  private readonly logs = new Map<string, number[]>();
+  constructor(private readonly limit: number, private readonly windowMs: number, private readonly clock: Clock) {}
+
+  tryAcquire(key: string): boolean {
+    const now = this.clock.now();
+    const log = this.logs.get(key) ?? [];
+    while (log.length > 0 && log[0] <= now - this.windowMs) log.shift(); // a deque in production
+    if (log.length >= this.limit) {
+      this.logs.set(key, log);
+      return false;
+    }
+    log.push(now);
+    this.logs.set(key, log);
+    return true;
+  }
+}
+
+class SlidingWindowCounterLimiter implements RateLimiter {
+  readonly name = 'sliding-counter';
+  private readonly state = new Map<string, { start: number; curr: number; prev: number }>();
+  constructor(private readonly limit: number, private readonly windowMs: number, private readonly clock: Clock) {}
+
+  tryAcquire(key: string): boolean {
+    const now = this.clock.now();
+    const start = Math.floor(now / this.windowMs) * this.windowMs;
+    let s = this.state.get(key);
+    if (!s) {
+      s = { start, curr: 0, prev: 0 };
+      this.state.set(key, s);
+    } else if (s.start !== start) {
+      s.prev = start - s.start === this.windowMs ? s.curr : 0; // only an adjacent window counts
+      s.curr = 0;
+      s.start = start;
+    }
+    const overlap = 1 - (now - start) / this.windowMs;
+    const estimate = s.prev * overlap + s.curr;
+    if (estimate >= this.limit) return false;
+    s.curr++;
+    return true;
+  }
+}
+
+class TokenBucketLimiter implements RateLimiter {
+  readonly name = 'token-bucket';
+  private readonly buckets = new Map<string, { tokens: number; last: number }>();
+  constructor(private readonly capacity: number, private readonly refillPerSec: number, private readonly clock: Clock) {}
+
+  tryAcquire(key: string, cost = 1): boolean {
+    const now = this.clock.now();
+    const b = this.buckets.get(key) ?? { tokens: this.capacity, last: now };
+    b.tokens = Math.min(this.capacity, b.tokens + ((now - b.last) * this.refillPerSec) / 1000);
+    b.last = now;
+    this.buckets.set(key, b);
+    if (b.tokens < cost) return false;
+    b.tokens -= cost;
+    return true;
+  }
+}
+
+class LeakyBucketLimiter implements RateLimiter {
+  readonly name = 'leaky-bucket';
+  private readonly buckets = new Map<string, { level: number; last: number }>();
+  constructor(private readonly capacity: number, private readonly leakPerSec: number, private readonly clock: Clock) {}
+
+  tryAcquire(key: string): boolean {
+    const now = this.clock.now();
+    const b = this.buckets.get(key) ?? { level: 0, last: now };
+    b.level = Math.max(0, b.level - ((now - b.last) * this.leakPerSec) / 1000);
+    b.last = now;
+    this.buckets.set(key, b);
+    if (b.level + 1 > this.capacity) return false;
+    b.level += 1;
+    return true;
+  }
+}
+
+// ---- same traffic for every algorithm: bursts of 5 at t = 900, 1000, 1500, 1950 ms ----
+const clock = new FakeClock();
+const limiters: RateLimiter[] = [
+  new FixedWindowLimiter(5, 1000, clock),
+  new SlidingWindowLogLimiter(5, 1000, clock),
+  new SlidingWindowCounterLimiter(5, 1000, clock),
+  new TokenBucketLimiter(5, 5, clock),
+  new LeakyBucketLimiter(5, 5, clock),
+];
+
+const times = [900, 1000, 1500, 1950];
+console.log(`limit ~5/s, bursts of 5 at t=${times.join(',')}`);
+for (const limiter of limiters) {
+  const row: string[] = [];
+  for (const t of times) {
+    clock.set(t);
+    let allowed = 0;
+    for (let i = 0; i < 5; i++) if (limiter.tryAcquire('algo-client-42')) allowed++;
+    row.push(`${allowed}/5`);
+  }
+  // Keys are independent: a different client at t=1950 still gets its first request through
+  const other = limiter.tryAcquire('retail-user-7');
+  console.log(`${limiter.name.padEnd(16)} ${row.join('  ')}  | other key allowed: ${other}`);
+}
+```
+
+```text
+limit ~5/s, bursts of 5 at t=900,1000,1500,1950
+fixed-window     5/5  5/5  0/5  0/5  | other key allowed: true
+sliding-log      5/5  0/5  0/5  5/5  | other key allowed: true
+sliding-counter  5/5  0/5  3/5  2/5  | other key allowed: true
+token-bucket     5/5  0/5  3/5  2/5  | other key allowed: true
+leaky-bucket     5/5  0/5  3/5  2/5  | other key allowed: true
+```
+
+Read the first column pair: the **fixed window let 10 requests through in 100 ms** (5 at t=900 and 5 more at t=1000), because the counter reset at the boundary. Every other algorithm rejected the second burst.
+
+## Comparison
+
+| Algorithm | Memory per key | Accuracy | Bursts | Typical use |
+|---|---|---|---|---|
+| Fixed window | O(1) | Boundary 2× spike | Allowed at edges | Simple quotas ("1,000/day"), Redis `INCR` + `EXPIRE` |
+| Sliding window log | O(limit) | Exact | No | Low limits where exactness matters (OTP attempts, login) |
+| Sliding window counter | O(1) | Approximate (assumes uniform previous window) | Smoothed | Large-scale API gateways (Cloudflare-style) |
+| Token bucket | O(1) | Exact average rate | Up to capacity | Public APIs, AWS/Stripe-style limits, per-user order rate |
+| Leaky bucket | O(1) (meter) / O(queue) | Constant output rate | No (smooths) | Traffic shaping, protecting a fixed-rate downstream (exchange gateway) |
+
+## Pitfalls and production notes
+
+- **Distributed limits:** with several pods, the counter lives in Redis. Do the read-modify-write in a **Lua script** (atomic), or use `INCR` + `PEXPIRE` for fixed windows and a sorted set (`ZADD`/`ZREMRANGEBYSCORE`/`ZCARD`) for the sliding log.
+- **Memory:** evict idle keys (a TTL on the Map entries, or an LRU).
+- **What key?** User id, API key, IP, or `(user, endpoint)`. Return `429` with `Retry-After` and `X-RateLimit-Remaining` headers.
+- **Fail open or closed** when Redis is down? It's a business decision: login endpoints usually fail closed, and market-data reads usually fail open.
+
+## How to say it in an interview
+
+> "I'd use a token bucket per user: it allows short bursts but caps the average rate, and it's O(1) memory. Fixed window is simplest, but it allows a 2× spike at the boundary. Sliding log is exact but stores every timestamp. Across pods, I'd move the bucket into Redis with a Lua script so refill-and-take is atomic."

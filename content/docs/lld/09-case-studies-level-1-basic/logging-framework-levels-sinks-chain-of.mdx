@@ -1,0 +1,732 @@
+---
+title: "9.5 Logging Framework (levels, sinks, chain of responsibility)"
+---
+
+## Problem & where it's asked
+
+"Design a logger" is reported at **Microsoft** (2026 list). That version wanted log levels, several sinks, buffering logs coming from many modules, streaming them to a file or tool **with acknowledgement**, and retrieving logs by criteria. It's a staple of general LLD guides (awesome-low-level-design, HelloInterview) as the canonical **Chain of Responsibility + Singleton** exercise. Inferred follow-ups: **async logging** and **log rotation**. No Indian company is reliably reported for it in the research notes (uncertain). At a stockbroker like Angel One, though, the redaction step below (never log a PAN or phone number) is exactly the kind of detail that shows domain maturity.
+
+You use `pino` or `winston` every day. This problem asks you to show you understand what's inside them.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Which levels? | DEBUG &lt; INFO &lt; WARN &lt; ERROR &lt; FATAL. Messages below the configured level are dropped. |
+| Per-module levels? | Yes, hierarchical: `payments.upi` inherits from `payments` unless it has its own setting, and the root is the fallback. |
+| Which sinks? | Console (text), in-memory (queryable), batching remote sink with acknowledgement. Files are simulated in memory. |
+| Output format? | Pluggable: text or JSON. |
+| Structured context? | Yes, key/value pairs attached to a record. |
+| Sensitive data? | Mask PAN numbers and 10-digit phone numbers before any sink sees them. |
+| Sync or async? | Console and memory sinks are synchronous. The remote sink buffers and flushes asynchronously. |
+| What if a sink fails? | Other sinks still get the record, and the app never crashes because of logging. |
+| Configuration changes at runtime? | Levels can be changed at runtime. |
+
+## Requirements
+
+**Functional**: `getLogger(module)`; `debug/info/warn/error/fatal(message, context?)`; per-module hierarchical levels; several sinks, each with its own minimum level and formatter; redaction; querying the in-memory store by level, module prefix, time range and text; batched delivery with acknowledgement.
+
+**Non-functional**: logging must not throw into business code; low overhead when a level is disabled; a new sink or processing step needs no changes to `Logger`; deterministic timestamps in tests (injected clock); record order is preserved per sink.
+
+**Out of scope**: real files and network, distributed tracing, log shipping agents.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `LogLevel` | Ordered severity enum | Used everywhere |
+| `LogRecord` | Immutable event: seq, time, level, module, message, context | Flows through the chain |
+| `Logger` | Module-scoped API that builds records | Created and cached by `LogManager` |
+| `LogManager` | Holds config, the chain and the logger cache | One per app (composition root / singleton) |
+| `LogHandler` | One step in the chain (filter, redact, enrich, dispatch) | Linked list via `next` |
+| `Sink` | Destination with a min level and formatter | `DispatchHandler` fans out to many |
+| `Formatter` | Record → string (text, JSON) | Strategy used by sinks |
+| `InMemorySink` | Stores records and answers queries | A `Sink` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class LogManager {
+        +getLogger(module) Logger
+        +setLevel(module, level) void
+    }
+    class Logger {
+        +string module
+        +debug(msg, ctx) void
+        +info(msg, ctx) void
+        +warn(msg, ctx) void
+        +error(msg, ctx) void
+    }
+    class LogHandler {
+        <<abstract>>
+        -LogHandler next
+        +setNext(h) LogHandler
+        +handle(record) void
+        #process(record) LogRecord
+    }
+    class LevelFilterHandler
+    class RedactionHandler
+    class EnrichmentHandler
+    class DispatchHandler
+    class Sink {
+        <<interface>>
+        +string name
+        +LogLevel minLevel
+        +write(record) void
+    }
+    class ConsoleSink
+    class InMemorySink {
+        +query(criteria) LogRecord[]
+    }
+    class Formatter {
+        <<interface>>
+        +format(record) string
+    }
+    class TextFormatter
+    class JsonFormatter
+    LogManager *-- Logger
+    LogManager --> LogHandler : head of chain
+    Logger --> LogManager
+    LogHandler <|-- LevelFilterHandler
+    LogHandler <|-- RedactionHandler
+    LogHandler <|-- EnrichmentHandler
+    LogHandler <|-- DispatchHandler
+    LogHandler --> LogHandler : next
+    DispatchHandler o-- Sink
+    Sink <|.. ConsoleSink
+    Sink <|.. InMemorySink
+    ConsoleSink --> Formatter
+    Formatter <|.. TextFormatter
+    Formatter <|.. JsonFormatter`} />
+
+## Design decisions & patterns
+
+- **Chain of Responsibility for processing.** Each step is a handler that can transform the record, pass it on, or stop the chain (the level filter stops it). New steps (sampling, rate limiting, adding a trace ID) are new handlers, and the order is configured in one place. The textbook version has one handler per level (`InfoHandler → WarnHandler → ErrorHandler`). Mention it, then explain why a pipeline of *different concerns* is the more useful reading of the pattern: per-level handlers duplicate what a numeric comparison does in one line.
+- **Sinks as a fan-out (Observer-like).** Every sink that accepts the level receives the record. A failing sink is isolated with try/catch, so one broken destination doesn't silence the others.
+- **Strategy for formatting.** Console output for humans, JSON for machines. A sink is built with whichever formatter it needs.
+- **Singleton, carefully.** Real apps want one `LogManager` per process, so it offers a lazily created `LogManager.default`. The constructor stays public, so tests create isolated managers. This is the "singleton by convention, DI by preference" approach from chapter 4.
+- **Logger cache (Flyweight-ish).** `getLogger('orders')` returns the same instance every time. Loggers are cheap and hold only the module name.
+- **Hierarchical level lookup** walks `a.b.c → a.b → a → root`. It's cached per module, and the cache is cleared when levels change.
+- **Early level check in `Logger`.** It skips building the record for disabled levels. That's the "low overhead" requirement: an ignored debug call in a hot path should cost almost nothing.
+- **Rejected:** `console.log` wrappers with `if` chains (no extensibility), and one global mutable config object accessed from everywhere (untestable).
+
+## Implementation
+
+**Part 1: levels, records, clock and formatters.**
+
+```ts
+enum LogLevel { DEBUG = 10, INFO = 20, WARN = 30, ERROR = 40, FATAL = 50 }
+
+type LogContext = Readonly<Record<string, string | number | boolean>>;
+
+interface LogRecord {
+  readonly seq: number;
+  readonly timestamp: number;
+  readonly level: LogLevel;
+  readonly module: string;
+  readonly message: string;
+  readonly context: LogContext;
+}
+
+interface Clock { now(): number }
+class FakeClock implements Clock {
+  constructor(private current: number) {}
+  now(): number { return this.current; }
+  advance(ms: number): void { this.current += ms; }
+}
+
+class LoggingConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LoggingConfigError';
+  }
+}
+
+interface Formatter { format(r: LogRecord): string }
+
+class TextFormatter implements Formatter {
+  format(r: LogRecord): string {
+    const ctx = Object.entries(r.context).map(([k, v]) => `${k}=${v}`).join(' ');
+    const time = new Date(r.timestamp).toISOString().slice(11, 19);
+    return `${time} ${LogLevel[r.level].padEnd(5)} [${r.module}] ${r.message}${ctx ? ` {${ctx}}` : ''}`;
+  }
+}
+
+class JsonFormatter implements Formatter {
+  format(r: LogRecord): string {
+    return JSON.stringify({ ts: new Date(r.timestamp).toISOString(), level: LogLevel[r.level], module: r.module, msg: r.message, ...r.context });
+  }
+}
+```
+
+**Part 2: sinks.** `InMemorySink` doubles as the "retrieve logs by criteria" requirement.
+
+```ts
+interface Sink {
+  readonly name: string;
+  readonly minLevel: LogLevel;
+  write(record: LogRecord): void;
+}
+
+class ConsoleSink implements Sink {
+  readonly name = 'console';
+  constructor(readonly minLevel: LogLevel, private readonly formatter: Formatter) {}
+  write(record: LogRecord): void { console.log(this.formatter.format(record)); }
+}
+
+interface LogQuery {
+  minLevel?: LogLevel;
+  modulePrefix?: string;
+  from?: number;
+  to?: number;
+  text?: string;
+}
+
+class InMemorySink implements Sink {
+  readonly name = 'memory';
+  private readonly records: LogRecord[] = [];
+  constructor(readonly minLevel: LogLevel, private readonly capacity = 1_000) {}
+
+  write(record: LogRecord): void {
+    this.records.push(record);
+    if (this.records.length > this.capacity) this.records.shift(); // drop oldest
+  }
+
+  query(q: LogQuery): LogRecord[] {
+    return this.records.filter((r) =>
+      (q.minLevel === undefined || r.level >= q.minLevel) &&
+      (q.modulePrefix === undefined || r.module === q.modulePrefix || r.module.startsWith(`${q.modulePrefix}.`)) &&
+      (q.from === undefined || r.timestamp >= q.from) &&
+      (q.to === undefined || r.timestamp <= q.to) &&
+      (q.text === undefined || r.message.toLowerCase().includes(q.text.toLowerCase())));
+  }
+}
+
+// A sink that always fails, to prove isolation.
+class BrokenSink implements Sink {
+  readonly name = 'broken-http';
+  readonly minLevel = LogLevel.ERROR;
+  write(): void { throw new Error('connection refused'); }
+}
+```
+
+**Part 3: the chain.** The base class owns the linking and the "pass it on" logic. Each concrete handler implements only `process`, returning the (possibly transformed) record, or `null` to stop the chain.
+
+```ts
+abstract class LogHandler {
+  private next: LogHandler | null = null;
+
+  setNext(handler: LogHandler): LogHandler {
+    this.next = handler;
+    return handler; // enables a.setNext(b).setNext(c)
+  }
+
+  handle(record: LogRecord): void {
+    const result = this.process(record);
+    if (result && this.next) this.next.handle(result);
+  }
+
+  protected abstract process(record: LogRecord): LogRecord | null;
+}
+
+class LevelFilterHandler extends LogHandler {
+  constructor(private readonly levels: LevelResolver) { super(); }
+  protected process(r: LogRecord): LogRecord | null {
+    return r.level >= this.levels.levelFor(r.module) ? r : null;
+  }
+}
+
+class RedactionHandler extends LogHandler {
+  private static readonly RULES: readonly [RegExp, string][] = [
+    [/\b[A-Z]{5}\d{4}[A-Z]\b/g, '[PAN]'],
+    [/\b[6-9]\d{9}\b/g, '[PHONE]'],
+  ];
+  protected process(r: LogRecord): LogRecord {
+    const mask = (s: string) => RedactionHandler.RULES.reduce((acc, [re, token]) => acc.replace(re, token), s);
+    const context: Record<string, string | number | boolean> = {};
+    for (const [k, v] of Object.entries(r.context)) context[k] = typeof v === 'string' ? mask(v) : v;
+    return { ...r, message: mask(r.message), context };
+  }
+}
+
+class EnrichmentHandler extends LogHandler {
+  constructor(private readonly fields: LogContext) { super(); }
+  protected process(r: LogRecord): LogRecord {
+    return { ...r, context: { ...r.context, ...this.fields } };
+  }
+}
+
+class DispatchHandler extends LogHandler {
+  readonly failures = new Map<string, number>();
+  constructor(private readonly sinks: readonly Sink[]) { super(); }
+  protected process(r: LogRecord): LogRecord {
+    for (const sink of this.sinks) {
+      if (r.level < sink.minLevel) continue;
+      try {
+        sink.write(r);
+      } catch (err) {
+        // Never let a sink failure reach business code.
+        this.failures.set(sink.name, (this.failures.get(sink.name) ?? 0) + 1);
+        console.log(`[logging-internal] sink ${sink.name} failed: ${(err as Error).message}`);
+      }
+    }
+    return r;
+  }
+}
+```
+
+**Part 4: level resolution, `Logger` and `LogManager`.**
+
+```ts
+class LevelResolver {
+  private readonly configured = new Map<string, LogLevel>();
+  private readonly cache = new Map<string, LogLevel>();
+
+  constructor(private rootLevel: LogLevel) {}
+
+  set(module: string, level: LogLevel): void {
+    if (!/^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$/.test(module) && module !== 'root') {
+      throw new LoggingConfigError(`Invalid module name "${module}"`);
+    }
+    if (module === 'root') this.rootLevel = level;
+    else this.configured.set(module, level);
+    this.cache.clear();
+  }
+
+  levelFor(module: string): LogLevel {
+    const cached = this.cache.get(module);
+    if (cached !== undefined) return cached;
+    let level = this.rootLevel;
+    for (let name = module; name; name = name.includes('.') ? name.slice(0, name.lastIndexOf('.')) : '') {
+      const found = this.configured.get(name);
+      if (found !== undefined) { level = found; break; }
+    }
+    this.cache.set(module, level);
+    return level;
+  }
+}
+
+class Logger {
+  constructor(readonly module: string, private readonly manager: LogManager) {}
+  debug(message: string, context: LogContext = {}): void { this.log(LogLevel.DEBUG, message, context); }
+  info(message: string, context: LogContext = {}): void { this.log(LogLevel.INFO, message, context); }
+  warn(message: string, context: LogContext = {}): void { this.log(LogLevel.WARN, message, context); }
+  error(message: string, context: LogContext = {}): void { this.log(LogLevel.ERROR, message, context); }
+  fatal(message: string, context: LogContext = {}): void { this.log(LogLevel.FATAL, message, context); }
+
+  isEnabled(level: LogLevel): boolean { return this.manager.isEnabled(this.module, level); }
+
+  private log(level: LogLevel, message: string, context: LogContext): void {
+    if (!this.isEnabled(level)) return; // cheap early exit
+    this.manager.emit(level, this.module, message, context);
+  }
+}
+
+class LogManager {
+  private static instance: LogManager | undefined;
+  private readonly loggers = new Map<string, Logger>();
+  private seq = 0;
+
+  constructor(
+    private readonly levels: LevelResolver,
+    private readonly chain: LogHandler,
+    private readonly clock: Clock,
+  ) {}
+
+  /** Process-wide default for app code; tests build their own managers. */
+  static get default(): LogManager {
+    LogManager.instance ??= new LogManager(
+      new LevelResolver(LogLevel.INFO),
+      new DispatchHandler([new ConsoleSink(LogLevel.INFO, new TextFormatter())]),
+      { now: () => 0 },
+    );
+    return LogManager.instance;
+  }
+
+  getLogger(module: string): Logger {
+    let logger = this.loggers.get(module);
+    if (!logger) {
+      logger = new Logger(module, this);
+      this.loggers.set(module, logger);
+    }
+    return logger;
+  }
+
+  setLevel(module: string, level: LogLevel): void { this.levels.set(module, level); }
+  isEnabled(module: string, level: LogLevel): boolean { return level >= this.levels.levelFor(module); }
+
+  emit(level: LogLevel, module: string, message: string, context: LogContext): void {
+    const record: LogRecord = { seq: ++this.seq, timestamp: this.clock.now(), level, module, message, context };
+    try {
+      this.chain.handle(record);
+    } catch (err) {
+      console.log(`[logging-internal] chain failed: ${(err as Error).message}`);
+    }
+  }
+}
+```
+
+**Part 5: wiring and demo.** Read the chain setup as a sentence: filter, then redact, then enrich, then dispatch.
+
+```ts
+const clock = new FakeClock(Date.UTC(2026, 0, 5, 9, 15, 0));
+const levels = new LevelResolver(LogLevel.INFO);
+levels.set('payments', LogLevel.DEBUG);
+levels.set('marketdata', LogLevel.ERROR);
+
+const memory = new InMemorySink(LogLevel.DEBUG);
+const dispatch = new DispatchHandler([
+  new ConsoleSink(LogLevel.INFO, new TextFormatter()),
+  memory,
+  new BrokenSink(),
+]);
+const head = new LevelFilterHandler(levels);
+head.setNext(new RedactionHandler()).setNext(new EnrichmentHandler({ env: 'prod' })).setNext(dispatch);
+
+const manager = new LogManager(levels, head, clock);
+const orders = manager.getLogger('orders');
+const upi = manager.getLogger('payments.upi');
+const ticks = manager.getLogger('marketdata.nse');
+
+console.log(`same instance: ${manager.getLogger('orders') === orders}`);
+console.log(`levels: orders=${LogLevel[levels.levelFor('orders')]} payments.upi=${LogLevel[levels.levelFor('payments.upi')]} marketdata.nse=${LogLevel[levels.levelFor('marketdata.nse')]}`);
+
+orders.info('order placed', { orderId: 'ORD-1', qty: 10 });
+clock.advance(1_000);
+orders.debug('this is dropped: orders is at INFO');
+upi.debug('collect request sent', { vpa: 'ritesh@okaxis' });
+clock.advance(1_000);
+upi.info('KYC check for PAN ABCDE1234F, phone 9876543210');
+ticks.warn('this is dropped: marketdata is at ERROR');
+clock.advance(1_000);
+upi.error('PSP timeout', { psp: 'razorpay', attempt: 3 });
+ticks.fatal('feed disconnected');
+
+console.log('--- runtime level change: orders -> DEBUG ---');
+manager.setLevel('orders', LogLevel.DEBUG);
+orders.debug('now visible in memory only (console is INFO+)');
+
+console.log('--- queries ---');
+const show = (rs: LogRecord[]) => rs.map((r) => `#${r.seq} ${LogLevel[r.level]} ${r.module}: ${r.message}`).join(' | ');
+console.log(`WARN+       -> ${show(memory.query({ minLevel: LogLevel.WARN }))}`);
+console.log(`payments.*  -> ${show(memory.query({ modulePrefix: 'payments' }))}`);
+console.log(`orders      -> ${show(memory.query({ modulePrefix: 'orders' }))}`);
+console.log(`text "kyc"  -> ${show(memory.query({ text: 'kyc' }))}`);
+const start = Date.UTC(2026, 0, 5, 9, 15, 1);
+console.log(`09:15:01-02 -> ${show(memory.query({ from: start, to: start + 1_000 }))}`);
+console.log(`sink failures: ${JSON.stringify(Object.fromEntries(dispatch.failures))}`);
+
+console.log('--- JSON formatter ---');
+console.log(new JsonFormatter().format(memory.query({ minLevel: LogLevel.FATAL })[0] ?? {
+  seq: 0, timestamp: 0, level: LogLevel.INFO, module: 'none', message: 'none', context: {},
+}));
+
+try {
+  manager.setLevel('Bad Module', LogLevel.INFO);
+} catch (err) {
+  console.log(`${(err as Error).name}: ${(err as Error).message}`);
+}
+console.log(`default manager is shared: ${LogManager.default === LogManager.default}`);
+```
+
+## Demo output
+
+```text
+same instance: true
+levels: orders=INFO payments.upi=DEBUG marketdata.nse=ERROR
+09:15:00 INFO  [orders] order placed {orderId=ORD-1 qty=10 env=prod}
+09:15:02 INFO  [payments.upi] KYC check for PAN [PAN], phone [PHONE] {env=prod}
+09:15:03 ERROR [payments.upi] PSP timeout {psp=razorpay attempt=3 env=prod}
+[logging-internal] sink broken-http failed: connection refused
+09:15:03 FATAL [marketdata.nse] feed disconnected {env=prod}
+[logging-internal] sink broken-http failed: connection refused
+--- runtime level change: orders -> DEBUG ---
+--- queries ---
+WARN+       -> #4 ERROR payments.upi: PSP timeout | #5 FATAL marketdata.nse: feed disconnected
+payments.*  -> #2 DEBUG payments.upi: collect request sent | #3 INFO payments.upi: KYC check for PAN [PAN], phone [PHONE] | #4 ERROR payments.upi: PSP timeout
+orders      -> #1 INFO orders: order placed | #6 DEBUG orders: now visible in memory only (console is INFO+)
+text "kyc"  -> #3 INFO payments.upi: KYC check for PAN [PAN], phone [PHONE]
+09:15:01-02 -> #2 DEBUG payments.upi: collect request sent | #3 INFO payments.upi: KYC check for PAN [PAN], phone [PHONE]
+sink failures: {"broken-http":2}
+--- JSON formatter ---
+{"ts":"2026-01-05T09:15:03.000Z","level":"FATAL","module":"marketdata.nse","msg":"feed disconnected","env":"prod"}
+LoggingConfigError: Invalid module name "Bad Module"
+default manager is shared: true
+```
+
+Read the output against the code. The two "this is dropped" calls never consumed a sequence number, because `Logger`'s early level check returned before a record was built. That's why memory holds `#1…#6` with no gaps. The chain's `LevelFilterHandler` is a second line of defence for records that enter the chain another way (for example, a bridge from a third-party library). PAN and phone are masked before *any* sink sees them. The broken HTTP sink failed twice (it only takes ERROR+) without stopping the console or memory sinks. After the runtime change, `orders` debug record `#6` goes to memory but not to the INFO+ console.
+
+## Concurrency
+
+Microsoft's version asks you to *buffer logs from many modules and stream them to a tool with acknowledgement*. That's an async sink, and it has three classic bugs:
+
+1. **Overlapping flushes.** A size-triggered flush and a timer-triggered flush both run while the first is awaiting the network. If both send "the current buffer", records are shipped twice.
+2. **Lost records on failure.** The buffer is cleared before the ack, then the send fails.
+3. **Unbounded memory.** The tool is down, and the buffer grows forever.
+
+The fixes: **swap the buffer out synchronously** before awaiting, allow **one in-flight flush** (others await it, i.e. single-flight), **requeue on a failed ack** at the front to preserve order, and **bound the buffer** with a drop-oldest policy plus a dropped counter.
+
+```ts
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+interface Transport { send(batch: readonly string[]): Promise<{ ack: boolean }> }
+
+class FlakyTransport implements Transport {
+  readonly received: string[] = [];
+  private calls = 0;
+  constructor(private readonly failOnCall: number) {}
+  async send(batch: readonly string[]): Promise<{ ack: boolean }> {
+    this.calls++;
+    await sleep(10);
+    if (this.calls === this.failOnCall) return { ack: false };
+    this.received.push(...batch);
+    return { ack: true };
+  }
+}
+
+// ❌ Reads the shared buffer after awaiting and clears it at the end.
+class NaiveBatchSink {
+  private buffer: string[] = [];
+  constructor(private readonly transport: Transport) {}
+  write(line: string): void { this.buffer.push(line); }
+  async flush(): Promise<void> {
+    if (this.buffer.length === 0) return;
+    await this.transport.send(this.buffer);
+    this.buffer = [];
+  }
+}
+
+// ✅ Swap-then-send, single-flight, requeue on failure, bounded buffer.
+class SafeBatchSink {
+  private buffer: string[] = [];
+  private inFlight: Promise<void> | null = null;
+  dropped = 0;
+
+  constructor(private readonly transport: Transport, private readonly maxBuffer: number) {}
+
+  write(line: string): void {
+    this.buffer.push(line);
+    if (this.buffer.length > this.maxBuffer) {
+      this.buffer.shift();
+      this.dropped++;
+    }
+  }
+
+  flush(): Promise<void> {
+    this.inFlight ??= this.drain().finally(() => { this.inFlight = null; });
+    return this.inFlight;
+  }
+
+  private async drain(): Promise<void> {
+    while (this.buffer.length > 0) {
+      const batch = this.buffer; // swap synchronously: new writes go to a fresh array
+      this.buffer = [];
+      const { ack } = await this.transport.send(batch);
+      if (!ack) {
+        this.buffer = [...batch, ...this.buffer]; // requeue in order, retry later
+        return;
+      }
+    }
+  }
+}
+
+const naiveTransport = new FlakyTransport(-1);
+const naive = new NaiveBatchSink(naiveTransport);
+naive.write('a1');
+naive.write('a2');
+const n1 = naive.flush();
+naive.write('a3'); // arrives while the first send is in flight
+const n2 = naive.flush();
+await Promise.all([n1, n2]);
+console.log(`naive received: ${naiveTransport.received.join(',')}`);
+
+const safeTransport = new FlakyTransport(1); // first send is not acknowledged
+const safe = new SafeBatchSink(safeTransport, 4);
+safe.write('b1');
+safe.write('b2');
+const f1 = safe.flush();
+safe.write('b3');
+const f2 = safe.flush();
+console.log(`same in-flight promise: ${f1 === f2}`);
+await Promise.all([f1, f2]);
+console.log(`after failed ack, received: [${safeTransport.received.join(',')}]`);
+await safe.flush();
+console.log(`after retry, received: [${safeTransport.received.join(',')}]`);
+for (const l of ['c1', 'c2', 'c3', 'c4', 'c5', 'c6']) safe.write(l);
+await safe.flush();
+console.log(`with bound 4: received: [${safeTransport.received.join(',')}], dropped=${safe.dropped}`);
+```
+
+```text
+naive received: a1,a2,a3,a1,a2,a3
+same in-flight promise: true
+after failed ack, received: []
+after retry, received: [b1,b2,b3]
+with bound 4: received: [b1,b2,b3,c3,c4,c5,c6], dropped=2
+
+```
+
+The naive sink sends `a1,a2,a3` and then `a1,a2,a3` again, because the second flush saw the same array. It clears the buffer only after awaiting. The safe sink keeps order across the failed ack, and it drops the two oldest records instead of growing without limit. In Java this is a `BlockingQueue` with a single consumer thread. In Node, one in-flight promise plays the same role.
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|-----------|---------------|
+| **Async logging** | Done above: batching sink with single-flight flush and acknowledgement. Add a timer that calls `flush()` every N ms, and flush on shutdown. |
+| **Log rotation** | A `RotatingFileSink` that rolls files by size or time. Implemented below. |
+| **Sampling / rate limiting** | New handler, e.g. keep 1 in 100 DEBUG records, or at most N per second per module. |
+| **Trace / request IDs** | `EnrichmentHandler` reading from `AsyncLocalStorage` in Node. |
+| **Config from file / remote** | `LevelResolver.set` called by a config watcher. The cache is already invalidated. |
+| **Child loggers with bound context** | `logger.child({ orderId })` returns a logger that merges context, like pino. |
+
+Log rotation. A tiny in-memory file system stands in for `fs`. When the active file reaches `maxLines`, it's renamed `app.log.1`, older files shift up, and anything past `maxFiles` is deleted.
+
+```ts
+interface FileSystem {
+  append(path: string, line: string): void;
+  lineCount(path: string): number;
+  rename(from: string, to: string): void;
+  remove(path: string): void;
+  exists(path: string): boolean;
+  list(): string[];
+  read(path: string): string[];
+}
+
+class MemoryFs implements FileSystem {
+  private readonly files = new Map<string, string[]>();
+  append(path: string, line: string): void { this.files.set(path, [...(this.files.get(path) ?? []), line]); }
+  lineCount(path: string): number { return this.files.get(path)?.length ?? 0; }
+  rename(from: string, to: string): void {
+    const content = this.files.get(from);
+    if (!content) return;
+    this.files.set(to, content);
+    this.files.delete(from);
+  }
+  remove(path: string): void { this.files.delete(path); }
+  exists(path: string): boolean { return this.files.has(path); }
+  list(): string[] { return [...this.files.keys()].sort(); }
+  read(path: string): string[] { return this.files.get(path) ?? []; }
+}
+
+class RotatingFileSink {
+  rotations = 0;
+  constructor(
+    private readonly fs: FileSystem,
+    private readonly path: string,
+    private readonly maxLines: number,
+    private readonly maxBackups: number,
+  ) {
+    if (maxLines < 1 || maxBackups < 0) throw new Error('Invalid rotation config');
+  }
+
+  write(line: string): void {
+    if (this.fs.lineCount(this.path) >= this.maxLines) this.rotate();
+    this.fs.append(this.path, line);
+  }
+
+  private rotate(): void {
+    this.rotations++;
+    this.fs.remove(`${this.path}.${this.maxBackups}`); // oldest falls off
+    for (let i = this.maxBackups - 1; i >= 1; i--) {
+      if (this.fs.exists(`${this.path}.${i}`)) this.fs.rename(`${this.path}.${i}`, `${this.path}.${i + 1}`);
+    }
+    if (this.maxBackups > 0) this.fs.rename(this.path, `${this.path}.1`);
+    else this.fs.remove(this.path);
+  }
+}
+
+const fs = new MemoryFs();
+const sink = new RotatingFileSink(fs, 'app.log', 2, 2);
+for (let i = 1; i <= 7; i++) sink.write(`line ${i}`);
+console.log(`rotations: ${sink.rotations}`);
+for (const file of fs.list()) console.log(`${file}: ${fs.read(file).join(', ')}`);
+```
+
+```text
+rotations: 3
+app.log: line 7
+app.log.1: line 5, line 6
+app.log.2: line 3, line 4
+```
+
+Lines 1 and 2 are gone. With two backups of two lines each plus the active file, at most six lines are kept, and the active file has only started filling again with line 7. Time-based rotation is the same class with a `Clock` and a "has the day changed since the file was opened?" check.
+
+## Edge cases
+
+- The level is disabled: no record is built (early exit), no sequence number is used.
+- A sink throws: the others still receive the record, and the failure is counted.
+- Circular or deep context objects: we restricted context to primitives, which avoids serialization crashes. A real framework needs a safe stringify.
+- PAN or phone numbers inside context values as well as messages: both are redacted.
+- An invalid module name in config: `LoggingConfigError` at setup, not a silent mismatch.
+- Buffer full while the tool is down: drop the oldest and count it (or block or drop the newest, depending on policy; say which).
+- Shutdown: flush pending batches before exit, or logs from the crash itself are lost.
+- Clock goes backwards (NTP): the sequence number, not the timestamp, gives the true order.
+
+## Complexity
+
+| Operation | Cost |
+|-----------|------|
+| Disabled log call | O(1) after the level cache warms (O(depth) the first time) |
+| Enabled log call | O(H + S) for H handlers and S sinks, plus formatting cost |
+| `query` on memory sink | O(n) scan. Add per-level or per-module indexes, or a time-bucketed structure, if it's hot. |
+| Batch flush | O(batch) per send |
+| Rotation | O(maxBackups) renames |
+
+## What graders look for / common mistakes
+
+- **Look for:** a clean chain with a single linking implementation, sink isolation, per-module levels, and a clear singleton story that doesn't hurt tests.
+- **Mistake:** a CoR where each handler re-implements "call next", or forgets to.
+- **Mistake:** a hard Singleton with a private constructor and no reset, so tests leak configuration.
+- **Mistake:** formatting the message before checking the level (wasted work in hot paths).
+- **Mistake:** a sink exception propagating into an order-placement flow. Logging must never break business logic.
+- **Mistake:** an async sink that clears its buffer after `await` (duplicates) or before the ack (loss).
+- **Domain signal (fintech):** redacting PAN, phone, card and account numbers by default.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–10 | Clarify levels, sinks, per-module config, formats, sync vs async, retrieval. |
+| 10–20 | Diagram: `Logger` → `LogManager` → chain → sinks. |
+| 20–50 | Levels, records, formatters, console and memory sinks, handler chain, manager. |
+| 50–60 | Demo: levels, redaction, failing sink, queries. |
+| 60–80 | Batching sink with acknowledgement, or rotation. |
+| 80–90 | Discuss overhead, back-pressure and shutdown flush. |
+
+## Interview Q&A
+
+**Q1. Where exactly is Chain of Responsibility here, and why not just a list of functions?**
+
+<details>
+<summary>Answer</summary>
+
+`LogHandler` subclasses form a linked chain where each one decides whether to transform and pass the record on or stop. A list of functions with a loop is practically the same thing, and it's a perfectly good implementation. The class form helps when handlers carry configuration and state (resolver, redaction rules, failure counters) and when you want them independently testable. The key property is that the sender (`LogManager`) doesn't know which handlers exist.
+
+</details>
+
+**Q2. Singleton or dependency injection for the log manager?**
+
+<details>
+<summary>Answer</summary>
+
+Both, in layers. App code often just wants `LogManager.default.getLogger('x')`, so a lazily created default is convenient. But the constructor stays public, so tests and multi-tenant setups create isolated managers. In NestJS, you'd register it as a provider and inject it. A hard private-constructor singleton makes tests share configuration and is the thing to avoid.
+
+</details>
+
+**Q3. How do you keep logging cheap when DEBUG is off?**
+
+<details>
+<summary>Answer</summary>
+
+Check the level before building anything: `Logger.log` returns early, and the level lookup is cached per module. For expensive messages, expose `isEnabled(level)` or accept a lazy `() => string`. Also avoid string interpolation of large objects at the call site when the level is off.
+
+</details>
+
+**Q4. The log tool is down for 10 minutes. What happens?**
+
+<details>
+<summary>Answer</summary>
+
+The batching sink keeps failed batches (requeued in order) up to a bound, then drops the oldest and increments a counter that we expose as a metric. Alternatives: spill to local disk, or block callers (rarely acceptable). Once the tool is back, the next flush drains the buffer in order. An error-level alert on the dropped counter tells operators that data was lost.
+
+</details>

@@ -1,0 +1,990 @@
+**41. What happens if you forget `await` before an async function call?**
+
+<details>
+<summary>Answer</summary>
+
+You get a pending `Promise` instead of the resolved value, so the code keeps running without waiting. Any error it throws becomes a rejection that your surrounding `try/catch` cannot catch, and if nobody handles it, Node crashes with an unhandled rejection (the default since Node 15).
+
+Three symptoms to name in an interview:
+
+- **Wrong value:** `user.name` is `undefined` because `user` is a Promise.
+- **Race conditions:** the next line runs before the DB write finishes, e.g. you send the response before the row is saved.
+- **Errors slip past `try/catch`:** the rejection happens after the `try` block has already exited.
+
+```js
+async function getUser() {
+  return { name: 'Asha' };
+}
+
+async function main() {
+  const user = getUser();        // ❌ forgot await
+  console.log(user);             // Promise { { name: 'Asha' } }
+  console.log(user.name);        // undefined
+
+  const ok = await getUser();    // ✅
+  console.log(ok.name);          // Asha
+}
+main();
+```
+
+```js
+async function save() {
+  throw new Error('DB down');
+}
+
+async function handler() {
+  try {
+    save();                           // ❌ no await, so the rejection escapes the try
+  } catch (e) {
+    console.log('caught', e.message); // never runs
+  }
+}
+handler(); // ❌ process crashes: Error: DB down (unhandled rejection, exit code 1)
+```
+
+- **Follow-up:** How do you catch this early? Use the `@typescript-eslint/no-floating-promises` and `require-await` lint rules. If you really mean fire-and-forget, say so with `void doWork().catch(log)`.
+- **Pitfall:** `return promise` inside `try` without `await` has the same problem. Use `return await promise` when you want the local `catch` to handle it.
+
+</details>
+
+**42. Why doesn't `await` inside `forEach` work as expected? How do you fix it?**
+
+<details>
+<summary>Answer</summary>
+
+`forEach` calls your callback and throws away its return value. An `async` callback returns a Promise, and `forEach` never awaits it, so the outer function carries on at once. Use `for...of` when the steps must run one after another, or `Promise.all` with `map` when they can run in parallel.
+
+`forEach` is synchronous. It starts every async callback, each one pauses at its own `await`, and then `forEach` returns `undefined`. The outer `await` has nothing to wait on. Errors inside the callbacks also become unhandled rejections.
+
+```js
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function broken() {
+  [3, 1, 2].forEach(async (n) => {
+    await sleep(n * 10);
+    console.log(n);
+  });
+  console.log('done');
+}
+
+async function sequential() {
+  for (const n of [3, 1, 2]) {
+    await sleep(n * 10);
+    console.log(n);
+  }
+  console.log('done');
+}
+
+async function parallel() {
+  const results = await Promise.all(
+    [3, 1, 2].map(async (n) => {
+      await sleep(n * 10);
+      return n * 2;
+    })
+  );
+  console.log(results);
+}
+
+(async () => {
+  await broken();      // done, 1, 2, 3   ("done" prints first!)
+  await sleep(50);
+  await sequential();  // 3, 1, 2, done
+  await parallel();    // [ 6, 2, 4 ]  (input order preserved)
+})();
+```
+
+| Need | Use |
+|---|---|
+| One at a time, order matters | `for...of` with `await` |
+| All at once, fail fast | `await Promise.all(arr.map(async ...))` |
+| All at once, keep partial results | `Promise.allSettled` |
+| Limited concurrency (e.g. 5 API calls at a time) | batching or a library such as `p-limit` |
+
+- **Pitfall:** `map`, `filter` and `reduce` don't await either. `arr.filter(async x => ...)` keeps every item, because a Promise is always truthy.
+
+</details>
+
+**43. What is the difference between sequential and parallel async execution? Write both versions.**
+
+<details>
+<summary>Answer</summary>
+
+In **sequential** execution each operation starts only after the previous one finishes, so the total time is the sum of all durations. In **parallel** execution all operations start together and you await them as a group, so the total time is about the slowest one. Use sequential when a step depends on the result of the step before it. Otherwise use parallel.
+
+```js
+const fetchUser = (id) =>
+  new Promise((r) => setTimeout(() => r({ id }), 100)); // fake 100ms API call
+
+async function sequential(ids) {
+  const users = [];
+  for (const id of ids) {
+    users.push(await fetchUser(id)); // waits for each one before starting the next
+  }
+  return users;
+}
+
+async function parallel(ids) {
+  return Promise.all(ids.map((id) => fetchUser(id))); // all start immediately
+}
+
+(async () => {
+  let t = Date.now();
+  await sequential([1, 2, 3]);
+  console.log('sequential', Math.round((Date.now() - t) / 100) * 100); // sequential 300
+
+  t = Date.now();
+  await parallel([1, 2, 3]);
+  console.log('parallel', Math.round((Date.now() - t) / 100) * 100);   // parallel 100
+})();
+```
+
+A common real-world case is a NestJS handler that needs independent data:
+
+```js
+// ❌ ~3 round trips in a row
+const user = await userRepo.findOne(id);
+const orders = await orderRepo.find(id);
+const wallet = await walletRepo.find(id);
+
+// ✅ ~1 round trip
+const [user2, orders2, wallet2] = await Promise.all([
+  userRepo.findOne(id), orderRepo.find(id), walletRepo.find(id),
+]);
+```
+
+- **Pitfall:** "parallel" here means *concurrent I/O*. JS still runs on one thread, so CPU-heavy work gets no speed-up.
+- **Follow-up:** firing 10,000 requests at once can exhaust the DB pool or hit rate limits. Cap concurrency with batches or `p-limit`.
+
+</details>
+
+**44. How do you handle errors in async/await code?**
+
+<details>
+<summary>Answer</summary>
+
+Wrap the awaited calls in `try/catch` (with `finally` for cleanup). A rejected promise that you `await` throws like a synchronous error. For single calls use `.catch()` to supply a fallback value. For batches where partial failure is acceptable use `Promise.allSettled`. Always have a last-resort handler at the top of the app, such as a NestJS exception filter or Express error middleware.
+
+```js
+async function getOrder(id) {
+  if (id < 0) throw new Error('Invalid id');
+  return { id, total: 499 };
+}
+
+// 1. try / catch / finally
+async function handler(id) {
+  try {
+    const order = await getOrder(id);
+    return order.total;
+  } catch (err) {
+    console.log('Failed:', err.message);
+    return null;
+  } finally {
+    console.log('cleanup'); // always runs
+  }
+}
+
+// 2. Go-style tuple helper, which avoids nested try/catch
+async function to(promise) {
+  try {
+    return [null, await promise];
+  } catch (err) {
+    return [err, null];
+  }
+}
+
+(async () => {
+  console.log(await handler(-1));   // Failed: Invalid id, then cleanup, then null
+
+  const [err, order] = await to(getOrder(7));
+  console.log(err, order);          // null { id: 7, total: 499 }
+
+  // 3. .catch() inline for a fallback value
+  const safe = await getOrder(-1).catch(() => ({ id: 0, total: 0 }));
+  console.log(safe);                // { id: 0, total: 0 }
+
+  // 4. Partial failures: allSettled
+  const results = await Promise.allSettled([getOrder(1), getOrder(-1)]);
+  console.log(results.map((r) => r.status)); // [ 'fulfilled', 'rejected' ]
+})();
+```
+
+Best practices:
+- Catch only where you can **do something**, such as retry, fall back, or map to an `HttpException`. Otherwise let the error bubble up to the global filter.
+- Rethrow with context: `throw new Error('Payment failed', { cause: err })`.
+- In TypeScript `err` is `unknown`, so narrow it with `if (err instanceof Error)`.
+- As a safety net, register `process.on('unhandledRejection', ...)` to log the error, then exit.
+
+- **Pitfall:** a `try/catch` only catches promises that are **awaited** inside it (see Q41).
+
+</details>
+
+**45. What is the Proxy object used for? Give a practical example.**
+
+<details>
+<summary>Answer</summary>
+
+A `Proxy` wraps an object and lets you intercept basic operations such as reading, writing, deleting, `in` and function calls, using "traps" in a handler. Common uses are validation, default values, logging and access tracking, and reactivity. Vue 3's reactivity system and MobX are built on Proxy.
+
+Syntax: `new Proxy(target, handler)`. Common traps are `get`, `set`, `has`, `deleteProperty` and `apply`. Inside a trap, `Reflect.*` performs the default behaviour.
+
+```js
+// 1. Validation
+const user = new Proxy({}, {
+  set(target, prop, value) {
+    if (prop === 'age' && (!Number.isInteger(value) || value < 0)) {
+      throw new TypeError('age must be a non-negative integer');
+    }
+    target[prop] = value;
+    return true; // must return true, or strict mode throws
+  },
+});
+
+user.age = 25;
+console.log(user.age);          // 25
+try {
+  user.age = -5;
+} catch (e) {
+  console.log(e.message);       // age must be a non-negative integer
+}
+
+// 2. Negative array indexes (Python style)
+const arr = new Proxy([10, 20, 30], {
+  get(target, prop, receiver) {
+    const i = Number(prop);
+    if (Number.isInteger(i) && i < 0) return target[target.length + i];
+    return Reflect.get(target, prop, receiver);
+  },
+});
+console.log(arr[-1], arr[0], arr.length); // 30 10 3
+
+// 3. Default values + logging access
+const config = new Proxy({ port: 3000 }, {
+  get(target, prop) {
+    console.log(`read ${String(prop)}`);
+    return prop in target ? target[prop] : 'N/A';
+  },
+});
+console.log(config.port);  // read port, then 3000
+console.log(config.host);  // read host, then N/A
+```
+
+- **Pitfall:** a Proxy only intercepts operations on the proxy itself. Mutating the original `target` directly bypasses the traps. Proxies also add overhead, so keep them off hot paths.
+- **Follow-up:** `Object.defineProperty` getters and setters (as in Vue 2) work per property. A Proxy covers the whole object, including properties added later.
+
+</details>
+
+**46. Explain the Observer/EventEmitter pattern. Implement a basic version.**
+
+<details>
+<summary>Answer</summary>
+
+In the Observer pattern a **subject** keeps a list of **observers (listeners)** and notifies all of them when something happens. The emitter doesn't need to know what the listeners do, which gives loose coupling. Node's `EventEmitter`, DOM `addEventListener`, and NestJS `@nestjs/event-emitter` all follow this pattern.
+
+Core API: `on` (subscribe), `off` (unsubscribe), `once` (auto-remove after the first call) and `emit` (notify all listeners synchronously, in registration order).
+
+```js
+class EventEmitter {
+  #events = new Map(); // eventName -> Set of listeners
+
+  on(event, listener) {
+    if (!this.#events.has(event)) this.#events.set(event, new Set());
+    this.#events.get(event).add(listener);
+    return () => this.off(event, listener); // handy unsubscribe
+  }
+
+  off(event, listener) {
+    this.#events.get(event)?.delete(listener);
+  }
+
+  once(event, listener) {
+    const wrapper = (...args) => {
+      this.off(event, wrapper);
+      listener(...args);
+    };
+    return this.on(event, wrapper);
+  }
+
+  emit(event, ...args) {
+    const listeners = this.#events.get(event);
+    if (!listeners?.size) return false; // like Node: false when nobody listens
+    [...listeners].forEach((fn) => fn(...args)); // copy: safe if a listener unsubscribes
+    return true;
+  }
+}
+
+const orders = new EventEmitter();
+const unsubscribe = orders.on('created', (o) => console.log('email for', o.id));
+orders.once('created', (o) => console.log('first order bonus', o.id));
+
+orders.emit('created', { id: 1 }); // email for 1, first order bonus 1
+orders.emit('created', { id: 2 }); // email for 2
+unsubscribe();
+console.log(orders.emit('created', { id: 3 })); // false
+```
+
+Walkthrough: a `Map` of `Set`s gives O(1) add and remove and prevents duplicate registration. `emit` iterates over a **copy** so that `once` wrappers removing themselves during iteration don't cause problems.
+
+- **Pitfall:** listeners that are never removed are a classic memory leak. Node warns with `MaxListenersExceededWarning` after 10 listeners on one event.
+- **Follow-up:** Node's `emit('error')` with no listener **throws**. Mention this if asked how Node differs.
+
+</details>
+
+**47. What is a memory leak? Give 3 common causes and how to avoid them.**
+
+<details>
+<summary>Answer</summary>
+
+A memory leak is memory that your program no longer needs but that is still **reachable** from a GC root (globals, the active stack, closures, timers, listeners), so the garbage collector can't free it. In a long-running Node server, heap usage keeps climbing until the process slows down from GC pressure or crashes with an out-of-memory error.
+
+| Cause | Why it leaks | Fix |
+|---|---|---|
+| Event listeners / subscriptions not removed | The emitter holds the callback, and the callback's closure holds components or big data | `removeEventListener`, `off`, `unsubscribe()`, and cleanup in React's `useEffect` return |
+| Timers not cleared | `setInterval` keeps its closure alive forever | `clearInterval` / `clearTimeout` on unmount or shutdown |
+| Unbounded caches / global collections | A module-level `Map` or array grows with every request | LRU cache with a max size or TTL, `WeakMap` for object keys, or Redis |
+
+Other causes: accidental globals (assigning to an undeclared variable in sloppy mode), closures that capture large objects, and detached DOM nodes still referenced from JS.
+
+```js
+// 1 + 2. React: clean up listeners and timers
+useEffect(() => {
+  const onResize = () => setWidth(window.innerWidth);
+  window.addEventListener('resize', onResize);
+  const id = setInterval(refresh, 5000);
+  return () => {                                   // ✅ runs on unmount
+    window.removeEventListener('resize', onResize);
+    clearInterval(id);
+  };
+}, []);
+
+// 3. Node: an unbounded cache grows forever in a long-lived process
+const cache = new Map();                           // ❌ one entry per user id, never evicted
+async function getUser(id) {
+  if (!cache.has(id)) cache.set(id, await db.findUser(id));
+  return cache.get(id);
+}
+// ✅ use an LRU with a max size / TTL, or a WeakMap when keys are objects
+const meta = new WeakMap(); // entry disappears when the key object is garbage-collected
+```
+
+- **How to detect it:** watch `process.memoryUsage().heapUsed` over time, take heap snapshots in Chrome DevTools (`node --inspect`) and compare them. Look for growing object counts and their "retainers".
+
+</details>
+
+**48. What is the difference between CommonJS and ES Modules?**
+
+<details>
+<summary>Answer</summary>
+
+CommonJS (`require` / `module.exports`) is Node's original module system. It loads modules **synchronously at runtime**, and you can call `require` anywhere. ES Modules (`import` / `export`) are the standard JavaScript module system. They are **static**: imports are resolved before the code runs, loading is async-capable, and top-level `await` is supported. Because of this, tools can analyse ESM and tree-shake it.
+
+| | CommonJS | ES Modules |
+|---|---|---|
+| Syntax | `require()`, `module.exports` | `import`, `export` |
+| When resolved | Runtime, synchronously | Parse time (static), async loading |
+| Conditional/dynamic import | `require` anywhere | Only via `await import()` |
+| Exported values | A **copy** of `module.exports` at require time | **Live bindings** (you see the exporter's updates) |
+| Top-level `await` | ❌ | ✅ |
+| `this` at top level | `module.exports` | `undefined` |
+| `__dirname`, `__filename` | ✅ | ❌ (use `import.meta.dirname` / `import.meta.url`) |
+| Strict mode | Opt-in | Always strict |
+| Tree-shaking | Hard or impossible | ✅ |
+| Enable in Node | Default for `.js` / `.cjs` | `.mjs` or `"type": "module"` in package.json |
+
+```js
+// CommonJS
+const { hash } = require('./crypto');
+module.exports = { login };
+
+// ES Modules
+import { hash } from './crypto.js'; // file extension required in Node ESM
+export function login() {}
+const { default: chalk } = await import('chalk'); // dynamic import
+```
+
+- **Interop:** ESM can `import` a CJS module (you get `module.exports` as the default). Recent Node versions (22.12+) can also `require()` synchronous ESM.
+- **Follow-up:** NestJS compiles to CommonJS by default (`"module": "commonjs"` in tsconfig), which is why some ESM-only packages need `await import()` or a newer Node.
+
+</details>
+
+**49. What is tree-shaking and which module system supports it?**
+
+<details>
+<summary>Answer</summary>
+
+Tree-shaking is dead-code elimination done by bundlers (Webpack, Rollup, Vite/esbuild): **exports that are never imported are dropped from the final bundle**. It relies on **ES Modules**, because `import` and `export` are static. The bundler can see exactly what is used without running the code. CommonJS `require` is dynamic, so it generally can't be tree-shaken reliably.
+
+```js
+// utils.js
+export function formatPrice(n) { return `₹${n}`; }
+export function heavyChart() { /* 50 KB of code */ }
+
+// app.js
+import { formatPrice } from './utils.js';
+// heavyChart is never imported, so it is removed from the production bundle
+```
+
+Why CommonJS blocks it:
+
+```js
+const utils = require('./utils');                   // whole object, resolved at runtime
+const fn = require(`./locales/${lang}`);            // path only known at runtime
+module.exports[cond ? 'a' : 'b'] = () => {};        // export names only known at runtime
+```
+
+Requirements for effective tree-shaking:
+- Ship and import ESM builds (`lodash-es` instead of `lodash`), and use named imports: `import { debounce } from 'lodash-es'`.
+- Mark packages as side-effect free: `"sideEffects": false` in package.json. Otherwise the bundler keeps modules that might run code on import (polyfills, CSS).
+- Build in production mode, since minifiers such as Terser remove the unused code.
+- Keep TypeScript `"module"` set to an ES target for frontend builds, so `tsc` doesn't convert imports to `require`.
+
+- **Pitfall:** `import * as _ from 'lodash'` (CJS build) pulls in the whole library, about 70 KB.
+
+</details>
+
+**50. What is the difference between `structuredClone()` and spread clone?**
+
+<details>
+<summary>Answer</summary>
+
+Spread (`{ ...obj }` or `[...arr]`) is a **shallow** copy. Only the top level is new, and nested objects are still shared references. `structuredClone()` is a built-in **deep** copy. It handles nested objects, `Date`, `Map`, `Set`, typed arrays and even circular references. It **cannot** clone functions, DOM nodes or class prototypes.
+
+```js
+const original = {
+  name: 'Asha',
+  address: { city: 'Pune' },
+  joined: new Date('2024-01-01'),
+  tags: new Set(['admin']),
+};
+
+const shallow = { ...original };
+const deep = structuredClone(original);
+
+original.address.city = 'Delhi';
+
+console.log(shallow.address.city);        // Delhi  (shared reference!)
+console.log(deep.address.city);           // Pune   (independent copy)
+console.log(deep.joined instanceof Date); // true   (JSON would give a string)
+console.log(deep.tags.has('admin'));      // true
+
+// Circular references work
+const a = { name: 'a' };
+a.self = a;
+const b = structuredClone(a);
+console.log(b.self === b);                // true
+
+// Limits
+try {
+  structuredClone({ fn: () => 1 });
+} catch (e) {
+  console.log(e.name);                    // DataCloneError
+}
+
+class User { greet() { return 'hi'; } }
+const u = structuredClone(new User());
+console.log(u instanceof User);           // false (prototype lost, becomes a plain object)
+```
+
+| | Spread | `JSON.parse(JSON.stringify())` | `structuredClone` |
+|---|---|---|---|
+| Depth | Shallow | Deep | Deep |
+| `Date`, `Map`, `Set` | Kept (same reference) | ❌ Date becomes string, Map/Set become `{}` | ✅ |
+| `undefined`, functions | Copied (same reference) | Silently dropped | `undefined` ✅, functions throw |
+| Circular refs | ✅ (shared) | ❌ throws | ✅ |
+| Speed | Fastest | Slow | Moderate |
+
+- **Use:** spread for immutable updates in React/Redux, where you copy only the path you change. Use `structuredClone` when you need a truly independent copy, for example before mutating a config or test fixture.
+
+</details>
+
+**51. What is the difference between `Object.keys()`, `Object.values()`, `Object.entries()`, and `Object.fromEntries()`?**
+
+<details>
+<summary>Answer</summary>
+
+The first three read an object's **own enumerable string-keyed** properties into arrays: `keys` returns the property names, `values` returns the values, and `entries` returns `[key, value]` pairs. `fromEntries` does the reverse of `entries`: it builds an object from an iterable of pairs. Together, `entries` then `map`/`filter` then `fromEntries` is the standard way to transform an object.
+
+```js
+const prices = { apple: 120, mango: 80, banana: 40 };
+
+console.log(Object.keys(prices));    // [ 'apple', 'mango', 'banana' ]
+console.log(Object.values(prices));  // [ 120, 80, 40 ]
+console.log(Object.entries(prices)); // [ [ 'apple', 120 ], [ 'mango', 80 ], [ 'banana', 40 ] ]
+
+// entries, then transform, then fromEntries: the "map over an object" idiom
+const discounted = Object.fromEntries(
+  Object.entries(prices)
+    .filter(([, price]) => price > 50)
+    .map(([fruit, price]) => [fruit, price * 0.9])
+);
+console.log(discounted); // { apple: 108, mango: 72 }
+
+// fromEntries accepts any iterable of pairs, e.g. a Map or URLSearchParams
+console.log(Object.fromEntries(new URLSearchParams('page=2&limit=10')));
+// { page: '2', limit: '10' }
+
+// Integer-like keys come first, in ascending order
+console.log(Object.keys({ b: 1, 2: 'x', a: 2, 1: 'y' })); // [ '1', '2', 'b', 'a' ]
+```
+
+| Method | Returns | Typical use |
+|---|---|---|
+| `Object.keys(o)` | `string[]` | Count or iterate over properties |
+| `Object.values(o)` | `any[]` | Sum or aggregate values |
+| `Object.entries(o)` | `[string, any][]` | Loop with `for (const [k, v] of ...)` |
+| `Object.fromEntries(iter)` | object | Map to object, query string to object, transform objects |
+
+- **Pitfall:** none of them include inherited or Symbol keys (use `Reflect.ownKeys` for those). In TypeScript, `Object.keys(obj)` is typed as `string[]` rather than `(keyof T)[]`, because an object can have extra properties at runtime.
+
+</details>
+
+**52. How does `Array.prototype.reduce` work? Rewrite `map` and `filter` using `reduce`.**
+
+<details>
+<summary>Answer</summary>
+
+`reduce(callback, initialValue)` walks the array and turns it into **a single value**. That value can be a number, an object, an array or anything else. The callback receives `(accumulator, currentItem, index, array)` and returns the new accumulator, which is passed into the next call. The final accumulator is the result. If you leave out `initialValue`, the first element becomes the accumulator and iteration starts at index 1.
+
+```js
+// reduce(callback(accumulator, current, index, array), initialValue)
+const cart = [{ price: 100, qty: 2 }, { price: 50, qty: 1 }];
+const total = cart.reduce((sum, item) => sum + item.price * item.qty, 0);
+console.log(total); // 250
+
+// map via reduce
+function mapWithReduce(arr, fn) {
+  return arr.reduce((acc, item, i) => {
+    acc.push(fn(item, i, arr));
+    return acc;
+  }, []);
+}
+
+// filter via reduce
+function filterWithReduce(arr, predicate) {
+  return arr.reduce((acc, item, i) => {
+    if (predicate(item, i, arr)) acc.push(item);
+    return acc;
+  }, []);
+}
+
+console.log(mapWithReduce([1, 2, 3], (x) => x * 2));           // [ 2, 4, 6 ]
+console.log(filterWithReduce([1, 2, 3, 4], (x) => x % 2 === 0)); // [ 2, 4 ]
+
+// Group by: a very common real-world reduce
+const users = [{ name: 'A', role: 'admin' }, { name: 'B', role: 'user' }, { name: 'C', role: 'admin' }];
+const byRole = users.reduce((acc, u) => {
+  (acc[u.role] ??= []).push(u.name);
+  return acc;
+}, {});
+console.log(byRole); // { admin: [ 'A', 'C' ], user: [ 'B' ] }
+
+// Pitfall: no initial value on an empty array
+try {
+  [].reduce((a, b) => a + b);
+} catch (e) {
+  console.log(e.message); // Reduce of empty array with no initial value
+}
+```
+
+Walkthrough: both rewrites start with `[]` as the accumulator. `map` pushes every transformed item, and `filter` pushes only the items that pass. Each is O(n). Using `push` instead of `[...acc, item]` matters: spreading on every step makes it O(n²).
+
+- **Pitfall:** always pass an initial value. Without it, reduce throws on an empty array, and for arrays of objects you get the wrong type (the first object becomes the accumulator).
+- **Follow-up:** the built-in `Object.groupBy(users, u => u.role)` (ES2024) now covers the group-by case.
+
+</details>
+
+**53. What is `flatMap`? How is it different from `map` followed by `flat`?**
+
+<details>
+<summary>Answer</summary>
+
+`flatMap(fn)` maps each element and then flattens the result **by exactly one level**. It gives the same result as `arr.map(fn).flat()` (depth 1), but it's a single pass that doesn't allocate the intermediate nested array, so it's slightly faster and reads more clearly. Unlike `flat(depth)`, you can't flatten deeper.
+
+```js
+const sentences = ['hello world', 'good morning'];
+
+console.log(sentences.map((s) => s.split(' ')));
+// [ [ 'hello', 'world' ], [ 'good', 'morning' ] ]
+
+console.log(sentences.flatMap((s) => s.split(' ')));
+// [ 'hello', 'world', 'good', 'morning' ]
+
+// Only ONE level is flattened
+console.log([1, 2].flatMap((x) => [[x, x * 10]])); // [ [ 1, 10 ], [ 2, 20 ] ]
+
+// Filter + map in one pass: return [] to drop, [value] to keep
+const orders = [{ id: 1, paid: true }, { id: 2, paid: false }, { id: 3, paid: true }];
+console.log(orders.flatMap((o) => (o.paid ? [o.id] : []))); // [ 1, 3 ]
+
+// One item to many items
+const cart = [{ sku: 'A', qty: 2 }, { sku: 'B', qty: 1 }];
+console.log(cart.flatMap(({ sku, qty }) => Array(qty).fill(sku))); // [ 'A', 'A', 'B' ]
+```
+
+| | `map().flat()` | `flatMap()` |
+|---|---|---|
+| Passes / allocations | 2 passes plus an intermediate array | 1 pass |
+| Depth | Any (`flat(Infinity)`) | Always 1 |
+| Non-array return | Kept as-is | Kept as-is |
+
+- **Use cases:** splitting or expanding items (one to many), filtering and mapping at once (one to zero or one), and flattening API responses such as `users.flatMap(u => u.orders)`.
+
+</details>
+
+**54. How would you implement memoization? Write a generic `memoize` function.**
+
+<details>
+<summary>Answer</summary>
+
+Memoization caches a function's result for a given set of arguments. Repeat calls with the same inputs return the cached value instead of computing it again. It only works for **pure** functions (same input, same output, no side effects). The implementation is a closure over a `Map` keyed by a serialized form of the arguments.
+
+```ts
+function memoize<Args extends unknown[], R>(
+  fn: (...args: Args) => R,
+  keyFn: (...args: Args) => string = (...args) => JSON.stringify(args),
+): (...args: Args) => R {
+  const cache = new Map<string, R>();
+  return (...args: Args): R => {
+    const key = keyFn(...args);
+    if (cache.has(key)) return cache.get(key)!;
+    const result = fn(...args);
+    cache.set(key, result);
+    return result;
+  };
+}
+
+let calls = 0;
+const slowSquare = (n: number): number => {
+  calls++;
+  return n * n;
+};
+
+const fastSquare = memoize(slowSquare);
+console.log(fastSquare(9), fastSquare(9), calls); // 81 81 1
+
+// Recursive memoization: the recursion must call the memoized version
+const fib: (n: number) => number = memoize((n: number): number =>
+  n < 2 ? n : fib(n - 1) + fib(n - 2),
+);
+console.log(fib(50)); // 12586269025 (instant; naive version makes ~40 billion calls)
+```
+
+Walkthrough:
+- The generics `Args` and `R` keep the original signature, so `fastSquare` is typed `(n: number) => number`.
+- The default key is `JSON.stringify(args)`. Pass a custom `keyFn` when arguments are objects with a cheap unique id, or when JSON would be ambiguous or slow.
+- `cache.has` is checked rather than truthiness, so cached `0`, `''` or `undefined` results still count as hits.
+- Lookup is O(1) plus the cost of building the key. Memory grows with every distinct input.
+
+Things to raise in an interview:
+- **Unbounded cache:** add an LRU or TTL limit in long-running servers (see Q47).
+- **Async functions:** cache the *Promise* so concurrent calls share one request, and delete the entry if the Promise rejects.
+- **Object args:** a `WeakMap` keyed by the object avoids both serialization and leaks.
+- **React:** `useMemo`, `useCallback` and `React.memo` are memoization with a cache size of 1 (the last dependencies).
+
+</details>
+
+**55. What is the Singleton pattern? Implement it using a class with a private static field.**
+
+<details>
+<summary>Answer</summary>
+
+A Singleton ensures a class has **exactly one instance** and provides a global access point to it. Typical examples are a DB connection pool, a config service or a logger. You store the instance in a `static #instance` field that nothing outside the class can see or overwrite. A static `getInstance()` creates it lazily on the first call, and the constructor is made private so nobody can call `new`.
+
+```ts
+class Database {
+  static #instance: Database | null = null; // private static field
+  readonly connectedAt = Date.now();
+
+  private constructor() {                   // blocks `new Database()` at compile time
+    console.log('connecting...');
+  }
+
+  static getInstance(): Database {
+    if (!Database.#instance) {
+      Database.#instance = new Database();
+    }
+    return Database.#instance;
+  }
+}
+
+const a = Database.getInstance(); // connecting...
+const b = Database.getInstance(); // (no log, instance reused)
+console.log(a === b);             // true
+
+// const c = new Database();      // ❌ Error: Constructor of class 'Database' is private and only accessible within the class declaration.
+```
+
+Why `#instance` rather than TypeScript's `private static instance`: `#` is **real runtime privacy**. TypeScript's `private` is only checked at compile time, so plain JS or a `(Database as any).instance = ...` can still reach it. In plain JS, which has no private constructors, you can enforce the rule by throwing in the constructor if `#instance` already exists.
+
+- **Follow-up (JS reality):** Node caches modules, so `export const db = new Database()` is already a singleton per process. In NestJS, providers are singletons by default (`Scope.DEFAULT`), which is why you rarely hand-write this pattern there.
+- **Pitfall:** Singletons are global state. They make unit tests harder, because state leaks between tests and they are hard to mock. Prefer dependency injection, and remember a singleton is per process, not per cluster (PM2 or K8s run many processes).
+
+</details>
+
+**56. Explain the difference between composition and inheritance. Why do many prefer composition?**
+
+<details>
+<summary>Answer</summary>
+
+**Inheritance** models an "is-a" relationship: a subclass extends a parent and inherits all of its behaviour. **Composition** models a "has-a" relationship: an object is built from smaller, independent pieces that it holds or delegates to. Composition is preferred ("favor composition over inheritance", from the Gang of Four book) because it is more flexible. You pick only the behaviour you need, you can swap parts at runtime or in tests, and you avoid deep, fragile class hierarchies.
+
+```js
+// Inheritance: rigid "is-a" tree
+class Animal { eat() { return 'eating'; } }
+class Bird extends Animal { fly() { return 'flying'; } }
+class Penguin extends Bird {} // ❌ inherits fly() it shouldn't have
+console.log(new Penguin().fly()); // flying
+
+// Composition: build objects from small "has-a" behaviours
+const canEat = () => ({ eat: () => 'eating' });
+const canFly = () => ({ fly: () => 'flying' });
+const canSwim = () => ({ swim: () => 'swimming' });
+
+const createDuck = () => ({ ...canEat(), ...canFly(), ...canSwim() });
+const createPenguin = () => ({ ...canEat(), ...canSwim() });
+
+console.log(Object.keys(createDuck()));    // [ 'eat', 'fly', 'swim' ]
+console.log(Object.keys(createPenguin())); // [ 'eat', 'swim' ]
+
+// Class-based composition (what NestJS DI does): inject collaborators
+class OrderService {
+  constructor(payment, notifier) {
+    this.payment = payment;
+    this.notifier = notifier;
+  }
+  place(order) {
+    this.payment.charge(order.amount);
+    this.notifier.send(`Order ${order.id} placed`);
+  }
+}
+const svc = new OrderService(
+  { charge: (amt) => console.log('charged', amt) },
+  { send: (msg) => console.log('sms:', msg) },
+);
+svc.place({ id: 42, amount: 999 }); // charged 999, sms: Order 42 placed
+```
+
+| | Inheritance | Composition |
+|---|---|---|
+| Relationship | is-a | has-a / uses-a |
+| Coupling | Tight: child depends on the parent's internals | Loose: depends on an interface |
+| Flexibility | Fixed at class definition | Mix and swap at runtime |
+| Testing | Hard to isolate the parent | Inject mocks easily |
+| Classic problem | Fragile base class, gorilla-banana problem, deep hierarchies | More wiring code |
+
+- **When inheritance is fine:** shallow, stable, true "is-a" hierarchies, e.g. `class NotFoundError extends HttpException`, or framework base classes.
+- **React angle:** React explicitly recommends composition (children, props, hooks) over component inheritance. Custom hooks are composition of behaviour.
+
+</details>
+
+**57. What is debounce vs throttle? Implement both.**
+
+<details>
+<summary>Answer</summary>
+
+**Debounce** waits until calls **stop** for a given delay and then runs once, with the last arguments. Use it for search-as-you-type, auto-save and window-resize end. **Throttle** runs **at most once per interval** however often it is called. Use it for scroll or mousemove handlers, analytics pings and rate-limited APIs.
+
+```js
+function debounce(fn, delay) {
+  let timer;
+  return function (...args) {
+    clearTimeout(timer);                               // reset on every call
+    timer = setTimeout(() => fn.apply(this, args), delay);
+  };
+}
+
+function throttle(fn, interval) {
+  let last = 0;
+  return function (...args) {
+    const now = Date.now();
+    if (now - last >= interval) {                      // ignore calls inside the window
+      last = now;
+      fn.apply(this, args);
+    }
+  };
+}
+
+const search = debounce((q) => console.log('search:', q), 300);
+const onScroll = throttle((y) => console.log('scroll:', y), 100);
+
+// Simulate a user typing "nest" quickly (one key every 50ms)
+['n', 'ne', 'nes', 'nest'].forEach((q, i) => setTimeout(() => search(q), i * 50));
+// search: nest   (once, 300ms after the last key)
+
+// Simulate scroll events every 20ms for ~250ms
+for (let t = 0; t <= 240; t += 20) setTimeout(() => onScroll(t), t);
+// scroll: 0, scroll: ~100-120, scroll: ~220-240  (at most one per 100ms; exact values vary with timer jitter)
+```
+
+Walkthrough:
+- **Debounce:** each call cancels the pending timer and starts a new one, so `fn` only fires after `delay` ms of silence. It is trailing-edge.
+- **Throttle:** remembers when it last ran and drops calls inside the window. This version is leading-edge: it fires immediately, and the calls dropped at the end are lost. Lodash's `throttle` also has a trailing call so the final value isn't lost.
+- `function` plus `fn.apply(this, args)` keeps `this` intact when these wrap object methods.
+
+| | Debounce | Throttle |
+|---|---|---|
+| Fires | After a pause | At a steady rate |
+| 10 rapid calls | 1 execution | About (duration / interval) executions |
+| Example | Search API call | Infinite scroll position check |
+
+- **React pitfall:** `debounce(...)` inside a component body creates a new debounced function on every render, so it never debounces. Wrap it in `useMemo` or `useRef`, and cancel the pending timer on unmount.
+
+</details>
+
+**58. What is the difference between `setTimeout(fn, 0)` and `setImmediate(fn)` in Node.js?**
+
+<details>
+<summary>Answer</summary>
+
+`setTimeout(fn, 0)` queues `fn` in the event loop's **timers** phase, after at least 1ms (Node clamps 0 to 1). `setImmediate(fn)` queues it in the **check** phase, which runs right after the poll (I/O) phase. From the main module, their order is **non-deterministic**. Inside an I/O callback, `setImmediate` **always** runs first, because the loop goes poll, then check, then around to timers.
+
+Node event loop phases, in order: **timers**, pending callbacks, idle/prepare, **poll** (I/O), **check** (`setImmediate`), close callbacks. Microtasks (`process.nextTick`, Promises) run between every callback.
+
+```js
+const fs = require('node:fs');
+
+// In the main module: order is NOT guaranteed (depends on process performance)
+setTimeout(() => console.log('main: timeout'), 0);
+setImmediate(() => console.log('main: immediate'));
+
+// Inside an I/O callback: setImmediate ALWAYS runs first
+fs.readFile(__filename, () => {
+  setTimeout(() => console.log('io: timeout'), 0);
+  setImmediate(() => console.log('io: immediate'));
+});
+
+// Possible output (the first two lines can swap between runs):
+// main: timeout
+// main: immediate
+// io: immediate
+// io: timeout
+```
+
+Why the main-module order varies: when the loop starts, it checks whether 1ms has already passed. If it has, the timer fires in the timers phase first. If not, the loop moves on and `setImmediate` runs first in the check phase.
+
+| | `setTimeout(fn, 0)` | `setImmediate(fn)` |
+|---|---|---|
+| Phase | Timers | Check |
+| Minimum delay | ~1ms | None (next check phase) |
+| Order in an I/O callback | After immediate | Always first |
+| Available in browsers | ✅ | ❌ (Node only) |
+
+- **Use:** `setImmediate` to split CPU-heavy work into chunks so that I/O can run in between without starving the loop.
+
+</details>
+
+**59. What is `process.nextTick` in Node.js and how does it compare to Promise microtasks?**
+
+<details>
+<summary>Answer</summary>
+
+`process.nextTick(fn)` schedules `fn` to run **immediately after the current operation**, before the event loop continues and before any I/O or timers. In CommonJS, the whole nextTick queue is drained **before** the Promise microtask queue. Both run ahead of all macrotasks (`setTimeout`, `setImmediate`, I/O).
+
+Order in a CommonJS module: synchronous code, then the `process.nextTick` queue, then Promise / `queueMicrotask` callbacks, then macrotasks.
+
+```js
+console.log('1 sync');
+
+setTimeout(() => console.log('6 timeout'), 0);
+
+Promise.resolve().then(() => console.log('4 promise'));
+process.nextTick(() => console.log('3 nextTick'));
+queueMicrotask(() => console.log('5 queueMicrotask'));
+
+console.log('2 sync');
+// CommonJS output: 1 sync, 2 sync, 3 nextTick, 4 promise, 5 queueMicrotask, 6 timeout
+```
+
+| | `process.nextTick` | Promise `.then` / `queueMicrotask` |
+|---|---|---|
+| Queue | Node's own nextTick queue | V8 microtask queue |
+| Priority | Higher (drained first, in CJS) | After nextTick |
+| Environment | Node only | Browser + Node (standard) |
+| Typical use | Emit events or errors asynchronously after the constructor returns, inside Node internals | App-level async logic |
+
+- **ESM gotcha:** save the same code as `.mjs` and the output becomes `1, 2, 4 promise, 5 queueMicrotask, 3 nextTick, 6`. An ES module is evaluated inside a microtask, so the Promise queue is drained before Node gets to process nextTicks.
+- **Pitfall (starvation):** a recursive `nextTick` or microtask chain blocks the event loop. Timers and I/O can't run until the chain ends:
+
+```js
+// Recursive nextTick starves the event loop: the timer waits for the whole chain
+let n = 0;
+setTimeout(() => console.log('timeout finally runs'), 0);
+function spin() {
+  if (++n > 1e6) return console.log('nextTick chain done');
+  process.nextTick(spin);
+}
+spin();
+// nextTick chain done
+// timeout finally runs
+```
+
+The Node docs recommend `queueMicrotask` or `setImmediate` over `nextTick` for most user code.
+
+</details>
+
+**60. How would you implement a simple pub/sub system in JavaScript?**
+
+<details>
+<summary>Answer</summary>
+
+Use a **broker** object that maps topic names to sets of handlers. `subscribe(topic, handler)` registers a handler and returns an unsubscribe function, and `publish(topic, data)` calls every handler for that topic. Publishers and subscribers never reference each other. They only share the broker and the topic name, which is what separates pub/sub from a plain observer, where subscribers attach directly to the subject.
+
+```js
+class PubSub {
+  #topics = new Map(); // topic -> Set<handler>
+
+  subscribe(topic, handler) {
+    if (!this.#topics.has(topic)) this.#topics.set(topic, new Set());
+    this.#topics.get(topic).add(handler);
+    return () => {                              // unsubscribe function
+      const handlers = this.#topics.get(topic);
+      handlers?.delete(handler);
+      if (handlers?.size === 0) this.#topics.delete(topic); // avoid leaking empty topics
+    };
+  }
+
+  publish(topic, data) {
+    const handlers = this.#topics.get(topic);
+    if (!handlers) return 0;
+    for (const handler of [...handlers]) {
+      try {
+        handler(data);                          // one bad subscriber shouldn't break the rest
+      } catch (err) {
+        console.error(`handler for "${topic}" failed:`, err.message);
+      }
+    }
+    return handlers.size;
+  }
+}
+
+// Usage: publisher and subscribers only know the broker + topic name
+const bus = new PubSub();
+
+const unsubEmail = bus.subscribe('order.placed', (o) => console.log('email to', o.user));
+bus.subscribe('order.placed', (o) => console.log('reserve stock for', o.id));
+bus.subscribe('order.placed', () => { throw new Error('analytics down'); });
+
+console.log(bus.publish('order.placed', { id: 101, user: 'asha@x.com' }));
+// email to asha@x.com
+// reserve stock for 101
+// handler for "order.placed" failed: analytics down
+// 3
+
+unsubEmail();
+console.log(bus.publish('order.placed', { id: 102, user: 'ravi@x.com' }));
+// reserve stock for 102
+// handler for "order.placed" failed: analytics down
+// 2
+console.log(bus.publish('user.signup', {})); // 0
+```
+
+Design points worth mentioning:
+- **Map of Sets:** O(1) subscribe and unsubscribe, and no duplicate handlers.
+- **Returned unsubscribe:** fits React's `useEffect(() => bus.subscribe(...), [])` cleanup directly and prevents leaks.
+- **Error isolation:** each handler runs in its own `try/catch`.
+- **Iterate over a copy** so handlers can unsubscribe while `publish` is running.
+
+Possible extensions: async delivery (`queueMicrotask(() => handler(data))`) so the publisher never blocks, wildcard topics (`order.*`), and replaying the last message to late subscribers.
+
+- **Follow-up:** this is in-process only. Across services or multiple Node instances, use Redis Pub/Sub, Kafka, RabbitMQ or NestJS microservice transports, which add persistence, retries and delivery guarantees.
+
+</details>

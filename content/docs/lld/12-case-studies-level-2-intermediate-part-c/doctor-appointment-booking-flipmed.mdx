@@ -1,0 +1,1027 @@
+---
+title: "12.2 Doctor Appointment Booking (\"FlipMed\")"
+---
+
+## Problem & where it's asked
+
+Build an in-memory appointment system for a clinic network. Doctors register with a speciality and declare the 60-minute slots when they are available. Patients search by speciality, book a slot, cancel, and can join a waitlist for a slot someone else has already booked. Search results are ordered by a **pluggable ranking strategy**.
+
+- **Flipkart SDE-2 (reported):** the "FlipMed" machine-coding prompt, also seen as "FlipFin". Its core requirements are to register doctors by speciality, declare slots, search and book, run a waitlist, and apply a ranking strategy. Reported follow-ups are *add a new ranking strategy* and *cancellation with waitlist promotion*; a "trending doctor" query is a likely add-on (inferred). Flipkart grades on readability, SOLID (especially SRP, OCP and DIP), extensibility, edge cases, exception handling and **working code**.
+- **The same skeleton covers gym and class booking.** **PhonePe SDE-1 (reported, Jul 2025)** asked for user tiers (Platinum, Gold, Silver), admin-created classes, booking with a waitlist, cancellation up to 30 minutes before a class, and thread safety. **Flipkart** (gym onboarding and slot management) and **Meesho SDE-3** (a gym portal with admin and customer views) are also reported. The gym variant is implemented as this problem's extension.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Slot length? | Exactly 60 minutes. A doctor may start slots at any minute (09:30–10:30). |
+| Working hours? | 09:00–21:00. Slots outside those hours are rejected. |
+| One day or a calendar? | One clinic day (as in the original prompt). Times are minutes since midnight; a real system would use full timestamps. |
+| Can a patient hold two overlapping appointments with different doctors? | No. That is a conflict. |
+| How many patients per slot? | One (capacity 1). The gym variant raises it. |
+| Waitlist behaviour? | FIFO per (doctor, slot). When the booking is cancelled, the first waitlisted patient *without a clash* is booked automatically and notified. |
+| Default ranking? | Earliest slot first (ties broken by higher rating). Must be swappable, for example to rating-first. |
+| Can you cancel after the slot starts? | No. |
+| Payments? | Out of scope for the core; used in the concurrency discussion. |
+
+## Requirements
+
+**Functional**
+1. Register a doctor (name, speciality, rating) and a patient.
+2. A doctor declares one or more slots; validate the 60-minute length, working hours and overlaps.
+3. Search available slots by speciality, ranked by a strategy (default or passed per call).
+4. Book a slot; reject double booking and patient clashes.
+5. Join a waitlist for a booked slot; cancel a booking, which promotes from the waitlist.
+6. View a patient's appointments and a doctor's schedule; find the trending doctor (most bookings).
+
+**Non-functional:** in-memory; clean layering (repository → service → driver); every failure is a typed error with a helpful message; new ranking strategies need no service changes; deterministic (injected clock and ids).
+
+**Out of scope:** payments, multi-day calendars, authentication, persistence, notification delivery channels (we only emit events).
+
+## Entities & relationships
+
+| Entity | Key fields | Notes |
+|---|---|---|
+| `Doctor` | id, name, speciality, rating | Has many slots and many bookings |
+| `Patient` | id, name | Has many bookings; can wait on many slots |
+| Slot | (doctorId, start) | Stored as a set of start minutes per doctor. It isn't a class because it has no behaviour. |
+| `Booking` | id, doctorId, patientId, start, status | At most **one CONFIRMED booking per slot** |
+| Waitlist | queue of patientIds per slot key | FIFO |
+| `SlotRankingStrategy` | `rank(candidates)` | `EarliestSlotFirst`, `HighestRatedFirst` |
+| `AppointmentListener` | `onEvent(event)` | Observer: notifications, analytics |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class DoctorService {
+        +register(name, speciality, rating) Doctor
+        +declareSlots(doctorId, ranges) string[]
+    }
+    class AppointmentService {
+        +registerPatient(name) Patient
+        +search(speciality, strategy) SlotCandidate[]
+        +book(patientId, doctorId, time) Booking
+        +joinWaitlist(patientId, doctorId, time) number
+        +cancel(bookingId) Booking
+        +trendingDoctor() string
+    }
+    class SlotRankingStrategy {
+        <<interface>>
+        +rank(candidates) SlotCandidate[]
+    }
+    class EarliestSlotFirst
+    class HighestRatedFirst
+    class AppointmentListener {
+        <<interface>>
+        +onEvent(event) void
+    }
+    class DoctorRepository
+    class PatientRepository
+    class SlotRepository
+    class BookingRepository
+    class WaitlistRepository
+    DoctorService --> DoctorRepository
+    DoctorService --> SlotRepository
+    AppointmentService --> DoctorRepository
+    AppointmentService --> PatientRepository
+    AppointmentService --> SlotRepository
+    AppointmentService --> BookingRepository
+    AppointmentService --> WaitlistRepository
+    AppointmentService --> SlotRankingStrategy
+    AppointmentService --> AppointmentListener
+    SlotRankingStrategy <|.. EarliestSlotFirst
+    SlotRankingStrategy <|.. HighestRatedFirst`} />
+
+A booking's life is short, but drawing it out makes the waitlist rule obvious:
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> Waitlisted : slot already booked
+    [*] --> Confirmed : slot free
+    Waitlisted --> Confirmed : booker cancels and patient has no clash
+    Waitlisted --> [*] : skipped due to clash
+    Confirmed --> Cancelled : cancel before start
+    Cancelled --> [*]`} />
+
+## Design decisions & patterns
+
+- **Strategy for ranking.** This is the explicit extensibility hook in the prompt. `search()` gathers candidates, and the strategy only orders them, so a new "most popular first" strategy is one new class (Open/Closed). The strategy can be injected as a default *or* passed per call, because product teams like A/B testing orderings.
+- **Repositories behind services.** Each map lives in one small class. Services hold the business rules: overlap checks, clash checks and promotion. This split is exactly what Flipkart evaluators mean by SRP, and a later swap to a database touches only the repositories.
+- **Observer for side effects.** Booking does not know about SMS or email. It emits `BOOKED`, `CANCELLED` and `PROMOTED` events to listeners. That keeps `AppointmentService` testable and lets you add analytics (for example, "trending") without editing it.
+- **A slot is a value, not an entity.** A `Slot` class with an `isBooked` flag duplicates state that already exists in `BookingRepository` (the one CONFIRMED booking per slot key). One source of truth means you can't get "slot says free, booking says taken" bugs.
+- **Validate everything before mutating anything.** `declareSlots` checks all ranges first, then adds them. A half-applied batch is a classic silent bug.
+- **Rejected:** a `Doctor.book()` method (a rich domain object would need access to patients and the waitlist, which drags repositories into entities); an inheritance tree of doctor types per speciality (speciality is data, so use an enum).
+
+## Implementation
+
+**Part 1: errors, clock, ids and time helpers.**
+
+```ts
+class FlipMedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends FlipMedError {}
+class NotFoundError extends FlipMedError {}
+class SlotUnavailableError extends FlipMedError {}
+class ConflictError extends FlipMedError {}
+
+/** Minutes since 00:00 on the clinic day. */
+interface Clock {
+  now(): number;
+}
+class ManualClock implements Clock {
+  constructor(private minutes: number) {}
+  now(): number {
+    return this.minutes;
+  }
+  set(hhmm: string): void {
+    this.minutes = parseTime(hhmm);
+  }
+}
+
+interface IdGenerator {
+  next(prefix: string): string;
+}
+class SequentialIds implements IdGenerator {
+  private readonly counters = new Map<string, number>();
+  next(prefix: string): string {
+    const n = (this.counters.get(prefix) ?? 0) + 1;
+    this.counters.set(prefix, n);
+    return `${prefix}${n}`;
+  }
+}
+
+const SLOT_MINUTES = 60;
+const OPENING = 9 * 60;
+const CLOSING = 21 * 60;
+
+function parseTime(hhmm: string): number {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+  if (!match) throw new ValidationError(`Invalid time "${hhmm}", expected HH:MM`);
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) throw new ValidationError(`Invalid time "${hhmm}"`);
+  return hours * 60 + minutes;
+}
+
+function formatTime(minutes: number): string {
+  const hh = String(Math.floor(minutes / 60)).padStart(2, '0');
+  const mm = String(minutes % 60).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+const slotLabel = (start: number): string => `${formatTime(start)}-${formatTime(start + SLOT_MINUTES)}`;
+const slotKey = (doctorId: string, start: number): string => `${doctorId}@${start}`;
+const overlaps = (a: number, b: number): boolean => Math.abs(a - b) < SLOT_MINUTES;
+```
+
+**Part 2: models and repositories.**
+
+```ts
+enum Speciality {
+  Cardiologist = 'Cardiologist',
+  Dermatologist = 'Dermatologist',
+  Orthopedic = 'Orthopedic',
+  GeneralPhysician = 'GeneralPhysician',
+}
+
+enum BookingStatus {
+  Confirmed = 'CONFIRMED',
+  Cancelled = 'CANCELLED',
+}
+
+interface Doctor {
+  readonly id: string;
+  readonly name: string;
+  readonly speciality: Speciality;
+  readonly rating: number; // 0.0 - 5.0
+}
+
+interface Patient {
+  readonly id: string;
+  readonly name: string;
+}
+
+interface Booking {
+  readonly id: string;
+  readonly doctorId: string;
+  readonly patientId: string;
+  readonly start: number;
+  status: BookingStatus;
+}
+
+class DoctorRepository {
+  private readonly doctors = new Map<string, Doctor>();
+  save(doctor: Doctor): void {
+    this.doctors.set(doctor.id, doctor);
+  }
+  get(id: string): Doctor {
+    const doctor = this.doctors.get(id);
+    if (!doctor) throw new NotFoundError(`Doctor ${id} not found`);
+    return doctor;
+  }
+  bySpeciality(speciality: Speciality): Doctor[] {
+    return [...this.doctors.values()].filter((d) => d.speciality === speciality);
+  }
+}
+
+class PatientRepository {
+  private readonly patients = new Map<string, Patient>();
+  save(patient: Patient): void {
+    this.patients.set(patient.id, patient);
+  }
+  get(id: string): Patient {
+    const patient = this.patients.get(id);
+    if (!patient) throw new NotFoundError(`Patient ${id} not found`);
+    return patient;
+  }
+}
+
+class SlotRepository {
+  private readonly startsByDoctor = new Map<string, Set<number>>();
+  add(doctorId: string, start: number): void {
+    const starts = this.startsByDoctor.get(doctorId) ?? new Set<number>();
+    starts.add(start);
+    this.startsByDoctor.set(doctorId, starts);
+  }
+  has(doctorId: string, start: number): boolean {
+    return this.startsByDoctor.get(doctorId)?.has(start) ?? false;
+  }
+  list(doctorId: string): number[] {
+    return [...(this.startsByDoctor.get(doctorId) ?? [])].sort((a, b) => a - b);
+  }
+}
+
+class BookingRepository {
+  private readonly bookings = new Map<string, Booking>();
+  private readonly confirmedBySlot = new Map<string, string>(); // slotKey -> bookingId
+
+  save(booking: Booking): void {
+    this.bookings.set(booking.id, booking);
+    const key = slotKey(booking.doctorId, booking.start);
+    if (booking.status === BookingStatus.Confirmed) this.confirmedBySlot.set(key, booking.id);
+    else if (this.confirmedBySlot.get(key) === booking.id) this.confirmedBySlot.delete(key);
+  }
+  get(id: string): Booking {
+    const booking = this.bookings.get(id);
+    if (!booking) throw new NotFoundError(`Booking ${id} not found`);
+    return booking;
+  }
+  confirmedFor(doctorId: string, start: number): Booking | undefined {
+    const id = this.confirmedBySlot.get(slotKey(doctorId, start));
+    return id === undefined ? undefined : this.bookings.get(id);
+  }
+  confirmed(filter: (b: Booking) => boolean): Booking[] {
+    return [...this.bookings.values()]
+      .filter((b) => b.status === BookingStatus.Confirmed && filter(b))
+      .sort((a, b) => a.start - b.start);
+  }
+}
+
+class WaitlistRepository {
+  private readonly queues = new Map<string, string[]>();
+  enqueue(doctorId: string, start: number, patientId: string): number {
+    const key = slotKey(doctorId, start);
+    const queue = this.queues.get(key) ?? [];
+    queue.push(patientId);
+    this.queues.set(key, queue);
+    return queue.length;
+  }
+  contains(doctorId: string, start: number, patientId: string): boolean {
+    return this.queues.get(slotKey(doctorId, start))?.includes(patientId) ?? false;
+  }
+  dequeue(doctorId: string, start: number): string | undefined {
+    return this.queues.get(slotKey(doctorId, start))?.shift();
+  }
+}
+```
+
+**Part 3: ranking strategies and the event listener.** A candidate carries the doctor's current booking count, so a popularity strategy needs no extra lookups.
+
+```ts
+interface SlotCandidate {
+  readonly doctor: Doctor;
+  readonly start: number;
+  readonly doctorBookings: number;
+}
+
+interface SlotRankingStrategy {
+  readonly name: string;
+  rank(candidates: readonly SlotCandidate[]): SlotCandidate[];
+}
+
+const byDoctorName = (a: SlotCandidate, b: SlotCandidate): number =>
+  a.doctor.name < b.doctor.name ? -1 : a.doctor.name > b.doctor.name ? 1 : 0;
+
+class EarliestSlotFirst implements SlotRankingStrategy {
+  readonly name = 'earliest slot';
+  rank(candidates: readonly SlotCandidate[]): SlotCandidate[] {
+    return [...candidates].sort(
+      (a, b) => a.start - b.start || b.doctor.rating - a.doctor.rating || byDoctorName(a, b),
+    );
+  }
+}
+
+class HighestRatedFirst implements SlotRankingStrategy {
+  readonly name = 'highest rating';
+  rank(candidates: readonly SlotCandidate[]): SlotCandidate[] {
+    return [...candidates].sort(
+      (a, b) => b.doctor.rating - a.doctor.rating || a.start - b.start || byDoctorName(a, b),
+    );
+  }
+}
+
+type AppointmentEventType = 'BOOKED' | 'CANCELLED' | 'WAITLISTED' | 'PROMOTED';
+
+interface AppointmentEvent {
+  readonly type: AppointmentEventType;
+  readonly patient: Patient;
+  readonly doctor: Doctor;
+  readonly start: number;
+}
+
+interface AppointmentListener {
+  onEvent(event: AppointmentEvent): void;
+}
+
+class ConsoleNotifier implements AppointmentListener {
+  onEvent(e: AppointmentEvent): void {
+    console.log(`  [notify ${e.patient.name}] ${e.type} with ${e.doctor.name} at ${slotLabel(e.start)}`);
+  }
+}
+```
+
+**Part 4: services.** Read `book()` and `cancel()` closely. The order of checks matters: existence first, then time, then availability, then clashes. Each failure is a distinct error type.
+
+```ts
+class DoctorService {
+  constructor(
+    private readonly doctors: DoctorRepository,
+    private readonly slots: SlotRepository,
+    private readonly ids: IdGenerator,
+  ) {}
+
+  register(name: string, speciality: Speciality, rating: number): Doctor {
+    if (!name.trim()) throw new ValidationError('Doctor name is required');
+    if (!(rating >= 0 && rating <= 5)) throw new ValidationError(`Rating must be 0-5, got ${rating}`);
+    const doctor: Doctor = { id: this.ids.next('D'), name: name.trim(), speciality, rating };
+    this.doctors.save(doctor);
+    return doctor;
+  }
+
+  /** Accepts ranges like "09:30-10:30". All ranges are validated before any is stored. */
+  declareSlots(doctorId: string, ranges: readonly string[]): string[] {
+    const doctor = this.doctors.get(doctorId);
+    const existing = this.slots.list(doctorId);
+    const accepted: number[] = [];
+    for (const range of ranges) {
+      const [from, to, ...rest] = range.split('-');
+      if (from === undefined || to === undefined || rest.length > 0) {
+        throw new ValidationError(`Invalid range "${range}", expected HH:MM-HH:MM`);
+      }
+      const start = parseTime(from);
+      const end = parseTime(to);
+      if (end - start !== SLOT_MINUTES) {
+        throw new ValidationError(`${doctor.name}: slots must be exactly 60 minutes ("${range}")`);
+      }
+      if (start < OPENING || end > CLOSING) {
+        throw new ValidationError(`${doctor.name}: "${range}" is outside 09:00-21:00`);
+      }
+      const clash = [...existing, ...accepted].find((s) => overlaps(s, start));
+      if (clash !== undefined) {
+        throw new ConflictError(`${doctor.name}: "${range}" overlaps ${slotLabel(clash)}`);
+      }
+      accepted.push(start);
+    }
+    for (const start of accepted) this.slots.add(doctorId, start);
+    return accepted.map(slotLabel);
+  }
+}
+
+class AppointmentService {
+  constructor(
+    private readonly doctors: DoctorRepository,
+    private readonly patients: PatientRepository,
+    private readonly slots: SlotRepository,
+    private readonly bookings: BookingRepository,
+    private readonly waitlist: WaitlistRepository,
+    private readonly defaultRanking: SlotRankingStrategy,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+    private readonly listeners: readonly AppointmentListener[],
+  ) {}
+
+  registerPatient(name: string): Patient {
+    if (!name.trim()) throw new ValidationError('Patient name is required');
+    const patient: Patient = { id: this.ids.next('P'), name: name.trim() };
+    this.patients.save(patient);
+    return patient;
+  }
+
+  search(speciality: Speciality, strategy: SlotRankingStrategy = this.defaultRanking): SlotCandidate[] {
+    const now = this.clock.now();
+    const candidates: SlotCandidate[] = [];
+    for (const doctor of this.doctors.bySpeciality(speciality)) {
+      const doctorBookings = this.bookings.confirmed((b) => b.doctorId === doctor.id).length;
+      for (const start of this.slots.list(doctor.id)) {
+        if (start > now && !this.bookings.confirmedFor(doctor.id, start)) {
+          candidates.push({ doctor, start, doctorBookings });
+        }
+      }
+    }
+    return strategy.rank(candidates);
+  }
+
+  book(patientId: string, doctorId: string, time: string): Booking {
+    const patient = this.patients.get(patientId);
+    const doctor = this.doctors.get(doctorId);
+    const start = this.requireFutureSlot(doctor, time);
+    if (this.bookings.confirmedFor(doctorId, start)) {
+      throw new SlotUnavailableError(`${doctor.name} ${slotLabel(start)} is taken; join the waitlist instead`);
+    }
+    this.assertNoClash(patient, start);
+    return this.createBooking(patient, doctor, start, 'BOOKED');
+  }
+
+  joinWaitlist(patientId: string, doctorId: string, time: string): number {
+    const patient = this.patients.get(patientId);
+    const doctor = this.doctors.get(doctorId);
+    const start = this.requireFutureSlot(doctor, time);
+    const current = this.bookings.confirmedFor(doctorId, start);
+    if (!current) throw new ValidationError(`${doctor.name} ${slotLabel(start)} is free; book it directly`);
+    if (current.patientId === patientId || this.waitlist.contains(doctorId, start, patientId)) {
+      throw new ConflictError(`${patient.name} is already booked or waiting for this slot`);
+    }
+    const position = this.waitlist.enqueue(doctorId, start, patientId);
+    this.emit('WAITLISTED', patient, doctor, start);
+    return position;
+  }
+
+  cancel(bookingId: string): Booking {
+    const booking = this.bookings.get(bookingId);
+    if (booking.status !== BookingStatus.Confirmed) {
+      throw new ConflictError(`Booking ${bookingId} is already ${booking.status}`);
+    }
+    if (booking.start <= this.clock.now()) {
+      throw new ValidationError(`Booking ${bookingId} has already started and cannot be cancelled`);
+    }
+    booking.status = BookingStatus.Cancelled;
+    this.bookings.save(booking);
+    const doctor = this.doctors.get(booking.doctorId);
+    this.emit('CANCELLED', this.patients.get(booking.patientId), doctor, booking.start);
+    this.promoteFromWaitlist(doctor, booking.start);
+    return booking;
+  }
+
+  appointmentsOf(patientId: string): string[] {
+    this.patients.get(patientId);
+    return this.bookings
+      .confirmed((b) => b.patientId === patientId)
+      .map((b) => `${slotLabel(b.start)} ${this.doctors.get(b.doctorId).name} (${b.id})`);
+  }
+
+  scheduleOf(doctorId: string): string[] {
+    return this.slots.list(doctorId).map((start) => {
+      const booking = this.bookings.confirmedFor(doctorId, start);
+      return `${slotLabel(start)} ${booking ? this.patients.get(booking.patientId).name : 'free'}`;
+    });
+  }
+
+  trendingDoctor(): string {
+    const counts = new Map<string, number>();
+    for (const b of this.bookings.confirmed(() => true)) {
+      counts.set(b.doctorId, (counts.get(b.doctorId) ?? 0) + 1);
+    }
+    let best: [string, number] | undefined;
+    for (const entry of counts) {
+      if (!best || entry[1] > best[1]) best = entry;
+    }
+    return best ? `${this.doctors.get(best[0]).name} (${best[1]} bookings)` : 'none';
+  }
+
+  private promoteFromWaitlist(doctor: Doctor, start: number): void {
+    for (let next = this.waitlist.dequeue(doctor.id, start); next; next = this.waitlist.dequeue(doctor.id, start)) {
+      const patient = this.patients.get(next);
+      if (this.findClash(patient.id, start)) {
+        console.log(`  (skipping ${patient.name}: clashes with another appointment)`);
+        continue;
+      }
+      this.createBooking(patient, doctor, start, 'PROMOTED');
+      return;
+    }
+  }
+
+  private requireFutureSlot(doctor: Doctor, time: string): number {
+    const start = parseTime(time);
+    if (!this.slots.has(doctor.id, start)) {
+      throw new NotFoundError(`${doctor.name} has no slot at ${time}`);
+    }
+    if (start <= this.clock.now()) throw new ValidationError(`Slot ${slotLabel(start)} has already started`);
+    return start;
+  }
+
+  private assertNoClash(patient: Patient, start: number): void {
+    const clash = this.findClash(patient.id, start);
+    if (clash) {
+      throw new ConflictError(`${patient.name} already has ${slotLabel(clash.start)} (${clash.id})`);
+    }
+  }
+
+  private findClash(patientId: string, start: number): Booking | undefined {
+    return this.bookings.confirmed((b) => b.patientId === patientId && overlaps(b.start, start))[0];
+  }
+
+  private createBooking(patient: Patient, doctor: Doctor, start: number, event: AppointmentEventType): Booking {
+    const booking: Booking = {
+      id: this.ids.next('B'),
+      doctorId: doctor.id,
+      patientId: patient.id,
+      start,
+      status: BookingStatus.Confirmed,
+    };
+    this.bookings.save(booking);
+    this.emit(event, patient, doctor, start);
+    return booking;
+  }
+
+  private emit(type: AppointmentEventType, patient: Patient, doctor: Doctor, start: number): void {
+    for (const listener of this.listeners) listener.onEvent({ type, patient, doctor, start });
+  }
+}
+```
+
+**Part 5: the driver.** It wires everything by hand. This is the "composition root", and it is the only place that knows the concrete classes.
+
+```ts
+const clock = new ManualClock(8 * 60);
+const ids = new SequentialIds();
+const doctorsRepo = new DoctorRepository();
+const slotsRepo = new SlotRepository();
+const doctorService = new DoctorService(doctorsRepo, slotsRepo, ids);
+const appointments = new AppointmentService(
+  doctorsRepo,
+  new PatientRepository(),
+  slotsRepo,
+  new BookingRepository(),
+  new WaitlistRepository(),
+  new EarliestSlotFirst(),
+  clock,
+  ids,
+  [new ConsoleNotifier()],
+);
+
+function attempt(label: string, action: () => unknown): void {
+  try {
+    const result = action();
+    console.log(`${label} -> ${typeof result === 'string' || typeof result === 'number' ? result : 'ok'}`);
+  } catch (err) {
+    const e = err as Error;
+    console.log(`${label} -> ${e.name}: ${e.message}`);
+  }
+}
+
+const printSearch = (title: string, rows: SlotCandidate[]): void =>
+  console.log(`${title}: ${rows.map((c) => `${c.doctor.name}(${c.doctor.rating}) ${slotLabel(c.start)}`).join(' | ')}`);
+
+const curious = doctorService.register('Dr Curious', Speciality.Cardiologist, 4.5);
+const dreadful = doctorService.register('Dr Dreadful', Speciality.Dermatologist, 3.9);
+const daring = doctorService.register('Dr Daring', Speciality.Dermatologist, 4.8);
+
+console.log(`Curious slots: ${doctorService.declareSlots(curious.id, ['09:30-10:30', '16:30-17:30']).join(', ')}`);
+console.log(`Dreadful slots: ${doctorService.declareSlots(dreadful.id, ['09:30-10:30', '12:30-13:30']).join(', ')}`);
+console.log(`Daring slots: ${doctorService.declareSlots(daring.id, ['11:30-12:30', '14:30-15:30']).join(', ')}`);
+attempt('2-hour slot', () => doctorService.declareSlots(dreadful.id, ['14:00-16:00']));
+attempt('overlapping slot', () => doctorService.declareSlots(daring.id, ['12:00-13:00']));
+attempt('after hours', () => doctorService.declareSlots(daring.id, ['21:00-22:00']));
+
+const anil = appointments.registerPatient('Anil');
+const bina = appointments.registerPatient('Bina');
+const chetan = appointments.registerPatient('Chetan');
+
+printSearch('Derm, earliest first', appointments.search(Speciality.Dermatologist));
+printSearch('Derm, best rated', appointments.search(Speciality.Dermatologist, new HighestRatedFirst()));
+
+console.log('--- bookings ---');
+const anilBooking = appointments.book(anil.id, dreadful.id, '09:30');
+attempt('Anil double-books 09:30', () => appointments.book(anil.id, curious.id, '09:30'));
+attempt('Bina wants the taken slot', () => appointments.book(bina.id, dreadful.id, '09:30'));
+attempt('Chetan joins waitlist', () => appointments.joinWaitlist(chetan.id, dreadful.id, '09:30'));
+attempt('Bina joins waitlist', () => appointments.joinWaitlist(bina.id, dreadful.id, '09:30'));
+appointments.book(chetan.id, curious.id, '09:30'); // Chetan now clashes with his waitlisted slot
+attempt('Waitlist a free slot', () => appointments.joinWaitlist(anil.id, daring.id, '11:30'));
+
+console.log('--- Anil cancels ---');
+appointments.cancel(anilBooking.id);
+appointments.book(anil.id, daring.id, '14:30');
+appointments.book(bina.id, daring.id, '11:30');
+attempt('Cancel twice', () => appointments.cancel(anilBooking.id));
+attempt('Unknown doctor', () => appointments.book(anil.id, 'D99', '09:30'));
+attempt('No such slot', () => appointments.book(anil.id, curious.id, '10:00'));
+
+printSearch('Derm now', appointments.search(Speciality.Dermatologist));
+console.log(`Bina: ${appointments.appointmentsOf(bina.id).join('; ')}`);
+console.log(`Dreadful schedule: ${appointments.scheduleOf(dreadful.id).join('; ')}`);
+console.log(`Trending: ${appointments.trendingDoctor()}`);
+
+clock.set('10:00');
+const binaFirst = appointments.appointmentsOf(bina.id)[0] ?? '';
+const binaBookingId = /\((B\d+)\)/.exec(binaFirst)?.[1] ?? 'missing';
+attempt('Cancel a started slot', () => appointments.cancel(binaBookingId));
+printSearch('Derm at 10:00', appointments.search(Speciality.Dermatologist));
+```
+
+## Demo output
+
+```text
+Curious slots: 09:30-10:30, 16:30-17:30
+Dreadful slots: 09:30-10:30, 12:30-13:30
+Daring slots: 11:30-12:30, 14:30-15:30
+2-hour slot -> ValidationError: Dr Dreadful: slots must be exactly 60 minutes ("14:00-16:00")
+overlapping slot -> ConflictError: Dr Daring: "12:00-13:00" overlaps 11:30-12:30
+after hours -> ValidationError: Dr Daring: "21:00-22:00" is outside 09:00-21:00
+Derm, earliest first: Dr Dreadful(3.9) 09:30-10:30 | Dr Daring(4.8) 11:30-12:30 | Dr Dreadful(3.9) 12:30-13:30 | Dr Daring(4.8) 14:30-15:30
+Derm, best rated: Dr Daring(4.8) 11:30-12:30 | Dr Daring(4.8) 14:30-15:30 | Dr Dreadful(3.9) 09:30-10:30 | Dr Dreadful(3.9) 12:30-13:30
+--- bookings ---
+  [notify Anil] BOOKED with Dr Dreadful at 09:30-10:30
+Anil double-books 09:30 -> ConflictError: Anil already has 09:30-10:30 (B1)
+Bina wants the taken slot -> SlotUnavailableError: Dr Dreadful 09:30-10:30 is taken; join the waitlist instead
+  [notify Chetan] WAITLISTED with Dr Dreadful at 09:30-10:30
+Chetan joins waitlist -> 1
+  [notify Bina] WAITLISTED with Dr Dreadful at 09:30-10:30
+Bina joins waitlist -> 2
+  [notify Chetan] BOOKED with Dr Curious at 09:30-10:30
+Waitlist a free slot -> ValidationError: Dr Daring 11:30-12:30 is free; book it directly
+--- Anil cancels ---
+  [notify Anil] CANCELLED with Dr Dreadful at 09:30-10:30
+  (skipping Chetan: clashes with another appointment)
+  [notify Bina] PROMOTED with Dr Dreadful at 09:30-10:30
+  [notify Anil] BOOKED with Dr Daring at 14:30-15:30
+  [notify Bina] BOOKED with Dr Daring at 11:30-12:30
+Cancel twice -> ConflictError: Booking B1 is already CANCELLED
+Unknown doctor -> NotFoundError: Doctor D99 not found
+No such slot -> NotFoundError: Dr Curious has no slot at 10:00
+Derm now: Dr Dreadful(3.9) 12:30-13:30
+Bina: 09:30-10:30 Dr Dreadful (B3); 11:30-12:30 Dr Daring (B5)
+Dreadful schedule: 09:30-10:30 Bina; 12:30-13:30 free
+Trending: Dr Daring (2 bookings)
+Cancel a started slot -> ValidationError: Booking B3 has already started and cannot be cancelled
+Derm at 10:00: Dr Dreadful(3.9) 12:30-13:30
+```
+
+Walk through the waitlist part. Chetan was first in the queue, but by the time Anil cancelled he had booked Dr Curious at the same hour, so promotion **skipped** him and booked Bina. Silently double-booking Chetan would be the bug graders look for.
+
+## Concurrency
+
+In this single-threaded, synchronous code, `book()` cannot interleave with another `book()`. The moment you add an `await`, for example a payment call between "is the slot free?" and "save the booking", two requests can both pass the check. That is the **check-then-act** race, and it produces double bookings.
+
+The fix is to **claim first, then await**: synchronously write a `HELD` marker (a lock with an owner), do the slow work, then confirm or release. In a database, the same idea is a unique index on `(doctor_id, slot_start)` where `status = 'CONFIRMED'`, or `SELECT … FOR UPDATE`. In Java, PhonePe's "thread-safe" ask maps to `ConcurrentHashMap.putIfAbsent` on the slot key.
+
+```ts
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+class PaymentGateway {
+  async charge(patient: string): Promise<boolean> {
+    await pause(5);
+    return patient !== 'broke'; // one patient's card is declined
+  }
+}
+
+const gateway = new PaymentGateway();
+
+class NaiveBookingDesk {
+  readonly owners = new Map<string, string>();
+  async book(slot: string, patient: string): Promise<string> {
+    if (this.owners.has(slot)) throw new Error(`${slot} already booked`);
+    await gateway.charge(patient); // ❌ the other request passes the check meanwhile
+    this.owners.set(slot, patient);
+    return `${patient} booked ${slot}`;
+  }
+}
+
+type Claim = { patient: string; state: 'HELD' | 'CONFIRMED' };
+
+class HoldingBookingDesk {
+  readonly claims = new Map<string, Claim>();
+  async book(slot: string, patient: string): Promise<string> {
+    if (this.claims.has(slot)) throw new Error(`${slot} already held by ${this.claims.get(slot)?.patient}`);
+    this.claims.set(slot, { patient, state: 'HELD' }); // claim synchronously, before any await
+    try {
+      if (!(await gateway.charge(patient))) throw new Error(`payment declined for ${patient}`);
+      this.claims.set(slot, { patient, state: 'CONFIRMED' });
+      return `${patient} booked ${slot}`;
+    } catch (err) {
+      this.claims.delete(slot); // release the hold so others can book
+      throw err;
+    }
+  }
+}
+
+function report(results: PromiseSettledResult<string>[]): string {
+  return results.map((r) => (r.status === 'fulfilled' ? r.value : `failed: ${(r.reason as Error).message}`)).join(' / ');
+}
+
+const naive = new NaiveBookingDesk();
+console.log(`naive: ${report(await Promise.allSettled([naive.book('09:30', 'anil'), naive.book('09:30', 'bina')]))}`);
+console.log(`naive owner: ${naive.owners.get('09:30')} (anil was charged but lost the slot)`);
+
+const safe = new HoldingBookingDesk();
+console.log(`hold: ${report(await Promise.allSettled([safe.book('09:30', 'anil'), safe.book('09:30', 'bina')]))}`);
+console.log(`hold: ${report(await Promise.allSettled([safe.book('10:30', 'broke'), safe.book('10:30', 'meera')]))}`);
+console.log(`retry: ${report(await Promise.allSettled([safe.book('10:30', 'meera')]))}`);
+```
+
+```text
+naive: anil booked 09:30 / bina booked 09:30
+naive owner: bina (anil was charged but lost the slot)
+hold: anil booked 09:30 / failed: 09:30 already held by anil
+hold: failed: payment declined for broke / failed: 10:30 already held by broke
+retry: meera booked 10:30
+```
+
+In production, a hold also needs an **expiry** (see the rental case study, 12.6). Otherwise a crashed request keeps the slot locked forever.
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|---|---|
+| **New ranking strategy** (reported) | New `SlotRankingStrategy` class, e.g. `MostPopularFirst` using `doctorBookings`. No service change. |
+| **Waitlist promotion on cancel** (reported) | Already implemented; the variation is "notify and give 15 minutes to accept", which adds an `OFFERED` state with expiry. |
+| **Trending doctor** (inferred) | A listener that counts `BOOKED`/`PROMOTED` events keeps it O(1) instead of scanning. |
+| **Multi-day calendar** | Replace minutes-of-day with epoch minutes; slot repository keyed by date. |
+| **Gym / class booking with tiers** (PhonePe, Flipkart, Meesho) | Capacity > 1, tier limits, tier-priority waitlist, cancellation cutoff. **Implemented below.** |
+| **Thread safety** (PhonePe) | Per-slot lock or `putIfAbsent` claim; see the concurrency section. |
+
+**Gym class booking.** Admins create classes with a capacity. Members have tiers that cap their active bookings. When a class is full, members join a waitlist ordered **by tier, then by arrival**. Cancellation is allowed only up to 30 minutes before the class, and a cancellation promotes the first waitlisted member who is still under their tier limit.
+
+```ts
+class GymError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+
+enum Tier {
+  Platinum = 'PLATINUM',
+  Gold = 'GOLD',
+  Silver = 'SILVER',
+}
+
+const TIER_RULES: Record<Tier, { maxActive: number; priority: number }> = {
+  [Tier.Platinum]: { maxActive: 3, priority: 0 },
+  [Tier.Gold]: { maxActive: 2, priority: 1 },
+  [Tier.Silver]: { maxActive: 1, priority: 2 },
+};
+
+interface Clock {
+  now(): number; // minutes since midnight
+}
+class ManualClock implements Clock {
+  constructor(private minutes: number) {}
+  now(): number {
+    return this.minutes;
+  }
+  set(h: number, m: number): void {
+    this.minutes = h * 60 + m;
+  }
+}
+
+interface Member {
+  readonly id: string;
+  readonly name: string;
+  readonly tier: Tier;
+}
+
+interface WaitEntry {
+  readonly memberId: string;
+  readonly seq: number;
+}
+
+interface GymClass {
+  readonly id: string;
+  readonly title: string;
+  readonly start: number;
+  readonly capacity: number;
+  readonly attendees: string[];
+  readonly waitlist: WaitEntry[];
+}
+
+class GymBookingService {
+  private readonly members = new Map<string, Member>();
+  private readonly classes = new Map<string, GymClass>();
+  private seq = 0;
+
+  constructor(
+    private readonly clock: Clock,
+    private readonly cancelCutoffMinutes = 30,
+  ) {}
+
+  addMember(id: string, name: string, tier: Tier): void {
+    this.members.set(id, { id, name, tier });
+  }
+
+  addClass(id: string, title: string, start: number, capacity: number): void {
+    if (!Number.isInteger(capacity) || capacity <= 0) throw new GymError('capacity must be a positive integer');
+    this.classes.set(id, { id, title, start, capacity, attendees: [], waitlist: [] });
+  }
+
+  book(memberId: string, classId: string): string {
+    const member = this.member(memberId);
+    const cls = this.gymClass(classId);
+    if (cls.start <= this.clock.now()) throw new GymError(`${cls.title} has already started`);
+    if (cls.attendees.includes(memberId) || cls.waitlist.some((w) => w.memberId === memberId)) {
+      throw new GymError(`${member.name} is already on ${cls.title}`);
+    }
+    if (cls.attendees.length < cls.capacity) {
+      this.assertUnderLimit(member);
+      cls.attendees.push(memberId);
+      return 'BOOKED';
+    }
+    cls.waitlist.push({ memberId, seq: this.seq++ });
+    cls.waitlist.sort((a, b) => this.priority(a) - this.priority(b) || a.seq - b.seq);
+    return `WAITLISTED #${cls.waitlist.findIndex((w) => w.memberId === memberId) + 1}`;
+  }
+
+  cancel(memberId: string, classId: string): string {
+    const member = this.member(memberId);
+    const cls = this.gymClass(classId);
+    const waitIndex = cls.waitlist.findIndex((w) => w.memberId === memberId);
+    if (waitIndex >= 0) {
+      cls.waitlist.splice(waitIndex, 1);
+      return 'left waitlist';
+    }
+    const index = cls.attendees.indexOf(memberId);
+    if (index < 0) throw new GymError(`${member.name} has no booking for ${cls.title}`);
+    if (this.clock.now() > cls.start - this.cancelCutoffMinutes) {
+      throw new GymError(`Too late: ${cls.title} can be cancelled only ${this.cancelCutoffMinutes} min before start`);
+    }
+    cls.attendees.splice(index, 1);
+    const promoted = this.promote(cls);
+    return promoted ? `cancelled; ${promoted} promoted` : 'cancelled';
+  }
+
+  describe(classId: string): string {
+    const cls = this.gymClass(classId);
+    const names = (ids: string[]): string => ids.map((id) => this.member(id).name).join(',') || '-';
+    return `${cls.title}: [${names(cls.attendees)}] waitlist [${names(cls.waitlist.map((w) => w.memberId))}]`;
+  }
+
+  private promote(cls: GymClass): string | undefined {
+    const index = cls.waitlist.findIndex((w) => this.activeCount(w.memberId) < TIER_RULES[this.member(w.memberId).tier].maxActive);
+    if (index < 0) return undefined;
+    const [entry] = cls.waitlist.splice(index, 1);
+    if (!entry) return undefined;
+    cls.attendees.push(entry.memberId);
+    return this.member(entry.memberId).name;
+  }
+
+  private assertUnderLimit(member: Member): void {
+    const limit = TIER_RULES[member.tier].maxActive;
+    if (this.activeCount(member.id) >= limit) {
+      throw new GymError(`${member.name} (${member.tier}) reached the limit of ${limit} active booking(s)`);
+    }
+  }
+
+  private activeCount(memberId: string): number {
+    const now = this.clock.now();
+    return [...this.classes.values()].filter((c) => c.start > now && c.attendees.includes(memberId)).length;
+  }
+
+  private priority(entry: WaitEntry): number {
+    return TIER_RULES[this.member(entry.memberId).tier].priority;
+  }
+
+  private member(id: string): Member {
+    const member = this.members.get(id);
+    if (!member) throw new GymError(`Member ${id} not found`);
+    return member;
+  }
+
+  private gymClass(id: string): GymClass {
+    const cls = this.classes.get(id);
+    if (!cls) throw new GymError(`Class ${id} not found`);
+    return cls;
+  }
+}
+
+const clock = new ManualClock(5 * 60);
+const gym = new GymBookingService(clock);
+gym.addMember('m1', 'Pia', Tier.Platinum);
+gym.addMember('m2', 'Gia', Tier.Gold);
+gym.addMember('m3', 'Sid', Tier.Silver);
+gym.addMember('m4', 'Sam', Tier.Silver);
+gym.addClass('yoga', 'Yoga 07:00', 7 * 60, 2);
+gym.addClass('hiit', 'HIIT 08:00', 8 * 60, 1);
+
+const run = (label: string, action: () => string): void => {
+  try {
+    console.log(`${label} -> ${action()}`);
+  } catch (err) {
+    console.log(`${label} -> ${(err as Error).message}`);
+  }
+};
+
+run('Sid books Yoga', () => gym.book('m3', 'yoga'));
+run('Sam books Yoga', () => gym.book('m4', 'yoga'));
+run('Gia books Yoga', () => gym.book('m2', 'yoga'));
+run('Pia books Yoga', () => gym.book('m1', 'yoga'));
+run('Sid books HIIT', () => gym.book('m3', 'hiit'));
+console.log(gym.describe('yoga'));
+clock.set(6, 0);
+run('06:00 Sam cancels Yoga', () => gym.cancel('m4', 'yoga'));
+clock.set(6, 45);
+run('06:45 Sid cancels Yoga', () => gym.cancel('m3', 'yoga'));
+run('Gia leaves waitlist', () => gym.cancel('m2', 'yoga'));
+console.log(gym.describe('yoga'));
+```
+
+```text
+Sid books Yoga -> BOOKED
+Sam books Yoga -> BOOKED
+Gia books Yoga -> WAITLISTED #1
+Pia books Yoga -> WAITLISTED #1
+Sid books HIIT -> Sid (SILVER) reached the limit of 1 active booking(s)
+Yoga 07:00: [Sid,Sam] waitlist [Pia,Gia]
+06:00 Sam cancels Yoga -> cancelled; Pia promoted
+06:45 Sid cancels Yoga -> Too late: Yoga 07:00 can be cancelled only 30 min before start
+Gia leaves waitlist -> left waitlist
+Yoga 07:00: [Sid,Pia] waitlist [-]
+```
+
+Pia arrived *after* Gia but jumped ahead of her in the waitlist because Platinum has a higher priority. Sid's HIIT booking failed because Silver allows only one active booking. Say this rule out loud in the interview, since "tier limits" can mean *per day* or *per week*, and you should confirm which.
+
+## Edge cases
+
+- A slot that is booked, cancelled and booked again: `BookingRepository.save` removes the slot index entry only if it still points at the cancelled booking.
+- A waitlisted patient who has since booked a clashing slot is skipped, not double-booked.
+- Joining the waitlist for a free slot, or for your own slot, is rejected.
+- Cancelling twice, or cancelling a slot that has started, is rejected.
+- Slot validation: ranges that aren't 60 minutes, times outside working hours, overlaps with existing slots *and* with other ranges in the same batch, and malformed `HH:MM`.
+- Search hides past slots (start ≤ now) and booked slots.
+- Ties in ranking are broken deterministically (rating, then name).
+- The gym waitlist respects tier limits at promotion time, not just at join time.
+
+## Complexity
+
+Let D be doctors in a speciality, S slots per doctor, B bookings in total and W the waitlist length.
+
+| Operation | Cost | Note |
+|---|---|---|
+| `declareSlots(k ranges)` | O(k · (S + k)) | Linear overlap scan; S is small (≤ 12 per day) |
+| `search` | O(D · S + D · B + R log R) | R candidates to rank. Keep a per-doctor booking counter to drop the D · B term. |
+| `book` | O(B) for the clash scan | Index bookings by patient to make it O(bookings of patient) |
+| `cancel` + promotion | O(W · B) worst case | W is usually tiny |
+| Slot availability check | O(1) | `confirmedBySlot` map |
+
+## What graders look for / common mistakes
+
+- ✅ A strategy interface for ranking, plus a demo that switches strategies at runtime.
+- ✅ Distinct, meaningful exceptions ("slot taken; join waitlist" vs "you already have a booking at 09:30").
+- ✅ Waitlist promotion that re-validates the promoted patient.
+- ✅ A driver that exercises the happy path *and* the failures. Flipkart explicitly asks for runnable code.
+- ❌ Keeping `isBooked` on a slot *and* a booking list, which then drift apart.
+- ❌ Forgetting that a patient can clash across doctors.
+- ❌ One god class `FlipMed` with 20 methods and five maps.
+- ❌ Catching errors and printing inside services (return or throw; let the driver print).
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---|---|
+| 0–10 | Read the prompt, confirm the 60-minute slot, waitlist and clash rules, and write down commands. |
+| 10–20 | Entities, repositories, services and the ranking strategy on paper. |
+| 20–50 | Models → repositories → `DoctorService` (slot validation) → `book` and `search`. |
+| 50–65 | Waitlist and cancel with promotion; the listener. |
+| 65–80 | Driver with happy path and failure cases; second ranking strategy. |
+| 80–90 | Trending doctor or tiers; tidy up names and errors; prepare the walkthrough. |
+
+## Interview Q&A
+
+<details>
+<summary>Q1. The interviewer adds "rank doctors by number of bookings". What do you change?</summary>
+
+Add a `MostPopularFirst` class that implements `SlotRankingStrategy` and sorts by `doctorBookings` descending, then by start time. The service already fills `doctorBookings` for each candidate. If it didn't, I'd inject a `DoctorStatsProvider` into the strategy rather than widen the service. No existing class changes.
+
+</details>
+
+<details>
+<summary>Q2. How would you make booking thread-safe in Java or with multiple Node instances?</summary>
+
+In a single JVM, use `ConcurrentHashMap<SlotKey, BookingId>.putIfAbsent`: the first writer wins atomically, and everyone else gets "taken". For multiple instances, the database must enforce it with a partial unique index on `(doctor_id, slot_start)` for confirmed bookings, or `SELECT … FOR UPDATE` on the slot row. With an async payment step, use a hold with an expiry and confirm afterwards.
+
+</details>
+
+<details>
+<summary>Q3. Why is the waitlist FIFO per slot and not per doctor?</summary>
+
+Patients wait for a *time* that suits them. A per-doctor queue would push someone who wanted 09:30 into a 16:30 slot they never asked for. If the product wants "any slot with this doctor", model that as a separate subscription that listens for `CANCELLED` events.
+
+</details>
+
+<details>
+<summary>Q4. Where would notifications go in a real system?</summary>
+
+Behind the `AppointmentListener` interface, the implementation publishes to a queue (outbox pattern), so the booking transaction and the event commit together. A worker then sends SMS or push messages with retries. The service never calls an SMS API directly.
+
+</details>

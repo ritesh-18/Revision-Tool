@@ -1,0 +1,824 @@
+---
+title: "11.3 Cab Booking / Ride Sharing (Uber / Ola)"
+---
+
+## Problem & where it's asked
+
+Riders request a ride from A to B. The system finds a nearby driver, quotes a fare (with surge when demand beats supply), and drives the trip through its states until payment. The interesting parts are **matching**, **fare calculation** and **not assigning one driver to two riders**.
+
+| Company | What was reported | Confidence |
+|---|---|---|
+| Flipkart | Cab booking in machine coding. Also a *ride-sharing* variant where users offer rides and selection strategies include "most vacant seats" and "preferred vehicle". | reported |
+| Salesforce (2026) | Onboard riders/drivers, update driver location, match, request/cancel/accept/complete rides, fare estimate | reported |
+| PhonePe, Swiggy | Cab booking listed among their machine-coding problems | reported (lists) |
+| Uber, Ola | Obvious fit. Uber's reported rounds are concurrency-heavy, but the exact problem is under NDA. | uncertain |
+
+Graded on: **Strategy** for matching and fare, the **trip state machine**, and (at Uber-style rounds) **concurrency on driver assignment**. Follow-ups: fare strategies, surge, ride history.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Location model? | 2-D km grid. Real systems use lat/long plus geohash/H3, discussed under extensions. |
+| Vehicle types? | AUTO, MINI, SEDAN, each with its own rate card. The rider picks one. |
+| How is a driver chosen? | The nearest available driver of that type within 3 km. Ties go to the higher rating. Pluggable. |
+| Does the driver have to accept? | Yes. We auto-offer to the best candidate. If they decline, we exclude them and rematch. |
+| No driver available? | The trip stays `REQUESTED`, and the rider (or a scheduler) can retry matching. |
+| Fare? | `base + perKm × km + perMin × min`, with a minimum fare. Surge multiplier from demand/supply near pickup, capped at 2×, **locked at request time**. |
+| Estimate vs final fare? | The estimate uses straight-line km at 20 km/h. The final fare uses the actual km and actual minutes from the trip meter. |
+| Cancellation? | The rider can cancel before the trip starts. A ₹50 fee applies if the cancel comes more than 2 minutes after assignment. |
+| One active trip per rider/driver? | Yes, enforced. |
+
+## Requirements
+
+**Functional**
+1. Register riders and drivers. Drivers go online/offline and update their location.
+2. Request a ride (pickup, drop, vehicle type) and get a fare estimate.
+3. Match a driver via a strategy. The driver can decline, which triggers a rematch.
+4. Trip lifecycle: `REQUESTED → DRIVER_ASSIGNED → IN_PROGRESS → COMPLETED`, plus `CANCELLED`.
+5. Final fare on completion, a cancellation fee when applicable, driver ratings, and ride history per rider.
+
+**Non-functional**
+- A driver is never on two trips. A rider never has two active trips.
+- Fare and matching rules are swappable (OCP).
+- Deterministic tests: injected clock, ids and trip meter.
+
+**Out of scope**
+- Payments (see 11.6), real maps/ETA, pooling (discussed), driver incentives.
+
+## Entities & relationships
+
+| Entity | Key fields | Relationships |
+|---|---|---|
+| `Rider` | id, name | has many `Trip`s |
+| `Driver` | id, name, vehicle, location, status, rating, currentTripId | 0..1 active `Trip` |
+| `Vehicle` | type, plate | owned by a driver |
+| `Trip` | id, riderId, driverId?, pickup, drop, type, status, surgePercent, estimate, finalFare, declinedBy | one rider, 0..1 driver |
+| `RateCard` | base, perKm, perMin, minimum | one per `VehicleType` |
+| `FareStrategy` | estimate(ctx) | Standard, decorated by Surge |
+| `SurgeProvider` | multiplierPercent(location) | demand/supply based |
+| `DriverMatchingStrategy` | rank(drivers, trip) | Nearest (grid index in extension) |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class RideService {
+        +requestRide(riderId, pickup, drop, type)
+        +declineTrip(tripId, driverId)
+        +retryMatching(tripId)
+        +startTrip(tripId, driverId)
+        +endTrip(tripId, driverId)
+        +cancelTrip(tripId, riderId)
+    }
+    class Driver {
+        +status
+        +location
+        +currentTripId
+    }
+    class Trip {
+        +status
+        +surgePercent
+        +estimatePaise
+        +finalFarePaise
+        +transition(to)
+    }
+    class FareStrategy {
+        <<interface>>
+        +fare(ctx)
+    }
+    class StandardFare
+    class SurgeFare
+    class SurgeProvider {
+        <<interface>>
+        +multiplierPercent(location)
+    }
+    class DriverMatchingStrategy {
+        <<interface>>
+        +rank(drivers, trip)
+    }
+    class NearestDriverStrategy
+    FareStrategy <|.. StandardFare
+    FareStrategy <|.. SurgeFare
+    SurgeFare --> FareStrategy : wraps
+    SurgeFare --> SurgeProvider
+    DriverMatchingStrategy <|.. NearestDriverStrategy
+    RideService --> FareStrategy
+    RideService --> DriverMatchingStrategy
+    RideService --> Trip
+    RideService --> Driver
+    Trip --> Rider
+    Trip --> Driver`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> REQUESTED
+    REQUESTED --> DRIVER_ASSIGNED : match found
+    DRIVER_ASSIGNED --> REQUESTED : driver declines
+    DRIVER_ASSIGNED --> IN_PROGRESS : driver starts
+    REQUESTED --> CANCELLED : rider cancels
+    DRIVER_ASSIGNED --> CANCELLED : rider cancels
+    IN_PROGRESS --> COMPLETED : driver ends
+    COMPLETED --> [*]
+    CANCELLED --> [*]`} />
+
+## Design decisions & patterns
+
+- **Strategy for matching** (`rank()` returns an ordered list, not one driver). The service can walk down the list when drivers decline or are grabbed by another request. Nearest-first, best-rated, or "most vacant seats" for pooling are all just new rankers.
+- **Strategy + Decorator for fares**: `StandardFare` knows rate cards. `SurgeFare` wraps *any* fare strategy and multiplies it. Night charges or airport fees become more decorators, and there's no `if (surge)` in the base formula.
+- **Surge locked on the trip**: the quote the rider accepted is a contract. Storing `surgePercent` on the trip means the final fare uses the same multiplier even if demand drops mid-ride.
+- **Surge as integer percent** (150 = 1.5×): keeps money math in integers until one explicit `Math.round`.
+- **Driver status plus `currentTripId`**: two fields that must move together. They change only inside `RideService`, which also makes the "reserve" step atomic.
+- **Transition table on `Trip`**, like food orders: the decline edge (`DRIVER_ASSIGNED → REQUESTED`) is explicit, not a hack.
+- **`TripMeter` port**: the actual distance comes from GPS in real life, and from a fake in tests.
+
+## Implementation
+
+**Part 1 — types, errors, models.**
+
+```ts
+type VehicleType = 'AUTO' | 'MINI' | 'SEDAN';
+type DriverStatus = 'OFFLINE' | 'AVAILABLE' | 'ON_TRIP';
+type TripStatus = 'REQUESTED' | 'DRIVER_ASSIGNED' | 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED';
+
+const TRIP_TRANSITIONS: Readonly<Record<TripStatus, readonly TripStatus[]>> = {
+  REQUESTED: ['DRIVER_ASSIGNED', 'CANCELLED'],
+  DRIVER_ASSIGNED: ['IN_PROGRESS', 'REQUESTED', 'CANCELLED'],
+  IN_PROGRESS: ['COMPLETED'],
+  COMPLETED: [],
+  CANCELLED: [],
+};
+
+class RideError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class ValidationError extends RideError {}
+class NotFoundError extends RideError {}
+class InvalidTransitionError extends RideError {}
+
+interface Clock { now(): number; }
+class FakeClock implements Clock {
+  constructor(private t: number) {}
+  now(): number { return this.t; }
+  advanceMinutes(m: number): void { this.t += m * 60_000; }
+}
+interface IdGenerator { next(prefix: string): string; }
+class SeqIds implements IdGenerator {
+  private n = 0;
+  next(prefix: string): string { return `${prefix}${++this.n}`; }
+}
+
+interface Location { x: number; y: number; }
+const distanceKm = (a: Location, b: Location): number => Math.hypot(a.x - b.x, a.y - b.y);
+const rupees = (p: number): string => `Rs ${(p / 100).toFixed(2)}`;
+const validLocation = (l: Location): boolean => Number.isFinite(l.x) && Number.isFinite(l.y);
+
+interface Rider { id: string; name: string; }
+
+class Driver {
+  status: DriverStatus = 'OFFLINE';
+  currentTripId: string | undefined = undefined;
+  private ratingSum = 0;
+  private ratingCount = 0;
+  constructor(readonly id: string, readonly name: string,
+              readonly vehicle: { type: VehicleType; plate: string }, public location: Location) {}
+  get rating(): number { return this.ratingCount === 0 ? 5 : this.ratingSum / this.ratingCount; }
+  addRating(stars: number): void {
+    if (!Number.isInteger(stars) || stars < 1 || stars > 5) throw new ValidationError('stars must be 1..5');
+    this.ratingSum += stars;
+    this.ratingCount += 1;
+  }
+}
+
+class Trip {
+  status: TripStatus = 'REQUESTED';
+  driverId: string | undefined = undefined;
+  assignedAt: number | undefined = undefined;
+  startedAt: number | undefined = undefined;
+  finalFarePaise: number | undefined = undefined;
+  readonly declinedBy = new Set<string>();
+  constructor(readonly id: string, readonly riderId: string, readonly pickup: Location, readonly drop: Location,
+              readonly vehicleType: VehicleType, readonly surgePercent: number,
+              readonly estimatePaise: number, readonly requestedAt: number) {}
+
+  transition(to: TripStatus): void {
+    if (!TRIP_TRANSITIONS[this.status].includes(to)) {
+      throw new InvalidTransitionError(`trip ${this.id}: ${this.status} -> ${to} not allowed`);
+    }
+    this.status = to;
+  }
+  get isActive(): boolean { return this.status !== 'COMPLETED' && this.status !== 'CANCELLED'; }
+}
+```
+
+**Part 2 — repositories.**
+
+```ts
+class Repo<T extends { id: string }> {
+  private readonly items = new Map<string, T>();
+  constructor(private readonly kind: string) {}
+  save(item: T): T {
+    if (this.items.has(item.id)) throw new ValidationError(`${this.kind} ${item.id} already exists`);
+    this.items.set(item.id, item);
+    return item;
+  }
+  get(id: string): T {
+    const item = this.items.get(id);
+    if (!item) throw new NotFoundError(`${this.kind} ${id} not found`);
+    return item;
+  }
+  all(): T[] { return [...this.items.values()]; }
+}
+```
+
+**Part 3 — strategies: fares, surge and matching.**
+
+```ts
+interface RateCard { basePaise: number; perKmPaise: number; perMinPaise: number; minimumPaise: number; }
+interface FareContext { type: VehicleType; km: number; minutes: number; surgePercent: number; }
+
+interface FareStrategy { fare(ctx: FareContext): number; }
+
+class StandardFare implements FareStrategy {
+  constructor(private readonly cards: Record<VehicleType, RateCard>) {}
+  fare({ type, km, minutes }: FareContext): number {
+    const c = this.cards[type];
+    const raw = c.basePaise + Math.round(km * c.perKmPaise) + minutes * c.perMinPaise;
+    return Math.max(raw, c.minimumPaise);
+  }
+}
+
+/** Decorator: applies the multiplier that was locked on the trip. */
+class SurgeFare implements FareStrategy {
+  constructor(private readonly inner: FareStrategy) {}
+  fare(ctx: FareContext): number {
+    return Math.round((this.inner.fare(ctx) * ctx.surgePercent) / 100);
+  }
+}
+
+interface SurgeProvider { multiplierPercent(at: Location): number; }
+
+/** 1.0x while demand <= supply; +50% per extra unit of demand/supply ratio, rounded to 10%, capped. */
+class DemandSupplySurge implements SurgeProvider {
+  constructor(
+    private readonly demandNear: (at: Location) => number,
+    private readonly supplyNear: (at: Location) => number,
+    private readonly capPercent = 200,
+  ) {}
+  multiplierPercent(at: Location): number {
+    const demand = this.demandNear(at);
+    const supply = Math.max(1, this.supplyNear(at));
+    const ratio = demand / supply;
+    if (ratio <= 1) return 100;
+    const pct = 100 + Math.round(((ratio - 1) * 50) / 10) * 10;
+    return Math.min(pct, this.capPercent);
+  }
+}
+
+interface DriverMatchingStrategy { rank(drivers: readonly Driver[], trip: Trip): Driver[]; }
+
+class NearestDriverStrategy implements DriverMatchingStrategy {
+  constructor(private readonly radiusKm: number) {}
+  rank(drivers: readonly Driver[], trip: Trip): Driver[] {
+    return drivers
+      .filter((d) => d.status === 'AVAILABLE' && d.vehicle.type === trip.vehicleType && !trip.declinedBy.has(d.id))
+      .map((d) => ({ d, km: distanceKm(d.location, trip.pickup) }))
+      .filter((c) => c.km <= this.radiusKm)
+      .sort((a, b) => a.km - b.km || b.d.rating - a.d.rating || a.d.id.localeCompare(b.d.id))
+      .map((c) => c.d);
+  }
+}
+
+interface TripMeter { actualKm(tripId: string): number; }
+```
+
+**Part 4 — the ride service.** Every change to driver status or trip status goes through here, and each method is synchronous, so no other request can interleave in the middle of an assignment.
+
+```ts
+const AVG_SPEED_KMPH = 20;
+const SURGE_RADIUS_KM = 3;
+const FREE_CANCEL_MS = 2 * 60_000;
+const CANCEL_FEE_PAISE = 5000;
+
+class RideService {
+  constructor(
+    private readonly riders: Repo<Rider>,
+    private readonly drivers: Repo<Driver>,
+    private readonly trips: Repo<Trip>,
+    private readonly fares: FareStrategy,
+    private readonly surge: SurgeProvider,
+    private readonly matcher: DriverMatchingStrategy,
+    private readonly meter: TripMeter,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+  ) {}
+
+  // ----- driver side -----
+  goOnline(driverId: string): void {
+    const d = this.drivers.get(driverId);
+    if (d.status === 'ON_TRIP') throw new ValidationError(`${d.name} is on a trip`);
+    d.status = 'AVAILABLE';
+  }
+  goOffline(driverId: string): void {
+    const d = this.drivers.get(driverId);
+    if (d.status === 'ON_TRIP') throw new ValidationError(`${d.name} cannot go offline during a trip`);
+    d.status = 'OFFLINE';
+  }
+  updateLocation(driverId: string, at: Location): void {
+    if (!validLocation(at)) throw new ValidationError('invalid location');
+    this.drivers.get(driverId).location = at;
+  }
+
+  // ----- rider side -----
+  requestRide(riderId: string, pickup: Location, drop: Location, type: VehicleType): Trip {
+    const rider = this.riders.get(riderId);
+    if (!validLocation(pickup) || !validLocation(drop)) throw new ValidationError('invalid location');
+    if (distanceKm(pickup, drop) < 0.1) throw new ValidationError('pickup and drop are the same');
+    if (this.trips.all().some((t) => t.riderId === rider.id && t.isActive)) {
+      throw new ValidationError(`${rider.name} already has an active trip`);
+    }
+    const km = distanceKm(pickup, drop);
+    const minutes = Math.ceil((km / AVG_SPEED_KMPH) * 60);
+    const surgePercent = this.surge.multiplierPercent(pickup);
+    const estimate = this.fares.fare({ type, km, minutes, surgePercent });
+    const trip = this.trips.save(new Trip(this.ids.next('T'), rider.id, pickup, drop, type, surgePercent, estimate, this.clock.now()));
+    this.tryAssign(trip);
+    return trip;
+  }
+
+  retryMatching(tripId: string): void {
+    const trip = this.trips.get(tripId);
+    if (trip.status !== 'REQUESTED') throw new ValidationError(`trip ${tripId} is ${trip.status}`);
+    this.tryAssign(trip);
+  }
+
+  declineTrip(tripId: string, driverId: string): void {
+    const trip = this.tripForDriver(tripId, driverId);
+    trip.transition('REQUESTED');
+    trip.declinedBy.add(driverId);
+    this.release(driverId);
+    trip.driverId = undefined;
+    console.log(`  ${this.drivers.get(driverId).name} declined ${trip.id}`);
+    this.tryAssign(trip);
+  }
+
+  startTrip(tripId: string, driverId: string): void {
+    const trip = this.tripForDriver(tripId, driverId);
+    trip.transition('IN_PROGRESS');
+    trip.startedAt = this.clock.now();
+  }
+
+  endTrip(tripId: string, driverId: string): number {
+    const trip = this.tripForDriver(tripId, driverId);
+    trip.transition('COMPLETED');
+    const minutes = Math.ceil((this.clock.now() - (trip.startedAt ?? this.clock.now())) / 60_000);
+    const km = this.meter.actualKm(trip.id);
+    trip.finalFarePaise = this.fares.fare({ type: trip.vehicleType, km, minutes, surgePercent: trip.surgePercent });
+    this.drivers.get(driverId).location = trip.drop;
+    this.release(driverId);
+    return trip.finalFarePaise;
+  }
+
+  cancelTrip(tripId: string, riderId: string): number {
+    const trip = this.trips.get(tripId);
+    if (trip.riderId !== riderId) throw new ValidationError('only the rider can cancel this trip');
+    const lateCancel = trip.status === 'DRIVER_ASSIGNED'
+      && trip.assignedAt !== undefined
+      && this.clock.now() - trip.assignedAt > FREE_CANCEL_MS;
+    trip.transition('CANCELLED');
+    if (trip.driverId) this.release(trip.driverId);
+    trip.finalFarePaise = lateCancel ? CANCEL_FEE_PAISE : 0;
+    return trip.finalFarePaise;
+  }
+
+  rateDriver(tripId: string, riderId: string, stars: number): void {
+    const trip = this.trips.get(tripId);
+    if (trip.riderId !== riderId || trip.status !== 'COMPLETED' || !trip.driverId) {
+      throw new ValidationError('can only rate your own completed trip');
+    }
+    this.drivers.get(trip.driverId).addRating(stars);
+  }
+
+  history(riderId: string): Trip[] {
+    return this.trips.all().filter((t) => t.riderId === riderId).sort((a, b) => a.requestedAt - b.requestedAt);
+  }
+
+  // ----- helpers used by the surge provider -----
+  openRequestsNear(at: Location): number {
+    return this.trips.all().filter((t) => t.status === 'REQUESTED' && distanceKm(t.pickup, at) <= SURGE_RADIUS_KM).length;
+  }
+  availableDriversNear(at: Location): number {
+    return this.drivers.all().filter((d) => d.status === 'AVAILABLE' && distanceKm(d.location, at) <= SURGE_RADIUS_KM).length;
+  }
+
+  // ----- internals -----
+  private tryAssign(trip: Trip): void {
+    const [best] = this.matcher.rank(this.drivers.all(), trip);
+    if (!best) {
+      console.log(`  no ${trip.vehicleType} driver for ${trip.id}; trip stays REQUESTED`);
+      return;
+    }
+    // reserve: status + trip id move together, with no await in between
+    best.status = 'ON_TRIP';
+    best.currentTripId = trip.id;
+    trip.driverId = best.id;
+    trip.assignedAt = this.clock.now();
+    trip.transition('DRIVER_ASSIGNED');
+    console.log(`  ${trip.id} -> ${best.name} (${distanceKm(best.location, trip.pickup).toFixed(1)} km away)`);
+  }
+
+  private release(driverId: string): void {
+    const d = this.drivers.get(driverId);
+    d.status = 'AVAILABLE';
+    d.currentTripId = undefined;
+  }
+
+  private tripForDriver(tripId: string, driverId: string): Trip {
+    const trip = this.trips.get(tripId);
+    if (trip.driverId !== driverId) throw new ValidationError(`driver ${driverId} is not assigned to ${tripId}`);
+    return trip;
+  }
+}
+```
+
+**Part 5 — wiring and demo.** The surge provider needs counts from the service, and the service needs the surge provider. Lazy closures break the cycle without a setter.
+
+```ts
+class FakeMeter implements TripMeter {
+  constructor(private readonly readings: Record<string, number>) {}
+  actualKm(tripId: string): number { return this.readings[tripId] ?? 0; }
+}
+
+const clock = new FakeClock(0);
+const ids = new SeqIds();
+const riders = new Repo<Rider>('rider');
+const drivers = new Repo<Driver>('driver');
+const trips = new Repo<Trip>('trip');
+const cards: Record<VehicleType, RateCard> = {
+  AUTO: { basePaise: 3000, perKmPaise: 1500, perMinPaise: 100, minimumPaise: 3000 },
+  MINI: { basePaise: 4000, perKmPaise: 1200, perMinPaise: 150, minimumPaise: 6000 },
+  SEDAN: { basePaise: 6000, perKmPaise: 1600, perMinPaise: 200, minimumPaise: 9000 },
+};
+let service: RideService | undefined;
+const surge = new DemandSupplySurge(
+  (at) => (service?.openRequestsNear(at) ?? 0) + 1, // +1: the request being priced
+  (at) => service?.availableDriversNear(at) ?? 0,
+);
+const svc = new RideService(riders, drivers, trips, new SurgeFare(new StandardFare(cards)), surge,
+  new NearestDriverStrategy(3), new FakeMeter({ T1: 11 }), clock, ids);
+service = svc;
+
+const attempt = (label: string, fn: () => void): void => {
+  try { fn(); } catch (err) {
+    console.log(`  ✗ ${label}: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+  }
+};
+
+for (const [id, name] of [['R1', 'Asha'], ['R2', 'Ravi'], ['R3', 'Neha'], ['R4', 'Karan'], ['R5', 'Meera'], ['R6', 'Arjun']]) {
+  riders.save({ id: id!, name: name! });
+}
+drivers.save(new Driver('D1', 'Ramesh', { type: 'MINI', plate: 'KA01' }, { x: 2, y: 0 }));
+drivers.save(new Driver('D2', 'Suresh', { type: 'MINI', plate: 'KA02' }, { x: 1, y: 0 }));
+drivers.save(new Driver('D3', 'Mahesh', { type: 'SEDAN', plate: 'KA03' }, { x: 0, y: 1 }));
+drivers.save(new Driver('D4', 'Ganesh', { type: 'AUTO', plate: 'KA04' }, { x: 0, y: 0 }));
+drivers.save(new Driver('D5', 'Dinesh', { type: 'MINI', plate: 'KA05' }, { x: 0, y: 2 }));
+for (const d of ['D1', 'D2', 'D3', 'D5']) svc.goOnline(d); // Ganesh stays offline
+
+console.log('# Asha requests a MINI (10 km)');
+const t1 = svc.requestRide('R1', { x: 0, y: 0 }, { x: 6, y: 8 }, 'MINI');
+console.log(`  estimate ${rupees(t1.estimatePaise)} at ${t1.surgePercent / 100}x`);
+svc.declineTrip('T1', 'D2');
+attempt('Asha books again', () => { svc.requestRide('R1', { x: 0, y: 0 }, { x: 1, y: 1 }, 'MINI'); });
+
+console.log('# Ravi requests a SEDAN; Neha an AUTO');
+const t2 = svc.requestRide('R2', { x: 0, y: 0.5 }, { x: 3, y: 4.5 }, 'SEDAN');
+const t3 = svc.requestRide('R3', { x: 1, y: 1 }, { x: 2, y: 3 }, 'AUTO');
+svc.goOnline('D4');
+svc.retryMatching(t3.id);
+
+console.log('# Rush hour: Dinesh logs off; three more SEDAN requests, no sedans left');
+svc.goOffline('D5');
+for (const r of ['R4', 'R5', 'R6']) {
+  const t = svc.requestRide(r, { x: 0.5, y: 0.5 }, { x: 5, y: 5 }, 'SEDAN');
+  console.log(`  ${t.id} surge ${t.surgePercent / 100}x, estimate ${rupees(t.estimatePaise)}`);
+}
+
+console.log('# Asha\'s trip');
+attempt('wrong driver starts', () => svc.startTrip('T1', 'D2'));
+attempt('complete before start', () => { svc.endTrip('T1', 'D1'); });
+svc.startTrip('T1', 'D1');
+attempt('Ramesh goes offline mid-trip', () => svc.goOffline('D1'));
+clock.advanceMinutes(35);
+console.log(`  final fare ${rupees(svc.endTrip('T1', 'D1'))} (11 km, 35 min)`);
+svc.rateDriver('T1', 'R1', 4);
+attempt('rate with 6 stars', () => svc.rateDriver('T1', 'R1', 6));
+
+console.log('# Cancellations');
+console.log(`  Ravi cancels after 35 min: fee ${rupees(svc.cancelTrip(t2.id, 'R2'))}`);
+const t4 = trips.get('T4');
+console.log(`  Karan cancels unassigned ${t4.id}: fee ${rupees(svc.cancelTrip(t4.id, 'R4'))}`);
+attempt('cancel completed trip', () => { svc.cancelTrip('T1', 'R1'); });
+
+console.log('# State after');
+console.log(`  drivers: ${drivers.all().map((d) => `${d.name}=${d.status}${d.currentTripId ? `(${d.currentTripId})` : ''}`).join(' ')}`);
+console.log(`  Ramesh rating ${drivers.get('D1').rating.toFixed(1)} at (${drivers.get('D1').location.x},${drivers.get('D1').location.y})`);
+console.log(`  Asha history: ${svc.history('R1').map((t) => `${t.id}:${t.status}:${rupees(t.finalFarePaise ?? 0)}`).join(', ')}`);
+```
+
+## Demo output
+
+```text
+# Asha requests a MINI (10 km)
+  T1 -> Suresh (1.0 km away)
+  estimate Rs 205.00 at 1x
+  Suresh declined T1
+  T1 -> Ramesh (2.0 km away)
+  ✗ Asha books again: ValidationError: Asha already has an active trip
+# Ravi requests a SEDAN; Neha an AUTO
+  T2 -> Mahesh (0.5 km away)
+  no AUTO driver for T3; trip stays REQUESTED
+  T3 -> Ganesh (1.4 km away)
+# Rush hour: Dinesh logs off; three more SEDAN requests, no sedans left
+  no SEDAN driver for T4; trip stays REQUESTED
+  T4 surge 1x, estimate Rs 201.82
+  no SEDAN driver for T5; trip stays REQUESTED
+  T5 surge 1.5x, estimate Rs 302.73
+  no SEDAN driver for T6; trip stays REQUESTED
+  T6 surge 2x, estimate Rs 403.64
+# Asha's trip
+  ✗ wrong driver starts: ValidationError: driver D2 is not assigned to T1
+  ✗ complete before start: InvalidTransitionError: trip T1: DRIVER_ASSIGNED -> COMPLETED not allowed
+  ✗ Ramesh goes offline mid-trip: ValidationError: Ramesh cannot go offline during a trip
+  final fare Rs 224.50 (11 km, 35 min)
+  ✗ rate with 6 stars: ValidationError: stars must be 1..5
+# Cancellations
+  Ravi cancels after 35 min: fee Rs 50.00
+  Karan cancels unassigned T4: fee Rs 0.00
+  ✗ cancel completed trip: InvalidTransitionError: trip T1: COMPLETED -> CANCELLED not allowed
+# State after
+  drivers: Ramesh=AVAILABLE Suresh=AVAILABLE Mahesh=AVAILABLE Ganesh=ON_TRIP(T3) Dinesh=OFFLINE
+  Ramesh rating 4.0 at (6,8)
+  Asha history: T1:COMPLETED:Rs 224.50
+```
+
+Trace the surge lines. Each unmatched sedan request adds to demand, while supply is every *available* driver within 3 km of the pickup (only Suresh once Dinesh logs off). So the ratio goes 1, 2, 3 and the multiplier goes 1×, 1.5×, then the 2× cap. Each trip keeps the multiplier it was quoted. Ravi paid ₹50 because he cancelled long after assignment, while Karan paid nothing because no driver had been assigned.
+
+## Concurrency
+
+**The race.** Real matching isn't synchronous. We fetch ETAs from a maps service for each candidate before choosing. If the code reads "Suresh is available", awaits the ETA, and then writes "Suresh is on trip T1", a second request can read the same "available" during that `await`. Both trips end up assigned to Suresh.
+
+**The fix: optimistic locking.** Each driver has a `version`. Read the version before the async work, and at commit time assign only if the version is unchanged (compare-and-set). On conflict, re-rank and try again. Uber-style interviews like to hear the words *optimistic vs pessimistic*. A per-driver mutex (pessimistic) also works, but it holds a lock across a network call, which hurts throughput.
+
+```ts
+interface Driver { id: string; available: boolean; tripId?: string; version: number; km: number; }
+
+const drivers: Driver[] = [
+  { id: 'Suresh', available: true, version: 0, km: 1 },
+  { id: 'Ramesh', available: true, version: 0, km: 2 },
+];
+const fetchEta = async (d: Driver): Promise<number> => {
+  await new Promise((r) => setTimeout(r, 5));
+  return Math.round(d.km * 3);
+};
+const reset = (): void => { for (const d of drivers) Object.assign(d, { available: true, tripId: undefined, version: 0 }); };
+
+async function assignNaive(tripId: string): Promise<string> {
+  const candidates = drivers.filter((d) => d.available);
+  const etas = await Promise.all(candidates.map(fetchEta));
+  const best = candidates[etas.indexOf(Math.min(...etas))];
+  if (!best) return 'none';
+  best.available = false;
+  best.tripId = tripId;
+  return best.id;
+}
+
+/** Compare-and-set: succeeds only if nobody touched the driver since we read `expectedVersion`. */
+function casAssign(d: Driver, expectedVersion: number, tripId: string): boolean {
+  if (d.version !== expectedVersion || !d.available) return false;
+  d.available = false;
+  d.tripId = tripId;
+  d.version += 1;
+  return true;
+}
+
+async function assignOptimistic(tripId: string, maxRetries = 3): Promise<string> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const snapshot = drivers.filter((d) => d.available).map((d) => ({ d, v: d.version }));
+    if (snapshot.length === 0) return 'none';
+    const etas = await Promise.all(snapshot.map((s) => fetchEta(s.d)));
+    const ranked = snapshot.map((s, i) => ({ ...s, eta: etas[i]! })).sort((a, b) => a.eta - b.eta);
+    for (const c of ranked) {
+      if (casAssign(c.d, c.v, tripId)) return `${c.d.id} (attempt ${attempt})`;
+    }
+  }
+  return 'none (retries exhausted)';
+}
+
+const naive = await Promise.all(['T1', 'T2'].map(assignNaive));
+console.log(`naive     : T1->${naive[0]}, T2->${naive[1]}; Suresh.tripId=${drivers[0]!.tripId}`);
+
+reset();
+const safe = await Promise.all(['T1', 'T2', 'T3'].map((t) => assignOptimistic(t)));
+console.log(`optimistic: T1->${safe[0]}, T2->${safe[1]}, T3->${safe[2]}`);
+console.log(`drivers   : ${drivers.map((d) => `${d.id}=${d.tripId ?? '-'}@v${d.version}`).join(' ')}`);
+```
+
+```text
+naive     : T1->Suresh, T2->Suresh; Suresh.tripId=T2
+optimistic: T1->Suresh (attempt 1), T2->Ramesh (attempt 1), T3->none
+drivers   : Suresh=T1@v1 Ramesh=T2@v1
+```
+
+Across servers, the same compare-and-set is `UPDATE drivers SET status='ON_TRIP', trip_id=?, version=version+1 WHERE id=? AND version=?`, checking that exactly one row changed. Alternatively, use a Redis lock `SET driver:{id}:lock tripId NX PX 15000` while the offer is pending. The TTL matters: if the server dies, the driver must not stay locked forever.
+
+## Extensions & follow-ups
+
+| Follow-up | How the design changes |
+|---|---|
+| "Matching is slow with 50k drivers in a city" | A spatial index (grid cells / geohash / H3). Only nearby cells are scanned. Implemented below. |
+| Surge pricing variants | Another `SurgeProvider` (time-of-day, weather, event). `SurgeFare` doesn't change. |
+| Ride sharing / pooling (Flipkart variant) | `Ride` with `seatsTotal`, `seatsTaken` and a route. `RideSelectionStrategy`: *most vacant seats*, *preferred vehicle*, *fastest*. Riders join an offered ride instead of a driver being matched. |
+| Scheduled rides | A `SCHEDULED` state plus a scheduler that calls `retryMatching` 15 minutes before pickup. |
+| Driver acceptance timeout | Offer with a TTL. If there's no response, treat it like a decline and rematch. |
+| Payment after trip | Emit `TripCompleted` and let the wallet service (11.6) debit with the idempotency key `trip:<id>`. |
+| Ride history, receipts | Already `history()`. Add pagination and store the fare breakdown on the trip. |
+
+**Extension implemented: a grid spatial index.** The city is split into 1 km cells. A driver's location update moves them between cell buckets in O(1). A nearby query scans only the cells that overlap the search radius.
+
+```ts
+interface Point { x: number; y: number; }
+const dist = (a: Point, b: Point): number => Math.hypot(a.x - b.x, a.y - b.y);
+
+class GridIndex {
+  private readonly cells = new Map<string, Set<string>>();
+  private readonly positions = new Map<string, Point>();
+  constructor(private readonly cellKm: number) {}
+
+  private cellOf(p: Point): [number, number] { return [Math.floor(p.x / this.cellKm), Math.floor(p.y / this.cellKm)]; }
+  private key(cx: number, cy: number): string { return `${cx}:${cy}`; }
+
+  upsert(id: string, p: Point): void {
+    const old = this.positions.get(id);
+    if (old) {
+      const [ox, oy] = this.cellOf(old);
+      const [nx, ny] = this.cellOf(p);
+      if (ox === nx && oy === ny) { this.positions.set(id, p); return; }
+      this.cells.get(this.key(ox, oy))?.delete(id);
+    }
+    const [cx, cy] = this.cellOf(p);
+    const k = this.key(cx, cy);
+    const bucket = this.cells.get(k) ?? new Set<string>();
+    bucket.add(id);
+    this.cells.set(k, bucket);
+    this.positions.set(id, p);
+  }
+
+  remove(id: string): void {
+    const p = this.positions.get(id);
+    if (!p) return;
+    const [cx, cy] = this.cellOf(p);
+    this.cells.get(this.key(cx, cy))?.delete(id);
+    this.positions.delete(id);
+  }
+
+  /** Returns ids within radius, nearest first, and how many candidates were examined. */
+  nearby(center: Point, radiusKm: number): { ids: string[]; examined: number } {
+    const [cx, cy] = this.cellOf(center);
+    const span = Math.ceil(radiusKm / this.cellKm);
+    const found: { id: string; d: number }[] = [];
+    let examined = 0;
+    for (let dx = -span; dx <= span; dx++) {
+      for (let dy = -span; dy <= span; dy++) {
+        for (const id of this.cells.get(this.key(cx + dx, cy + dy)) ?? []) {
+          examined++;
+          const d = dist(this.positions.get(id)!, center);
+          if (d <= radiusKm) found.push({ id, d });
+        }
+      }
+    }
+    found.sort((a, b) => a.d - b.d || a.id.localeCompare(b.id));
+    return { ids: found.map((f) => f.id), examined };
+  }
+}
+
+// Deterministic pseudo-random positions (LCG) for a 50 km x 50 km city.
+let seed = 42;
+const rand = (): number => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+
+const index = new GridIndex(1);
+const all = new Map<string, Point>();
+for (let i = 0; i < 20000; i++) {
+  const p = { x: rand() * 50, y: rand() * 50 };
+  all.set(`d${i}`, p);
+  index.upsert(`d${i}`, p);
+}
+
+const rider = { x: 25.3, y: 25.7 };
+const brute = [...all].map(([id, p]) => ({ id, d: dist(p, rider) }))
+  .filter((c) => c.d <= 2).sort((a, b) => a.d - b.d || a.id.localeCompare(b.id)).map((c) => c.id);
+const fast = index.nearby(rider, 2);
+console.log(`drivers: ${all.size}, within 2 km: ${fast.ids.length}`);
+console.log(`brute force examined ${all.size}, grid examined ${fast.examined}`);
+console.log(`same answer: ${JSON.stringify(brute) === JSON.stringify(fast.ids)}`);
+
+const nearest = fast.ids[0]!;
+index.upsert(nearest, { x: 40, y: 40 }); // driver drove away
+all.set(nearest, { x: 40, y: 40 });
+console.log(`after ${nearest} moved away, nearest is ${index.nearby(rider, 2).ids[0]}`);
+index.remove('d1');
+console.log(`d1 removed; index still consistent: ${!index.nearby(all.get('d1')!, 0.01).ids.includes('d1')}`);
+```
+
+```text
+drivers: 20000, within 2 km: 117
+brute force examined 20000, grid examined 225
+same answer: true
+after d11973 moved away, nearest is d17206
+d1 removed; index still consistent: true
+```
+
+In production the same idea is **geohash** (base-32 cell strings, so "nearby" is a prefix match) or Uber's **H3** hexagons (all six neighbours are equidistant). Redis `GEOADD` / `GEOSEARCH` gives you this out of the box.
+
+## Edge cases
+
+- The rider already has an active trip. It's rejected.
+- Pickup equals drop, or a location is `NaN`. It's rejected.
+- A driver declines. They're excluded from *this* trip's rematch, and not globally.
+- Every candidate declines. The trip stays `REQUESTED` and can be retried.
+- A driver tries to go offline or change vehicle during a trip. It's rejected.
+- Demand drops during the ride. Surge stays locked at quote time.
+- The minimum fare applies to very short trips.
+- The meter reports 0 km (GPS failure). Fall back to the estimated distance, or flag the trip for review. Say which.
+- A rider cancels at the moment the driver starts the trip. Synchronous transitions let exactly one win, and the other gets `InvalidTransitionError`.
+- A driver's location update arrives out of order. Carry a timestamp and ignore stale updates (not implemented here).
+
+## Complexity
+
+| Operation | Time |
+|---|---|
+| requestRide (linear matching) | O(D log D), D = drivers |
+| requestRide with grid index | O(k log k), k = drivers in nearby cells |
+| updateLocation (grid) | O(1) |
+| start / end / cancel | O(1) |
+| surge computation (linear) | O(D + T). Maintain per-cell counters for O(1). |
+| history | O(T log T). Index trips by rider for O(t). |
+
+## What graders look for / common mistakes
+
+- ✅ Matching and fare behind interfaces, with surge as a decorator or separate provider.
+- ✅ An explicit trip state machine, including the decline path.
+- ✅ Driver reservation that is atomic, and a clear explanation of the async race.
+- ✅ The surge multiplier stored on the trip.
+- ❌ Assigning the driver *after* an `await`.
+- ❌ Recomputing surge at trip end, so the rider pays a different multiplier than quoted.
+- ❌ Floating-point rupee fares that are never rounded.
+- ❌ `Driver.status` and `currentTripId` updated in different places, so they drift apart.
+- ❌ No handling of "no drivers" (null pointer on `drivers[0]`).
+
+## 90-minute plan
+
+| Minutes | Work |
+|---|---|
+| 0–10 | Clarify matching, fare, surge, decline and cancel rules. Draw the trip states. |
+| 10–25 | Models, transition table, repos, errors. |
+| 25–40 | `StandardFare`, `SurgeFare`, surge provider, `NearestDriverStrategy`. |
+| 40–60 | `RideService`: request/assign, decline/rematch, start, end, cancel. |
+| 60–75 | Driver demo with happy path, decline, no driver, surge, cancellation fee. |
+| 75–85 | Concurrency: explain the race, show CAS or per-driver lock. |
+| 85–90 | Discuss the spatial index and pooling extension. |
+
+## Interview Q&A
+
+**Q1. Why is the fare strategy a decorator chain instead of one class with flags?**
+
+<details>
+<summary>Answer</summary>
+
+Pricing rules pile up: surge, night charge, airport fee, toll, promo. With flags, every rule edits the same method and the combinations explode. With decorators, each rule is a small class you can test on its own, and the composition root decides the order (for example, surge before promo). New rules don't touch existing code.
+
+</details>
+
+**Q2. Optimistic or pessimistic locking for driver assignment?**
+
+<details>
+<summary>Answer</summary>
+
+Use optimistic locking when conflicts are rare and the critical section includes slow I/O, like the ETA calls here. You don't want to hold locks across network calls, and a conflict just means re-ranking. Use pessimistic locking (a per-driver lock with TTL) when conflicts are frequent (hot zones at rush hour) or when the driver must not receive two simultaneous offers. Many real systems combine them: a short TTL lock while the offer is pending, plus a version check on commit.
+
+</details>
+
+**Q3. How would you support Flipkart's ride-sharing variant (users offer rides, others pick one)?**
+
+<details>
+<summary>Answer</summary>
+
+Invert the model. A `RideOffer` has an owner, vehicle, origin, destination, `availableSeats` and a status. `selectRide(rider, origin, dest, strategy)` filters offers matching the route, and the `RideSelectionStrategy` picks one: `MostVacantSeats` or `PreferredVehicle(model)`. Booking decrements seats atomically (the same CAS idea), and the offer ends when the owner ends it. Matching and fare interfaces carry over.
+
+</details>
+
+**Q4. How do you keep surge computation cheap?**
+
+<details>
+<summary>Answer</summary>
+
+Don't scan all trips and drivers per request. Keep per-cell counters (open requests, available drivers) updated on events, and recompute multipliers per cell every 30–60 seconds into a cache. `multiplierPercent(location)` then becomes a cell lookup. Smoothing (a moving average) also stops the price flickering.
+
+</details>

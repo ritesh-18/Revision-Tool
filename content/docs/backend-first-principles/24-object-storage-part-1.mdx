@@ -1,0 +1,1559 @@
+---
+title: "Object Storage: Everything You Need to Know, Part 1"
+description: Why files don't belong on your server's disk, how object storage works inside (keys, metadata, the metadata and data planes, erasure coding), and how to build production uploads with presigned URLs, verification, cleanup and conditional writes.
+---
+
+<Callout type="info">
+  Notes for [Object Storage: Everything You Need to Know, Part 1](https://youtu.be/Ie0TjKI9cDI) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+A new requirement arrives for a backend that already has auth, a database and a clean handler/service/repository structure: **users need to upload files**, starting with something as small as a profile picture. This part follows the naive approach until it breaks, explains **what object storage is and how it works inside**, then builds the **production upload flow** for small and medium files. Large files, downloads, range requests, video and pricing are in [Part 2](/docs/backend-first-principles/object-storage-part-2).
+
+<Mermaid chart={`flowchart LR
+  A["Naive: save to local disk"] --> B["Six reasons it breaks"]
+  B --> C["Block vs file vs object storage"]
+  C --> D["Anatomy: key, bytes, metadata"]
+  D --> E["Folders are an illusion"]
+  E --> F["Key design rules"]
+  F --> X1["➕ Access control"]
+  X1 --> X2["➕ Encryption at rest"]
+  X2 --> G["Inside a PUT: metadata + data plane"]
+  G --> H["Erasure coding + 11 nines"]
+  H --> I["Durability is not backup"]
+  I --> X3["➕ Object Lock"]
+  X3 --> X4["➕ Replication semantics"]
+  X4 --> J["Never LIST + consistency<br/>(➕ Inventory)"]
+  J --> K["Conditional writes"]
+  K --> L["Uploads: via server vs presigned"]
+  L --> M["Presigned POST + two-phase flow"]
+  M --> X5["➕ Event notifications"]
+  X5 --> N["CORS"]
+  N --> X6["➕ Testing storage code"]`} />
+
+---
+
+## 1. The naive approach, and how it breaks 🎓
+
+### The intuitive design
+1. The browser sends the file as **form data** (`multipart/form-data`).
+2. The backend pulls the file out of the request and writes it to the **local file system** (a Linux server, so ext4 or similar).
+3. It records the **path** in the database, so a later request can find the file and send it back for the browser to render.
+
+For profile pictures this seems to work. Images are small (about **300 KB to 10 MB** from a phone, perhaps **15–20 MB** from a mirrorless camera), they fit in memory, and nothing spikes.
+
+### The first real failure: a 4 GB video
+Then the product adds **video** (feed posts, or videos in messages), and files now range from a few MB to **several GB**. Same pattern:
+
+<Mermaid chart={`flowchart TD
+  U["User uploads a 4 GB video"] --> LB["Load balancer"]
+  LB --> I1["Instance 1<br/>4 GB RAM"]
+  I1 --> P["Framework helpfully buffers<br/>the whole body in memory"]
+  P --> OOM["Out of memory:<br/>container killed"]
+  OOM --> R["Orchestrator restarts it"]
+  R --> W["New container, fresh disk:<br/>every file stored on instance 1 is gone"]
+  LB --> I2["Instance 2: its own files"]
+  LB --> I3["Instance 3: its own files"]
+  W --> X["About 1 in 3 profile-picture requests<br/>now hit an instance without the file: 404"]`} />
+
+- The instance has **4 GB of RAM**, and the framework reads the **whole file into memory** before handing it to you, so the process **runs out of memory** and the container is **killed**.
+- The container restarts (good autoscaling setup), but **container file systems are ephemeral**. Every file that instance ever stored, pictures and videos alike, is **wiped**.
+- You scaled to **three instances** last month, so files uploaded to the other two survive **only on those instances**. Roughly **1 in 3** profile-picture requests now return **404**.
+
+### The wrong assumption underneath
+**"A file is something my application owns."** It isn't. Files are a different **shape** of data from the JSON your server handles 95% of the time: a different **access pattern**, a different **cost profile**, and they need a **different kind of storage system**. That system is **object storage**.
+
+---
+
+## 2. Six reasons files don't belong on your server 🎓
+
+### Problem 1: the server's disk is ephemeral
+- **Why:** with Docker/Kubernetes, PaaS (Railway, Render) or serverless (Vercel, Netlify), your app runs in a **container**. Its file system lives only as long as that container. A restart or a deploy creates a **new container from the image**: same image, brand-new instance. The image contains your **code**, not your users' files. **Every deploy wipes them.**
+- **Partial fix:** attach a **persistent volume**. It solves "the disk disappears on restart", but the lesson's point is that it **still fails problems 2 and 3**.
+
+### Problem 2: horizontal scaling
+- Three instances sit behind a load balancer. An upload lands on **instance 1** and is written to its disk.
+- Two minutes later the browser asks for the file. With **round robin**, the request might go to **instance 3**, which has never heard of it → **404**.
+- The more instances you add, the worse it gets: the chance of hitting the right one is roughly **1 ÷ number of instances**.
+- **First principle:** a horizontally scalable server must be **stateless**. *A server must never hold state the other servers don't have.*
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant LB as Load balancer (round robin)
+  participant I1 as Instance 1
+  participant I3 as Instance 3
+  B->>LB: POST /avatar (file)
+  LB->>I1: route
+  I1->>I1: write /data/avatars/u7.png
+  I1-->>B: 201
+  Note over B: 2 minutes later
+  B->>LB: GET /avatar/u7
+  LB->>I3: route (next in rotation)
+  I3-->>B: 404, file is on instance 1's disk`} />
+
+### Problem 3: disks grow vertically, files grow forever
+- You can add **instances** horizontally, but a disk only grows by being made **bigger**. A resize usually means detaching, resizing and reattaching, often with **downtime**, and every provider has a **maximum size** (a ceiling).
+- Meanwhile user files are the **fastest-growing data** in almost every app. **1,000 users × 100 MB = 100 GB of new data every month**, and it rarely shrinks, because people delete far less than they upload.
+
+### Problem 4: durability
+- One server, one disk. **Disks die**: power failures, hardware faults, wear. When it dies, the only copy of every file dies with it.
+- Two terms the lesson introduces:
+  - **Availability:** can you reach the data **right now**?
+  - **Durability:** does the data **still exist anywhere**?
+- You recover from an availability problem **by waiting** for a fix. You **can't** wait your way out of a durability problem: the data is gone.
+- The industry's answer is **replication** (keep copies elsewhere), plus **checksums** to detect corruption and **background repair** to fix it. That's a whole engineering field you don't want to build for a to-do app.
+
+### Problem 5: downloads tie up your server
+- A **50 MB** file to a phone on a **2 megabit/s** link (megabits, not megabytes) takes about **3.5 minutes** (50 MB × 8 = 400 Mb, ÷ 2 Mb/s = 200 s).
+- For those minutes, one of your **workers** (a goroutine, or event-loop time in Node) does nothing but **slowly copy bytes** to a phone far away.
+- Your server becomes **a very expensive, very slow CDN** with perhaps a 100-connection limit. Serving bytes is IO bound work your API server isn't built for (see [lesson 23 on IO vs CPU](/docs/backend-first-principles/23-concurrency-parallelism)), and **CDNs exist precisely for it**.
+
+### Problem 6: files and DB rows share no transaction
+The file system and the database are **two independent systems**. Neither can roll the other back.
+
+| Order of operations | Failure | Result |
+|---|---|---|
+| Write file, then insert row | Insert fails | **Orphan file**: nobody can reach it, but you pay to store it |
+| Insert row, then write file | Write fails | **Dangling row**: the path is invalid, so every fetch errors (500 or 404, depending on your handling) |
+
+Nothing guarantees **both happen or neither does**. The lesson flags that **object storage doesn't make this problem disappear**; it makes it **easier to solve** with a specific pattern (section 18).
+
+---
+
+## 3. Three kinds of storage 🎓
+
+<Mermaid chart={`flowchart TB
+  subgraph OBJ["Object storage (S3, R2, GCS)"]
+    O1["PUT / GET / DELETE / LIST by key over HTTP<br/>immutable objects, flat namespace, ms latency"]
+  end
+  subgraph FS["File storage (ext4, NTFS, NFS)"]
+    F1["directories, paths, permissions, inodes<br/>open, seek, overwrite, rename, lock, append (POSIX)"]
+  end
+  subgraph BLK["Block storage (SSD, EBS)"]
+    B1["numbered fixed-size blocks (512 B / 4 KB)<br/>read or write block N, microsecond latency"]
+  end
+  F1 -->|"built on top of"| B1
+  O1 -.->|"internally also stored on drives, but a different contract"| B1`} />
+
+### Block storage
+- **Interface:** a raw array of fixed-size **blocks** (typically **512 bytes or 4 KB**), each with a number. "Read block 9,000,000", "write block 9,000,000". No files, names or folders.
+- **That's what an SSD is**, and what **Amazon EBS** (Elastic Block Store) sells.
+- **Strength:** the lowest-level, fastest interface, with **microsecond** latency. That's why databases such as **Postgres and MySQL** sit on block storage. They still use a file system, but they manage their files directly to keep that low latency.
+- **Weaknesses:** far too primitive to build an application on directly, and **a block device attaches to one machine at a time**, so you can't share it across servers.
+
+### File storage
+- A **file system** is an abstraction **on top of blocks**: directories, files, paths, permissions, inodes.
+- In return you get a rich interface: open and close, **seek** to byte 9,000,000, **overwrite exactly 4 bytes** in the middle, **rename a folder instantly and atomically**, **lock**, **append**. These are the **POSIX** semantics. (POSIX is an operating-system standard; an OS that implements most of it is "POSIX compliant".)
+- **The cost: coordination.** These guarantees need careful bookkeeping:
+  - **Atomic rename:** it must fully succeed or fully fail, never leave a half-state. Many programs depend on this.
+  - **Consistent visibility of writes.** The lesson's example is an editor: while you edit, it writes to a **temporary file**, and on save it creates the new file from the temp contents and removes the old and temp files. Anyone reading sees either the **old** version or the **new** one, never a half-written file.
+  - **Locking** when two processes write the same file (log files are the classic case).
+- **This coordination doesn't scale across networks, data centers and continents.** Network file systems like **NFS** exist, with their own trade-offs.
+
+### Object storage
+It starts from the opposite question: not "how rich can the interface be?" but **"what is the smallest interface we can get away with, so it scales to unlimited capacity"** (exabytes, "planet scale").
+
+**The whole interface is four operations:**
+
+| Operation | Meaning |
+|---|---|
+| `PUT key` | Store an object under a name |
+| `GET key` | Fetch it by name |
+| `DELETE key` | Remove it by name |
+| `LIST` | List names |
+
+**What you give up:**
+- **No in-place modification:** no update, no append. (That's why it's called an *object*, not a file: "file" implies features objects don't have.)
+- **No seek and no partial write.** To change **one byte** of a **1 GB** object, download 1 GB, change it, and upload 1 GB under the same key. Objects are **immutable; they can only be replaced.** (🔧 Partial *reads* do exist, via HTTP Range requests. See Part 2.)
+- **No real directories** (only prefixes, an illusion; section 5).
+- **No rename:** a "rename" is **copy to the new key, then delete the old one**, so it costs the **full size** of the object.
+- **No locks** like the OS offers.
+- **Latency of milliseconds to tens of milliseconds**, not microseconds, because **every operation is an HTTP request across a network**.
+
+**What you get in return:**
+1. **Nothing to coordinate.** No in-place modification means a whole class of distributed-systems problems disappears.
+2. **No hierarchy**, so no tree to lock or rebalance.
+3. **Every operation is a self-contained HTTP request**, so **any of thousands of front-end servers can serve any request**. The system scales **horizontally without limit**.
+4. **Capacity is effectively infinite.** Never provision, never resize; just keep uploading.
+5. **Durability:** on Amazon S3, the famous **"eleven nines"** (section 10).
+6. **Every object is addressable over HTTP**, so browsers, video players and mobile apps (almost every device today) can talk to storage **directly, with no server in between**.
+
+**A distributed-systems footnote from the lesson:** the same trade appears in caching, stateless servers and immutable deployments. **To reach near-infinite scale you almost always give up mutability**, meaning changing state in place. Object storage is one of the purest examples.
+
+---
+
+## 4. Anatomy of an object 🎓
+
+| Part | What it is | Examples |
+|---|---|---|
+| **Key** | A string: the object's **entire identity** | `uploads/2026/cat.png` |
+| **Value** | An opaque blob of bytes | the PNG's bytes |
+| **System metadata** | Maintained by storage | size, last-modified time, content type, **ETag** |
+| **User metadata** | Your own key/value pairs | `uploaded-by: user_123` (an ID that maps to your DB) |
+
+- Objects live in a **bucket**: a named container one level above objects. It isn't a folder.
+- **Bucket + key** identifies an object uniquely, and the **bucket name** must be unique across the whole platform (all of AWS, for S3).
+
+🔧 **Metadata facts that change your design** (S3 docs):
+- User metadata is sent as `x-amz-meta-*` headers, limited to **2 KB** in total, and stored with **lowercase** keys.
+- **You can't edit metadata after upload.** The only way is to **copy the object onto itself with new metadata** (a full rewrite). So set it at write time, and keep anything mutable (status, display name, permissions) **in your database**.
+- `HeadObject` returns all of this **without** downloading the bytes, which is the basis of upload verification (section 18).
+
+```ts title="🔧 writing and reading metadata"
+await s3.send(new PutObjectCommand({
+  Bucket, Key: key, Body: bytes,
+  ContentType: 'image/png',                        // system metadata
+  Metadata: { 'uploaded-by': user.id },            // becomes x-amz-meta-uploaded-by
+}));
+
+const head = await s3.send(new HeadObjectCommand({ Bucket, Key: key }));
+head.ContentLength;          // size, read from the index without touching the data
+head.ContentType;            // 'image/png'
+head.ETag;                   // '"9b2cf535f27731c974343645a3985328"'
+head.Metadata?.['uploaded-by'];
+```
+
+---
+
+## 5. Folders are an illusion 🎓
+
+### What you see vs what exists
+The console shows a folder `uploads`, then `2026` inside it, then `cat.png`. In reality there is **one object** whose key is the single string **`uploads/2026/cat.png`**. The slashes are ordinary characters with **no operational meaning**; you could use `-`, `@` or `#` instead. There's no parent and no nesting: **one bucket with millions, billions or trillions of string keys.**
+
+### What the demo shows 🎓
+1. Upload one object with the CLI under the key `uploads/2026/cat.png`.
+2. The **console** shows **two folders**, both invented for display.
+3. The **raw listing** shows what actually exists: **one key**.
+4. Listing with a **prefix and a delimiter** makes the "folder" appear in a field called **`CommonPrefixes`**. That array is the entire folder feature.
+
+```bash title="🔧 reproduce it"
+aws s3api put-object --bucket demo --key uploads/2026/cat.png --body cat.png
+
+aws s3api list-objects-v2 --bucket demo
+# Contents: [ { "Key": "uploads/2026/cat.png", ... } ]      <- the only thing that exists
+
+aws s3api list-objects-v2 --bucket demo --prefix uploads/ --delimiter /
+# CommonPrefixes: [ { "Prefix": "uploads/2026/" } ]          <- a computed "folder"
+```
+
+### The algorithm: a GROUP BY on strings
+For `prefix = "uploads/"` and `delimiter = "/"`, storage:
+1. finds every key **starting with the prefix**,
+2. looks at **the rest** of each key,
+3. if the rest **contains the delimiter**, cuts it there and reports that piece **once** as a common prefix; otherwise reports the key as an object.
+
+<Mermaid chart={`flowchart LR
+  K1["uploads/2026/cat.png"] --> S{"rest after 'uploads/'<br/>contains '/'?"}
+  K2["uploads/2026/dog.png"] --> S
+  K3["uploads/2025/a.pdf"] --> S
+  K4["uploads/readme.txt"] --> S
+  S -->|"yes: cut at first '/'"| CP["CommonPrefixes<br/>uploads/2026/<br/>uploads/2025/"]
+  S -->|"no"| CT["Contents<br/>uploads/readme.txt"]`} />
+
+```ts title="🔧 the same algorithm in a few lines"
+export function listWithDelimiter(keys: string[], prefix: string, delimiter = '/') {
+  const prefixes = new Set<string>();
+  const contents: string[] = [];
+  for (const key of keys) {
+    if (!key.startsWith(prefix)) continue;
+    const rest = key.slice(prefix.length);
+    const cut = rest.indexOf(delimiter);
+    if (cut === -1) contents.push(key);                          // a "file" at this level
+    else prefixes.add(prefix + rest.slice(0, cut + 1));          // a "folder", reported once
+  }
+  return { contents, commonPrefixes: [...prefixes] };
+}
+```
+
+### Consequences
+- **Moving a "folder" is slow and costs money.** There's no folder to move, just (say) **40,000 objects**, each **copied** to a new key and then **deleted**. 🔧 `aws s3 mv s3://b/old/ s3://b/new/ --recursive` really issues 40,000 copies and 40,000 deletes.
+- **An empty folder can't exist**, because folders have no identity. Tools **fake** one with a **zero-byte object whose key ends in `/`**; the grouping algorithm then reports it as a prefix.
+
+---
+
+## 6. Designing keys 🎓
+
+The key is the object's whole identity, so it's one of the few real design decisions you make with object storage.
+
+### Rule 1 (non-negotiable): never use the user's file name as the key
+Three separate problems:
+
+1. **Collisions.** Two users upload `resume.pdf`, and the second **silently replaces** the first. The upload operation is called **PUT** on purpose: in HTTP semantics PUT **replaces the entity at that URL**, unlike POST, which always creates. Same key means the old object is overwritten with **no error and no warning**.
+2. **Path traversal.** File names can contain `..` and other special characters. Depending on what you do downstream (building paths, local temp files, proxies), the name can **escape the prefix you thought you were writing into**.
+3. **Hostile or odd characters.** Users can send emoji, **right-to-left override** characters (which make `cod.exe` display as something harmless), **null bytes**, anything. Each one is a future bug.
+
+**Fix:**
+- **Generate the key yourself**, ideally random.
+- Store the **original file name in the database** (optionally also in user metadata).
+- Use it **only when serving the file back**. 🔧 For example as `Content-Disposition: attachment; filename="..."` on download (see Part 2).
+
+### Rule 2: put the randomness at the front
+- A common pattern is `uploads/<timestamp>/<id>`.
+- **Why it hurts:** storage **partitions its index by key prefix** (a huge sorted index; section 14). If every key written in the next hour starts with the same timestamp prefix, every write **hits the same index partition**: a **hot partition**. Under heavy traffic you get **503 Slow Down** errors.
+- **Fix:** put something **high-entropy** (very random) early in the key: a UUID, a generated user ID, the first characters of a hash. Instead of `date/user/file`, use something like `user/tenantId/uuid`.
+- AWS has improved automatic partitioning a lot, and you probably won't hit this at small scale. It still **costs nothing to do it right from day one**.
+
+<Mermaid chart={`flowchart LR
+  subgraph Bad["uploads/2026-04-02T10/..."]
+    direction TB
+    W1["all writes this hour"] --> HP["one index partition<br/>(hot)"] --> E["503 Slow Down"]
+  end
+  subgraph Good["tenants/RANDOM/users/RANDOM/uuid"]
+    direction TB
+    W2["all writes this hour"] --> P1["partition A"] & P2["partition B"] & P3["partition C"]
+  end`} />
+
+🔧 **The numbers** (S3 docs): at least **3,500 PUT/COPY/POST/DELETE** and **5,500 GET/HEAD requests per second per partitioned prefix**, with no limit on the number of prefixes. S3 scales up gradually and returns **503 Slow Down** while it does. Retry with exponential backoff (the AWS SDKs do this by default).
+
+### Rule 3 (the author's personal rule): make the key carry ownership
+With a key like `tenantId/userId/objectId`:
+- **Authorization becomes a string comparison** in middleware, done **before** you talk to storage at all.
+- You can write a storage **access policy** scoped to exactly **one prefix**.
+
+With random UUIDs in a flat namespace, **every authorization check needs a database lookup**. One naming decision saves a network hop.
+
+```ts title="🔧 key generation + prefix authorization"
+import { randomUUID } from 'node:crypto';
+
+const KEY_RE = /^tenants\/[0-9a-f-]{36}\/users\/[0-9a-f-]{36}\/[0-9a-f-]{36}$/;
+
+export const ownerPrefix = (tenantId: string, userId: string) => `tenants/${tenantId}/users/${userId}/`;
+export const newKey = (tenantId: string, userId: string) => ownerPrefix(tenantId, userId) + randomUUID();
+
+export function canAccess(user: { tenantId: string; id: string }, key: string) {
+  // Validate the exact shape first, so "..", "%2F" or extra segments can't sneak past the prefix check.
+  return KEY_RE.test(key) && key.startsWith(ownerPrefix(user.tenantId, user.id));
+}
+```
+
+```json title="🔧 an IAM policy scoped to one tenant's prefix"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::my-app-uploads/tenants/7c9e6679-7425-40de-944b-e07fc1f90ae7/*"
+    }
+  ]
+}
+```
+
+Edge case: random IDs at the start keep partitions spread out, but a **single huge tenant** still concentrates writes under one prefix. The UUID that follows lets storage split that prefix further.
+
+---
+
+## 7. Who may touch a bucket: IAM, bucket policies, ACLs and Block Public Access ➕
+
+Rule 3 ended with an IAM policy scoped to one prefix, but that policy is only one of several layers S3 consults on every request, and most real bucket leaks come from misunderstanding how those layers combine.
+
+<Mermaid chart={`flowchart TD
+  R["Request: s3:GetObject on key K"] --> BPA{"Block Public Access<br/>forbids this?"}
+  BPA -->|"yes"| D1["Denied"]
+  BPA -->|"no"| DENY{"Any explicit Deny<br/>in any policy?"}
+  DENY -->|"yes"| D2["Denied"]
+  DENY -->|"no"| SAME{"Same account as<br/>the bucket?"}
+  SAME -->|"yes"| EITHER{"Identity policy OR<br/>bucket policy allows?"}
+  SAME -->|"no, cross-account"| BOTH{"Identity policy AND<br/>bucket policy allow?"}
+  EITHER -->|"yes"| A1["Allowed"]
+  EITHER -->|"no"| D3["Denied (implicit)"]
+  BOTH -->|"yes"| A2["Allowed"]
+  BOTH -->|"no"| D4["Denied (implicit)"]`} />
+
+#### Identity policies vs bucket policies: two ways to say the same allow ➕
+**Problem.** A team gives the app's role `s3:*` on `*` "temporarily", someone else adds a bucket policy denying a prefix, and nobody can predict which wins.
+
+**First principles.** AWS evaluates every request against **all** applicable policies:
+- **Identity-based policies** are attached to the caller (a role or user) and say *what this caller may do*.
+- **Resource-based policies** (the **bucket policy**) are attached to the bucket and say *who may do what to this bucket*.
+- **Default is deny.** An **explicit `Deny` anywhere always wins.** Within one account, an `Allow` in **either** policy is enough. For a **cross-account** caller, **both** sides must allow: the caller's account must allow the action, and the bucket policy must allow that principal.
+
+**Implementation: least privilege on the identity, guardrails on the bucket.** Give each service a role that allows only the actions and prefixes it needs (the Rule 3 policy), and put **non-negotiable rules** in the bucket policy as explicit denies, because a deny holds even if someone later over-grants a role.
+
+```json title="bucket-policy.json: guardrails that no role can override"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::my-app-uploads", "arn:aws:s3:::my-app-uploads/*"],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    },
+    {
+      "Sid": "DenyDeletesExceptCleanupRole",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-app-uploads/*",
+      "Condition": { "ArnNotEquals": { "aws:PrincipalArn": "arn:aws:iam::111122223333:role/upload-cleanup" } }
+    }
+  ]
+}
+```
+
+**Edge cases.**
+- A **`Deny` with `Principal: "*"` also applies to you**, including admins. Lock yourself out of `s3:PutBucketPolicy` and only the account root user can fix it. Always exclude a break-glass role.
+- `s3:ListBucket` targets the **bucket ARN**, object actions target **`bucket/*`**. Mixing them up is the most common "access denied but the policy looks right" bug.
+- Without `s3:ListBucket`, a `GET` on a missing key returns **403 instead of 404**, so callers can't tell "missing" from "forbidden". That's often what you want for private buckets, but it surprises people debugging.
+
+#### ACLs and Object Ownership: the legacy layer you should switch off ➕
+**Problem.** Before bucket policies existed, S3 used per-object **ACLs**. With ACLs enabled, an object uploaded by **another account** can be **owned by that account**, so your bucket policy doesn't control it, and you can't even read objects in your own bucket.
+
+**Mechanism.** The **Object Ownership** setting fixes this. **Bucket owner enforced** (the default for new buckets) disables ACLs completely: the bucket owner owns every object, and access is decided only by policies. Uploads that try to set a non-default ACL fail with `AccessControlListNotSupported`.
+
+**Implementation.** Keep the default, and check it explicitly in infrastructure code, because older buckets may predate it:
+
+```bash
+aws s3api put-bucket-ownership-controls --bucket my-app-uploads \
+  --ownership-controls 'Rules=[{ObjectOwnership=BucketOwnerEnforced}]'
+```
+
+**Edge case.** Old client code that sends `ACL: 'public-read'` on upload starts failing with a 400 after the switch. That's the point: find those callers before they make objects public.
+
+#### Block Public Access: the switch that overrides everything ➕
+**Problem.** One mistyped policy (`"Principal": "*"` with `s3:GetObject`) makes every user upload world-readable, and this is the classic data-leak headline.
+
+**Mechanism.** **Block Public Access** is a separate set of four flags at the account, bucket and access-point level that **override** policies and ACLs:
+- `BlockPublicAcls`: reject requests that try to set a public ACL,
+- `IgnorePublicAcls`: ignore any public ACL that exists,
+- `BlockPublicPolicy`: reject a bucket policy that grants public access,
+- `RestrictPublicBuckets`: if a public policy exists anyway, allow only AWS service principals and the bucket owner's account.
+
+S3 applies the **most restrictive** combination of the levels. New buckets have it on. Turn it on **at the account level** too: with only the bucket-level setting, someone who can edit the bucket policy can also switch it off.
+
+**Implementation.** Public files go through a CDN with origin access control ([Part 2, section 9](/docs/backend-first-principles/object-storage-part-2)), never through a public bucket, so you never need to turn this off.
+
+#### Presigned URLs inherit the signer's permissions ➕
+**Problem.** A presigned URL (section 17) works even though the bucket is private, so people assume it's a separate permission system.
+
+**Mechanism.** S3 evaluates a presigned request **as if the signer made it**, at the moment it's used. So:
+- if the signing role can't `PutObject` on that prefix, the URL fails with 403 even though the signature is valid,
+- if you **remove** the role's permission, URLs already handed out stop working,
+- if the signer used **temporary credentials** (a Lambda or ECS role), the URL dies when those credentials expire, whatever `expiresIn` said.
+
+**Implementation.** Sign with a **dedicated role** whose policy allows exactly the upload and download actions on user prefixes, so a leaked or over-broad URL can never do more than that role can.
+
+---
+
+## 8. Encryption at rest: SSE-S3, SSE-KMS and client-side ➕
+
+Access policies decide who may ask for the bytes; encryption decides what someone gets if they reach the bytes **without** going through those policies (a stolen disk, a mis-scoped backup, an insider at the storage layer), and the choice of key management changes your costs and audit trail.
+
+#### SSE-S3: the default, and what it does and doesn't protect ➕
+**What happens.** Since **5 January 2023**, every new object in S3 is encrypted at rest with **SSE-S3** by default, at no cost: each object gets its own AES-256 data key, which S3 encrypts with a regularly rotated root key.
+
+**First principles: what it protects against.** Physical theft of drives and access below S3's API. It does **not** protect against anyone who can call `GetObject` with valid credentials: S3 decrypts transparently for any authorized request. So SSE-S3 is a baseline, not an access control.
+
+#### SSE-KMS: a second, audited permission check ➕
+**Problem.** You need to prove who decrypted what (compliance), or to make sure that even a role with `s3:GetObject` can't read certain data unless it also has rights to a specific key.
+
+**Mechanism.** With **SSE-KMS**, S3 asks **AWS KMS** for a data key under a KMS key you choose. On every read, S3 needs KMS to decrypt the data key, so the caller needs **both** `s3:GetObject` **and** `kms:Decrypt` on that key. The KMS **key policy** becomes a second, independent gate, and every use appears in **CloudTrail**.
+
+```ts title="set SSE-KMS per upload (or make it the bucket default)"
+await s3.send(new PutObjectCommand({
+  Bucket, Key: key, Body: bytes, ContentType: 'application/pdf',
+  ServerSideEncryption: 'aws:kms',
+  SSEKMSKeyId: process.env.UPLOADS_KMS_KEY_ARN,
+  BucketKeyEnabled: true,                 // see the cost note below
+}));
+```
+
+```bash title="bucket default: every new object uses this key"
+aws s3api put-bucket-encryption --bucket my-app-uploads --server-side-encryption-configuration '{
+  "Rules": [{ "ApplyServerSideEncryptionByDefault": { "SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "arn:aws:kms:us-east-1:111122223333:key/EXAMPLE" },
+              "BucketKeyEnabled": true }]
+}'
+```
+
+**The cost and throttling trap.** Without further settings, S3 calls KMS for **every object request**. A busy bucket can generate millions of KMS requests: you pay per request, and KMS has per-second **request quotas**, so reads start failing with throttling errors. **S3 Bucket Keys** fix this: S3 gets a short-lived bucket-level key from KMS and derives per-object keys locally, cutting KMS request costs by **up to 99%**.
+
+**Edge cases.**
+- With a Bucket Key, the encryption context and CloudTrail entries show the **bucket ARN** instead of the object ARN, and you see fewer KMS events. Key policies that matched on the object ARN stop working.
+- Changing the default to SSE-KMS **doesn't re-encrypt existing objects**. Re-encrypting means copying each object onto itself (S3 Batch Operations for large buckets).
+- Cross-account readers need permission in the **KMS key policy**, not only the bucket policy. "Access denied" on a bucket you've shared is often a KMS denial.
+- **Deleting or disabling the KMS key makes the data unreadable.** KMS enforces a waiting period before deletion; alert on any scheduled key deletion.
+
+#### SSE-C, DSSE-KMS and client-side encryption ➕
+- **SSE-C** (you send the key with every request, S3 encrypts and forgets it): S3 never stores the key, but your app now has to store, rotate and send it on every request, and a lost key means lost data. AWS turned SSE-C **off by default for new buckets in April 2026**; you must enable it deliberately. Prefer SSE-KMS unless a regulation requires you to hold the key.
+- **DSSE-KMS** applies two independent layers of AES-256 for regimes that require multi-layer encryption. It doesn't support Bucket Keys, so KMS costs are higher.
+- **Client-side encryption** (encrypt before upload, for example with the AWS Encryption SDK): S3 only ever sees ciphertext. It's the only option that protects against someone with full S3 and KMS access in your account, but you lose server-side features that need the plaintext: range reads at meaningful offsets, image processing, malware scanning and content-type sniffing.
+
+#### Enforcing encryption so nobody forgets ➕
+Bucket default encryption covers clients that send nothing. To **reject** clients that request a weaker option, add a deny to the bucket policy:
+
+```json title="require SSE-KMS with your key"
+{
+  "Sid": "DenyWrongKey",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "s3:PutObject",
+  "Resource": "arn:aws:s3:::my-app-uploads/*",
+  "Condition": { "StringNotEqualsIfExists": {
+    "s3:x-amz-server-side-encryption-aws-kms-key-id": "arn:aws:kms:us-east-1:111122223333:key/EXAMPLE"
+  } }
+}
+```
+
+**Edge case.** Presigned uploads must include the encryption headers **in the signature**, and the browser must send them, or this policy rejects the upload with 403.
+
+---
+
+## 9. What happens inside a PUT 🎓
+
+When you `PUT` a 100 MB file:
+
+1. The request lands on one of thousands (or millions) of **stateless front-end nodes**.
+2. That node **authenticates** the request by **recomputing the signature** (the same mechanism that powers presigned URLs; section 17).
+3. The work then **splits into two completely separate problems**. This split is the core architectural idea of object storage.
+
+<Mermaid chart={`flowchart TD
+  C["Client: PUT uploads/2026/cat.png (100 MB)"] --> FE["Stateless front-end node<br/>recompute signature = authN"]
+  FE --> DP["DATA PLANE<br/>store the bytes so they survive"]
+  FE --> MP["METADATA PLANE<br/>remember: bucket + key maps to these shards"]
+  DP --> SH["Erasure-coded shards on many drives,<br/>racks and power domains"]
+  MP --> IDX[("Distributed sorted index<br/>key: shard locations, size, ETag, type")]
+  SH -.->|"locations recorded in"| IDX
+  IDX --> OK["200 OK: commit is visible to every reader at once"]`} />
+
+| | Data plane | Metadata plane |
+|---|---|---|
+| Job | Store the bytes durably | Map `bucket + key` to where the pieces live |
+| Volume | **Huge** | **Small** by comparison |
+| Operations | Simple | **Huge number** of them |
+| Requirements | Survive failures | **Strongly consistent** and **extremely fast** |
+| Difficulty | Solved for decades (store exabytes on drives) | **The hard problem** |
+
+### Strong vs eventual consistency
+- **Strongly consistent:** once one client's upload succeeds, **any** reader, even a second later, is guaranteed to see it.
+- **Eventually consistent:** there's a lag; a read right after a write may not see it yet.
+
+The metadata plane is hard because it must be a **strongly consistent, globally distributed, sorted index over hundreds of trillions of keys**, with each lookup taking **a few milliseconds**. Countless production systems depend on exactly that property.
+
+---
+
+## 10. The data plane: replication vs erasure coding 🎓
+
+### Naive durability: replication
+- Keep **3 copies** on 3 machines, ideally in **3 different failure domains**, so one failure can't take out all of them. If one dies, copy from another.
+- **Problem: cost.** 1 PB of customer data needs **3 PB of drives**, which is **200% overhead**. At cloud scale that's billions of dollars just for copies.
+
+### What large providers do: erasure coding
+1. Split the object into **14 data shards**.
+2. Run a mathematical transform (**Reed–Solomon**, a classic algorithm) to compute **6 parity shards**, for **20** in total.
+3. Spread the 20 shards across **20 drives** in different racks, power domains and ideally buildings.
+4. **The key property: any 14 of the 20 shards reconstruct the original object**, whichever 14 they are.
+
+<Mermaid chart={`flowchart LR
+  O["Object"] --> SPLIT["Split into 14 data shards"]
+  SPLIT --> RS["Reed-Solomon encode"]
+  RS --> D["14 data shards"]
+  RS --> P["6 parity shards"]
+  D & P --> SPREAD["20 drives across racks,<br/>power domains, buildings"]
+  SPREAD --> LOSS["Up to 6 drives fail"]
+  LOSS --> REB["Any 14 survivors<br/>rebuild the object"]`} />
+
+| | 3× replication | Erasure coding 14 + 6 |
+|---|---|---|
+| Raw storage per byte | **3.0×** | 20 ÷ 14 ≈ **1.43×** |
+| Simultaneous failures tolerated | 2 | **6** |
+| Extra cost | drives | **CPU** to encode, plus **extra reads** to rebuild |
+
+About **half the storage cost and more durable**. CPU is cheap compared with drives, so it's a very good trade.
+
+🔧 **Note:** 14 + 6 is the lesson's illustrative layout. AWS doesn't publish S3's exact coding parameters.
+
+### 🔧 Going deeper: how parity can rebuild lost data
+The smallest erasure code is **2 data shards + 1 parity shard using XOR**. Reed–Solomon generalizes the same idea to `k` data shards plus `m` parity shards, tolerating **any `m` losses**.
+
+```ts title="xor-parity.ts"
+const xor = (a: Buffer, b: Buffer) => Buffer.from(a.map((byte, i) => byte ^ b[i]));
+
+const A = Buffer.from('HELLO');         // data shard 1
+const B = Buffer.from('WORLD');         // data shard 2
+const P = xor(A, B);                    // parity shard, stored on a third drive
+
+// The drive holding A dies. Since A ^ B ^ B = A:
+const rebuiltA = xor(P, B);
+console.log(rebuiltA.toString());       // "HELLO"
+```
+
+### Eleven nines 🎓
+S3 is designed for **99.999999999%** durability ("11 nines"). Roughly: **store 10 million objects and statistically expect to lose one every 10,000 years** (10⁷ objects × 10⁻¹¹ annual loss rate = 10⁻⁴ objects per year). That figure comes from shard math like the above: how many shards must fail at once, before repair finishes, to lose data.
+
+---
+
+## 11. Durability is not a backup 🎓
+
+### Problem
+Eleven nines protect you against **drives dying**. They don't protect you against **your own actions**:
+- A bug runs `DELETE` on the **wrong prefix**, and storage deletes everything under it, very durably and with eleven nines of confidence. There's no "the data is durable, so give it back".
+- A bug **overwrites** objects with garbage, and storage faithfully keeps the **corrupted** version.
+
+### Solution (when the data matters)
+1. **Turn on versioning.** An overwrite or delete creates a **new version** (or a delete marker) instead of destroying the old bytes.
+2. **Replicate to a second bucket in a different cloud account.** If your credentials leak, the attacker shouldn't have access to both copies.
+
+<Mermaid chart={`flowchart LR
+  APP["App credentials<br/>(account A)"] --> SRC[("Bucket: versioning ON")]
+  SRC -->|"overwrite"| V["old version kept"]
+  SRC -->|"delete"| DM["delete marker<br/>(remove it to restore)"]
+  SRC ==>|"replication"| DST[("Backup bucket<br/>account B, versioning ON")]
+  ATK["Leaked account A keys"] -.->|"no access"| DST`} />
+
+```bash title="🔧 turn on versioning, and cap what old versions cost"
+aws s3api put-bucket-versioning --bucket my-app-uploads \
+  --versioning-configuration Status=Enabled
+```
+
+```json title="🔧 lifecycle: keep old versions 30 days, then delete them"
+{
+  "Rules": [
+    {
+      "ID": "expire-old-versions",
+      "Filter": {},
+      "Status": "Enabled",
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 30 }
+    }
+  ]
+}
+```
+
+🔧 Edge cases:
+- **Every version is billed.** An app that overwrites the same key constantly multiplies storage. Hence the noncurrent-version rule.
+- With versioning, a plain `DELETE` only adds a **delete marker**. To restore, delete the marker. To truly erase, delete specific **version IDs**.
+- **Replication requires versioning on both buckets**, and cross-account replication needs a bucket policy on the destination granting the source permission.
+- For compliance-grade protection, **S3 Object Lock** makes versions **undeletable** for a retention period. In compliance mode nobody, including the account's root user, can delete them early.
+
+---
+
+## 12. Object Lock: making versions undeletable ➕
+
+Versioning keeps old versions, but anyone with `s3:DeleteObjectVersion` (a buggy cleanup job, ransomware using stolen keys) can still destroy them; **Object Lock** removes that last hole by putting a write-once-read-many (WORM) rule on individual versions.
+
+#### Retention periods and legal holds ➕
+**Mechanism.** A lock is stored in a version's metadata and comes in two independent forms:
+- a **retention period**: the version can't be overwritten-in-place or deleted until a *retain-until* date. It can be **extended**, never shortened (in compliance mode). S3 recently added **variable retention**, where the clock starts only when you release an "event hold" (for example, when a contract closes),
+- a **legal hold**: same protection, **no end date**, until someone with `s3:PutObjectLegalHold` removes it. Use it for litigation or audits of unknown length.
+
+A version can have both; it stays protected while **either** applies.
+
+#### Governance vs compliance mode ➕
+| | Governance | Compliance |
+|---|---|---|
+| Who can delete early or shorten retention | Principals with `s3:BypassGovernanceRetention` who send `x-amz-bypass-governance-retention: true` | **Nobody**, including the root user |
+| Typical use | Protect against accidents and most users, test settings | Regulations requiring WORM (SEC 17a-4, FINRA style) |
+| Way out of a mistake | Bypass with the special permission | Wait, or close the AWS account |
+
+**First principles.** Compliance mode is only meaningful because there's **no escape hatch**. That's also why it's dangerous: a default retention of 10 years in compliance mode on a busy bucket means 10 years of storage bills you can't stop. **Test with governance mode first.**
+
+#### Setting it up ➕
+Object Lock requires versioning. You can enable it on new or existing buckets, but **never disable it** (or suspend versioning) afterwards.
+
+```bash title="enable Object Lock with a default 30-day governance retention"
+aws s3api put-object-lock-configuration --bucket my-app-invoices --object-lock-configuration '{
+  "ObjectLockEnabled": "Enabled",
+  "Rule": { "DefaultRetention": { "Mode": "GOVERNANCE", "Days": 30 } }
+}'
+```
+
+```ts title="lock one object explicitly at upload"
+await s3.send(new PutObjectCommand({
+  Bucket: 'my-app-invoices', Key: key, Body: pdf, ContentType: 'application/pdf',
+  ObjectLockMode: 'COMPLIANCE',
+  ObjectLockRetainUntilDate: new Date(Date.now() + 7 * 365 * 24 * 3600 * 1000),  // 7 years
+  ChecksumAlgorithm: 'SHA256',   // locked uploads need an integrity checksum; the SDK computes it
+}));
+```
+
+#### How deletes behave on a locked bucket ➕
+- A **plain `DELETE`** (no version ID) still returns **200**: it just adds a **delete marker** on top. The locked version is untouched, and the object "disappears" from normal reads.
+- A **`DELETE` with the version ID** of a locked version returns **403**.
+- **Overwriting** the key creates a new version; the locked one stays.
+
+**Edge cases.**
+- Lifecycle rules **can't expire locked versions** until the lock ends. Noncurrent-version expiration rules then catch up.
+- Locked buckets **can't be destinations for server access logs**.
+- Object Lock protects bytes, not **access**: a locked object can still be read by anyone with permission. Combine it with section 7.
+- Your **database still points at keys**. After a plain delete adds a marker, the app thinks the file is gone while it's actually retained, so make "deleted" a status in the DB and document that the bytes live until the retention date (important for GDPR-style deletion requests, which conflict with WORM: keep personal data out of locked buckets, or encrypt it per user and delete the key).
+
+---
+
+## 13. Replication semantics: what actually gets copied ➕
+
+Section 11 said "replicate to a second bucket"; this section covers **what that replication guarantees and what it silently skips**, because a backup or failover plan built on wrong assumptions fails exactly when you need it.
+
+<Mermaid chart={`flowchart LR
+  subgraph SRC["Source bucket (versioned)"]
+    N["New object versions<br/>after the rule exists"]
+    E["Objects that existed<br/>before the rule"]
+    DM["Delete markers"]
+    VD["Delete of a specific version"]
+    LC["Lifecycle expirations"]
+  end
+  N -->|"replicated, async"| DST[("Destination bucket")]
+  E -.->|"NOT replicated:<br/>use Batch Replication"| DST
+  DM -.->|"only if delete-marker<br/>replication is enabled"| DST
+  VD -.->|"never replicated<br/>(protects the replica)"| DST
+  LC -.->|"never replicated"| DST`} />
+
+#### Only new writes are replicated ➕
+**Problem.** You add a replication rule to a bucket holding 5 TB, check the destination a week later, and it contains only that week's uploads.
+
+**Mechanism.** A replication rule applies to objects **created after the rule exists**. Existing objects, objects that previously **failed** to replicate, and objects that are themselves **replicas** (A → B → C chains) aren't copied by live replication. **S3 Batch Replication** is the tool that backfills them.
+
+**Implementation.** When you enable replication on a bucket with data, run a Batch Replication job immediately, then verify with Inventory (section 14) that every source object shows a replication status of `COMPLETED`.
+
+#### Deletes don't replicate the way you'd guess ➕
+**Mechanism.**
+- **Version-specific deletes are never replicated.** If an attacker or bug permanently deletes versions in the source, the replica keeps them. That's the property that makes replication a backup.
+- **Delete markers** (plain deletes) are replicated only if you enable **delete-marker replication** on the rule. If you enable it, a plain delete hides the object in both buckets (the data remains as a noncurrent version in both).
+- **Lifecycle actions aren't replicated.** If the source expires objects after 30 days and the destination has no rule, the destination keeps them forever (and bills you). Configure lifecycle on **both** buckets deliberately.
+
+**Implementation.** For a backup copy: delete-marker replication **off**, Object Lock (section 12) on the destination, and a destination lifecycle that keeps noncurrent versions as long as your recovery window. For a **failover** copy you *do* want deletes mirrored, so the two choices are in tension. Decide which one each rule is for.
+
+#### Replication is asynchronous: timing and RTC ➕
+**Problem.** You fail over to the replica region and find the last few minutes of uploads missing.
+
+**Mechanism.** Replication runs **in the background**, so most objects arrive in seconds but there's no default upper bound. **Replication Time Control (RTC)** adds an SLA: **99.9% of objects within 15 minutes**, plus replication metrics and events when an object misses the threshold (`OperationMissedThreshold`). It costs extra.
+
+**Implementation.** Watch the replication status per object (`HeadObject` returns `ReplicationStatus`: `PENDING`, `COMPLETED`, `FAILED` on the source and `REPLICA` on the destination) and alert on `FAILED` via replication events.
+
+```ts title="is this object safely replicated yet?"
+const head = await s3.send(new HeadObjectCommand({ Bucket: SOURCE, Key: key }));
+if (head.ReplicationStatus === 'FAILED') await alerts.page(`replication failed for ${key}`);
+```
+
+#### Failover consequences for your app ➕
+- The replica bucket has a **different name** (and region). Presigned URLs, CDN origins and keys stored in your DB as full URLs all point to the source. Store **keys**, not URLs, and resolve the bucket from config.
+- Your **database** is the index (section 14). If it fails over to a region where some objects haven't replicated yet, rows can point at keys that 404. Treat "row exists, object missing" as a retriable state during failover.
+- Replication requires **versioning on both buckets**; SSE-KMS objects need KMS permissions for the replication role in **both** regions, and they count against KMS request quotas.
+
+---
+
+## 14. The metadata plane: a giant sorted index 🎓
+
+### What it is
+Conceptually a **huge, distributed, sorted key-value index**, like a distributed **B-tree** (the balanced tree that databases use):
+
+> `bucket + key` → shard locations, size, ETag, content type, …
+
+It's **partitioned by key range**, which is exactly why the hot-partition rule in section 6 exists.
+
+### Consequences you can now explain from first principles
+- **`LIST` is slow.** It's a **range scan over a distributed sorted index**, paginated (🔧 up to **1,000** keys per call). Range scans are fundamentally more expensive than single-key lookups.
+- **No atomic rename.** Renaming means changing a key in the index while the data stays put, but **the key decides which partition owns the entry**. Moving it across partitions atomically is hard, so it isn't offered.
+- **Size comes back instantly.** `HEAD` reads the **index entry** and never touches a drive.
+
+### The single most important rule here
+**Never use `LIST` in the request path.** **Your database is the index of which files exist** (and who owns them). The bucket stores **bytes**. Calling `ListObjects` to answer "what files does this user have?" doesn't scale and adds latency.
+
+```sql title="🔧 the DB is the index"
+CREATE TABLE files (
+  id            uuid PRIMARY KEY,
+  owner_id      uuid        NOT NULL,
+  object_key    text        NOT NULL UNIQUE,
+  original_name text        NOT NULL,          -- the user's file name, never used as the key
+  content_type  text        NOT NULL,
+  max_size      bigint      NOT NULL,          -- what we agreed to accept
+  size          bigint,                        -- what actually arrived (from HEAD)
+  status        text        NOT NULL CHECK (status IN ('PENDING', 'READY', 'REJECTED', 'EXPIRED')),
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX files_owner_ready ON files (owner_id, created_at DESC) WHERE status = 'READY';
+
+-- "What files does this user have?" One indexed query, no LIST:
+SELECT id, original_name, size, created_at
+FROM files WHERE owner_id = $1 AND status = 'READY'
+ORDER BY created_at DESC LIMIT 50;
+```
+
+### When you really do need every key: S3 Inventory ➕
+
+"Never LIST in the request path" leaves one legitimate need: periodically comparing **everything** in the bucket against the database, to find orphans and dangling rows that slipped past the two-phase flow (section 18), and listing a bucket with a billion keys 1,000 at a time is slow, costs a request per page and competes with production traffic.
+
+#### What Inventory gives you ➕
+**Mechanism.** You configure an inventory on the bucket (or a prefix), and S3 writes a **report of every object** (CSV, ORC or Parquet, plus a manifest) into a destination bucket **daily or weekly**. It doesn't use the LIST API, so it doesn't consume your request rate. You choose the fields: size, last-modified, ETag, storage class, encryption status, replication status, Object Lock state, and more.
+
+```bash title="daily Parquet inventory of the uploads prefix"
+aws s3api put-bucket-inventory-configuration --bucket my-app-uploads --id daily-uploads \
+  --inventory-configuration '{
+    "Id": "daily-uploads", "IsEnabled": true, "IncludedObjectVersions": "Current",
+    "Filter": { "Prefix": "tenants/" },
+    "Schedule": { "Frequency": "Daily" },
+    "OptionalFields": ["Size", "LastModifiedDate", "ETag", "StorageClass", "EncryptionStatus", "ReplicationStatus"],
+    "Destination": { "S3BucketDestination": {
+      "Bucket": "arn:aws:s3:::my-app-inventory", "Format": "Parquet", "Prefix": "uploads" } }
+  }'
+```
+
+#### A reconciler built on Inventory ➕
+**Problem.** Which objects have no DB row (orphans you pay for), and which READY rows have no object (dangling rows that will 404)?
+
+**Mechanism.** Load the report into a staging table (or query it in place with Athena), then do two **anti-joins** against the files table.
+
+```sql title="reconcile.sql (after loading the report into inventory_staging)"
+-- Orphans: in the bucket, not in the DB, and old enough that no upload is mid-flight
+SELECT i.key, i.size
+FROM inventory_staging i
+LEFT JOIN files f ON f.object_key = i.key
+WHERE f.id IS NULL AND i.last_modified < now() - interval '2 days';
+
+-- Dangling rows: READY in the DB, absent from the report
+SELECT f.id, f.object_key
+FROM files f
+LEFT JOIN inventory_staging i ON i.key = f.object_key
+WHERE f.status = 'READY' AND i.key IS NULL
+  AND f.created_at < now() - interval '2 days';
+```
+
+**Implementation rules.**
+- **Never delete straight from the report.** The inventory is an **eventually consistent snapshot**: it may miss objects added or deleted shortly before it ran. For each candidate, `HEAD` the object and re-check the DB row, then delete (or quarantine under a prefix with an expiry rule first).
+- The grace period (2 days here) must exceed the time between report generation and delivery, plus your longest legitimate upload.
+- In **CSV** reports, keys are **URL-encoded**. Decode them before joining.
+
+#### Edge cases ➕
+- The **first report can take up to 48 hours**. It isn't a tool for real-time state.
+- The destination must be in the **same region** and have a bucket policy letting S3 write to it. Put a lifecycle rule on it, or old reports pile up.
+- Inventory is also the input for **S3 Batch Operations** (re-encrypting, copying, restoring or tagging millions of objects), which is how sections 8 and 13 handle existing objects at scale.
+
+### Consistency, then and now 🎓
+- **Historically S3 was eventually consistent.** Upload, then immediately `GET`, and you might get **404**, because the read hit an **index replica** that hadn't caught up. Lots of systems suffered from this.
+- **Since December 2020, S3 has strong read-after-write consistency.** A successful upload is immediately readable (200 OK).
+- So the old blog posts and Stack Overflow answers recommending **retry loops or sleeps after upload are outdated**.
+
+---
+
+## 15. Conditional writes: compare-and-swap on object storage 🎓
+
+### Problem
+For almost **20 years**, a `PUT` **always overwrote**. If two processes wrote the same key at once, one **silently won**, and there was **no way to detect** which, or to say "**only write this if it doesn't already exist**". That makes object storage useless for coordination.
+
+### Mechanism (added to S3 in 2024)
+
+| Header | Meaning | If the condition fails |
+|---|---|---|
+| `If-None-Match: *` | **Create only if the key doesn't exist** | **412 Precondition Failed** |
+| `If-Match: <ETag>` | **Replace only if the current content is still the version I read** | **412 Precondition Failed** |
+
+`If-Match` gives you **compare-and-swap (CAS)**. The lesson's scenario:
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant A as Client A
+  participant S3 as S3
+  participant B as Client B
+  A->>S3: GET doc
+  S3-->>A: body + ETag "v1"
+  B->>S3: GET doc
+  S3-->>B: body + ETag "v1"
+  Note over A: edits locally (slow)
+  B->>S3: PUT doc, If-Match "v1"
+  S3-->>B: 200, new ETag "v2"
+  A->>S3: PUT doc, If-Match "v1"
+  S3-->>A: 412 Precondition Failed
+  Note over A: re-read v2, re-apply the edit, retry. B's write is NOT lost`} />
+
+Without the condition, A's late write would have **silently erased B's update** (a lost update, exactly the race from [lesson 23](/docs/backend-first-principles/23-concurrency-parallelism)). With it, storage **protects B's data**, and A learns it must re-read.
+
+### What the demo shows 🎓
+The same CLI `put-object --if-none-match "*"` runs twice. The first returns **200 and an ETag**; the second returns **412**, because the object now exists.
+
+### Why this is a big deal
+- A 412 is a **"you lost the race" signal**, the primitive behind a **distributed lock**.
+- Combined with **strong consistency**, people now build **leader election**, coordination, and even databases that keep their **write-ahead logs on S3**. A WAL's first requirement is that **exactly one writer wins** each log position, and conditional writes guarantee that.
+- **The everyday benefit:** an upload can **never silently clobber an existing object**, which closes the duplicate-key bug from Rule 1.
+
+### "S3-compatible" doesn't mean "has conditional writes" 🎓
+"S3-compatible" roughly means **speaks the same API**, so the AWS SDK works against it (Cloudflare R2 is the usual example). It **doesn't guarantee every feature**. The lesson's example is **Backblaze**, which is S3-compatible but (per the lesson) doesn't support conditional writes. **Check the provider's docs before you depend on it.**
+
+### 🔧 Going deeper: conditional writes in Node
+
+```ts title="create-only and optimistic update"
+import { S3Client, GetObjectCommand, PutObjectCommand, S3ServiceException } from '@aws-sdk/client-s3';
+
+const statusOf = (e: unknown) => (e as S3ServiceException)?.$metadata?.httpStatusCode;
+
+// 1) Create only if absent: no silent overwrite, ever.
+export async function putIfAbsent(Key: string, Body: Uint8Array, ContentType: string) {
+  try {
+    await s3.send(new PutObjectCommand({ Bucket, Key, Body, ContentType, IfNoneMatch: '*' }));
+    return true;
+  } catch (e) {
+    if (statusOf(e) === 412) return false;          // someone already created this key
+    throw e;
+  }
+}
+
+// 2) Compare-and-swap on a small JSON document (a manifest, a counter, a lease).
+export async function updateJson<T>(Key: string, change: (doc: T) => T, maxAttempts = 5) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const current = await s3.send(new GetObjectCommand({ Bucket, Key }));
+    const doc = JSON.parse(await current.Body!.transformToString()) as T;
+    try {
+      await s3.send(new PutObjectCommand({
+        Bucket, Key, ContentType: 'application/json',
+        Body: JSON.stringify(change(doc)),
+        IfMatch: current.ETag,                      // only if nobody wrote since our read
+      }));
+      return;
+    } catch (e) {
+      const s = statusOf(e);
+      if (s === 412 || s === 409) {                 // lost the race (or a concurrent conflict): re-read and retry
+        await new Promise(r => setTimeout(r, 50 * 2 ** attempt * Math.random()));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error(`too much contention on ${Key}`);
+}
+```
+
+Edge cases:
+- **409 Conflict** can also come back when requests race, for example a delete landing during a conditional write. For `PutObject` you can retry. For `CompleteMultipartUpload` the **whole multipart upload must be restarted**.
+- **In-progress multipart uploads don't count** as existing objects. If someone else writes the key first, your conditional `CompleteMultipartUpload` fails with 412.
+- **A lock object has no built-in expiry.** If the holder crashes, it never releases. Store `expiresAt` in the body. A taker that sees an expired lease **steals it with `If-Match` on the expired lease's ETag**, so exactly one stealer wins. Also pass a **fencing token** (a counter in the lease) to downstream systems, so a paused ex-holder's late writes are rejected.
+- You can **enforce** conditional writes with a bucket policy, so no client can forget the header.
+
+---
+
+## 16. Getting a file into storage: two architectures 🎓
+
+### Architecture 1: through your server
+The browser posts to your API, and the backend forwards the file to the bucket.
+
+**Advantages:**
+- The backend **sees every byte**: it can validate, scan, hash and reject **before** anything reaches storage.
+- Authorization is your normal middleware; there's **no CORS** to configure.
+- For **small files** (avatars, CSVs, documents of a few MB) it's fine, and it's genuinely used. It isn't objectively wrong.
+
+**The hidden problem: buffering.**
+- Go's `ParseMultipartForm`, or a default body parser in a Node framework, **reads the whole file into memory**.
+- One 100 MB upload means 100 MB of RAM, and **20 concurrent 100 MB uploads exhaust 2 GB instantly**. The container hits its memory limit, gets **OOM-killed** and restarts: the opening scenario again.
+- **Why you don't see it locally:** small test files, a fast connection and a 16 GB+ development machine.
+
+**The correct version of this pattern: stream, with a size limit.**
+- Read the request body **in chunks** and write each chunk to the storage client **as it arrives**. Memory stays at **one small buffer** (kilobytes) whether the file is 1 MB or 1 GB.
+- **Wrap the body in a size limit before reading anything**, so a 4 GB upload is **cut off at your limit** instead of being allowed to try.
+
+<Mermaid chart={`flowchart LR
+  subgraph Buffered["Buffered"]
+    direction TB
+    B1["request body"] --> B2["whole file in RAM<br/>(memory grows to file size)"] --> B3["then PUT to bucket"]
+  end
+  subgraph Streamed["Streamed + capped"]
+    direction TB
+    S1["request body"] --> S2["size-limit wrapper"] --> S3["one chunk at a time<br/>(memory flat)"] --> S4["multipart upload<br/>to bucket"]
+  end`} />
+
+### What the demo shows 🎓
+Two servers each receive the same **500 MB** upload while `btop` watches memory:
+- **Buffered:** the memory column **climbs as the body arrives**, ending about **500 MB higher** than it started.
+- **Streamed:** same file, same client, same time (**about 6.5 seconds**), but the memory line **barely moves**, because it holds one chunk at a time.
+
+### Limits you can't stream around
+Even streamed, **your bandwidth is now the bottleneck**, and the infrastructure in front of you has limits:
+
+| Layer | Limit | Symptom |
+|---|---|---|
+| Load balancer | **Idle timeout**, often **60 s** by default (🔧 the AWS ALB default) | Slow mobile uploads get cut off |
+| Reverse proxy (nginx, Caddy) | **Body-size limit** (🔧 nginx `client_max_body_size` defaults to **1 MB**) | **413 Request Entity Too Large** |
+| Serverless / API gateway | A **hard payload cap** of a few MB (🔧 e.g. **6 MB** for a synchronous Lambda request) | Can't be raised |
+
+**Verdict:** it works for small files on traditional servers, but it's **not the production-grade architecture**.
+
+### 🔧 Going deeper: streaming through a Node server correctly
+
+```ts title="avatar-upload.route.ts"
+import Busboy from 'busboy';
+import { Upload } from '@aws-sdk/lib-storage';
+
+const MAX = 10 * 1024 * 1024;   // 10 MB
+
+app.post('/avatar', requireAuth, (req, res) => {
+  // Cheap early rejection based on the declared size (it can lie, so we enforce again while streaming).
+  if (Number(req.headers['content-length'] ?? 0) > MAX + 64 * 1024) return res.status(413).end();
+
+  const bb = Busboy({ headers: req.headers, limits: { files: 1, fileSize: MAX } });
+  let sawFile = false;
+
+  bb.on('file', (_field, stream, info) => {
+    sawFile = true;
+    if (!info.mimeType.startsWith('image/')) {     // client-declared: re-check magic bytes later
+      stream.resume();
+      return res.status(415).json({ error: 'images only' });
+    }
+    const key = newKey(req.user.tenantId, req.user.id);
+    const upload = new Upload({
+      client: s3,
+      params: { Bucket, Key: key, Body: stream, ContentType: info.mimeType },
+      partSize: 5 * 1024 * 1024,                   // memory ≈ partSize × queueSize, not the file size
+      queueSize: 2,
+    });
+    stream.on('limit', () => upload.abort());      // busboy hit fileSize: stop and abort the multipart upload
+
+    upload.done()
+      .then(async () => {
+        await db.file.create({ data: { ownerId: req.user.id, objectKey: key, originalName: info.filename,
+                                       contentType: info.mimeType, maxSize: MAX, status: 'READY' } });
+        res.status(201).json({ key });
+      })
+      .catch(() => {
+        if (!res.headersSent) res.status(stream.truncated ? 413 : 500).json({ error: stream.truncated ? 'too large' : 'upload failed' });
+      });
+  });
+
+  bb.on('close', () => { if (!sawFile && !res.headersSent) res.status(400).json({ error: 'no file' }); });
+  req.pipe(bb);
+});
+```
+
+- The Node version of the buffering trap is `multer({ storage: multer.memoryStorage() })`, which keeps every file in RAM as a `Buffer`.
+- If the DB insert fails after the upload succeeded, you have an orphan object. That's problem 6 again, and why the two-phase flow (section 18) records intent **first**.
+
+The lesson's Go shape (labelled **Go**): read the multipart stream part by part and hand the reader straight to the uploader.
+
+```go title="Go: stream a multipart part to storage"
+func uploadAvatar(w http.ResponseWriter, r *http.Request) {
+    r.Body = http.MaxBytesReader(w, r.Body, 10<<20) // cap BEFORE reading anything
+    mr, err := r.MultipartReader()                   // not ParseMultipartForm: no buffering
+    if err != nil { http.Error(w, "expected multipart form", http.StatusBadRequest); return }
+    part, err := mr.NextPart()
+    if err != nil { http.Error(w, "no file", http.StatusBadRequest); return }
+
+    key := newKey(tenantID(r), userID(r))
+    _, err = uploader.Upload(r.Context(), &s3.PutObjectInput{ // manager.Uploader streams in parts
+        Bucket: aws.String(bucket), Key: aws.String(key), Body: part,
+    })
+    if err != nil { http.Error(w, "upload failed", http.StatusBadGateway); return }
+    w.WriteHeader(http.StatusCreated)
+}
+```
+
+---
+
+## 17. Architecture 2: presigned URLs 🎓
+
+### The problem it solves
+Let the **browser talk directly to the bucket**, so bytes never pass through your server. But:
+- the bucket is (and **should be**) **private**, because a public bucket is a major security risk,
+- you **can't give storage credentials to a browser**.
+
+What you need is a **capability**: permission for **exactly one operation**, on **exactly one key**, for **exactly the next few minutes**, without leaking any credential.
+
+### What a presigned URL is
+A **normal URL** plus query parameters:
+
+```text
+https://my-app-uploads.s3.us-east-1.amazonaws.com/tenants/7c9e.../users/1b4e.../f47ac10b...
+  ?X-Amz-Algorithm=AWS4-HMAC-SHA256                         <- algorithm
+  &X-Amz-Credential=AKIA.../20260402/us-east-1/s3/aws4_request <- access key ID + scope
+  &X-Amz-Date=20260402T101500Z                              <- timestamp
+  &X-Amz-Expires=60                                         <- validity in seconds
+  &X-Amz-SignedHeaders=content-type%3Bhost                  <- which headers are covered
+  &X-Amz-Signature=9f1c...                                  <- HMAC over the request description
+```
+
+The **signature** is an **HMAC** (a keyed hash) computed with your **secret key** over a string describing the request: **HTTP method, bucket, key, expiry, signed headers…**
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant API as Your backend (holds secret)
+  participant S3 as Bucket (private)
+  B->>API: I want to upload an avatar
+  API->>API: authZ, generate key, HMAC(secret, PUT + bucket + key + expiry...)
+  API-->>B: presigned URL (no secret inside)
+  B->>S3: PUT bytes to the URL
+  S3->>S3: rebuild the same string, HMAC with its copy of the secret, compare
+  alt signature matches and not expired
+    S3-->>B: 200 stored
+  else key or method changed, or expired
+    S3-->>B: 403 Forbidden
+  end`} />
+
+- Storage **rebuilds the same string from the incoming request**, computes the HMAC with **its own copy of the secret**, and compares.
+- Change **one character** of the key or the method, or use the URL **after expiry**, and the recomputed signature doesn't match → **rejected**.
+- **The credential never leaves your server**, but the browser holds a narrow, short-lived capability.
+
+### What the demo shows 🎓
+1. The page asks **your server** for a signed URL. The response shows the algorithm, credential, date, a **60-second expiry**, the signed headers and the signature.
+2. The upload in the network panel is a **`PUT` straight to the bucket's own domain**, not to your server, carrying **no credentials** → **200**, stored.
+3. A button waits **60 seconds** and sends the identical request → **403 Forbidden**: the URL is dead.
+4. Another button sends a still-valid URL with **one character of the key changed** → signature mismatch → **403**.
+
+```ts title="🔧 presigning a PUT in Node"
+import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+
+const url = await getSignedUrl(
+  s3,
+  new PutObjectCommand({ Bucket, Key: key, ContentType: 'image/png' }),
+  { expiresIn: 60 },                 // seconds
+);
+// The browser must send the SAME Content-Type header, or the signature won't match (403).
+```
+
+🔧 Presigning is **pure local computation** (no network call). For how the SigV4 signing key and string-to-sign are built, see [Part 2, section 9](/docs/backend-first-principles/object-storage-part-2).
+
+---
+
+## 18. Presigned POST with a policy, and the two-phase flow 🎓
+
+### The bug hiding in presigned PUT
+You sign a PUT URL "for a profile picture". **What stops the user uploading 5 GB to it? Nothing.** The signature covers the method, bucket and key, but **nobody enforces the body size**.
+
+### The fix: presigned POST with a policy
+Instead of signing a URL, you sign a small **JSON policy document** and return **a URL plus form fields**. Storage itself enforces the policy's **conditions**:
+- **`content-length-range`**: a hard **minimum and maximum size**, enforced by storage, so your server isn't involved,
+- **content type must start with** `image/`,
+- **key must start with** the user's prefix, so the client can't write outside its own "folder".
+
+Violate any condition and **storage rejects the whole request**; the data is never stored.
+
+```ts title="server: sign a POST policy (the lesson's three conditions)"
+import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
+
+const prefix = ownerPrefix(user.tenantId, user.id);
+const key = prefix + randomUUID();
+
+const { url, fields } = await createPresignedPost(s3, {
+  Bucket,
+  Key: key,
+  Expires: 300,                                         // seconds
+  Conditions: [
+    ['content-length-range', 1024, 5 * 1024 * 1024],    // 1 KB to 5 MB, enforced by storage
+    ['starts-with', '$Content-Type', 'image/'],
+    ['starts-with', '$key', prefix],                    // can't escape the user's prefix
+  ],
+  Fields: { 'Content-Type': contentType },
+});
+```
+
+```ts title="client: two details that matter"
+const form = new FormData();
+for (const [name, value] of Object.entries(fields)) form.append(name, value);
+form.append('file', file);                               // 1. the file field goes LAST
+
+const res = await fetch(url, { method: 'POST', body: form });
+// 2. do NOT set Content-Type yourself: the browser adds the multipart boundary
+if (!res.ok) throw new Error(await res.text());          // S3 returns an XML error naming the failed condition
+```
+
+🔧 Why "file last"? S3 processes the form **in order** and ignores fields that come after the file, so a policy field placed after it would be missing. A successful POST returns **204 No Content** by default.
+
+🔧 The `starts-with $key` condition matters most when you let the client choose part of the key (the `${filename}` placeholder). With a fully server-chosen key it's defence in depth.
+
+### What the demo shows 🎓
+- **Round 1, naive PUT URL "for a profile picture":** the page uploads a **300 MB** file instead. The network panel shows a real PUT of 300 MB straight to S3 → **200**. The bucket now holds **about 314 million bytes** under a URL meant for an avatar.
+- **Round 2, the same file with a POST policy** → **400 Entity Too Large**, and **nothing is stored**.
+- **A 415 KB image with the same policy** → accepted, because it fits the size condition.
+- **Toggle "upload into another user's prefix"** → **403**, and S3's error **names the exact condition** that failed.
+
+### The last piece: how does the server learn about an upload it never saw?
+The browser uploads **directly** to storage, so your server never sees the bytes. How does the **database** learn the key, so you can serve the file later? The lesson's answer is a **two-phase flow**:
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant API as Backend
+  participant DB as Database
+  participant S3 as Bucket
+  B->>API: POST /uploads/init (name, type, size)
+  API->>API: authN + authZ, generate the key
+  API->>DB: INSERT row: status PENDING, key, expected size + type
+  API-->>B: uploadId + presigned POST (url + fields)
+  Note over DB: intent is recorded BEFORE any byte moves
+  B->>S3: POST form with the file
+  S3-->>B: 204
+  B->>API: POST /uploads/complete (uploadId, not the key)
+  API->>S3: HEAD object (exists? size? content type?)
+  S3-->>API: metadata only, nearly free
+  API->>DB: UPDATE status READY (or REJECTED)
+  API-->>B: file record`} />
+
+1. **Init:** the browser asks for an upload. The backend **authorizes**, **generates the key**, **writes a `PENDING` row** with the key and the expected constraints, and returns the **presigned POST**. **Before any data moves, the DB already holds the client's intent and the object's identity.**
+2. **Upload:** the browser uploads directly.
+3. **Complete:** the browser calls your completion API with the **upload ID** from phase 1, **not the key**, so it can't point you at some other object.
+4. **Verify:** the server sends **`HEAD`** to storage, a metadata-only call that costs almost nothing, to check that the object **exists**, its **size** is in range and its **content type** is as expected. If so, the row goes from `PENDING` to **`READY`** (or "completed").
+
+### Cleanup: the logic hole
+Some uploads will be **abandoned**: the tab closes, the network drops, a mobile connection dies, or the file arrives but `complete` is never called. You can't control the client. So:
+- a **lifecycle rule** on the bucket **deletes anything under the pending prefix after 24 hours**, and
+- a small **background job** finds `PENDING` rows older than 24 hours and marks them **`EXPIRED`**.
+
+This keeps the two systems from **drifting apart**:
+- the **database** is the source of truth for **which files exist**,
+- the **bucket** is the source of truth for **the bytes**,
+- a **background reconciler** settles any disagreement.
+
+This is the pattern that answers problem 6.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> PENDING : init (row + key + presigned POST)
+  PENDING --> READY : complete + HEAD checks pass
+  PENDING --> REJECTED : HEAD shows wrong size or type
+  PENDING --> EXPIRED : older than 24 h (background job)
+  READY --> [*]
+  REJECTED --> [*] : object deleted
+  EXPIRED --> [*] : bytes removed by the lifecycle rule`} />
+
+### 🔧 Going deeper: implementing the two-phase flow
+One way to realize "a pending prefix": upload to `pending/...`, and on completion **copy** to the final key. The copy runs **inside** storage, so no bytes cross your server. A lifecycle rule then sweeps `pending/`. (Alternatively, tag pending objects and use a **tag-filtered** lifecycle rule, which avoids the copy.)
+
+```json title="lifecycle.json"
+{
+  "Rules": [
+    {
+      "ID": "expire-abandoned-pending-uploads",
+      "Filter": { "Prefix": "pending/" },
+      "Status": "Enabled",
+      "Expiration": { "Days": 1 }
+    }
+  ]
+}
+```
+
+```ts title="uploads.controller.ts"
+// POST /uploads/init
+async init(user: User, body: { fileName: string; type: string; size: number }) {
+  if (!body.type.startsWith('image/') || body.size > 5 * 1024 * 1024) throw new BadRequest('not allowed');
+  const id = randomUUID();
+  const finalKey = ownerPrefix(user.tenantId, user.id) + id;
+  const pendingKey = `pending/${finalKey}`;
+  await db.file.create({ data: {
+    id, ownerId: user.id, objectKey: finalKey, pendingKey, originalName: body.fileName,
+    contentType: body.type, maxSize: 5 * 1024 * 1024, status: 'PENDING',
+  } });
+  const post = await createPresignedPost(s3, {
+    Bucket, Key: pendingKey, Expires: 300,
+    Conditions: [
+      ['content-length-range', 1024, 5 * 1024 * 1024],
+      ['eq', '$Content-Type', body.type],
+    ],
+    Fields: { 'Content-Type': body.type },
+  });
+  return { uploadId: id, ...post };
+}
+
+// POST /uploads/complete   { uploadId }
+async complete(user: User, uploadId: string) {
+  const f = await db.file.findFirstOrThrow({ where: { id: uploadId, ownerId: user.id } }); // owner check
+  if (f.status === 'READY') return f;                        // idempotent: retries and double clicks are safe
+  if (f.status !== 'PENDING') throw new Conflict(f.status);
+
+  let head;
+  try {
+    head = await s3.send(new HeadObjectCommand({ Bucket, Key: f.pendingKey }));
+  } catch (e) {
+    if ((e as S3ServiceException).$metadata?.httpStatusCode === 404) throw new BadRequest('nothing uploaded yet');
+    throw e;
+  }
+  if (!head.ContentLength || head.ContentLength > f.maxSize || head.ContentType !== f.contentType) {
+    await s3.send(new DeleteObjectCommand({ Bucket, Key: f.pendingKey }));
+    await db.file.update({ where: { id: f.id }, data: { status: 'REJECTED' } });
+    throw new BadRequest('upload does not match what was requested');
+  }
+
+  await s3.send(new CopyObjectCommand({ Bucket, CopySource: `${Bucket}/${f.pendingKey}`, Key: f.objectKey })); // server-side copy
+  const ready = await db.file.update({ where: { id: f.id }, data: { status: 'READY', size: head.ContentLength } });
+  await s3.send(new DeleteObjectCommand({ Bucket, Key: f.pendingKey })).catch(() => {}); // the lifecycle rule is the safety net
+  return ready;
+}
+```
+
+```sql title="expire-pending.job.sql (every few minutes)"
+UPDATE files
+SET status = 'EXPIRED'
+WHERE status = 'PENDING' AND created_at < now() - interval '24 hours'
+RETURNING id, object_key;     -- before expiring, HEAD object_key: if it exists, complete was interrupted mid-way
+```
+
+**Crash-point analysis**: why each piece exists.
+
+| Crash after… | DB row | Bucket | What repairs it |
+|---|---|---|---|
+| init, before upload | PENDING | nothing | job → EXPIRED |
+| upload, before `complete` | PENDING | `pending/` object | lifecycle deletes the bytes; job expires the row |
+| copy, before the DB update | PENDING | both copies | client retries `complete` (idempotent, the copy simply repeats); the job should **HEAD the final key** before expiring |
+| DB update, before deleting pending | READY | both copies | lifecycle deletes the pending copy |
+
+🔧 Edge cases:
+- **The lifecycle rule isn't exact.** S3 rounds expiry to the **next midnight UTC** after the period, and runs asynchronously. Treat it as "eventually, after at least a day".
+- `HEAD` checks the **declared** content type. Verifying the **real** type (magic bytes via a ranged GET) and virus scanning belong before `READY` too (Part 2 covers ranges).
+- A single `CopyObject` handles objects up to **5 GB**. Beyond that you need a multipart copy, but files that big shouldn't go through this flow anyway (Part 2: multipart).
+
+---
+
+## 19. Event notifications: letting the bucket tell you about uploads ➕
+
+The two-phase flow relies on the **client** calling `complete`, and the cleanup job exists because clients don't always do it; the bucket itself can also announce every new object, which gives you a second, server-side path to the same `READY` transition.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant S3 as Bucket
+  participant Q as SQS queue
+  participant W as Worker
+  participant DB as Postgres
+  B->>S3: POST upload to pending/ key
+  S3-->>B: 204
+  S3->>Q: ObjectCreated event (at least once, any order)
+  Note over B: tab closes, complete is never called
+  W->>Q: receive message
+  W->>S3: HEAD object (current truth)
+  W->>DB: UPDATE status READY WHERE status = PENDING
+  W->>Q: delete message`} />
+
+#### What S3 emits and where it can go ➕
+**Mechanism.** A bucket **notification configuration** subscribes destinations to event types, filtered by key **prefix** and **suffix**: `s3:ObjectCreated:*` (Put, Post, Copy, CompleteMultipartUpload), `s3:ObjectRemoved:*`, lifecycle, replication, restore and tagging events. Destinations are **SQS, SNS, Lambda** or **EventBridge** (which adds richer filtering, many targets and archive/replay). **SQS FIFO queues aren't supported directly**; go through EventBridge if you need them.
+
+```json title="notification.json: new uploads under pending/ go to a queue"
+{
+  "QueueConfigurations": [{
+    "Id": "pending-uploads",
+    "QueueArn": "arn:aws:sqs:us-east-1:111122223333:upload-events",
+    "Events": ["s3:ObjectCreated:*"],
+    "Filter": { "Key": { "FilterRules": [{ "Name": "prefix", "Value": "pending/" }] } }
+  }]
+}
+```
+
+The queue's access policy must allow `s3.amazonaws.com` to send messages, scoped with `aws:SourceArn` to your bucket.
+
+#### Delivery semantics: at least once, unordered ➕
+**First principles.** S3 documents notifications as **at-least-once**, usually delivered within seconds but sometimes a minute or longer, and **not guaranteed to arrive in order**. So the consumer must be **idempotent** (the same event twice is harmless) and must not trust event order.
+
+**Mechanism for ordering.** Create and delete events for a key carry a **`sequencer`** value: for the **same key**, a larger sequencer means a later event (compare after left-padding the shorter string with zeros). It means nothing across different keys.
+
+#### A consumer that converges with the client path ➕
+**Implementation.** The worker treats the event as a **hint**, re-reads the current truth with `HEAD`, and uses a **conditional `UPDATE`** so it races safely with the client's `complete` call (whichever arrives second matches zero rows).
+
+```ts title="upload-events.worker.ts"
+import { ReceiveMessageCommand, DeleteMessageCommand } from '@aws-sdk/client-sqs';
+
+export async function pollOnce() {
+  const { Messages = [] } = await sqs.send(new ReceiveMessageCommand({
+    QueueUrl, MaxNumberOfMessages: 10, WaitTimeSeconds: 20,      // long polling
+  }));
+  for (const msg of Messages) {
+    const body = JSON.parse(msg.Body!);
+    if (body.Event === 's3:TestEvent') { await ack(msg); continue; } // sent once when you configure the bucket
+    for (const rec of body.Records ?? []) {
+      const key = decodeURIComponent(rec.s3.object.key.replace(/\+/g, ' ')); // keys arrive URL-encoded
+      await markReadyIfValid(key);
+    }
+    await ack(msg);                                                  // only after processing succeeded
+  }
+}
+
+async function markReadyIfValid(pendingKey: string) {
+  const f = await db.file.findFirst({ where: { pendingKey } });
+  if (!f || f.status !== 'PENDING') return;                          // duplicate or already completed: no-op
+  const head = await s3.send(new HeadObjectCommand({ Bucket, Key: pendingKey })).catch(() => null);
+  if (!head) return;                                                 // deleted since the event: nothing to do
+  if (!head.ContentLength || head.ContentLength > f.maxSize || head.ContentType !== f.contentType) {
+    await db.$executeRaw`UPDATE files SET status = 'REJECTED' WHERE id = ${f.id} AND status = 'PENDING'`;
+    return;
+  }
+  await s3.send(new CopyObjectCommand({ Bucket, CopySource: `${Bucket}/${pendingKey}`, Key: f.objectKey }));
+  await db.$executeRaw`UPDATE files SET status = 'READY', size = ${head.ContentLength}
+                       WHERE id = ${f.id} AND status = 'PENDING'`;    // conditional: safe against the complete call
+}
+
+const ack = (msg: { ReceiptHandle?: string }) =>
+  sqs.send(new DeleteMessageCommand({ QueueUrl, ReceiptHandle: msg.ReceiptHandle! }));
+```
+
+#### Edge cases ➕
+- **Recursive triggers.** If the worker writes to the same bucket under a prefix the rule watches, it triggers itself forever. The `pending/` prefix filter, with outputs written elsewhere, prevents it.
+- **Poison messages.** Give the queue a **dead-letter queue** after a few receives, so one malformed event doesn't block or loop.
+- **Don't drop the client `complete` call.** Events can lag; the client call gives instant feedback to the user, the event path catches the clients that never call. Both converge on the same conditional update.
+- Generic queue mechanics (visibility timeouts, retries, DLQ sizing) are in [lesson 14](/docs/backend-first-principles/14-task-queues-background-jobs); post-upload processing pipelines are in [Part 2](/docs/backend-first-principles/object-storage-part-2).
+
+---
+
+## 20. CORS: the error everyone hits once 🎓
+
+A browser uploading to S3, R2 or B2 is making a **cross-origin request** (your site's origin ≠ the bucket's domain), so **CORS** applies. The bucket needs a CORS configuration that:
+- **allows your front-end's origin** explicitly,
+- **allows the `PUT` or `POST` method**,
+- **exposes the `ETag` header**, which Part 2 needs for multipart uploads.
+
+**Debugging rule:** if an upload **works in curl or Postman but fails in the browser**, it's almost certainly **CORS**. Check the bucket's CORS policy.
+
+```json title="🔧 cors.json"
+[
+  {
+    "AllowedOrigins": ["https://app.example.com"],
+    "AllowedMethods": ["PUT", "POST"],
+    "AllowedHeaders": ["content-type"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+🔧 **Why curl works:** CORS is enforced **by the browser**, not by the server, and curl ignores it. A `PUT` with a `Content-Type` such as `image/png` triggers a **preflight** `OPTIONS` request, which the bucket must answer with matching allow headers. A form `POST` (`multipart/form-data`) is a "simple" request with no preflight, but the response still needs `Access-Control-Allow-Origin`, or your JavaScript can't read it.
+
+---
+
+## 21. Developing and testing object-storage code ➕
+
+Everything above is code with network calls to a service you don't run, so the last practical question is how to develop and test it without a real bucket per developer, and without tests that pass locally and fail against S3. General test strategy and Testcontainers are in [lesson 27](/docs/backend-first-principles/27-testing); config-driven endpoints are in [lesson 28](/docs/backend-first-principles/28-twelve-factor-app).
+
+#### Make the endpoint configuration, not code ➕
+**Problem.** Code that builds URLs like `https://${bucket}.s3.amazonaws.com/...` by hand, or creates its own `S3Client` in five places, can't be pointed at a local server.
+
+**Mechanism.** Create **one** client from config. S3-compatible local servers usually need **path-style** addressing (`http://localhost:9000/bucket/key`) because they can't serve a DNS name per bucket.
+
+```ts title="s3-client.ts"
+import { S3Client } from '@aws-sdk/client-s3';
+
+export const s3 = new S3Client({
+  region: config.AWS_REGION,
+  ...(config.S3_ENDPOINT && {               // set only in dev and CI
+    endpoint: config.S3_ENDPOINT,            // e.g. http://localhost:9000
+    forcePathStyle: true,
+    credentials: { accessKeyId: config.S3_KEY!, secretAccessKey: config.S3_SECRET! },
+  }),
+});
+```
+
+**Edge case.** Presigned URLs embed the endpoint. A URL signed against `http://localhost:9000` from inside a Docker network may not resolve from the browser on your host. Use a hostname both can reach.
+
+#### Choosing a local emulator, and its parity gaps ➕
+**The landscape changed recently.** MinIO was the default choice for years, but its community repository was **archived in early 2026** and stopped publishing official images, so you'd be pinning an unmaintained build. **LocalStack** now ships one image that **requires a (free-tier) account and auth token** since March 2026, including in CI. Other S3-compatible servers exist (for example SeaweedFS and Garage). Whichever you pick, pin a version.
+
+**First principles: an emulator implements the documented API, not S3's behaviour.** Expect gaps in exactly the places this page relies on:
+- **conditional writes** (`If-None-Match`, `If-Match`), POST policy enforcement and checksum validation may be missing or differ,
+- **lifecycle rules** won't run on S3's schedule (or at all), so cleanup can't be tested by waiting,
+- **IAM and bucket-policy evaluation** is simplified or absent, so a 403 you'd get in production passes locally,
+- event notifications, replication, Object Lock and Inventory are partial or missing.
+
+**Rule.** Use the emulator for **fast feedback on your own code paths**, and run a small **contract suite against a real S3 bucket** in CI (a dedicated test account, prefix per run, lifecycle rule to clean up) for the behaviours above.
+
+#### Unit tests: mock the client at the command level ➕
+**Problem.** Logic like "reject if HEAD size exceeds the limit" or "on 412, re-read and retry" shouldn't need any server.
+
+**Mechanism.** `aws-sdk-client-mock` intercepts `client.send()` per **command type**, so you can script responses, including errors with an HTTP status.
+
+```ts title="complete-upload.test.ts"
+import { mockClient } from 'aws-sdk-client-mock';
+import { S3Client, HeadObjectCommand, DeleteObjectCommand, CopyObjectCommand } from '@aws-sdk/client-s3';
+
+const s3Mock = mockClient(S3Client);
+beforeEach(() => s3Mock.reset());
+
+test('rejects an upload larger than what was requested', async () => {
+  await seedPendingFile({ id: 'f1', maxSize: 5_000_000, contentType: 'image/png' });
+  s3Mock.on(HeadObjectCommand).resolves({ ContentLength: 9_000_000, ContentType: 'image/png' });
+
+  await expect(uploads.complete(user, 'f1')).rejects.toThrow('does not match');
+  expect(s3Mock.commandCalls(DeleteObjectCommand)).toHaveLength(1);  // bytes were removed
+  expect(s3Mock.commandCalls(CopyObjectCommand)).toHaveLength(0);    // never promoted
+  expect((await db.file.findUnique({ where: { id: 'f1' } }))!.status).toBe('REJECTED');
+});
+
+test('treats a 404 on HEAD as "nothing uploaded yet"', async () => {
+  await seedPendingFile({ id: 'f2', maxSize: 5_000_000, contentType: 'image/png' });
+  s3Mock.on(HeadObjectCommand).rejects(Object.assign(new Error('NotFound'), { $metadata: { httpStatusCode: 404 } }));
+  await expect(uploads.complete(user, 'f2')).rejects.toThrow('nothing uploaded yet');
+});
+```
+
+#### Integration tests: the real protocol end to end ➕
+**What they catch that mocks can't:** signature mismatches (a header the browser sends but you didn't sign), wrong `Content-Type` handling, the "file field last" rule in presigned POST, CORS.
+
+**Implementation sketch.** Start the emulator (or use the real test bucket), call your `init` endpoint, perform the **actual HTTP upload** the browser would make with `fetch` and `FormData`, call `complete`, then assert on the DB row and a `HEAD` of the final key. Add the negative cases from the lesson's demos: a body over `content-length-range` must fail, a key outside the user's prefix must fail, a reused expired URL must fail.
+
+**Edge case.** Tests that share a bucket must use a **unique prefix per test run** and clean up, or parallel CI jobs read each other's objects. A lifecycle rule on the test bucket is the safety net, as in section 18.
+
+---
+
+## 🔧 Key takeaways
+
+- Files are a different kind of data. **Don't keep them on app servers**: disks are ephemeral, servers must be stateless, disks don't grow horizontally, one disk isn't durable, and serving bytes wastes workers.
+- Object storage is **PUT/GET/DELETE/LIST over HTTP on immutable objects**. It gives up mutability, folders, rename and locks in exchange for unlimited scale, eleven nines and direct HTTP access.
+- **You design the keys:** generate them, put entropy first, encode ownership. Set metadata at write time.
+- Internally there's a **metadata plane** (strongly consistent sorted index) and a **data plane** (erasure-coded shards, about 1.43× overhead instead of 3×).
+- **Durability ≠ backup:** turn on versioning and replicate cross-account.
+- **The DB is the index; never LIST in a request.**
+- **Conditional writes** (`If-None-Match`, `If-Match`) turn S3 into a coordination primitive and stop silent overwrites.
+- **Uploads:** stream with a cap if you go through the server; otherwise use **presigned POST with `content-length-range`**, **record intent first**, **verify with HEAD**, **clean up in the background**, and **configure CORS**.
+- ➕ **Access:** explicit deny beats any allow; same-account needs one allow, cross-account needs both. Keep ACLs disabled (bucket owner enforced), Block Public Access on at the account level, and sign presigned URLs with a narrow role.
+- ➕ **Encryption:** SSE-S3 is automatic; SSE-KMS adds an audited second permission check, and needs Bucket Keys to avoid KMS cost and throttling. Client-side encryption is the only option S3 can't read, at the cost of server-side features.
+- ➕ **Object Lock** makes versions undeletable (governance can be bypassed with a permission, compliance by nobody) and can never be turned off.
+- ➕ **Replication** copies only new writes, never version-specific deletes or lifecycle actions, and is asynchronous (RTC: 99.9% within 15 minutes). Backfill with Batch Replication.
+- ➕ **Inventory** is the scalable way to reconcile the whole bucket against the DB; verify each candidate with HEAD before acting.
+- ➕ **Event notifications** are at-least-once and unordered: idempotent consumers, conditional updates, a DLQ, and no writes back under the watched prefix.
+- ➕ **Testing:** one config-driven client, command-level mocks for logic, real-protocol integration tests, and a small contract suite against real S3 for the features emulators don't match.
+
+**Next:** large files (multipart), downloads, CDNs, range requests, video and pricing → [Object Storage, Part 2](/docs/backend-first-principles/object-storage-part-2).
+
+---
+
+## Interview questions
+
+1. **Why is storing uploads on the app server's disk wrong, beyond running out of space?** **The disk is ephemeral (wiped on restart or deploy), it breaks statelessness behind a load balancer (about 1 ÷ N chance of hitting the right instance), it grows only vertically, it's a single point of durability failure, and serving files ties up workers.**
+2. **Availability vs durability?** **Availability is whether you can reach the data now, and you recover by waiting; durability is whether it still exists anywhere, and loss is permanent.**
+3. **Block vs file vs object storage in one line each?** **Block: numbered fixed-size blocks, microsecond latency, one machine (databases). File: POSIX hierarchy with rename, lock and seek, which needs coordination. Object: PUT/GET/DELETE/LIST by key over HTTP, immutable, infinitely scalable.**
+4. **Why can't you rename or edit an object in place?** **Objects are immutable by design, so nothing needs coordination; and the key determines the index partition, so a rename is a copy plus a delete that costs the full object size.**
+5. **Do folders exist in S3?** **No. Keys are flat strings; a "folder" is a GROUP BY on a prefix and delimiter, returned as CommonPrefixes. Empty folders are faked with zero-byte keys ending in `/`.**
+6. **Three reasons never to use the user's file name as the key?** **Silent overwrite on collision (PUT replaces), path traversal, and hostile characters (RTL override, null bytes, emoji).**
+7. **Why put randomness at the start of keys?** **The index is partitioned by key prefix; timestamp-first keys send every write to one hot partition and cause 503 Slow Down.**
+8. **What are the metadata plane and the data plane?** **The data plane durably stores the bytes (simple, huge volume); the metadata plane is a strongly consistent distributed sorted index mapping bucket + key to shards (small, very many ops, the hard part).**
+9. **Why is erasure coding better than 3× replication?** **14 + 6 Reed–Solomon costs about 1.43× instead of 3× and survives 6 simultaneous failures instead of 2, at the price of CPU and extra reads during recovery.**
+10. **Is eleven-nines durability a backup?** **No. It protects against hardware loss, not your own deletes or overwrites; enable versioning and cross-account replication.**
+11. **Why never call LIST in the request path?** **It's a paginated range scan over a distributed index, so it's slow; the database must be the index of which files exist and who owns them.**
+12. **What do `If-None-Match: *` and `If-Match` do on a PUT?** **Create-only-if-absent and compare-and-swap on the ETag; a failed condition returns 412, which enables locks, leader election and WALs on S3.**
+13. **What's wrong with a plain presigned PUT for avatars, and the fix?** **Nothing limits the body size; use a presigned POST policy with `content-length-range`, a content-type prefix and a key prefix, all enforced by storage.**
+14. **How does the server learn about a direct-to-bucket upload?** **The two-phase flow: init writes a PENDING row with a server-generated key, the client uploads, `complete` (with the upload ID) HEADs the object to verify it, then the row becomes READY; abandoned uploads are swept by a lifecycle rule plus a background job.**
+15. **The upload works in Postman but not in the browser. Why?** **CORS: the bucket must allow your origin and the PUT/POST method, and expose ETag.**
+16. ➕ **A role has an IAM policy allowing `s3:GetObject` and the bucket policy has a Deny for it. Result?** **Denied: an explicit Deny in any applicable policy always wins. Without the Deny, same-account access needs an Allow in either policy; cross-account needs both.**
+17. ➕ **What do Block Public Access and Object Ownership protect against?** **BPA overrides any policy or ACL that would make data public (set it at the account level); bucket-owner-enforced Object Ownership disables ACLs so every object is owned by the bucket owner and governed by policies.**
+18. ➕ **SSE-S3 vs SSE-KMS, and the main operational risk of SSE-KMS?** **Both encrypt at rest; SSE-KMS adds a key policy as a second permission check and CloudTrail audit of each use, but every object request calls KMS, causing cost and throttling unless S3 Bucket Keys are enabled.**
+19. ➕ **Governance vs compliance mode in Object Lock?** **Governance can be bypassed by principals with `s3:BypassGovernanceRetention` sending the bypass header; compliance can't be bypassed or shortened by anyone, including root, until the retention date.**
+20. ➕ **You enable cross-region replication on a full bucket. What's in the destination after a week?** **Only objects written after the rule was created; existing objects need S3 Batch Replication. Version-specific deletes and lifecycle actions are never replicated, delete markers only if enabled.**
+21. ➕ **How do you find orphaned objects in a bucket with a billion keys?** **Use S3 Inventory (daily/weekly report, no LIST calls), anti-join it with the files table, then HEAD each candidate before deleting, because the report is an eventually consistent snapshot.**
+22. ➕ **What delivery guarantees do S3 event notifications give, and what does that force on the consumer?** **At-least-once and unordered (use `sequencer` per key), so consumers must be idempotent, re-read state with HEAD, use conditional DB updates, and avoid writing back under the watched prefix.**
+23. ➕ **How do you test code that talks to S3?** **One config-driven client; command-level mocks (aws-sdk-client-mock) for logic; integration tests that do the real HTTP upload against an emulator or test bucket; and a contract suite on real S3 for conditional writes, policies and lifecycle, which emulators don't fully match.**
+
+## Sources
+
+- [Lesson video: Object Storage, Part 1 (Sriniously)](https://youtu.be/Ie0TjKI9cDI)
+- [AWS: Working with object metadata (2 KB user metadata, edit = copy)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html)
+- [AWS: Optimizing S3 performance (3,500 / 5,500 requests per second per prefix)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html)
+- [AWS: S3 strong consistency](https://aws.amazon.com/s3/consistency/)
+- [AWS: Conditional requests](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html)
+- [AWS: Conditional writes (412, 409, multipart behaviour)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+- [AWS: Creating a POST policy (content-length-range, starts-with, eq)](https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html)
+- [AWS: Presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)
+- [AWS: Replication requirements (versioning on both buckets, cross-account)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-requirements.html)
+- [AWS: S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html)
+- [AWS: Lifecycle expiration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)
+- [AWS: ALB connection idle timeout (default 60 s)](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-load-balancer-attributes.html)
+- [AWS: Lambda quotas (6 MB synchronous payload)](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html)
+- [nginx: client_max_body_size (default 1m, 413)](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size)
+- [AWS SDK for JavaScript v3: lib-storage Upload](https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/Package/-aws-sdk-lib-storage/)
+- [AWS IAM: Policy evaluation logic](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic.html)
+- [AWS IAM: Cross-account policy evaluation](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_evaluation-logic-cross-account.html)
+- [AWS: Object Ownership and disabling ACLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html)
+- [AWS: Blocking public access to S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/access-control-block-public-access.html)
+- [AWS: Server-side encryption (SSE-S3 default since Jan 2023, SSE-C default change in April 2026)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/serv-side-encryption.html)
+- [AWS: S3 Bucket Keys for SSE-KMS (up to 99% fewer KMS requests)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-key.html)
+- [AWS: Locking objects with Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)
+- [AWS: Configuring Object Lock (cannot be disabled)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-configure.html)
+- [AWS: What S3 replicates and what it doesn't](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-what-is-isnot-replicated.html)
+- [AWS: S3 Replication Time Control (99.9% within 15 minutes)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-time-control.html)
+- [AWS: S3 Inventory (formats, consistency, 48 hours to first report)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html)
+- [AWS: S3 Event Notifications (at-least-once delivery)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventNotifications.html)
+- [AWS: Event message structure (URL-encoded keys, sequencer, test event)](https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-content-structure.html)
+- [aws-sdk-client-mock](https://github.com/m-radzikowski/aws-sdk-client-mock)
+- [MinIO repository (archived)](https://github.com/minio/minio)
+- [LocalStack: moving to a single image with auth tokens](https://blog.localstack.cloud/localstack-single-image-next-steps/)

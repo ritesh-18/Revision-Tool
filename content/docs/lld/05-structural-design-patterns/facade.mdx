@@ -1,0 +1,214 @@
+---
+title: "5.5 Facade"
+---
+
+## Intent
+
+Provide one simple, high-level interface to a complex subsystem so clients don't need to know its many parts or the order in which to call them.
+
+## Problem
+
+Placing an order in a broking system touches many services: validate the instrument, check the user's KYC and segment activation, run risk checks, block margin in the funds service, send to the exchange gateway, release margin if the exchange rejects, write an audit record, and notify the user. If every controller (web, mobile, API for algo traders, basket orders) orchestrates this itself, the sequence is duplicated and inevitably diverges: one path forgets to release margin on rejection. A facade owns the workflow.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class OrderPlacementFacade {
+        +placeOrder(userId, req) Promise~PlaceResult~
+    }
+    class InstrumentService
+    class RiskService
+    class FundsService
+    class ExchangeGateway
+    class NotificationService
+    class AuditLog
+    WebController --> OrderPlacementFacade
+    MobileController --> OrderPlacementFacade
+    OrderPlacementFacade --> InstrumentService
+    OrderPlacementFacade --> RiskService
+    OrderPlacementFacade --> FundsService
+    OrderPlacementFacade --> ExchangeGateway
+    OrderPlacementFacade --> NotificationService
+    OrderPlacementFacade --> AuditLog`} />
+
+## TypeScript implementation
+
+```ts
+interface OrderReq {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  qty: number;
+  price: number;
+}
+
+type PlaceResult = { ok: true; orderId: string } | { ok: false; reason: string };
+
+// ----- Subsystem classes (each does one thing) -----
+class InstrumentService {
+  private readonly tradable = new Set(['INFY', 'TCS', 'SBIN', 'YESBANK']);
+  assertTradable(symbol: string): void {
+    if (!this.tradable.has(symbol)) throw new Error(`${symbol} is not tradable`);
+  }
+}
+
+class RiskService {
+  check(userId: string, req: OrderReq): void {
+    if (req.qty * req.price > 500_000) throw new Error('order value exceeds per-order limit');
+    if (userId === 'u-blocked') throw new Error('account blocked by RMS');
+  }
+}
+
+class FundsService {
+  private readonly balances = new Map<string, number>([['u1', 200_000]]);
+  block(userId: string, amount: number): void {
+    const bal = this.balances.get(userId) ?? 0;
+    if (bal < amount) throw new Error(`insufficient funds: need ${amount}, have ${bal}`);
+    this.balances.set(userId, bal - amount);
+  }
+  release(userId: string, amount: number): void {
+    this.balances.set(userId, (this.balances.get(userId) ?? 0) + amount);
+  }
+  balance(userId: string): number {
+    return this.balances.get(userId) ?? 0;
+  }
+}
+
+class ExchangeGateway {
+  private seq = 0;
+  async send(req: OrderReq): Promise<string> {
+    await Promise.resolve();
+    if (req.symbol === 'YESBANK') throw new Error('exchange rejected: price outside circuit');
+    return `NSE-${++this.seq}`;
+  }
+}
+
+class NotificationService {
+  send(userId: string, text: string): void {
+    console.log(`  notify ${userId}: ${text}`);
+  }
+}
+
+class AuditLog {
+  readonly entries: string[] = [];
+  record(entry: string): void {
+    this.entries.push(entry);
+  }
+}
+
+// ----- The facade -----
+class OrderPlacementFacade {
+  constructor(
+    private readonly instruments: InstrumentService,
+    private readonly risk: RiskService,
+    private readonly funds: FundsService,
+    private readonly exchange: ExchangeGateway,
+    private readonly notifier: NotificationService,
+    private readonly audit: AuditLog,
+  ) {}
+
+  async placeOrder(userId: string, req: OrderReq): Promise<PlaceResult> {
+    const amount = req.side === 'BUY' ? req.qty * req.price : 0;
+    let blocked = false;
+    try {
+      this.instruments.assertTradable(req.symbol);
+      this.risk.check(userId, req);
+      if (amount > 0) {
+        this.funds.block(userId, amount);
+        blocked = true;
+      }
+      const orderId = await this.exchange.send(req);
+      this.audit.record(`${userId} ${orderId} ${req.side} ${req.qty} ${req.symbol}`);
+      this.notifier.send(userId, `order ${orderId} placed`);
+      return { ok: true, orderId };
+    } catch (err) {
+      if (blocked) this.funds.release(userId, amount); // compensation, in ONE place
+      const reason = (err as Error).message;
+      this.audit.record(`${userId} REJECTED ${req.symbol}: ${reason}`);
+      this.notifier.send(userId, `order rejected: ${reason}`);
+      return { ok: false, reason };
+    }
+  }
+}
+
+// Composition root
+const funds = new FundsService();
+const audit = new AuditLog();
+const facade = new OrderPlacementFacade(
+  new InstrumentService(),
+  new RiskService(),
+  funds,
+  new ExchangeGateway(),
+  new NotificationService(),
+  audit,
+);
+
+// Controllers only ever see this one call:
+const requests: Array<[string, OrderReq]> = [
+  ['u1', { symbol: 'INFY', side: 'BUY', qty: 10, price: 1500 }],
+  ['u1', { symbol: 'YESBANK', side: 'BUY', qty: 1000, price: 20 }],
+  ['u1', { symbol: 'TCS', side: 'BUY', qty: 100, price: 4100 }],
+  ['u1', { symbol: 'DOGE', side: 'BUY', qty: 1, price: 10 }],
+];
+for (const [user, req] of requests) {
+  const r = await facade.placeOrder(user, req);
+  console.log(r.ok ? `OK ${r.orderId}` : `FAIL ${r.reason}`);
+}
+console.log(`u1 balance: ${funds.balance('u1')}`);
+console.log(`audit entries: ${audit.entries.length}`);
+```
+
+```text
+  notify u1: order NSE-1 placed
+OK NSE-1
+  notify u1: order rejected: exchange rejected: price outside circuit
+FAIL exchange rejected: price outside circuit
+  notify u1: order rejected: insufficient funds: need 410000, have 185000
+FAIL insufficient funds: need 410000, have 185000
+  notify u1: order rejected: DOGE is not tradable
+FAIL DOGE is not tradable
+u1 balance: 185000
+audit entries: 4
+```
+
+The YESBANK rejection happened *after* margin was blocked, and the facade released it (balance is 185000, not 165000). That compensation logic lives in exactly one place.
+
+## When to use / when NOT to use
+
+- **Use** when clients keep repeating the same multi-step orchestration, when you want a clean boundary for a module (a NestJS module's exported service is often a facade), or when wrapping a complex library (`EmailFacade.sendTemplate()` over templating + SMTP + retries).
+- **Don't use** as a place to dump all business logic; that becomes a **god object**. Don't hide subsystem classes completely if advanced clients legitimately need them; a facade is a convenience, not a prison.
+
+## Pitfalls
+
+- **God facade**: 40 methods for every use case. Split by use case (`OrderPlacementFacade`, `OrderModificationFacade`).
+- **Leaking subsystem types** in the facade's signature defeats the simplification.
+- **Missing compensation**: a facade that orchestrates side effects must handle partial failure (release margin, refund payment). For cross-service workflows this grows into a **saga**.
+- Hard to test if the facade `new`s its subsystems. Inject them.
+
+## Related patterns
+
+- **Adapter** makes one interface match another; Facade creates a new, simpler one over many classes.
+- **Mediator** (Chapter 6) coordinates peers that talk *to each other through it*; with a Facade the subsystem classes don't know the facade exists.
+- **Abstract Factory** can supply the subsystem objects; facades are often **Singletons** in practice.
+- In NestJS, an "application service" / use-case class is usually a facade over repositories and domain services.
+
+## Where it shows up in LLD interview problems
+
+- Order placement in a trading or e-commerce system.
+- Hotel/movie/flight booking: `BookingFacade.book()` over seat lock, pricing, payment, ticket issue.
+- Home theatre / smart home "movie mode" (the classic textbook example).
+- Food delivery: `placeOrder()` over restaurant, cart, payment, delivery-partner assignment.
+
+Interview line: *"Controllers call a single `placeOrder()`. The facade orchestrates validation, risk, funds, exchange and notifications, and owns the compensation if a later step fails."*
+
+## Quick check
+
+1. Why is it important that funds are released inside the facade rather than by each controller?
+2. Facade vs Mediator?
+
+<details>
+<summary>Answers</summary>
+
+1. Compensation is part of the workflow; if each caller handles it, some path will forget, leaving money blocked. Centralising it guarantees consistent behaviour.
+2. A facade is a one-way simplifying front door; subsystem classes don't know about it. A mediator sits between colleagues that communicate *through* it, so they do know about it.
+
+</details>

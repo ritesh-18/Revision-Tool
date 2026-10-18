@@ -1,0 +1,906 @@
+---
+title: "15.2 Analytics SDK"
+---
+
+## Problem & where it's asked
+
+"Design an analytics SDK: an event interface, scheduling, local storage and periodic upload." A search snippet **reports** this for **Angel One** as an Android LLD round. For a frontend role, expect the web version of the same question. It is a good interview problem because it touches everything a client library has to deal with: batching, retries, offline mode, privacy, page lifecycle and extensibility. Segment, Mixpanel, Amplitude and Firebase all ship SDKs shaped like this, so it's worth knowing the vocabulary.
+
+On a broker app the SDK tracks funnels such as `watchlist_viewed → order_ticket_opened → order_placed`. Two constraints matter more than usual there: **PII** (PAN, phone and email must never reach the analytics vendor) and **consent** (regulatory opt-out).
+
+## Requirements
+
+**Functional**
+
+- `track(name, properties)` and `identify(userId, traits)`.
+- Events are **queued** and sent in **batches**: when `batchSize` is reached, or `flushIntervalMs` after the first queued event, whichever comes first.
+- Failed sends are **retried with exponential backoff**, but only for retryable failures (network errors, 5xx, 429).
+- **Offline buffer**: when offline, or when retries run out, events go to persistent storage and are replayed when the network comes back.
+- **Sampling**: keep a fixed percentage of *users*, deterministically.
+- **Consent**: nothing is collected without consent. Revoking consent wipes the queue and the buffer.
+- **PII scrubbing** runs on every event, after all plugins.
+- **Flush on page hide**, through a beacon-style, fire-and-forget transport.
+- A **plugin/middleware pipeline** that can enrich, transform or drop events.
+- One shared instance for the app, but the class stays constructible for tests (singleton-ish).
+
+**Non-functional**
+
+- `track` must be synchronous and cheap. It is called from click handlers.
+- Memory is bounded (`maxQueueSize`), and so is storage (`maxStoredEvents`).
+- No direct use of `window`, `localStorage`, `fetch` or `navigator`. Everything is injected, so the SDK also works in SSR, React Native and tests.
+
+**Public API (written first)**
+
+```ts
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+type Properties = { [key: string]: Json };
+
+interface AnalyticsEvent {
+  readonly messageId: string; // for server-side de-duplication of retried batches
+  readonly type: 'track' | 'identify';
+  readonly name: string;
+  readonly properties: Properties;
+  readonly timestamp: number;
+  readonly anonymousId: string;
+  readonly userId: string | null;
+}
+
+type Middleware = (event: AnalyticsEvent, next: (event: AnalyticsEvent) => void) => void;
+
+interface AnalyticsClient {
+  track(name: string, properties?: Properties): void;
+  identify(userId: string, traits?: Properties): void;
+  setConsent(granted: boolean): void;
+  use(middleware: Middleware): () => void;
+  flush(): Promise<void>;
+  shutdown(): Promise<void>;
+}
+
+// Ports: the SDK only talks to these.
+interface Transport {
+  send(batch: readonly AnalyticsEvent[]): Promise<void>; // rejects on failure
+  beacon?(batch: readonly AnalyticsEvent[]): boolean; // fire-and-forget, for page hide
+}
+interface KeyValueStorage { // same shape as window.localStorage
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+interface Scheduler {
+  now(): number;
+  setTimeout(fn: () => void, ms: number): number;
+  clearTimeout(id: number): void;
+}
+interface NetworkStatus {
+  isOnline(): boolean;
+  subscribe(listener: (online: boolean) => void): () => void;
+}
+interface PageLifecycle {
+  onHide(listener: () => void): () => void;
+}
+```
+
+`Properties` is a recursive `Json` type, not `Record<string, unknown>`. A `Date`, a `Map` or a class instance won't survive `JSON.stringify` in the transport, so the compiler rejects them at the `track` call site.
+
+## Design
+
+**Event flow**
+
+<Mermaid chart={`flowchart LR
+    A["track()"] --> B{consent?}
+    B -- no --> X[drop]
+    B -- yes --> C{in sample?}
+    C -- no --> X
+    C -- yes --> D[plugins]
+    D --> E[PII scrub]
+    E --> F[queue]
+    F -->|size or timer| G[deliver]
+    G -->|5xx / network| H[backoff retry]
+    H --> G
+    G -->|retries exhausted or offline| S[(storage buffer)]
+    S -->|back online| F
+    F -->|page hide| K[beacon]`} />
+
+**State model:** an in-memory `queue`, one `timer` id, one `sending` promise (so only one batch is in flight at a time), plus three storage keys: `buffer`, `consent` and `anon-id`.
+
+<Mermaid chart={`classDiagram
+    class AnalyticsClient {
+        <<interface>>
+        +track(name, props)
+        +identify(userId, traits)
+        +setConsent(granted)
+        +use(middleware)
+        +flush() Promise
+    }
+    class Analytics {
+        -queue AnalyticsEvent[]
+        -middlewares Middleware[]
+        -sending Promise
+        -timer number
+        -deliver(batch, attempt)
+        -persist(events)
+        -restoreBuffered()
+    }
+    class Transport {
+        <<interface>>
+        +send(batch) Promise
+        +beacon(batch) boolean
+    }
+    class KeyValueStorage {
+        <<interface>>
+    }
+    class Scheduler {
+        <<interface>>
+    }
+    class NetworkStatus {
+        <<interface>>
+    }
+    class PageLifecycle {
+        <<interface>>
+    }
+    AnalyticsClient <|.. Analytics
+    Analytics --> Transport
+    Analytics --> KeyValueStorage
+    Analytics --> Scheduler
+    Analytics --> NetworkStatus
+    Analytics --> PageLifecycle`} />
+
+**Patterns and why**
+
+| Pattern | Where | Why |
+|---|---|---|
+| **Dependency Injection / Ports & Adapters** | `Transport`, `KeyValueStorage`, `Scheduler`, `NetworkStatus`, `PageLifecycle` | Runs in the browser, SSR, React Native and tests. The browser adapters are about ten lines each. |
+| **Chain of Responsibility** | Middleware pipeline | Plugins can enrich, change or drop an event without the core knowing about them (Open/Closed). |
+| **Singleton-ish** | `initAnalytics` / `getAnalytics` | The app gets one shared queue, while tests still use `new Analytics(...)`. |
+| **Strategy** | Retry policy and sampling | Easy to swap, e.g. full-jitter backoff, or per-event sampling for high-volume events. |
+| **Observer** | Network and lifecycle subscriptions | The SDK reacts to the environment without polling. |
+
+The PII scrubber runs **after** the plugins on purpose. A plugin that adds `user.email` for "debugging" still gets scrubbed.
+
+## Implementation
+
+Part 1 covers types, the scrubber, a hash for sampling, and the error type.
+
+```ts
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+type Properties = { [key: string]: Json };
+
+interface AnalyticsEvent {
+  readonly messageId: string;
+  readonly type: 'track' | 'identify';
+  readonly name: string;
+  readonly properties: Properties;
+  readonly timestamp: number;
+  readonly anonymousId: string;
+  readonly userId: string | null;
+}
+type Middleware = (event: AnalyticsEvent, next: (event: AnalyticsEvent) => void) => void;
+
+interface AnalyticsClient {
+  track(name: string, properties?: Properties): void;
+  identify(userId: string, traits?: Properties): void;
+  setConsent(granted: boolean): void;
+  use(middleware: Middleware): () => void;
+  flush(): Promise<void>;
+  shutdown(): Promise<void>;
+}
+interface Transport {
+  send(batch: readonly AnalyticsEvent[]): Promise<void>;
+  beacon?(batch: readonly AnalyticsEvent[]): boolean;
+}
+interface KeyValueStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+interface Scheduler {
+  now(): number;
+  setTimeout(fn: () => void, ms: number): number;
+  clearTimeout(id: number): void;
+}
+interface NetworkStatus {
+  isOnline(): boolean;
+  subscribe(listener: (online: boolean) => void): () => void;
+}
+interface PageLifecycle {
+  onHide(listener: () => void): () => void;
+}
+
+interface AnalyticsConfig {
+  batchSize: number;
+  flushIntervalMs: number;
+  maxRetries: number;
+  baseBackoffMs: number;
+  maxQueueSize: number;
+  maxStoredEvents: number;
+  sampleRate: number; // 0..1, applied per anonymous user
+  requireConsent: boolean;
+}
+interface AnalyticsDeps {
+  transport: Transport;
+  storage: KeyValueStorage;
+  scheduler: Scheduler;
+  network: NetworkStatus;
+  lifecycle: PageLifecycle;
+  newId: () => string;
+  log?: (message: string) => void;
+}
+
+class TransportError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'TransportError';
+    this.status = status;
+  }
+}
+
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+// --- PII scrubbing -------------------------------------------------------
+const PII_KEYS = new Set(['email', 'phone', 'mobile', 'pan', 'aadhaar', 'password']);
+const PII_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/[\w.+-]+@[\w-]+\.[\w.]+/g, '[email]'],
+  [/\b[A-Z]{5}\d{4}[A-Z]\b/g, '[pan]'], // Indian PAN format
+  [/\b\d{10}\b/g, '[phone]'],
+];
+
+function scrubValue(value: Json): Json {
+  if (typeof value === 'string') {
+    return PII_PATTERNS.reduce((text, [pattern, label]) => text.replace(pattern, label), value);
+  }
+  if (Array.isArray(value)) return value.map(scrubValue);
+  if (value !== null && typeof value === 'object') return scrubProperties(value);
+  return value;
+}
+
+function scrubProperties(properties: Properties): Properties {
+  const clean: Properties = {};
+  for (const [key, value] of Object.entries(properties)) {
+    clean[key] = PII_KEYS.has(key.toLowerCase()) ? '[redacted]' : scrubValue(value);
+  }
+  return clean;
+}
+
+// --- deterministic sampling ---------------------------------------------
+/** FNV-1a 32-bit: tiny, fast, well distributed for short ids. */
+function fnv1a(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+```
+
+Part 2 is the client. Note three things as you read it: the single in-flight `sending` promise, the retryable-versus-fatal split in `deliver`, and the fact that storage failures never throw into the caller.
+
+```ts
+const KEYS = { buffer: 'analytics:buffer', consent: 'analytics:consent', anonId: 'analytics:anon-id' } as const;
+
+class Analytics implements AnalyticsClient {
+  readonly stats = { sent: 0, dropped: 0, persisted: 0, sampledOut: 0 };
+  private queue: AnalyticsEvent[] = [];
+  private readonly middlewares: Middleware[] = [];
+  private timer: number | null = null;
+  private sending: Promise<void> | null = null;
+  private userId: string | null = null;
+  private consent: boolean;
+  private closed = false;
+  private readonly anonymousId: string;
+  private readonly inSample: boolean;
+  private readonly cleanups: Array<() => void>;
+  private readonly config: AnalyticsConfig;
+  private readonly deps: AnalyticsDeps;
+
+  constructor(config: AnalyticsConfig, deps: AnalyticsDeps) {
+    this.config = config;
+    this.deps = deps;
+    const storedConsent = this.read(KEYS.consent);
+    this.consent = storedConsent === null ? !config.requireConsent : storedConsent === 'granted';
+    this.anonymousId = this.read(KEYS.anonId) ?? this.createAnonymousId();
+    // Per-USER sampling keeps funnels intact: a sampled user is tracked end to end.
+    this.inSample = fnv1a(this.anonymousId) % 10_000 < config.sampleRate * 10_000;
+    this.cleanups = [
+      deps.network.subscribe((online) => {
+        if (online) this.restoreBuffered();
+      }),
+      deps.lifecycle.onHide(() => this.flushOnHide()),
+    ];
+    if (deps.network.isOnline()) this.restoreBuffered(); // replay what the last session left behind
+  }
+
+  get isSampled(): boolean {
+    return this.inSample;
+  }
+
+  track(name: string, properties: Properties = {}): void {
+    this.capture('track', name, properties);
+  }
+
+  identify(userId: string, traits: Properties = {}): void {
+    this.userId = userId;
+    this.capture('identify', 'identify', traits);
+  }
+
+  setConsent(granted: boolean): void {
+    this.consent = granted;
+    this.write(KEYS.consent, granted ? 'granted' : 'denied');
+    if (granted) {
+      this.log('consent granted');
+      return;
+    }
+    const cleared = this.queue.length;
+    this.queue = [];
+    this.clearTimer();
+    this.deps.storage.removeItem(KEYS.buffer);
+    this.log(`consent revoked: cleared ${cleared} queued event(s) and the offline buffer`);
+  }
+
+  use(middleware: Middleware): () => void {
+    this.middlewares.push(middleware);
+    return () => {
+      const index = this.middlewares.indexOf(middleware);
+      if (index >= 0) this.middlewares.splice(index, 1);
+    };
+  }
+
+  flush(): Promise<void> {
+    this.clearTimer();
+    if (this.sending) return this.sending;
+    if (this.queue.length === 0) return Promise.resolve();
+    if (!this.deps.network.isOnline()) {
+      this.persist(this.queue.splice(0));
+      return Promise.resolve();
+    }
+    const batch = this.queue.splice(0, this.config.batchSize);
+    this.sending = this.deliver(batch, 0).finally(() => {
+      this.sending = null;
+      if (this.queue.length >= this.config.batchSize) void this.flush();
+      else if (this.queue.length > 0) this.armTimer();
+    });
+    return this.sending;
+  }
+
+  async shutdown(): Promise<void> {
+    this.closed = true;
+    while (this.queue.length > 0 || this.sending) await this.flush();
+    this.clearTimer();
+    this.cleanups.forEach((cleanup) => cleanup());
+  }
+
+  // --- capture pipeline --------------------------------------------------
+  private capture(type: AnalyticsEvent['type'], name: string, properties: Properties): void {
+    if (this.closed) return;
+    if (!this.consent) {
+      this.stats.dropped++;
+      this.log(`drop "${name}": no consent`);
+      return;
+    }
+    if (!this.inSample) {
+      this.stats.sampledOut++;
+      return;
+    }
+    const event: AnalyticsEvent = {
+      messageId: this.deps.newId(),
+      type,
+      name,
+      properties,
+      timestamp: this.deps.scheduler.now(),
+      anonymousId: this.anonymousId,
+      userId: this.userId,
+    };
+    this.runPipeline(event);
+  }
+
+  private runPipeline(event: AnalyticsEvent): void {
+    const chain = this.middlewares.slice(); // plugins added mid-dispatch apply to the next event
+    const dispatch = (index: number, current: AnalyticsEvent): void => {
+      if (index === chain.length) {
+        this.enqueue({ ...current, properties: scrubProperties(current.properties) });
+        return;
+      }
+      chain[index](current, (next) => dispatch(index + 1, next));
+    };
+    try {
+      dispatch(0, event);
+    } catch (error) {
+      this.stats.dropped++;
+      this.log(`plugin error, "${event.name}" dropped: ${errorMessage(error)}`);
+    }
+  }
+
+  private enqueue(event: AnalyticsEvent): void {
+    this.queue.push(event);
+    if (this.queue.length > this.config.maxQueueSize) {
+      this.queue.shift();
+      this.stats.dropped++;
+      this.log('queue full: dropped oldest event');
+    }
+    if (this.queue.length >= this.config.batchSize) void this.flush();
+    else this.armTimer();
+  }
+
+  // --- delivery ------------------------------------------------------------
+  private async deliver(batch: readonly AnalyticsEvent[], attempt: number): Promise<void> {
+    try {
+      await this.deps.transport.send(batch);
+      this.stats.sent += batch.length;
+      const suffix = attempt > 0 ? ` after ${attempt} retr${attempt === 1 ? 'y' : 'ies'}` : '';
+      this.log(`delivered ${batch.length} event(s)${suffix}`);
+    } catch (error) {
+      const status = error instanceof TransportError ? error.status : 0; // 0 = network failure
+      const retryable = status === 0 || status === 429 || status >= 500;
+      if (!retryable) {
+        this.stats.dropped += batch.length; // a 400 will never succeed: don't loop, don't store
+        this.log(`dropped ${batch.length} event(s): HTTP ${status} is not retryable`);
+        return;
+      }
+      if (attempt >= this.config.maxRetries) {
+        this.persist(batch);
+        return;
+      }
+      const delay = this.config.baseBackoffMs * 2 ** attempt;
+      this.log(`send failed (${errorMessage(error)}), retry #${attempt + 1} in ${delay}ms`);
+      await new Promise<void>((resolve) => this.deps.scheduler.setTimeout(resolve, delay));
+      return this.deliver(batch, attempt + 1);
+    }
+  }
+
+  private flushOnHide(): void {
+    this.clearTimer();
+    const batch = this.queue.splice(0);
+    if (batch.length === 0) return;
+    // We cannot await here: the page may be gone. Beacon or persist, synchronously.
+    const beaconed = this.deps.network.isOnline() && this.deps.transport.beacon?.(batch) === true;
+    if (beaconed) {
+      this.stats.sent += batch.length;
+      this.log(`page hidden: beaconed ${batch.length} event(s)`);
+    } else {
+      this.persist(batch);
+    }
+  }
+
+  // --- offline buffer --------------------------------------------------------
+  private persist(events: readonly AnalyticsEvent[]): void {
+    if (events.length === 0 || !this.consent) return;
+    const merged = [...this.loadBuffered(), ...events].slice(-this.config.maxStoredEvents);
+    if (this.write(KEYS.buffer, JSON.stringify(merged))) {
+      this.stats.persisted += events.length;
+      this.log(`persisted ${events.length} event(s) offline (buffer=${merged.length})`);
+    } else {
+      this.stats.dropped += events.length;
+    }
+  }
+
+  private loadBuffered(): AnalyticsEvent[] {
+    const raw = this.read(KEYS.buffer);
+    if (!raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as AnalyticsEvent[]) : [];
+    } catch {
+      return []; // corrupted buffer: start fresh rather than crash the app
+    }
+  }
+
+  private restoreBuffered(): void {
+    const stored = this.loadBuffered();
+    if (stored.length === 0 || !this.consent) return;
+    this.deps.storage.removeItem(KEYS.buffer);
+    this.queue = [...stored, ...this.queue];
+    this.log(`online: restored ${stored.length} buffered event(s)`);
+    void this.flush();
+  }
+
+  // --- helpers -------------------------------------------------------------
+  private armTimer(): void {
+    if (this.timer !== null) return;
+    this.timer = this.deps.scheduler.setTimeout(() => {
+      this.timer = null;
+      void this.flush();
+    }, this.config.flushIntervalMs);
+  }
+
+  private clearTimer(): void {
+    if (this.timer === null) return;
+    this.deps.scheduler.clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  private createAnonymousId(): string {
+    const id = this.deps.newId();
+    this.write(KEYS.anonId, id);
+    return id;
+  }
+
+  private read(key: string): string | null {
+    try {
+      return this.deps.storage.getItem(key);
+    } catch {
+      return null; // storage disabled (Safari private mode, sandboxed iframe)
+    }
+  }
+
+  private write(key: string, value: string): boolean {
+    try {
+      this.deps.storage.setItem(key, value);
+      return true;
+    } catch (error) {
+      this.log(`storage write failed: ${errorMessage(error)}`);
+      return false;
+    }
+  }
+
+  private log(message: string): void {
+    this.deps.log?.(message);
+  }
+}
+
+// --- singleton-ish access for app code -------------------------------------
+let sharedClient: Analytics | null = null;
+
+function initAnalytics(config: AnalyticsConfig, deps: AnalyticsDeps): Analytics {
+  sharedClient ??= new Analytics(config, deps); // idempotent: safe under HMR / double init
+  return sharedClient;
+}
+
+function getAnalytics(): AnalyticsClient {
+  if (!sharedClient) throw new Error('Analytics not initialised: call initAnalytics() at app start');
+  return sharedClient;
+}
+```
+
+Part 3 covers the fakes (a manual scheduler, memory storage, a controllable network and transport) and the demo.
+
+```ts
+interface Task { at: number; fn: () => void }
+
+class FakeScheduler implements Scheduler {
+  private time = 0;
+  private seq = 0;
+  private readonly tasks = new Map<number, Task>();
+  now(): number { return this.time; }
+  setTimeout(fn: () => void, ms: number): number {
+    const id = ++this.seq;
+    this.tasks.set(id, { at: this.time + ms, fn });
+    return id;
+  }
+  clearTimeout(id: number): void { this.tasks.delete(id); }
+  /** Run every task due within `ms`, letting promise chains settle between tasks. */
+  async advance(ms: number): Promise<void> {
+    const end = this.time + ms;
+    await settle(); // let already-resolved promises schedule their timers first
+    for (;;) {
+      let next: [number, Task] | undefined;
+      for (const entry of this.tasks) {
+        if (entry[1].at <= end && (!next || entry[1].at < next[1].at)) next = entry;
+      }
+      if (!next) break;
+      this.tasks.delete(next[0]);
+      this.time = next[1].at;
+      next[1].fn();
+      await settle();
+    }
+    this.time = end;
+    await settle();
+  }
+}
+const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+class MemoryStorage implements KeyValueStorage {
+  private readonly data = new Map<string, string>();
+  getItem(key: string): string | null { return this.data.get(key) ?? null; }
+  setItem(key: string, value: string): void { this.data.set(key, value); }
+  removeItem(key: string): void { this.data.delete(key); }
+}
+
+class FakeNetwork implements NetworkStatus {
+  private online = true;
+  private readonly listeners = new Set<(online: boolean) => void>();
+  isOnline(): boolean { return this.online; }
+  subscribe(listener: (online: boolean) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  set(online: boolean): void {
+    this.online = online;
+    this.listeners.forEach((l) => l(online));
+  }
+}
+
+class FakeLifecycle implements PageLifecycle {
+  private readonly listeners = new Set<() => void>();
+  onHide(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  hide(): void { this.listeners.forEach((l) => l()); }
+}
+
+class FakeTransport implements Transport {
+  lastBatch: readonly AnalyticsEvent[] = [];
+  private readonly failures: number[] = [];
+  failWith(...statuses: number[]): void { this.failures.push(...statuses); }
+  async send(batch: readonly AnalyticsEvent[]): Promise<void> {
+    const status = this.failures.shift();
+    if (status !== undefined) throw new TransportError(`HTTP ${status}`, status);
+    this.lastBatch = batch;
+    console.log(`  [server] ${batch.map((e) => e.name).join(', ')}`);
+  }
+  beacon(batch: readonly AnalyticsEvent[]): boolean {
+    console.log(`  [beacon] ${batch.map((e) => e.name).join(', ')}`);
+    return true;
+  }
+}
+
+// --- wiring ------------------------------------------------------------------
+const scheduler = new FakeScheduler();
+const storage = new MemoryStorage();
+const network = new FakeNetwork();
+const lifecycle = new FakeLifecycle();
+const transport = new FakeTransport();
+let idCounter = 0;
+
+const config: AnalyticsConfig = {
+  batchSize: 3,
+  flushIntervalMs: 5_000,
+  maxRetries: 2,
+  baseBackoffMs: 1_000,
+  maxQueueSize: 100,
+  maxStoredEvents: 500,
+  sampleRate: 1,
+  requireConsent: true,
+};
+const deps: AnalyticsDeps = {
+  transport, storage, scheduler, network, lifecycle,
+  newId: () => `id-${++idCounter}`,
+  log: (message) => console.log(`  [sdk t=${scheduler.now()}] ${message}`),
+};
+
+console.log('1) singleton access');
+try {
+  getAnalytics();
+} catch (error) {
+  console.log(`  ${errorMessage(error)}`);
+}
+const client = initAnalytics(config, deps);
+console.log(`  same instance on re-init: ${initAnalytics(config, deps) === client}`);
+const analytics = getAnalytics();
+
+console.log('2) consent gate');
+analytics.track('app_opened');
+analytics.setConsent(true);
+
+console.log('3) plugins + PII scrubbing, size-based flush');
+analytics.use((event, next) => next({ ...event, properties: { ...event.properties, appVersion: '5.2.0' } }));
+analytics.use((event, next) => {
+  if (!event.name.startsWith('debug_')) next(event); // drop debug events in prod
+});
+analytics.identify('U123', { email: 'ritesh@example.com', plan: 'pro' });
+analytics.track('debug_render', { ms: 12 });
+analytics.track('order_ticket_opened', { symbol: 'RELIANCE' });
+analytics.track('order_placed', {
+  symbol: 'RELIANCE', qty: 10, side: 'BUY',
+  note: 'call 9876543210, PAN ABCDE1234F',
+});
+await scheduler.advance(0);
+const placed = transport.lastBatch.find((e) => e.name === 'order_placed');
+console.log(`  scrubbed props: ${JSON.stringify(placed?.properties)}`);
+const identified = transport.lastBatch.find((e) => e.type === 'identify');
+console.log(`  identify traits: ${JSON.stringify(identified?.properties)}`);
+
+console.log('4) time-based flush');
+analytics.track('watchlist_viewed', { count: 12 });
+await scheduler.advance(4_999);
+console.log('  (nothing sent before 5s)');
+await scheduler.advance(1);
+```
+
+Step 5 needs care. `flush()` only resolves after the retries, and the retries wait on *virtual* time. If you `await analytics.flush()` directly, the demo hangs forever. So we start the flush, advance the clock through each backoff, and await the promise afterwards. Tests of retrying code usually look like this.
+
+```ts
+console.log('5) retry with backoff on 503 (driven by the scheduler)');
+transport.failWith(503, 503);
+analytics.track('chart_opened', { symbol: 'TCS' });
+const pendingFlush = analytics.flush();
+await scheduler.advance(1_000);
+await scheduler.advance(2_000);
+await pendingFlush;
+
+console.log('6) non-retryable 400 is dropped, not retried');
+transport.failWith(400);
+analytics.track('bad_event', { x: 1 });
+await analytics.flush();
+
+console.log('7) offline -> buffer -> online replay');
+network.set(false);
+analytics.track('order_cancelled', { orderId: 'ORD-9' });
+analytics.track('funds_viewed');
+await analytics.flush();
+network.set(true);
+await scheduler.advance(0);
+await scheduler.advance(5_000);
+
+console.log('8) page hide uses the beacon');
+analytics.track('session_end', { screens: 7 });
+lifecycle.hide();
+
+console.log('9) deterministic per-user sampling at 50%');
+const sampled: string[] = [];
+for (const anon of ['anon-a', 'anon-b', 'anon-c', 'anon-d', 'anon-e', 'anon-f']) {
+  const s = new MemoryStorage();
+  s.setItem('analytics:anon-id', anon);
+  const c = new Analytics({ ...config, sampleRate: 0.5, requireConsent: false }, { ...deps, storage: s, log: undefined });
+  const again = new Analytics({ ...config, sampleRate: 0.5, requireConsent: false }, { ...deps, storage: s, log: undefined });
+  sampled.push(`${anon}=${c.isSampled ? 'in' : 'out'}${c.isSampled === again.isSampled ? '' : '(unstable!)'}`);
+  await c.shutdown();
+  await again.shutdown();
+}
+console.log(`  ${sampled.join(' ')}`);
+
+console.log('10) revoke consent, then checks');
+analytics.track('pending_event');
+analytics.setConsent(false);
+analytics.track('after_opt_out');
+await client.shutdown();
+
+const check = (name: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${name}`);
+check('PII patterns masked in free text', placed?.properties['note'] === 'call [phone], PAN [pan]');
+check('PII keys redacted', identified?.properties['email'] === '[redacted]');
+check('plugin enrichment applied before scrub', placed?.properties['appVersion'] === '5.2.0');
+check('messageIds unique', new Set(transport.lastBatch.map((e) => e.messageId)).size === transport.lastBatch.length);
+check('offline buffer emptied after replay', storage.getItem('analytics:buffer') === null);
+check('consent persisted as denied', storage.getItem('analytics:consent') === 'denied');
+check(`stats ${JSON.stringify(client.stats)}`, client.stats.sent === 8 && client.stats.dropped === 3 && client.stats.persisted === 2);
+```
+
+## Demo output
+
+```text
+1) singleton access
+  Analytics not initialised: call initAnalytics() at app start
+  same instance on re-init: true
+2) consent gate
+  [sdk t=0] drop "app_opened": no consent
+  [sdk t=0] consent granted
+3) plugins + PII scrubbing, size-based flush
+  [server] identify, order_ticket_opened, order_placed
+  [sdk t=0] delivered 3 event(s)
+  scrubbed props: {"symbol":"RELIANCE","qty":10,"side":"BUY","note":"call [phone], PAN [pan]","appVersion":"5.2.0"}
+  identify traits: {"email":"[redacted]","plan":"pro","appVersion":"5.2.0"}
+4) time-based flush
+  (nothing sent before 5s)
+  [server] watchlist_viewed
+  [sdk t=5000] delivered 1 event(s)
+5) retry with backoff on 503 (driven by the scheduler)
+  [sdk t=5000] send failed (HTTP 503), retry #1 in 1000ms
+  [sdk t=6000] send failed (HTTP 503), retry #2 in 2000ms
+  [server] chart_opened
+  [sdk t=8000] delivered 1 event(s) after 2 retries
+6) non-retryable 400 is dropped, not retried
+  [sdk t=8000] dropped 1 event(s): HTTP 400 is not retryable
+7) offline -> buffer -> online replay
+  [sdk t=8000] persisted 2 event(s) offline (buffer=2)
+  [sdk t=8000] online: restored 2 buffered event(s)
+  [server] order_cancelled, funds_viewed
+  [sdk t=8000] delivered 2 event(s)
+8) page hide uses the beacon
+  [beacon] session_end
+  [sdk t=13000] page hidden: beaconed 1 event(s)
+9) deterministic per-user sampling at 50%
+  anon-a=out anon-b=in anon-c=in anon-d=out anon-e=out anon-f=in
+10) revoke consent, then checks
+  [sdk t=13000] consent revoked: cleared 1 queued event(s) and the offline buffer
+  [sdk t=13000] drop "after_opt_out": no consent
+  PASS PII patterns masked in free text
+  PASS PII keys redacted
+  PASS plugin enrichment applied before scrub
+  PASS messageIds unique
+  PASS offline buffer emptied after replay
+  PASS consent persisted as denied
+  PASS stats {"sent":8,"dropped":3,"persisted":2,"sampledOut":0}
+```
+
+## Testing strategy
+
+- **Fake time** (`FakeScheduler.advance`) makes the size and timer triggers and the backoff delays exact. The test above proves nothing is sent at 4 999 ms and that it is sent at 5 000 ms.
+- **Scripted failures** (`failWith(503, 503)`, `failWith(400)`) cover the retry-then-succeed path and the fatal path without any real network.
+- **Environment fakes** (`FakeNetwork.set(false)`, `FakeLifecycle.hide()`) exercise the offline buffer and the beacon path. Those two paths are hard to reach in a browser test.
+- **Property checks**: scrubbed output, plugin order, unique `messageId`s, consent persisted, and the final `stats` counters.
+- Also worth adding: storage `setItem` throwing (`QuotaExceededError`), corrupted JSON in the buffer, and a plugin that throws.
+
+## Performance & memory considerations
+
+- `track` is O(plugins) and never awaits. Serialization happens once per batch, in `send`.
+- Batching trades latency for fewer requests. 10–20 events or 5–10 s is typical. Beacon payloads are capped at about 64 KB, so cap the batch by **bytes** as well.
+- Memory is bounded by `maxQueueSize` (drop oldest) and storage by `maxStoredEvents`. Both are important on low-end Android WebViews.
+- `localStorage` is synchronous and blocks the main thread. For a heavy SDK, use an IndexedDB adapter behind the same `KeyValueStorage`-style port, made async.
+- Retries without jitter cause a **thundering herd** when the collector recovers and every client retries at once. Production code should use full jitter: `delay = random() * base * 2^attempt`, with `random` injected so tests stay deterministic.
+- Sampling is decided once per user, which keeps the per-event hot path free of any hashing.
+
+## How it plugs into React
+
+```tsx
+// main.tsx: browser adapters live at the edge of the app
+initAnalytics(config, {
+  transport: {
+    send: async (batch) => {
+      const res = await fetch('/collect', { method: 'POST', body: JSON.stringify(batch), keepalive: true });
+      if (!res.ok) throw new TransportError(`HTTP ${res.status}`, res.status);
+    },
+    beacon: (batch) => navigator.sendBeacon('/collect', JSON.stringify(batch)),
+  },
+  storage: window.localStorage, // already matches KeyValueStorage
+  scheduler: { now: Date.now, setTimeout: (f, ms) => window.setTimeout(f, ms), clearTimeout: (id) => window.clearTimeout(id) },
+  network: {
+    isOnline: () => navigator.onLine,
+    subscribe: (cb) => {
+      const on = () => cb(true), off = () => cb(false);
+      addEventListener('online', on); addEventListener('offline', off);
+      return () => { removeEventListener('online', on); removeEventListener('offline', off); };
+    },
+  },
+  lifecycle: {
+    onHide: (cb) => {
+      const h = () => { if (document.visibilityState === 'hidden') cb(); };
+      document.addEventListener('visibilitychange', h);
+      return () => document.removeEventListener('visibilitychange', h);
+    },
+  },
+  newId: () => crypto.randomUUID(),
+});
+
+// a hook for screen views
+function useTrackScreen(name: string, props?: Properties) {
+  useEffect(() => { getAnalytics().track('screen_viewed', { name, ...props }); }, [name]);
+}
+```
+
+## Extensions & follow-ups
+
+- **Implemented:** a plugin pipeline (enrichment and a drop filter), per-user sampling, and the singleton-ish accessor.
+- **Byte-size batching** (`TextEncoder().encode(json).length`) to respect beacon limits.
+- **Per-event sampling overrides**, e.g. keep 100 % of `order_placed` and 5 % of `price_tick_rendered`.
+- **Cross-tab coordination**: use `BroadcastChannel` or a Web Lock so only one tab flushes the shared buffer.
+- **Schema validation plugin**: a typed tracking plan (`track<K extends keyof Plan>(name: K, props: Plan[K])`) that catches typos at compile time.
+- **Circuit breaker**: after N consecutive failures, stop trying for a cool-down period.
+
+## Interview Q&A
+
+**Q1. Why sample by user instead of by event?**
+
+<details>
+<summary>Answer</summary>
+
+Funnels and retention are computed per user. If each event is sampled independently at 50 %, a user's `order_ticket_opened` may be kept while their `order_placed` is dropped, which corrupts conversion rates. Hashing a stable `anonymousId` gives the same decision on every page load and on every device session for that id, so a sampled user is complete. Per-event sampling is still useful for very high-volume, non-funnel events.
+
+</details>
+
+**Q2. The user closes the tab while a batch is in flight. What is lost, and how would you reduce it?**
+
+<details>
+<summary>Answer</summary>
+
+Anything still in the queue is beaconed (or persisted if the beacon fails). A `fetch` that is already in flight may be cancelled by the browser. Mitigations: use `keepalive: true` on fetch; persist the batch **before** sending and remove it on success (an outbox pattern, at the cost of possible duplicates); and send a `messageId` so the server can de-duplicate. Delivery is at-least-once, so de-duplication has to happen on the server.
+
+</details>
+
+**Q3. Why not retry a 400?**
+
+<details>
+<summary>Answer</summary>
+
+A 4xx means the request itself is wrong: bad schema, oversized payload, bad auth. Sending it again gives the same result and burns battery and quota. It could also block the queue forever if retries are unbounded. Only transient failures (network errors, 5xx, 429) are retried with backoff. Fatal ones are dropped and reported through a diagnostics hook.
+
+</details>
+
+**Q4. Isn't a singleton bad for testing?**
+
+<details>
+<summary>Answer</summary>
+
+A *hard* singleton is: a private constructor plus a global `getInstance()` that builds its own dependencies. Here the class is an ordinary constructor with every dependency injected. The module-level accessor is just a convenience for app code, so tests create as many isolated instances as they need (the sampling demo creates twelve). This is sometimes called "singleton by convention, not by construction".
+
+</details>

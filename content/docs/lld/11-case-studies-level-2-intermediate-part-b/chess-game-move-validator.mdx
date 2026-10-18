@@ -1,0 +1,710 @@
+---
+title: "11.4 Chess (Game & Move Validator)"
+---
+
+## Problem & where it's asked
+
+Model a two-player chess game: a board, six piece types with different movement rules, alternating turns, move validation, and detection of check, checkmate and stalemate. The question is really a test of **polymorphism**: can you add a new piece or rule without a giant `switch`?
+
+| Company | What was reported | Confidence |
+|---|---|---|
+| Microsoft, Salesforce, Adobe, Amazon | Chess (game or move validator) on company-wise LLD lists | reported (lists) |
+| workat.tech "Chess Validator" | Board, pieces, validate moves, turns, check detection. A common practice spec. | reported (practice platform) |
+| Flipkart, Atlassian | Board-game problems (Snake & Ladder, Tic-Tac-Toe, Snake) are common there. Chess appears less often. | uncertain |
+
+Graded on: **polymorphism across piece types** and **where validation lives**. Typical follow-ups: castling, en passant, undo.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Full FIDE rules? | Standard piece moves, captures, pawn double-step, auto-promotion to queen, check/checkmate/stalemate. **Castling and en passant are out of scope** (discussed under extensions). |
+| Input format? | Coordinate pairs such as `e2`→`e4`. No algebraic parsing (`Nf3`). |
+| Human vs human only? | Yes. Players are identified by color, and there's no AI. |
+| Draw rules (threefold repetition, 50 moves)? | Out of scope. Only stalemate. |
+| Undo? | Yes, needed for "takeback" and cheap to add with a move history. |
+| Custom starting positions? | Yes, for testing puzzles (`Board.from({...})`). |
+
+## Requirements
+
+**Functional**
+1. Set up the standard board or a custom position.
+2. `move(from, to)` validates the square format, whose turn it is, piece geometry, blocked paths, own-piece capture and **king safety** (you may not leave your king in check).
+3. Captures and pawn promotion.
+4. After each move, report `ACTIVE`, `CHECK`, `CHECKMATE` or `STALEMATE`. No moves are accepted after the game ends.
+5. Undo the last move. Print the board.
+
+**Non-functional**
+- Adding a piece type (for example a fairy "Archbishop") shouldn't require editing `Game`.
+- Clear error messages for every illegal move.
+
+**Out of scope**
+- Castling, en passant, draw rules, time control (a clock is shown as an extension), PGN/algebraic notation, AI.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|---|---|---|
+| `Pos` | 0-based file/rank value object, parse/format `e4` | used everywhere |
+| `Piece` | color, kind, symbol. Delegates movement to its strategy. | has one `MoveStrategy` |
+| `MoveStrategy` (interface) | `canMove` (geometry + path + target) and `attacks` | `SlidingMove`, `StepMove`, `PawnMove` |
+| `PieceFactory` | kind → piece with the right (shared) strategy | creates `Piece` |
+| `Board` | 64 squares, lookup, attack detection, render | contains `Piece`s |
+| `Game` | turn, status, history, validation pipeline, undo | owns a `Board` and `MoveRecord`s |
+| `MoveRecord` | from, to, piece, captured?, promotedTo? | used by undo |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Game {
+        +status
+        +toMove
+        +move(from, to) string
+        +undo() string
+    }
+    class Board {
+        +at(pos) Piece
+        +put(pos, piece)
+        +isAttacked(pos, byColor) bool
+        +isInCheck(color) bool
+        +render() string[]
+    }
+    class Piece {
+        +color
+        +kind
+        +symbol
+        +canMove(from, to, board) bool
+        +attacks(from, to, board) bool
+    }
+    class MoveStrategy {
+        <<interface>>
+        +canMove(from, to, board, color) bool
+        +attacks(from, to, board, color) bool
+    }
+    class SlidingMove
+    class StepMove
+    class PawnMove
+    class PieceFactory {
+        +create(kind, color) Piece
+    }
+    class MoveRecord
+    Game *-- Board
+    Game o-- MoveRecord
+    Board o-- Piece
+    Piece --> MoveStrategy
+    MoveStrategy <|.. SlidingMove
+    MoveStrategy <|.. StepMove
+    MoveStrategy <|.. PawnMove
+    PieceFactory ..> Piece : creates`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> ACTIVE
+    ACTIVE --> CHECK : move gives check
+    CHECK --> ACTIVE : check resolved
+    ACTIVE --> CHECKMATE : in check, no legal move
+    CHECK --> CHECKMATE : in check, no legal move
+    ACTIVE --> STALEMATE : not in check, no legal move
+    CHECKMATE --> ACTIVE : undo
+    CHECKMATE --> [*]
+    STALEMATE --> [*]`} />
+
+## Design decisions & patterns
+
+- **Strategy (composition) over a deep inheritance tree.** Rook, bishop and queen are *the same algorithm* (slide along directions) with different direction sets. King and knight are both "jump by fixed offsets". So we need three strategies, not six subclasses with duplicated loops. *Rejected:* `class Rook extends Piece { canMove() {...} }` ×6. It works, but the sliding logic gets copied three times.
+- **`attacks` separate from `canMove`.** The two differ only for pawns: a pawn moves straight but attacks diagonally. Check detection must use `attacks`.
+- **King safety lives in `Game`, not in the pieces.** "Does this leave my king in check?" is a board-level rule. We *simulate* (apply → test → revert), which handles pins, discovered checks and king moves with one mechanism.
+- **Factory with shared (flyweight) strategies.** All white and black rooks share one stateless `SlidingMove` instance.
+- **Move history (Command-like `MoveRecord`)** stores just enough to revert, so undo comes free, and the same revert powers the simulation.
+- **Status evaluated after every move** for the side to move: in check + no legal moves = checkmate, not in check + no legal moves = stalemate.
+
+## Implementation
+
+**Part 1 — types, errors, positions.**
+
+```ts
+type Color = 'WHITE' | 'BLACK';
+type PieceKind = 'KING' | 'QUEEN' | 'ROOK' | 'BISHOP' | 'KNIGHT' | 'PAWN';
+type GameStatus = 'ACTIVE' | 'CHECK' | 'CHECKMATE' | 'STALEMATE';
+
+class ChessError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class ValidationError extends ChessError {}
+class IllegalMoveError extends ChessError {}
+class GameOverError extends ChessError {}
+
+interface Pos { readonly file: number; readonly rank: number; } // both 0..7
+const FILES = 'abcdefgh';
+
+function parsePos(square: string): Pos {
+  if (!/^[a-h][1-8]$/.test(square)) throw new ValidationError(`bad square "${square}"`);
+  return { file: FILES.indexOf(square[0]!), rank: Number(square[1]) - 1 };
+}
+const fmtPos = (p: Pos): string => `${FILES[p.file]}${p.rank + 1}`;
+const opponent = (c: Color): Color => (c === 'WHITE' ? 'BLACK' : 'WHITE');
+const ALL_SQUARES: readonly Pos[] = Array.from({ length: 64 }, (_, i) => ({ file: i % 8, rank: Math.floor(i / 8) }));
+```
+
+**Part 2 — move strategies, pieces and the factory.**
+
+```ts
+type Dir = readonly [number, number];
+
+interface MoveStrategy {
+  /** Geometry, path and target-square rules. Ignores king safety. */
+  canMove(from: Pos, to: Pos, board: Board, color: Color): boolean;
+  /** Would a piece on `from` attack `to`? Differs from canMove only for pawns. */
+  attacks(from: Pos, to: Pos, board: Board, color: Color): boolean;
+}
+
+class SlidingMove implements MoveStrategy {
+  constructor(private readonly dirs: readonly Dir[]) {}
+  attacks(from: Pos, to: Pos, board: Board): boolean {
+    const df = to.file - from.file;
+    const dr = to.rank - from.rank;
+    const steps = Math.max(Math.abs(df), Math.abs(dr));
+    if (steps === 0) return false;
+    const dir = this.dirs.find(([sf, sr]) => sf * steps === df && sr * steps === dr);
+    if (!dir) return false;
+    for (let i = 1; i < steps; i++) {
+      if (board.at({ file: from.file + dir[0] * i, rank: from.rank + dir[1] * i })) return false; // path blocked
+    }
+    return true;
+  }
+  canMove(from: Pos, to: Pos, board: Board, color: Color): boolean {
+    return this.attacks(from, to, board) && board.at(to)?.color !== color;
+  }
+}
+
+class StepMove implements MoveStrategy {
+  constructor(private readonly offsets: readonly Dir[]) {}
+  attacks(from: Pos, to: Pos): boolean {
+    return this.offsets.some(([f, r]) => to.file - from.file === f && to.rank - from.rank === r);
+  }
+  canMove(from: Pos, to: Pos, board: Board, color: Color): boolean {
+    return this.attacks(from, to) && board.at(to)?.color !== color;
+  }
+}
+
+class PawnMove implements MoveStrategy {
+  private dir(color: Color): number { return color === 'WHITE' ? 1 : -1; }
+  attacks(from: Pos, to: Pos, _board: Board, color: Color): boolean {
+    return to.rank - from.rank === this.dir(color) && Math.abs(to.file - from.file) === 1;
+  }
+  canMove(from: Pos, to: Pos, board: Board, color: Color): boolean {
+    const d = this.dir(color);
+    const df = to.file - from.file;
+    const dr = to.rank - from.rank;
+    const target = board.at(to);
+    if (df === 0 && dr === d) return !target;
+    const startRank = color === 'WHITE' ? 1 : 6;
+    if (df === 0 && dr === 2 * d && from.rank === startRank) {
+      return !target && !board.at({ file: from.file, rank: from.rank + d });
+    }
+    if (this.attacks(from, to, board, color)) return target !== undefined && target.color !== color;
+    return false;
+  }
+}
+
+const SYMBOLS: Record<PieceKind, string> = { KING: 'k', QUEEN: 'q', ROOK: 'r', BISHOP: 'b', KNIGHT: 'n', PAWN: 'p' };
+
+class Piece {
+  constructor(readonly color: Color, readonly kind: PieceKind, private readonly strategy: MoveStrategy) {}
+  get symbol(): string { return this.color === 'WHITE' ? SYMBOLS[this.kind].toUpperCase() : SYMBOLS[this.kind]; }
+  canMove(from: Pos, to: Pos, board: Board): boolean { return this.strategy.canMove(from, to, board, this.color); }
+  attacks(from: Pos, to: Pos, board: Board): boolean { return this.strategy.attacks(from, to, board, this.color); }
+}
+
+const ORTHOGONAL: readonly Dir[] = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const DIAGONAL: readonly Dir[] = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+const KNIGHT_JUMPS: readonly Dir[] = [[1, 2], [2, 1], [2, -1], [1, -2], [-1, -2], [-2, -1], [-2, 1], [-1, 2]];
+
+class PieceFactory {
+  // Strategies are stateless, so one instance per kind is shared by all pieces (flyweight).
+  private static readonly strategies: Record<PieceKind, MoveStrategy> = {
+    KING: new StepMove([...ORTHOGONAL, ...DIAGONAL]),
+    QUEEN: new SlidingMove([...ORTHOGONAL, ...DIAGONAL]),
+    ROOK: new SlidingMove(ORTHOGONAL),
+    BISHOP: new SlidingMove(DIAGONAL),
+    KNIGHT: new StepMove(KNIGHT_JUMPS),
+    PAWN: new PawnMove(),
+  };
+  static create(kind: PieceKind, color: Color): Piece {
+    return new Piece(color, kind, PieceFactory.strategies[kind]);
+  }
+}
+```
+
+**Part 3 — the board.** `Board.from()` builds puzzle positions, which is invaluable for testing pins and stalemates without playing 30 moves.
+
+```ts
+const LETTER_TO_KIND: Record<string, PieceKind> = { K: 'KING', Q: 'QUEEN', R: 'ROOK', B: 'BISHOP', N: 'KNIGHT', P: 'PAWN' };
+
+class Board {
+  private readonly squares: (Piece | undefined)[] = new Array<Piece | undefined>(64).fill(undefined);
+
+  at(p: Pos): Piece | undefined { return this.squares[p.rank * 8 + p.file]; }
+  put(p: Pos, piece: Piece | undefined): void { this.squares[p.rank * 8 + p.file] = piece; }
+
+  occupied(): [Pos, Piece][] {
+    const out: [Pos, Piece][] = [];
+    for (const p of ALL_SQUARES) {
+      const piece = this.at(p);
+      if (piece) out.push([p, piece]);
+    }
+    return out;
+  }
+
+  kingOf(color: Color): Pos {
+    const found = this.occupied().find(([, pc]) => pc.kind === 'KING' && pc.color === color);
+    if (!found) throw new ValidationError(`${color} has no king`);
+    return found[0];
+  }
+
+  isAttacked(target: Pos, by: Color): boolean {
+    return this.occupied().some(([from, pc]) => pc.color === by && pc.attacks(from, target, this));
+  }
+
+  isInCheck(color: Color): boolean { return this.isAttacked(this.kingOf(color), opponent(color)); }
+
+  render(): string[] {
+    const rows: string[] = [];
+    for (let rank = 7; rank >= 0; rank--) {
+      const cells = Array.from({ length: 8 }, (_, file) => this.at({ file, rank })?.symbol ?? '.');
+      rows.push(`${rank + 1} ${cells.join(' ')}`);
+    }
+    rows.push(`  ${FILES.split('').join(' ')}`);
+    return rows;
+  }
+
+  static standard(): Board {
+    const b = new Board();
+    const back: PieceKind[] = ['ROOK', 'KNIGHT', 'BISHOP', 'QUEEN', 'KING', 'BISHOP', 'KNIGHT', 'ROOK'];
+    back.forEach((kind, file) => {
+      b.put({ file, rank: 0 }, PieceFactory.create(kind, 'WHITE'));
+      b.put({ file, rank: 1 }, PieceFactory.create('PAWN', 'WHITE'));
+      b.put({ file, rank: 6 }, PieceFactory.create('PAWN', 'BLACK'));
+      b.put({ file, rank: 7 }, PieceFactory.create(kind, 'BLACK'));
+    });
+    return b;
+  }
+
+  /** e.g. { e1: 'wK', e8: 'bQ' } */
+  static from(placement: Record<string, string>): Board {
+    const b = new Board();
+    for (const [square, code] of Object.entries(placement)) {
+      const kind = LETTER_TO_KIND[code[1] ?? ''];
+      if (!/^[wb][KQRBNP]$/.test(code) || !kind) throw new ValidationError(`bad piece code "${code}"`);
+      b.put(parsePos(square), PieceFactory.create(kind, code[0] === 'w' ? 'WHITE' : 'BLACK'));
+    }
+    return b;
+  }
+}
+```
+
+**Part 4 — the game: validation pipeline, status, undo.**
+
+```ts
+interface MoveRecord {
+  from: Pos;
+  to: Pos;
+  piece: Piece;
+  captured: Piece | undefined;
+  promotedTo: Piece | undefined;
+  notation: string;
+}
+
+class Game {
+  private turn: Color;
+  status: GameStatus;
+  private readonly history: MoveRecord[] = [];
+
+  constructor(readonly board: Board, firstToMove: Color = 'WHITE') {
+    board.kingOf('WHITE');
+    board.kingOf('BLACK');
+    this.turn = firstToMove;
+    this.status = this.evaluate();
+  }
+
+  get toMove(): Color { return this.turn; }
+
+  move(fromSquare: string, toSquare: string): string {
+    if (this.status === 'CHECKMATE' || this.status === 'STALEMATE') {
+      throw new GameOverError(`game over (${this.status})`);
+    }
+    const from = parsePos(fromSquare);
+    const to = parsePos(toSquare);
+    const piece = this.board.at(from);
+    if (!piece) throw new IllegalMoveError(`no piece on ${fromSquare}`);
+    if (piece.color !== this.turn) throw new IllegalMoveError(`it is ${this.turn}'s turn`);
+    if (!piece.canMove(from, to, this.board)) {
+      throw new IllegalMoveError(`${piece.kind} cannot move ${fromSquare}->${toSquare}`);
+    }
+
+    const record = this.apply(from, to, piece);
+    if (this.board.isInCheck(piece.color)) {
+      this.revert(record);
+      throw new IllegalMoveError('move would leave your king in check');
+    }
+    this.history.push(record);
+    this.turn = opponent(this.turn);
+    this.status = this.evaluate();
+    record.notation += this.status === 'CHECKMATE' ? '#' : this.status === 'CHECK' ? '+' : '';
+    return record.notation;
+  }
+
+  undo(): string {
+    const last = this.history.pop();
+    if (!last) throw new IllegalMoveError('nothing to undo');
+    this.revert(last);
+    this.turn = last.piece.color;
+    this.status = this.evaluate();
+    return `undo ${last.notation}`;
+  }
+
+  private apply(from: Pos, to: Pos, piece: Piece): MoveRecord {
+    const captured = this.board.at(to);
+    const lastRank = piece.color === 'WHITE' ? 7 : 0;
+    const promotedTo = piece.kind === 'PAWN' && to.rank === lastRank ? PieceFactory.create('QUEEN', piece.color) : undefined;
+    this.board.put(to, promotedTo ?? piece);
+    this.board.put(from, undefined);
+    const notation = `${piece.symbol}${fmtPos(from)}${captured ? 'x' : '-'}${fmtPos(to)}${promotedTo ? '=Q' : ''}`;
+    return { from, to, piece, captured, promotedTo, notation };
+  }
+
+  private revert(r: MoveRecord): void {
+    this.board.put(r.from, r.piece);
+    this.board.put(r.to, r.captured);
+  }
+
+  private hasLegalMove(color: Color): boolean {
+    for (const [from, piece] of this.board.occupied()) {
+      if (piece.color !== color) continue;
+      for (const to of ALL_SQUARES) {
+        if (!piece.canMove(from, to, this.board)) continue;
+        const r = this.apply(from, to, piece);
+        const unsafe = this.board.isInCheck(color);
+        this.revert(r);
+        if (!unsafe) return true;
+      }
+    }
+    return false;
+  }
+
+  private evaluate(): GameStatus {
+    const inCheck = this.board.isInCheck(this.turn);
+    if (!this.hasLegalMove(this.turn)) return inCheck ? 'CHECKMATE' : 'STALEMATE';
+    return inCheck ? 'CHECK' : 'ACTIVE';
+  }
+}
+```
+
+**Part 5 — demo.** Scholar's mate with illegal attempts mixed in, then three puzzle positions: a pin, a promotion and a stalemate.
+
+```ts
+function play(game: Game, moves: string[]): void {
+  for (const m of moves) {
+    const [from = '', to = ''] = m.split('-');
+    try {
+      console.log(`  ${game.move(from, to).padEnd(12)} status=${game.status} next=${game.toMove}`);
+    } catch (err) {
+      console.log(`  ✗ ${m}: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+    }
+  }
+}
+
+console.log('# Game 1: illegal attempts, then scholar\'s mate');
+const g1 = new Game(Board.standard());
+play(g1, ['e7-e5', 'e2-e5', 'a1-a3', 'g1-g3', 'd2-e3', 'e1-e2', 'z9-a1', 'e3-e4']);
+play(g1, ['e2-e4', 'e7-e5', 'f1-c4', 'b8-c6', 'd1-h5', 'g8-f6', 'h5-f7', 'a7-a6']);
+console.log(`  ${g1.undo()} -> status=${g1.status} next=${g1.toMove}`);
+play(g1, ['d2-d3']);
+for (const row of g1.board.render()) console.log(`    ${row}`);
+
+console.log('# Game 2: pinned rook');
+const g2 = new Game(Board.from({ e1: 'wK', e2: 'wR', e8: 'bR', a8: 'bK' }));
+play(g2, ['e2-a2', 'e2-e8', 'a8-a7']);
+
+console.log('# Game 3: promotion with check');
+const g3 = new Game(Board.from({ a7: 'wP', h1: 'wK', h8: 'bK' }));
+play(g3, ['a7-a8', 'h8-h7']);
+console.log(`  ${g3.undo()} ; ${g3.undo()} ; a7 holds ${g3.board.at(parsePos('a7'))?.symbol}`);
+
+console.log('# Game 4: stalemate');
+const g4 = new Game(Board.from({ a8: 'bK', c5: 'wQ', h1: 'wK' }));
+play(g4, ['c5-b6', 'a8-b8']);
+```
+
+## Demo output
+
+```text
+# Game 1: illegal attempts, then scholar's mate
+  ✗ e7-e5: IllegalMoveError: it is WHITE's turn
+  ✗ e2-e5: IllegalMoveError: PAWN cannot move e2->e5
+  ✗ a1-a3: IllegalMoveError: ROOK cannot move a1->a3
+  ✗ g1-g3: IllegalMoveError: KNIGHT cannot move g1->g3
+  ✗ d2-e3: IllegalMoveError: PAWN cannot move d2->e3
+  ✗ e1-e2: IllegalMoveError: KING cannot move e1->e2
+  ✗ z9-a1: ValidationError: bad square "z9"
+  ✗ e3-e4: IllegalMoveError: no piece on e3
+  Pe2-e4       status=ACTIVE next=BLACK
+  pe7-e5       status=ACTIVE next=WHITE
+  Bf1-c4       status=ACTIVE next=BLACK
+  nb8-c6       status=ACTIVE next=WHITE
+  Qd1-h5       status=ACTIVE next=BLACK
+  ng8-f6       status=ACTIVE next=WHITE
+  Qh5xf7#      status=CHECKMATE next=BLACK
+  ✗ a7-a6: GameOverError: game over (CHECKMATE)
+  undo Qh5xf7# -> status=ACTIVE next=WHITE
+  Pd2-d3       status=ACTIVE next=BLACK
+    8 r . b q k b . r
+    7 p p p p . p p p
+    6 . . n . . n . .
+    5 . . . . p . . Q
+    4 . . B . P . . .
+    3 . . . P . . . .
+    2 P P P . . P P P
+    1 R N B . K . N R
+      a b c d e f g h
+# Game 2: pinned rook
+  ✗ e2-a2: IllegalMoveError: move would leave your king in check
+  Re2xe8+      status=CHECK next=BLACK
+  ka8-a7       status=ACTIVE next=WHITE
+# Game 3: promotion with check
+  Pa7-a8=Q+    status=CHECK next=BLACK
+  kh8-h7       status=ACTIVE next=WHITE
+  undo kh8-h7 ; undo Pa7-a8=Q+ ; a7 holds P
+# Game 4: stalemate
+  Qc5-b6       status=STALEMATE next=BLACK
+  ✗ a8-b8: GameOverError: game over (STALEMATE)
+```
+
+Look at the undo line: after taking back `Qh5xf7#` the status goes back to `ACTIVE` and it is white's turn again, so white plays a different move (`d2-d3`). In game 3, undoing the promotion puts the **pawn** (not the queen) back on a7, because the record keeps the original piece.
+
+## Concurrency
+
+A chess engine running in one process has no shared-state races. The interesting case is **online chess**. A player double-clicks, or has two tabs open, and two move requests for the same position arrive at the server together. Both are "valid" against the position they were computed from, and applying both would corrupt the game.
+
+The standard fix is **optimistic concurrency with a version (ply counter)**. The client sends the version it saw, and the server applies a move only if the version still matches, then increments it. A per-game mutex is the pessimistic alternative (one game = one lock key).
+
+```ts
+class StaleMoveError extends Error { override name = 'StaleMoveError'; }
+class NotYourTurnError extends Error { override name = 'NotYourTurnError'; }
+
+interface MoveRequest { playerId: string; move: string; expectedVersion: number; }
+
+class GameSession {
+  private version = 0;
+  private readonly moves: string[] = [];
+  constructor(private readonly white: string, private readonly black: string) {}
+
+  private get playerToMove(): string { return this.version % 2 === 0 ? this.white : this.black; }
+
+  /** Validation + commit run with no await in between, so the version check is atomic. */
+  async submit(req: MoveRequest): Promise<number> {
+    await new Promise((r) => setTimeout(r, 1)); // network / auth work happens before the critical section
+    if (req.playerId !== this.playerToMove) throw new NotYourTurnError(`${req.playerId} cannot move now`);
+    if (req.expectedVersion !== this.version) {
+      throw new StaleMoveError(`client saw v${req.expectedVersion}, server is at v${this.version}`);
+    }
+    // (real code: game.move(from, to) here — still synchronous)
+    this.moves.push(req.move);
+    this.version += 1;
+    return this.version;
+  }
+  get log(): string { return this.moves.join(' '); }
+}
+
+const session = new GameSession('alice', 'bob');
+const results = await Promise.allSettled([
+  session.submit({ playerId: 'alice', move: 'e2-e4', expectedVersion: 0 }),
+  session.submit({ playerId: 'alice', move: 'd2-d4', expectedVersion: 0 }), // second tab / double click
+  session.submit({ playerId: 'bob', move: 'e7-e5', expectedVersion: 0 }),   // bob's client is behind
+]);
+for (const r of results) {
+  console.log(r.status === 'fulfilled' ? `ok -> v${r.value}` : `rejected: ${r.reason instanceof Error ? `${r.reason.name}: ${r.reason.message}` : String(r.reason)}`);
+}
+console.log(`bob retries: v${await session.submit({ playerId: 'bob', move: 'e7-e5', expectedVersion: 1 })}`);
+console.log(`moves: ${session.log}`);
+```
+
+```text
+ok -> v1
+rejected: NotYourTurnError: alice cannot move now
+rejected: StaleMoveError: client saw v0, server is at v1
+bob retries: v2
+moves: e2-e4 e7-e5
+```
+
+## Extensions & follow-ups
+
+| Follow-up | How the design changes |
+|---|---|
+| Castling | `Piece` gains `hasMoved` (restored on undo). King move validation adds: king and rook unmoved, squares between empty, king not in check and doesn't pass through an attacked square. `apply` moves the rook too, and `MoveRecord` stores the rook move. |
+| En passant | `Game` tracks `enPassantTarget` (the square jumped over by the last double-step). `PawnMove` receives it through a context object. The captured pawn isn't on `to`, so the record stores its square. |
+| Promotion choice | `move(from, to, promoteTo?: 'QUEEN' \| 'KNIGHT'…)`. The factory creates it. |
+| Draw rules | Keep a position-hash count (threefold) and a half-move clock (50-move rule) in `Game`. |
+| Undo / redo | Two stacks of `MoveRecord`. Already half-built. |
+| Time control | A `ChessClock` with increment and flag detection. Implemented below. |
+| New piece types | A new `MoveStrategy` (or a composite of two, e.g. Archbishop = bishop + knight) plus a factory entry. `Game` doesn't change. |
+| Performance for engines | Bitboards (64-bit masks) and precomputed attack tables. A different design, but mention it. |
+
+**Extension implemented: a chess clock with increment (Fischer time).** It's a separate class with an injected clock, so it's testable without waiting.
+
+```ts
+type Color = 'WHITE' | 'BLACK';
+interface Clock { now(): number; }
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number { return this.t; }
+  advance(ms: number): void { this.t += ms; }
+}
+class FlagFallError extends Error { override name = 'FlagFallError'; }
+
+class ChessClock {
+  private readonly remaining: Record<Color, number>;
+  private running: Color = 'WHITE';
+  private turnStartedAt: number;
+  private flagged: Color | undefined;
+
+  constructor(initialMs: number, private readonly incrementMs: number, private readonly clock: Clock) {
+    if (initialMs <= 0 || incrementMs < 0) throw new RangeError('invalid time control');
+    this.remaining = { WHITE: initialMs, BLACK: initialMs };
+    this.turnStartedAt = clock.now();
+  }
+
+  /** Called when `color` completes a move. */
+  press(color: Color): void {
+    if (this.flagged) throw new FlagFallError(`${this.flagged} already lost on time`);
+    if (color !== this.running) throw new Error(`${color}'s clock is not running`);
+    const left = this.timeLeft(color);
+    if (left <= 0) {
+      this.flagged = color;
+      throw new FlagFallError(`${color} flagged`);
+    }
+    this.remaining[color] = left + this.incrementMs;
+    this.running = color === 'WHITE' ? 'BLACK' : 'WHITE';
+    this.turnStartedAt = this.clock.now();
+  }
+
+  timeLeft(color: Color): number {
+    const elapsed = color === this.running ? this.clock.now() - this.turnStartedAt : 0;
+    return Math.max(0, this.remaining[color] - elapsed);
+  }
+
+  display(): string {
+    const f = (ms: number): string => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
+    return `W ${f(this.timeLeft('WHITE'))} | B ${f(this.timeLeft('BLACK'))}`;
+  }
+}
+
+const clock = new FakeClock();
+const cc = new ChessClock(60_000, 2_000, clock); // 1 minute + 2 s increment
+const thinking: [Color, number][] = [['WHITE', 5_000], ['BLACK', 20_000], ['WHITE', 10_000], ['BLACK', 45_000]];
+for (const [color, ms] of thinking) {
+  clock.advance(ms);
+  try {
+    cc.press(color);
+    console.log(`${color} moved after ${ms / 1000}s -> ${cc.display()}`);
+  } catch (err) {
+    console.log(`${color} after ${ms / 1000}s: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+  }
+}
+try { cc.press('WHITE'); } catch (err) { console.log(err instanceof Error ? err.message : String(err)); }
+```
+
+```text
+WHITE moved after 5s -> W 0:57 | B 1:00
+BLACK moved after 20s -> W 0:57 | B 0:42
+WHITE moved after 10s -> W 0:49 | B 0:42
+BLACK after 45s: FlagFallError: BLACK flagged
+BLACK already lost on time
+```
+
+To integrate, `Game.move()` calls `clock.press(color)` after a successful move. A timer (or the next request) checks `timeLeft(running) === 0` and ends the game with a `TIMEOUT` status.
+
+## Edge cases
+
+- Moving onto your own piece, or "moving" to the same square. Both are rejected by `canMove` (steps = 0, or own color on the target).
+- A sliding piece jumping over pieces. The path check rejects it. Knights are exempt by design.
+- A pawn capturing straight ahead, or moving diagonally onto an empty square. Both are rejected.
+- A pawn double-step through a piece. Rejected (the middle square must be empty).
+- A pinned piece moving, or a king stepping into check. Caught by simulation.
+- A king capturing a *protected* piece. Simulation finds the recapture attack.
+- Checkmate vs stalemate. Both mean "no legal moves". Only the in-check flag differs.
+- Undo after checkmate. It restores play and recomputes the status.
+- A custom position with no king, or two kings of one color. Validate in the constructor (we check existence).
+- Any move after game over. Rejected with `GameOverError`.
+
+## Complexity
+
+| Operation | Time |
+|---|---|
+| `canMove` | O(8) path scan at most |
+| `isAttacked` | O(64 × 8) = O(1) for a fixed board |
+| `move` (validate + simulate + status) | Status needs legal-move generation: pieces × 64 targets × attack check. Roughly 16·64·(64·8) ≈ 400k ops worst case, which is fine for a game and too slow for an engine. |
+| undo | O(1) plus status evaluation |
+
+A smarter move generator walks each piece's actual directions instead of trying all 64 targets.
+
+## What graders look for / common mistakes
+
+- ✅ Movement rules in piece or strategy objects, not in a 200-line `switch` in `Game`.
+- ✅ Sliding logic written once and reused by rook, bishop and queen.
+- ✅ King safety checked by simulation, with correct revert.
+- ✅ Separate, clear errors for each validation step.
+- ❌ Forgetting path blocking for sliding pieces.
+- ❌ Using `canMove` for pawn attack detection (pawns attack diagonally even on empty squares).
+- ❌ Not reverting the board after a simulated move, which corrupts it.
+- ❌ Checking only "is the opponent in check" and never "did I leave myself in check".
+- ❌ `Board` knowing piece rules, or `Piece` knowing about turns.
+
+## 90-minute plan
+
+| Minutes | Work |
+|---|---|
+| 0–8 | Clarify scope (castling? en passant? promotion?) and the input format. |
+| 8–20 | `Pos`, errors, `MoveStrategy` + three implementations. |
+| 20–35 | `Piece`, `PieceFactory`, `Board` (standard, from, render, isAttacked). |
+| 35–55 | `Game.move` validation pipeline, apply/revert, check test. |
+| 55–65 | Status evaluation (check / mate / stalemate), undo. |
+| 65–80 | Demo: illegal moves, scholar's mate, pin, promotion, stalemate. |
+| 80–90 | Explain the castling/en passant design and the online-play concurrency. |
+
+## Interview Q&A
+
+**Q1. Inheritance (`Rook extends Piece`) or composition (`Piece` has a `MoveStrategy`)?**
+
+<details>
+<summary>Answer</summary>
+
+Both work, and interviewers accept either if you can justify it. Composition removes the duplicated sliding loop across three classes and lets you build hybrid pieces (Archbishop = Bishop + Knight) with a `CompositeMove`. Inheritance reads naturally ("a Rook *is a* Piece"). A good middle ground is subclasses that each *pass* a strategy to a common base. The important thing is that `Game` never asks "what kind of piece is this?".
+
+</details>
+
+**Q2. How do you detect that a move leaves your own king in check?**
+
+<details>
+<summary>Answer</summary>
+
+Apply the move on the board, ask `board.isInCheck(myColor)`, then revert. This single mechanism covers pins, discovered attacks and king moves into check, so there's no special-case code. The cost is a full attack scan per candidate move, which is acceptable for a game.
+
+</details>
+
+**Q3. How would you add castling without breaking the design?**
+
+<details>
+<summary>Answer</summary>
+
+Track `hasMoved` per piece (restored on undo). In `Game.move`, recognise a king moving two files as a castling *request* and validate: the king and that rook are unmoved, the squares between are empty, the king isn't currently in check, and neither square the king crosses is attacked. The `apply` step moves both pieces, and `MoveRecord` gets an optional `rookMove` so undo can revert it. Castling is a *game* rule involving two pieces, so it belongs in `Game` (or a `SpecialMoveRule` chain), not in `StepMove`.
+
+</details>
+
+**Q4. Why is `attacks` separate from `canMove`?**
+
+<details>
+<summary>Answer</summary>
+
+For every piece except the pawn they're the same. A pawn moves forward but attacks diagonally, and it attacks a diagonal square even when that square is empty. That matters for checking whether a king may step there. Merging the two gives wrong check detection.
+
+</details>

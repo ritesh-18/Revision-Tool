@@ -1,0 +1,277 @@
+---
+title: "5.4 Decorator"
+---
+
+## Intent
+
+Attach extra responsibilities to an object dynamically by wrapping it in another object that implements the same interface, instead of subclassing.
+
+## Problem
+
+You have a `QuoteService` that fetches the last traded price from an upstream vendor. Now you need logging, caching (quotes are valid for a second), retry on transient failures, and maybe metrics. Subclassing gives `LoggingCachingRetryingQuoteService` and every other combination. Editing the service mixes infrastructure with business logic and breaks the Single Responsibility Principle. Decorators let you **stack** behaviours: `new Logging(new Caching(new Retry(real)))`, and choose the combination at wiring time.
+
+## Structure
+
+<Mermaid chart={`classDiagram
+    class QuoteService {
+        <<interface>>
+        +getQuote(symbol) Promise~number~
+    }
+    class VendorQuoteService
+    class QuoteServiceDecorator {
+        <<abstract>>
+        #QuoteService inner
+        +getQuote(symbol) Promise~number~
+    }
+    class LoggingDecorator
+    class CachingDecorator
+    class RetryDecorator
+    QuoteService <|.. VendorQuoteService
+    QuoteService <|.. QuoteServiceDecorator
+    QuoteServiceDecorator o-- QuoteService : wraps
+    QuoteServiceDecorator <|-- LoggingDecorator
+    QuoteServiceDecorator <|-- CachingDecorator
+    QuoteServiceDecorator <|-- RetryDecorator`} />
+
+## TypeScript implementation
+
+The clock is injected so the cache is testable and the output is deterministic.
+
+```ts
+interface QuoteService {
+  getQuote(symbol: string): Promise<number>;
+}
+
+interface Clock {
+  now(): number;
+}
+
+// ----- The real component: fails the first call for each symbol (a flaky upstream) -----
+class VendorQuoteService implements QuoteService {
+  calls = 0;
+  private readonly seen = new Set<string>();
+  private readonly prices: Record<string, number> = { INFY: 1500.25, TCS: 4100 };
+
+  async getQuote(symbol: string): Promise<number> {
+    this.calls++;
+    if (!this.seen.has(symbol)) {
+      this.seen.add(symbol);
+      throw new Error('503 upstream busy');
+    }
+    const p = this.prices[symbol];
+    if (p === undefined) throw new Error(`unknown symbol ${symbol}`);
+    return p;
+  }
+}
+
+// ----- Base decorator: forwards everything by default -----
+abstract class QuoteServiceDecorator implements QuoteService {
+  constructor(protected readonly inner: QuoteService) {}
+  getQuote(symbol: string): Promise<number> {
+    return this.inner.getQuote(symbol);
+  }
+}
+
+class LoggingDecorator extends QuoteServiceDecorator {
+  constructor(
+    inner: QuoteService,
+    private readonly log: (line: string) => void,
+  ) {
+    super(inner);
+  }
+
+  override async getQuote(symbol: string): Promise<number> {
+    this.log(`-> getQuote(${symbol})`);
+    try {
+      const price = await super.getQuote(symbol);
+      this.log(`<- ${symbol} = ${price}`);
+      return price;
+    } catch (err) {
+      this.log(`x  ${symbol} failed: ${(err as Error).message}`);
+      throw err;
+    }
+  }
+}
+
+class RetryDecorator extends QuoteServiceDecorator {
+  constructor(
+    inner: QuoteService,
+    private readonly attempts: number,
+    private readonly isRetryable: (e: Error) => boolean,
+  ) {
+    super(inner);
+  }
+
+  override async getQuote(symbol: string): Promise<number> {
+    let lastError = new Error('no attempts made');
+    for (let i = 1; i <= this.attempts; i++) {
+      try {
+        return await super.getQuote(symbol);
+      } catch (err) {
+        lastError = err as Error;
+        if (!this.isRetryable(lastError)) break;
+        await new Promise((r) => setTimeout(r, 5 * i)); // small backoff
+      }
+    }
+    throw lastError;
+  }
+}
+
+class CachingDecorator extends QuoteServiceDecorator {
+  private readonly cache = new Map<string, { price: number; expiresAt: number }>();
+
+  constructor(
+    inner: QuoteService,
+    private readonly ttlMs: number,
+    private readonly clock: Clock,
+  ) {
+    super(inner);
+  }
+
+  override async getQuote(symbol: string): Promise<number> {
+    const hit = this.cache.get(symbol);
+    if (hit && hit.expiresAt > this.clock.now()) return hit.price;
+    const price = await super.getQuote(symbol);
+    this.cache.set(symbol, { price, expiresAt: this.clock.now() + this.ttlMs });
+    return price;
+  }
+}
+
+// ----- Wiring: the order of wrapping is a design decision -----
+const fakeClock = { t: 0, now() { return this.t; } };
+const vendor = new VendorQuoteService();
+
+const service: QuoteService = new CachingDecorator(
+  new LoggingDecorator(
+    new RetryDecorator(vendor, 3, (e) => e.message.startsWith('503')),
+    (line) => console.log(`  [log] ${line}`),
+  ),
+  1_000,
+  fakeClock,
+);
+
+console.log(`INFY: ${await service.getQuote('INFY')}`); // miss -> retry hides the 503
+console.log(`INFY: ${await service.getQuote('INFY')}`); // cache hit: no log, no vendor call
+fakeClock.t = 1_500;
+console.log(`INFY: ${await service.getQuote('INFY')}`); // expired -> fetch again
+try {
+  await service.getQuote('WIPRO');
+} catch (err) {
+  console.log(`WIPRO: ${(err as Error).message}`);
+}
+console.log(`vendor calls: ${vendor.calls}`);
+```
+
+```text
+  [log] -> getQuote(INFY)
+  [log] <- INFY = 1500.25
+INFY: 1500.25
+INFY: 1500.25
+  [log] -> getQuote(INFY)
+  [log] <- INFY = 1500.25
+INFY: 1500.25
+  [log] -> getQuote(WIPRO)
+  [log] x  WIPRO failed: unknown symbol WIPRO
+WIPRO: unknown symbol WIPRO
+vendor calls: 5
+```
+
+Read the wiring from the outside in: cache → log → retry → vendor. Because logging sits *outside* retry, the log shows one call per request, not every attempt; cache hits don't log at all. Swap the order and you get different, equally valid, behaviour. That flexibility is the point.
+
+**Function decorators.** In TypeScript, if the "interface" is a single function, a higher-order function is the lightest decorator:
+
+```ts
+type AsyncFn<A extends unknown[], R> = (...args: A) => Promise<R>;
+
+function withCallLog<A extends unknown[], R>(name: string, fn: AsyncFn<A, R>): AsyncFn<A, R> {
+  let calls = 0; // state lives in the closure, like a field on a decorator object
+  return async (...args) => {
+    calls++;
+    const result = await fn(...args);
+    console.log(`${name} finished (call ${calls}) args=${JSON.stringify(args)}`);
+    return result;
+  };
+}
+
+const placeOrder = async (symbol: string, qty: number) => `order ${symbol} x${qty} accepted`;
+const loggedPlaceOrder = withCallLog('placeOrder', placeOrder); // same signature, extra behaviour
+console.log(await loggedPlaceOrder('INFY', 10));
+console.log(await loggedPlaceOrder('TCS', 2));
+```
+
+```text
+placeOrder finished (call 1) args=["INFY",10]
+order INFY x10 accepted
+placeOrder finished (call 2) args=["TCS",2]
+order TCS x2 accepted
+```
+
+**What about TypeScript `@decorators`?** The `@logged` syntax (TC39 standard decorators, TS 5+; NestJS still uses the older `experimentalDecorators`) is a *language feature* that modifies a class or method at definition time. It is often used to implement the Decorator pattern's idea (cross-cutting behaviour), but it works on classes, not on individual object instances at runtime, and it can't be stacked differently per instance. Here is what it looks like (type-checked only; this book's runtime doesn't transform decorator syntax):
+
+```ts
+function logged<This, Args extends unknown[], Ret>(
+  target: (this: This, ...args: Args) => Ret,
+  context: ClassMethodDecoratorContext<This, (this: This, ...args: Args) => Ret>,
+) {
+  const name = String(context.name);
+  return function (this: This, ...args: Args): Ret {
+    console.log(`calling ${name}`);
+    return target.call(this, ...args);
+  };
+}
+
+class OrderService {
+  @logged
+  cancel(orderId: string): string {
+    return `cancelled ${orderId}`;
+  }
+}
+
+export const svc = new OrderService();
+```
+
+The classic object decorator (above) is what interviewers mean by "Decorator pattern".
+
+## When to use / when NOT to use
+
+- **Use** for cross-cutting concerns you want to combine freely: logging, caching, retries, metrics, rate limiting, auth checks, compression, encryption. Also for optional features on a product (add-ons to a pizza or coffee).
+- **Don't use** when the interface is huge (every decorator must forward every method; consider a JS `Proxy` or a base class that forwards). Don't use when order-dependent stacks would confuse your team more than a single, explicit class.
+
+## Pitfalls
+
+- **Order matters**: retry outside cache vs inside cache, logging outside vs inside retry. Document the intended stack.
+- **Identity**: `decorated !== original`, and `instanceof VendorQuoteService` fails on the wrapper. Code that relies on concrete types breaks.
+- **Forgetting to forward** a method in a hand-written decorator of a multi-method interface. A forwarding base class helps.
+- **Retrying non-idempotent operations**: a retry decorator around `placeOrder` can place the order twice. Use idempotency keys or only retry safe calls.
+- Deep stacks make stack traces and debugging harder.
+
+## Related patterns
+
+- **Proxy** has the same structure. Decorator *adds behaviour* and is usually composed by the client, often stacked. Proxy *controls access* to the subject (lazy creation, permission, caching of a remote object), and typically manages the subject's lifecycle itself.
+- **Adapter** changes the interface; Decorator keeps it identical.
+- **Composite** has many children and aggregates; Decorator has one child and enriches.
+- **Chain of Responsibility** (Chapter 6) also forms a chain, but each handler may stop the request; decorators normally always delegate. NestJS interceptors and Express middleware sit between the two.
+
+## Where it shows up in LLD interview problems
+
+- Pizza / coffee with add-ons (`new Cheese(new Olives(new Margherita()))`, each adding cost).
+- API client with retry/caching/logging; rate-limited service.
+- Notification with extra channels ("also send SMS") or formatting.
+- Text editor / stream processing (buffered, compressed, encrypted streams).
+
+Interview line: *"I don't want caching and retries inside the quote service, so I'll wrap it: each decorator implements `QuoteService`, holds the inner one, and adds one concern. Wiring decides the stack."*
+
+## Quick check
+
+1. In the demo, why does the log show only one call for the first INFY request even though the vendor was called twice?
+2. Why is a retry decorator dangerous around `placeOrder`?
+3. How is a `@decorator` in TypeScript different from the Decorator pattern?
+
+<details>
+<summary>Answers</summary>
+
+1. The logging decorator wraps the retry decorator, so it sees one call that eventually succeeds; the retry happens *inside* it.
+2. Order placement is not idempotent. A timeout may happen after the exchange accepted the order, and a retry creates a duplicate. Retry only with an idempotency key or only for safe reads.
+3. `@decorator` is compile/definition-time syntax that modifies a class or method for all instances. The Decorator pattern wraps individual objects at runtime, so different instances can have different stacks.
+
+</details>

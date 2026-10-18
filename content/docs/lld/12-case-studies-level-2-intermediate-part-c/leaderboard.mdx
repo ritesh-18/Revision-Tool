@@ -1,0 +1,762 @@
+---
+title: "12.1 Leaderboard"
+---
+
+## Problem & where it's asked
+
+Design a leaderboard that ranks users by a score and answers "who is in the top K?" and "what is my rank?" quickly, even while scores keep changing.
+
+- **Angel One (SDE-2, reported, snippet-level):** rank users by the total amount they have spent on orders. Treat the exact wording as indicative, because only search snippets of those write-ups were readable. Since Angel One is a stockbroker, expect a trading flavour: "top traders by turnover this week".
+- **Uber, Microsoft, Meesho, Atlassian (reported in aggregated lists):** fantasy-team scores, and a support-agent ratings leaderboard (Atlassian).
+- **Graded on:** your data-structure choice (a sorted structure or a heap, plus a hash map) and how you handle ties and frequent updates.
+
+## Clarifying questions
+
+| Question | Assumption for this design |
+|---|---|
+| What is the score? Does it accumulate, or do we keep the best? | Default: **cumulative** order value in paise. A "best score" mode is a pluggable strategy. |
+| Can a score go down (refunds, cancelled orders)? | Yes. A refund lowers the total, which can never go below 0. |
+| How are ties ranked? | Tied users share a **competition rank** (1, 2, 2, 4). For a stable list we also show a unique **position**: whoever reached the score first comes first. |
+| Read/write ratio? | Many writes (every order) and many reads (the top-10 widget on the home screen). Both must be fast. |
+| How many users? | Up to about 1 million on one board in memory. A single-node design is fine for the round. |
+| Time windows? | All-time first; daily and weekly boards as a follow-up. |
+| Do we need "users around me"? | Yes, `around(user, radius)` is cheap once we have positions. |
+
+## Requirements
+
+**Functional**
+- `record(userId, value)`: apply an order amount (or a refund, if negative) to the user's score.
+- `topK(k)`: the top K users with rank, position and score.
+- `rankOf(userId)`: one user's rank and position.
+- `around(userId, radius)`: the neighbours above and below a user.
+- `remove(userId)`: for example, when a user is banned.
+- Pluggable scoring: cumulative or best-score.
+
+**Non-functional**
+- `topK` in O(K log N) or better; `rankOf` in O(log N). No full re-sort on reads.
+- Deterministic ordering, so two calls never disagree about who is #2.
+- Money is stored in integer paise. Never use floats for money.
+
+**Out of scope:** persistence, sharding across nodes (discussed in follow-ups), authentication.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|---|---|---|
+| `Entry` | Value object: `userId`, `score`, `reachedAt` | Stored in a `RankedIndex` |
+| `RankedIndex` | Keeps entries sorted and finds positions | Implemented by `SortedArrayIndex` |
+| `ScoringPolicy` | Decides the new score from the old score and an event | `CumulativeScoring`, `BestScoreScoring` |
+| `LeaderboardService` | Validates input and turns entries into `RankedRow`s | Uses a `RankedIndex`, a `ScoringPolicy` and a `Clock` |
+| `RankedRow` | Read model: rank, position, user, score | Returned to callers |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class LeaderboardService {
+        +record(userId, value) RankedRow
+        +topK(k) RankedRow[]
+        +rankOf(userId) RankedRow
+        +around(userId, radius) RankedRow[]
+        +remove(userId) void
+    }
+    class RankedIndex {
+        <<interface>>
+        +get(userId) Entry
+        +upsert(entry) void
+        +remove(userId) boolean
+        +positionOf(userId) number
+        +countStrictlyAbove(score) number
+        +range(from, to) Entry[]
+    }
+    class SortedArrayIndex
+    class ScoringPolicy {
+        <<interface>>
+        +next(current, value) number
+    }
+    class CumulativeScoring
+    class BestScoreScoring
+    class Clock {
+        <<interface>>
+        +now() number
+    }
+    LeaderboardService --> RankedIndex
+    LeaderboardService --> ScoringPolicy
+    LeaderboardService --> Clock
+    RankedIndex <|.. SortedArrayIndex
+    ScoringPolicy <|.. CumulativeScoring
+    ScoringPolicy <|.. BestScoreScoring`} />
+
+## Design decisions & patterns
+
+**1. The core trade-off: sorted structure vs heap.** This is what the interviewer is really asking about.
+
+| Option | Update | Top-K | Rank of a user | Verdict |
+|---|---|---|---|---|
+| Hash map only, sort on every read | O(1) | O(N log N) | O(N log N) | Fine for 100 users; fails "frequent reads" |
+| Hash map + **min-heap of size K** | O(1) + recompute | O(N log K) per query | Not supported | Good for a one-off "top 10 of this batch". Heaps cannot answer "rank of user X" or handle score *decreases* cheaply. |
+| Hash map + **sorted structure** (sorted array, skip list, balanced BST / order-statistic tree) | O(log N) search + shift (array) or O(log N) (tree / skip list) | O(log N + K) | O(log N) | **Chosen.** Redis sorted sets (`ZADD`, `ZREVRANK`, `ZREVRANGE`) work this way, using a skip list plus a hash table. |
+| Bucketed counts (Fenwick tree over score values) | O(log S) | Needs extra work | O(log S) | Great when scores are small bounded integers (game points). A poor fit for paise totals. |
+
+We hide the choice behind a `RankedIndex` interface. The in-round implementation is a **sorted array with binary search**. It takes 40 lines, the binary search is O(log N), and `splice` is an O(N) memory move that stays fast for tens of thousands of entries. If the interviewer pushes on scale, you swap in a skip list without touching the service. That is the Dependency Inversion Principle doing real work.
+
+**2. The hash map sits beside the sorted structure.** To move a user you must first find their *old* entry. The map gives you that entry in O(1), and binary search on the old entry finds its index. Without the map you would scan.
+
+**3. Strategy for scoring.** "Total spent" and "best game score" differ in one line of logic. `ScoringPolicy` keeps the service closed for modification when a third rule arrives, such as "decayed score".
+
+**4. Explicit tie-breaking.** The comparator orders by score descending, then `reachedAt` ascending (earlier achiever first), then `userId`. A total order means binary search is well-defined and output is stable. We *also* compute the competition rank (`1 + number of strictly higher scores`), because product teams usually want tied users to show the same rank.
+
+**5. Injected `Clock`.** `reachedAt` comes from the clock, so tests and this demo stay deterministic.
+
+**Rejected:** a `Leaderboard` singleton (you will want daily, weekly and per-segment boards, so boards are values, not globals); storing the rank on the user (every update would force O(N) rank rewrites).
+
+## Implementation
+
+**Part 1: errors, clock and models.**
+
+```ts
+// ---------- Errors ----------
+class LeaderboardError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends LeaderboardError {}
+class UserNotRankedError extends LeaderboardError {
+  constructor(userId: string) {
+    super(`User ${userId} is not on the leaderboard`);
+  }
+}
+
+// ---------- Infrastructure ----------
+interface Clock {
+  now(): number; // epoch millis
+}
+
+class ManualClock implements Clock {
+  constructor(private current: number) {}
+  now(): number {
+    return this.current;
+  }
+  advance(ms: number): void {
+    this.current += ms;
+  }
+}
+
+// ---------- Models ----------
+type UserId = string;
+
+interface Entry {
+  readonly userId: UserId;
+  readonly score: number; // e.g. total order value in paise
+  readonly reachedAt: number; // when the user reached this score (tie-breaker)
+}
+
+interface RankedRow {
+  readonly rank: number; // competition rank: ties share it (1, 2, 2, 4)
+  readonly position: number; // unique ordinal after tie-breaks (1, 2, 3, 4)
+  readonly userId: UserId;
+  readonly score: number;
+}
+
+/** Higher score first; on a tie, whoever got there earlier; finally userId so the order is total. */
+function compareEntries(a: Entry, b: Entry): number {
+  if (a.score !== b.score) return b.score - a.score;
+  if (a.reachedAt !== b.reachedAt) return a.reachedAt - b.reachedAt;
+  return a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0;
+}
+
+function formatPaise(paise: number): string {
+  const sign = paise < 0 ? '-' : '';
+  const abs = Math.abs(paise);
+  return `${sign}₹${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
+}
+```
+
+**Part 2: the ranked index.** One generic `lowerBound` powers every query. It takes a *monotone predicate*, meaning one that is false for a prefix of the array and true for the rest, and returns the first index where the predicate is true.
+
+```ts
+interface RankedIndex {
+  get(userId: UserId): Entry | undefined;
+  upsert(entry: Entry): void;
+  remove(userId: UserId): boolean;
+  positionOf(userId: UserId): number; // 0-based, -1 if absent
+  countStrictlyAbove(score: number): number;
+  range(from: number, to: number): Entry[]; // [from, to)
+  size(): number;
+}
+
+class SortedArrayIndex implements RankedIndex {
+  private readonly sorted: Entry[] = [];
+  private readonly byUser = new Map<UserId, Entry>();
+
+  get(userId: UserId): Entry | undefined {
+    return this.byUser.get(userId);
+  }
+
+  upsert(entry: Entry): void {
+    this.remove(entry.userId);
+    const at = this.lowerBound((e) => compareEntries(e, entry) >= 0);
+    this.sorted.splice(at, 0, entry);
+    this.byUser.set(entry.userId, entry);
+  }
+
+  remove(userId: UserId): boolean {
+    const existing = this.byUser.get(userId);
+    if (!existing) return false;
+    const at = this.lowerBound((e) => compareEntries(e, existing) >= 0);
+    this.sorted.splice(at, 1);
+    this.byUser.delete(userId);
+    return true;
+  }
+
+  positionOf(userId: UserId): number {
+    const existing = this.byUser.get(userId);
+    return existing ? this.lowerBound((e) => compareEntries(e, existing) >= 0) : -1;
+  }
+
+  countStrictlyAbove(score: number): number {
+    // Sorted by score descending, so "score <= target" is false...false, true...true.
+    return this.lowerBound((e) => e.score <= score);
+  }
+
+  range(from: number, to: number): Entry[] {
+    return this.sorted.slice(Math.max(0, from), Math.max(0, to));
+  }
+
+  size(): number {
+    return this.sorted.length;
+  }
+
+  /** First index whose entry satisfies `pred`. `pred` must be monotone over the array. */
+  private lowerBound(pred: (e: Entry) => boolean): number {
+    let lo = 0;
+    let hi = this.sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (pred(this.sorted[mid])) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo;
+  }
+}
+```
+
+**Part 3: scoring strategies.** A cumulative board accepts refunds as negative values. A best-score board rejects them.
+
+```ts
+interface ScoringPolicy {
+  readonly name: string;
+  next(current: number | undefined, value: number): number;
+}
+
+class CumulativeScoring implements ScoringPolicy {
+  readonly name = 'cumulative';
+  next(current: number | undefined, value: number): number {
+    const total = (current ?? 0) + value;
+    if (total < 0) {
+      throw new ValidationError(
+        `Refund of ${formatPaise(-value)} exceeds total ${formatPaise(current ?? 0)}`,
+      );
+    }
+    return total;
+  }
+}
+
+class BestScoreScoring implements ScoringPolicy {
+  readonly name = 'best';
+  next(current: number | undefined, value: number): number {
+    if (value < 0) throw new ValidationError('Best-score boards do not accept negative scores');
+    return current === undefined ? value : Math.max(current, value);
+  }
+}
+```
+
+**Part 4: the service.** Note that `reachedAt` changes only when the score actually changes. A best-score submission that doesn't beat the old best must not cost the user their tie-break seniority.
+
+```ts
+class LeaderboardService {
+  constructor(
+    private readonly index: RankedIndex,
+    private readonly scoring: ScoringPolicy,
+    private readonly clock: Clock,
+  ) {}
+
+  record(userId: UserId, value: number): RankedRow {
+    if (!userId.trim()) throw new ValidationError('userId is required');
+    if (!Number.isSafeInteger(value) || value === 0) {
+      throw new ValidationError(`value must be a non-zero integer, got ${value}`);
+    }
+    const current = this.index.get(userId);
+    const score = this.scoring.next(current?.score, value);
+    if (!current || current.score !== score) {
+      this.index.upsert({ userId, score, reachedAt: this.clock.now() });
+    }
+    return this.rankOf(userId);
+  }
+
+  topK(k: number): RankedRow[] {
+    if (!Number.isInteger(k) || k <= 0) throw new ValidationError(`k must be a positive integer, got ${k}`);
+    return this.index.range(0, k).map((entry, i) => this.toRow(entry, i));
+  }
+
+  rankOf(userId: UserId): RankedRow {
+    const entry = this.index.get(userId);
+    if (!entry) throw new UserNotRankedError(userId);
+    return this.toRow(entry, this.index.positionOf(userId));
+  }
+
+  around(userId: UserId, radius: number): RankedRow[] {
+    if (!Number.isInteger(radius) || radius < 0) throw new ValidationError('radius must be >= 0');
+    const pos = this.rankOf(userId).position - 1;
+    const from = Math.max(0, pos - radius);
+    return this.index.range(from, pos + radius + 1).map((entry, i) => this.toRow(entry, from + i));
+  }
+
+  remove(userId: UserId): void {
+    if (!this.index.remove(userId)) throw new UserNotRankedError(userId);
+  }
+
+  size(): number {
+    return this.index.size();
+  }
+
+  private toRow(entry: Entry, zeroBasedPosition: number): RankedRow {
+    return {
+      rank: this.index.countStrictlyAbove(entry.score) + 1,
+      position: zeroBasedPosition + 1,
+      userId: entry.userId,
+      score: entry.score,
+    };
+  }
+}
+```
+
+**Part 5: the driver.** It replays a few orders the way an order-completed event consumer would.
+
+```ts
+const MINUTE = 60_000;
+const clock = new ManualClock(Date.UTC(2026, 0, 5, 9, 15));
+const board = new LeaderboardService(new SortedArrayIndex(), new CumulativeScoring(), clock);
+
+function printRows(title: string, rows: RankedRow[]): void {
+  console.log(title);
+  for (const r of rows) {
+    console.log(`  rank ${r.rank} (pos ${r.position}) ${r.userId.padEnd(7)} ${formatPaise(r.score)}`);
+  }
+}
+
+function attempt(label: string, action: () => void): void {
+  try {
+    action();
+  } catch (err) {
+    const e = err as Error;
+    console.log(`${label} -> ${e.name}: ${e.message}`);
+  }
+}
+
+const orders: Array<[UserId, number]> = [
+  ['asha', 250_000],
+  ['bala', 120_050],
+  ['chitra', 300_000],
+  ['dev', 90_000],
+  ['bala', 129_950], // bala now ties asha at ₹2500.00, but reached it later
+  ['esha', 50_000],
+];
+for (const [user, paise] of orders) {
+  clock.advance(MINUTE);
+  board.record(user, paise);
+}
+
+printRows('Top 3 after 6 orders:', board.topK(3));
+const dev = board.rankOf('dev');
+console.log(`dev is rank ${dev.rank} of ${board.size()} with ${formatPaise(dev.score)}`);
+
+clock.advance(MINUTE);
+const afterRefund = board.record('chitra', -100_000); // order cancelled
+console.log(`chitra after refund: rank ${afterRefund.rank}, ${formatPaise(afterRefund.score)}`);
+printRows('Top 3 after refund:', board.topK(3));
+printRows('Around chitra (radius 1):', board.around('chitra', 1));
+
+attempt('fractional paise', () => board.record('dev', 12.5));
+attempt('refund too large', () => board.record('esha', -60_000));
+attempt('unknown user', () => board.rankOf('zara'));
+attempt('bad k', () => board.topK(0));
+
+// Same service, different strategy: a quiz where only the best attempt counts.
+const quiz = new LeaderboardService(new SortedArrayIndex(), new BestScoreScoring(), clock);
+for (const [user, points] of [['ravi', 70], ['sana', 90], ['ravi', 95], ['sana', 60]] as const) {
+  clock.advance(MINUTE);
+  quiz.record(user, points);
+}
+console.log(
+  `Quiz: ${quiz.topK(5).map((r) => `${r.rank}. ${r.userId}=${r.score}`).join(', ')}`,
+);
+```
+
+## Demo output
+
+```text
+Top 3 after 6 orders:
+  rank 1 (pos 1) chitra  ₹3000.00
+  rank 2 (pos 2) asha    ₹2500.00
+  rank 2 (pos 3) bala    ₹2500.00
+dev is rank 4 of 5 with ₹900.00
+chitra after refund: rank 3, ₹2000.00
+Top 3 after refund:
+  rank 1 (pos 1) asha    ₹2500.00
+  rank 1 (pos 2) bala    ₹2500.00
+  rank 3 (pos 3) chitra  ₹2000.00
+Around chitra (radius 1):
+  rank 1 (pos 2) bala    ₹2500.00
+  rank 3 (pos 3) chitra  ₹2000.00
+  rank 4 (pos 4) dev     ₹900.00
+fractional paise -> ValidationError: value must be a non-zero integer, got 12.5
+refund too large -> ValidationError: Refund of ₹600.00 exceeds total ₹500.00
+unknown user -> UserNotRankedError: User zara is not on the leaderboard
+bad k -> ValidationError: k must be a positive integer, got 0
+Quiz: 1. ravi=95, 2. sana=90
+```
+
+Notice that `asha` and `bala` both show `rank 2`, but their positions are 2 and 3, because asha reached ₹2500.00 first. Once chitra's refund drops her to ₹2000.00, she falls to rank 3 and the two ₹2500.00 users share rank 1. The quiz board kept each player's *best* attempt, so sana's later 60 changed nothing.
+
+## Concurrency
+
+Node runs your JavaScript on one thread, so `record()` above is atomic: nothing can interleave between reading the old entry and writing the new one. The race appears as soon as the score store is **asynchronous** (Redis, a database, or a remote cache), because every `await` gives other requests a chance to run. The classic bug is a **lost update**: five orders for the same user arrive together, all five read `0`, and all five write `0 + amount`.
+
+The fix is to serialise work **per user** with a keyed mutex (a promise chain per key), or to push atomicity into the store (`ZINCRBY` in Redis, `UPDATE … SET score = score + $1` in SQL). Different users still run in parallel.
+
+```ts
+interface ScoreStore {
+  get(userId: string): Promise<number>;
+  set(userId: string, score: number): Promise<void>;
+}
+
+const pause = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 1));
+
+class SlowStore implements ScoreStore {
+  private readonly scores = new Map<string, number>();
+  async get(userId: string): Promise<number> {
+    await pause(); // simulated network hop
+    return this.scores.get(userId) ?? 0;
+  }
+  async set(userId: string, score: number): Promise<void> {
+    await pause();
+    this.scores.set(userId, score);
+  }
+}
+
+/** Serialises async tasks that share a key; tasks with different keys run concurrently. */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+
+  async run<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => (release = resolve));
+    const tail = previous.then(() => mine);
+    this.tails.set(key, tail);
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key); // no leak for idle keys
+    }
+  }
+}
+
+class NaiveAccumulator {
+  constructor(private readonly store: ScoreStore) {}
+  async add(userId: string, paise: number): Promise<void> {
+    const current = await this.store.get(userId); // ❌ others read the same value meanwhile
+    await this.store.set(userId, current + paise);
+  }
+}
+
+class SafeAccumulator {
+  private readonly mutex = new KeyedMutex();
+  constructor(private readonly store: ScoreStore) {}
+  add(userId: string, paise: number): Promise<void> {
+    return this.mutex.run(userId, async () => {
+      const current = await this.store.get(userId);
+      await this.store.set(userId, current + paise);
+    });
+  }
+}
+
+interface Accumulator {
+  add(userId: string, paise: number): Promise<void>;
+}
+const variants: Array<[string, (s: ScoreStore) => Accumulator]> = [
+  ['naive', (s) => new NaiveAccumulator(s)],
+  ['keyed mutex', (s) => new SafeAccumulator(s)],
+];
+for (const [label, make] of variants) {
+  const store = new SlowStore();
+  const acc = make(store);
+  await Promise.all([1, 2, 3, 4, 5].map(() => acc.add('asha', 10_000)));
+  console.log(`${label}: 5 orders of ₹100.00 -> total paise ${await store.get('asha')}`);
+}
+```
+
+```text
+naive: 5 orders of ₹100.00 -> total paise 10000
+keyed mutex: 5 orders of ₹100.00 -> total paise 50000
+```
+
+A per-process mutex protects only one process. With several API pods, use the store's atomic increment, or partition events by `userId` (for example, a Kafka key) so that a single consumer owns each user.
+
+## Extensions & follow-ups
+
+| Follow-up | How the design changes |
+|---|---|
+| **Daily / weekly boards** | A board per window key (`2026-01-05`, `2026-W02`), created lazily; evict old windows. Each event updates the all-time board *and* the current window's board. |
+| **Top-K only, huge N** | Keep a map of totals and compute the top K with a size-K min-heap in O(N log K) on a schedule; cache the result. |
+| **Millions of users, many nodes** | Redis sorted set per board; shard by board, not by user, because ranking needs the whole set. For approximate ranks, use score buckets ("top 5%"). |
+| **Frequent updates, reads can lag** | Buffer increments per user for about 1 s and flush them in a batch, which gives fewer re-sorts. |
+| **Ties by a different rule** | Change the comparator only (for example, by fewer orders, or alphabetically). |
+| **Segmented boards (per city, per plan)** | Map from segment to board; one event fans out to several boards. |
+
+Below, **time-windowed boards** are implemented with the *heap* approach, to show where a heap is the right call. A daily board is small and read rarely, so "map of totals + heap top-K on read" is simpler than maintaining a sorted index. Windows use IST day boundaries, and only the last `keep` windows are retained.
+
+```ts
+type UserId = string;
+const DAY_MS = 86_400_000;
+const IST_OFFSET_MS = 5.5 * 3_600_000;
+
+interface Clock {
+  now(): number;
+}
+class ManualClock implements Clock {
+  constructor(private t: number) {}
+  now(): number {
+    return this.t;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+  }
+}
+
+interface WindowPolicy {
+  keyFor(epochMs: number): string;
+}
+class IstDailyWindow implements WindowPolicy {
+  keyFor(epochMs: number): string {
+    const istDay = Math.floor((epochMs + IST_OFFSET_MS) / DAY_MS);
+    return new Date(istDay * DAY_MS).toISOString().slice(0, 10);
+  }
+}
+
+/** Minimal binary min-heap driven by a comparator. */
+class MinHeap<T> {
+  private readonly items: T[] = [];
+  constructor(private readonly less: (a: T, b: T) => boolean) {}
+  get size(): number {
+    return this.items.length;
+  }
+  peek(): T | undefined {
+    return this.items[0];
+  }
+  push(item: T): void {
+    const a = this.items;
+    a.push(item);
+    let i = a.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!this.less(a[i], a[p])) break;
+      [a[i], a[p]] = [a[p], a[i]];
+      i = p;
+    }
+  }
+  pop(): T | undefined {
+    const a = this.items;
+    const top = a[0];
+    const last = a.pop();
+    if (a.length > 0 && last !== undefined) {
+      a[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < a.length && this.less(a[l], a[m])) m = l;
+        if (r < a.length && this.less(a[r], a[m])) m = r;
+        if (m === i) break;
+        [a[i], a[m]] = [a[m], a[i]];
+        i = m;
+      }
+    }
+    return top;
+  }
+}
+
+interface Scored {
+  userId: UserId;
+  score: number;
+}
+/** "Worse" = lower score, or same score and larger userId. The heap root is the worst of the current top K. */
+const worse = (a: Scored, b: Scored): boolean =>
+  a.score !== b.score ? a.score < b.score : a.userId > b.userId;
+
+function topKWithHeap(totals: ReadonlyMap<UserId, number>, k: number): Scored[] {
+  const heap = new MinHeap<Scored>(worse);
+  for (const [userId, score] of totals) {
+    const candidate = { userId, score };
+    if (heap.size < k) heap.push(candidate);
+    else {
+      const root = heap.peek();
+      if (root && worse(root, candidate)) {
+        heap.pop();
+        heap.push(candidate);
+      }
+    }
+  }
+  const out: Scored[] = [];
+  for (let s = heap.pop(); s; s = heap.pop()) out.push(s);
+  return out.reverse(); // best first
+}
+
+class WindowedLeaderboard {
+  private readonly windows = new Map<string, Map<UserId, number>>();
+
+  constructor(
+    private readonly clock: Clock,
+    private readonly policy: WindowPolicy,
+    private readonly keep: number,
+  ) {}
+
+  record(userId: UserId, paise: number): void {
+    const key = this.policy.keyFor(this.clock.now());
+    let totals = this.windows.get(key);
+    if (!totals) {
+      totals = new Map();
+      this.windows.set(key, totals);
+      this.evictOld();
+    }
+    totals.set(userId, (totals.get(userId) ?? 0) + paise);
+  }
+
+  topK(k: number, windowKey = this.policy.keyFor(this.clock.now())): Scored[] {
+    const totals = this.windows.get(windowKey);
+    if (!totals) throw new Error(`No data for window ${windowKey}`);
+    return topKWithHeap(totals, k);
+  }
+
+  windowKeys(): string[] {
+    return [...this.windows.keys()];
+  }
+
+  private evictOld(): void {
+    // Map keeps insertion order, and windows are created in time order.
+    while (this.windows.size > this.keep) {
+      const oldest = this.windows.keys().next().value;
+      if (oldest === undefined) break;
+      this.windows.delete(oldest);
+    }
+  }
+}
+
+const HOUR = 3_600_000;
+const clock = new ManualClock(Date.UTC(2026, 0, 4, 17, 0)); // 22:30 IST on Jan 4
+const daily = new WindowedLeaderboard(clock, new IstDailyWindow(), 2);
+const fmt = (rows: Scored[]): string => rows.map((r) => `${r.userId}:${r.score}`).join(' ');
+
+daily.record('asha', 5_000);
+daily.record('bala', 9_000);
+clock.advance(2 * HOUR); // 00:30 IST on Jan 5 -> new window
+daily.record('asha', 7_000);
+daily.record('chitra', 7_000);
+daily.record('dev', 1_000);
+console.log(`today top2: ${fmt(daily.topK(2))}`);
+console.log(`yesterday top2: ${fmt(daily.topK(2, '2026-01-04'))}`);
+clock.advance(24 * HOUR);
+daily.record('esha', 3_000);
+console.log(`windows kept: ${daily.windowKeys().join(', ')}`);
+try {
+  daily.topK(2, '2026-01-04');
+} catch (err) {
+  console.log(`old window -> ${(err as Error).message}`);
+}
+```
+
+```text
+today top2: asha:7000 chitra:7000
+yesterday top2: bala:9000 asha:5000
+windows kept: 2026-01-05, 2026-01-06
+old window -> No data for window 2026-01-04
+```
+
+## Edge cases
+
+- **Ties:** decide between competition rank, dense rank and unique position, and say which one you chose. Tie-breaking by `reachedAt` needs the timestamp updated only when the score *changes*.
+- **Refund larger than the total:** reject it (or clamp it to 0, as long as you say so).
+- **Refund for an unknown user:** our cumulative policy sees `current = undefined` and rejects the negative total.
+- **`k` larger than N:** `slice` simply returns everything.
+- **`around` at the edges:** clamp `from` to 0; the upper end is clamped by `slice`.
+- **Fractional or huge values:** `Number.isSafeInteger` rejects both `12.5` and values above 2^53.
+- **Removed user comes back:** they start again from 0 with a fresh `reachedAt`.
+- **Window boundaries:** use the business timezone (IST), not UTC midnight.
+
+## Complexity
+
+| Operation | Sorted array (ours) | Skip list / order-statistic tree | Map + heap |
+|---|---|---|---|
+| `record` | O(log N) search + O(N) memory shift | O(log N) | O(1) |
+| `topK(k)` | O(k log N) (rank per row) | O(log N + k) | O(N log k) |
+| `rankOf` | O(log N) | O(log N) | O(N) |
+| `around(r)` | O(r log N) | O(log N + r) | not supported |
+| Space | O(N) | O(N) | O(N + k) |
+
+(`topK` does a binary search per row to compute the competition rank. If you need only positions, it is O(k).)
+
+## What graders look for / common mistakes
+
+- ✅ Saying the trade-off out loud: *heap = top-K only; sorted set + map = top-K and rank and updates.*
+- ✅ A clearly stated tie rule, and deterministic output.
+- ✅ The index hidden behind an interface, so it can be swapped for a skip list or Redis.
+- ❌ Sorting the whole list on every `topK` call, then claiming it is "efficient".
+- ❌ Updating a user by pushing a new entry without removing the old one (duplicates).
+- ❌ Storing rupees as floats (`1200.5 + 1299.5` works here, but `0.1 + 0.2` does not).
+- ❌ Forgetting score *decreases* (refunds), which break the naive "heap of the best".
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---|---|
+| 0–10 | Clarify score semantics, ties, refunds and windows; write the API down. |
+| 10–20 | Draw the service, index and scoring policy; state the heap vs sorted trade-off. |
+| 20–55 | Models → `SortedArrayIndex` (test `lowerBound` early) → scoring → service. |
+| 55–70 | Driver: ties, refund, `around`, validation errors. |
+| 70–80 | Windowed boards or keyed-mutex follow-up. |
+| 80–90 | Walk through the complexity table; clean up naming. |
+
+## Interview Q&A
+
+<details>
+<summary>Q1. Why not just use a max-heap of all users?</summary>
+
+A heap gives you only the maximum cheaply. Getting the top K means popping K items and pushing them back. Finding user X's rank needs a full scan. Updating X's score needs their heap index plus a sift (an indexed heap), and a heap still can't answer "rank" in O(log N). A sorted structure answers all three in O(log N).
+
+</details>
+
+<details>
+<summary>Q2. How would you build this on Redis?</summary>
+
+Use one sorted set per board: `ZINCRBY board:alltime <paise> <userId>` for updates, `ZREVRANGE board:alltime 0 K-1 WITHSCORES` for the top K, and `ZREVRANK` for a rank. For daily boards, use keys such as `board:2026-01-05` with `EXPIRE`. To break ties by time, encode the score as `amount * 2^k + (MAX_TS - ts)` or keep a secondary sorted set.
+
+</details>
+
+<details>
+<summary>Q3. Scores update 50k times a second. What changes?</summary>
+
+Decouple writes from ranking. Increments go to a log (Kafka) partitioned by `userId`. A consumer aggregates them in micro-batches and applies them to the sorted set, so reads are about a second stale. The top-100 widget is cached and refreshed every few seconds. Rank lookups for most users can be approximate (percentile buckets).
+
+</details>
+
+<details>
+<summary>Q4. Competition rank vs dense rank vs position?</summary>
+
+For scores 90, 80, 80, 70: competition rank is 1, 2, 2, 4; dense rank is 1, 2, 2, 3; position is 1, 2, 3, 4. Competition rank is `1 + count(score > mine)`. Dense rank needs a count of *distinct* higher scores, which you can get with a second index over distinct scores.
+
+</details>

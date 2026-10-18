@@ -1,0 +1,404 @@
+---
+title: "12.4 Text Editor with Undo/Redo"
+---
+
+## Problem & where it's asked
+
+Design the core model for a plain-text editor that supports inserting, deleting and replacing text, moving the cursor, and an unlimited (but bounded) undo/redo stack.
+
+- **Microsoft, Amazon, Uber (reported in aggregated lists):** often phrased as "design Ctrl+Z and Ctrl+Y" or "design a collaborative text editor without the collaboration". The simpler form is the one below; the harder form adds multi-user cursors.
+- **LeetCode-adjacent round (common):** a restricted version asks only for `insert` / `delete` / `undo` on a string.
+- **Graded on:** clean separation between the **Command** (what happened) and the **Receiver** (the buffer it happened to), correct redo invalidation, bounded history without memory leaks, and no `any` or duck-typed state reconstruction.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| What operations must be undoable? | Insert, delete and replace. Cursor movement is not undoable (cursor is UI, not document state). |
+| How are selections handled? | A `ReplaceCommand` covers "select then type" by atomically deleting the selection and inserting the replacement. |
+| Redo after a new edit? | Redo stack is **cleared** (the "branching history" model, not a tree). |
+| History limit? | Configurable cap (default 50). Oldest command is evicted when the cap is reached. |
+| Collaborative editing? | Out of scope for the core; discussed in extensions. |
+| Encoding? | ASCII (chars = bytes). Unicode grapheme clusters are an extension. |
+
+## Requirements
+
+**Functional:** `insert(pos, text)`, `delete(start, end)`, `replace(start, end, text)`, `undo()` → `boolean`, `redo()` → `boolean`. All operations update the cursor.
+
+**Non-functional:** `undo`/`redo` O(1); `insert`/`delete` O(n) on the string (acceptable for the interview; a rope or piece-table is the extension). History bounded; no `any`; typed errors.
+
+**Out of scope:** syntax highlighting, file I/O, clipboard, multi-cursor.
+
+## Entities & relationships
+
+| Entity | Role | Relationship |
+|---|---|---|
+| `TextBuffer` | Receiver: owns the text string and cursor | Used by all commands |
+| `Command` (interface) | Declares `execute()`, `undo()` | Implemented by concrete commands |
+| `InsertCommand` | Leaf command: stores position and inserted string | Has a `TextBuffer` |
+| `DeleteCommand` | Leaf command: captures deleted string at execute-time | Has a `TextBuffer` |
+| `ReplaceCommand` | Composite of delete + insert, captures removed text | Has a `TextBuffer` |
+| `Editor` | Invoker: owns undo/redo stacks and history cap | Has a `TextBuffer` and `Command[]` stacks |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Editor {
+        +execute(cmd) void
+        +undo() boolean
+        +redo() boolean
+        +getText() string
+        +getCursor() number
+        -undoStack Command[]
+        -redoStack Command[]
+        -maxHistory number
+    }
+    class Command {
+        <<interface>>
+        +description string
+        +execute() void
+        +undo() void
+    }
+    class TextBuffer {
+        +insert(pos, s) void
+        +delete(start, end) string
+        +setCursor(pos) void
+        +getText() string
+        +getCursor() number
+    }
+    class InsertCommand
+    class DeleteCommand
+    class ReplaceCommand
+    Editor --> TextBuffer
+    Editor --> Command
+    Command <|.. InsertCommand
+    Command <|.. DeleteCommand
+    Command <|.. ReplaceCommand
+    InsertCommand --> TextBuffer
+    DeleteCommand --> TextBuffer
+    ReplaceCommand --> TextBuffer`} />
+
+## Design decisions & patterns
+
+**1. Command pattern.** Each edit is an object with `execute()` and `undo()`. The `Editor` (Invoker) does not know the mechanics of inserting or deleting — it only pushes and pops commands. This lets you add a `MacroCommand` (a sequence of commands packaged as one) without touching the editor.
+
+**2. Captured state for undo.** `DeleteCommand` captures the deleted substring on `execute()`, not on construction — because the text at that position is only known at execution time. `ReplaceCommand` does the same for the replaced text. This is the **Memento** idea applied inside the command: the command is its own memento.
+
+**3. Redo invalidation.** When the user types after undo, the future they undid to is gone. Clearing `redoStack` on every `execute()` call implements this rule in one line.
+
+**4. Bounded history.** The undo stack is an array capped at `maxHistory`. When a new command would exceed the cap, the oldest entry is `shift()`-ed off. This is an O(n) operation on an array; for a large cap a double-ended queue (linked list) is O(1), but the difference is not observable at interview scale.
+
+**5. Cursor ownership.** The cursor lives on `TextBuffer`, not on `Editor`. Each command sets the cursor to the natural post-operation position (after the inserted text, or at the start of the deleted region). Undo moves the cursor back to where it was before the command. This keeps cursor logic close to the mutation logic.
+
+**Rejected:** making `Editor` store cursor position separately and having commands return a cursor delta — the delta depends on the buffer, which the command already touches, so double-tracking creates drift.
+
+## Implementation
+
+**Part 1: errors and buffer.**
+
+```ts
+class EditorError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class InvalidRangeError extends EditorError {}
+
+class TextBuffer {
+  private text = '';
+  private cursor = 0;
+
+  getText(): string { return this.text; }
+  getCursor(): number { return this.cursor; }
+
+  setCursor(pos: number): void {
+    this.cursor = Math.max(0, Math.min(pos, this.text.length));
+  }
+
+  insert(pos: number, s: string): void {
+    if (pos < 0 || pos > this.text.length)
+      throw new InvalidRangeError(`insert pos ${pos} out of range [0,${this.text.length}]`);
+    this.text = this.text.slice(0, pos) + s + this.text.slice(pos);
+    this.cursor = pos + s.length;
+  }
+
+  /** Deletes [start, end) and returns the removed substring. */
+  delete(start: number, end: number): string {
+    if (start < 0 || end > this.text.length || start > end)
+      throw new InvalidRangeError(`delete [${start},${end}) out of range [0,${this.text.length}]`);
+    const removed = this.text.slice(start, end);
+    this.text = this.text.slice(0, start) + this.text.slice(end);
+    this.cursor = start;
+    return removed;
+  }
+}
+```
+
+**Part 2: commands.**
+
+```ts
+interface Command {
+  readonly description: string;
+  execute(): void;
+  undo(): void;
+}
+
+class InsertCommand implements Command {
+  get description(): string { return `insert "${this.s}" @${this.pos}`; }
+  constructor(
+    private readonly buf: TextBuffer,
+    private readonly pos: number,
+    private readonly s: string,
+  ) {}
+  execute(): void { this.buf.insert(this.pos, this.s); }
+  undo(): void {
+    this.buf.delete(this.pos, this.pos + this.s.length);
+    this.buf.setCursor(this.pos);
+  }
+}
+
+class DeleteCommand implements Command {
+  private removed = '';
+  get description(): string { return `delete [${this.start},${this.end})`; }
+  constructor(
+    private readonly buf: TextBuffer,
+    private readonly start: number,
+    private readonly end: number,
+  ) {}
+  execute(): void { this.removed = this.buf.delete(this.start, this.end); }
+  undo(): void {
+    this.buf.insert(this.start, this.removed);
+    this.buf.setCursor(this.end);
+  }
+}
+
+/** Atomically replaces [start, end) with newText. Covers "select then type". */
+class ReplaceCommand implements Command {
+  private removed = '';
+  private readonly newText: string;
+  private readonly start: number;
+  private readonly end: number;
+  get description(): string { return `replace [${this.start},${this.end}) -> "${this.newText}"`; }
+  constructor(buf: TextBuffer, start: number, end: number, newText: string);
+  constructor(
+    private readonly buf: TextBuffer,
+    start: number,
+    end: number,
+    newText: string,
+  ) { this.start = start; this.end = end; this.newText = newText; }
+  execute(): void {
+    this.removed = this.buf.delete(this.start, this.end);
+    this.buf.insert(this.start, this.newText);
+  }
+  undo(): void {
+    this.buf.delete(this.start, this.start + this.newText.length);
+    this.buf.insert(this.start, this.removed);
+    this.buf.setCursor(this.start + this.removed.length);
+  }
+}
+```
+
+**Part 3: the editor (Invoker).**
+
+```ts
+class Editor {
+  private readonly undoStack: Command[] = [];
+  private readonly redoStack: Command[] = [];
+
+  constructor(readonly buf: TextBuffer, private readonly maxHistory = 50) {}
+
+  execute(cmd: Command): void {
+    cmd.execute();
+    this.undoStack.push(cmd);
+    this.redoStack.length = 0; // invalidate redo on every new command
+    if (this.undoStack.length > this.maxHistory) this.undoStack.shift();
+  }
+
+  undo(): boolean {
+    const cmd = this.undoStack.pop();
+    if (!cmd) return false;
+    cmd.undo();
+    this.redoStack.push(cmd);
+    return true;
+  }
+
+  redo(): boolean {
+    const cmd = this.redoStack.pop();
+    if (!cmd) return false;
+    cmd.execute();
+    this.undoStack.push(cmd);
+    return true;
+  }
+
+  get undoDepth(): number { return this.undoStack.length; }
+  get redoDepth(): number { return this.redoStack.length; }
+  getText(): string { return this.buf.getText(); }
+  getCursor(): number { return this.buf.getCursor(); }
+}
+```
+
+**Part 4: driver.**
+
+```ts
+const buf = new TextBuffer();
+const ed = new Editor(buf, 5);
+
+const snap = (): string => `"${ed.getText()}" @${ed.getCursor()}`;
+
+ed.execute(new InsertCommand(buf, 0, 'abc'));
+console.log(snap());
+ed.execute(new InsertCommand(buf, 3, 'def'));
+console.log(snap());
+ed.execute(new DeleteCommand(buf, 2, 4));
+console.log(snap());
+console.log('undo:', ed.undo(), snap());
+console.log('undo:', ed.undo(), snap());
+console.log('undo:', ed.undo(), snap());
+console.log('undo empty:', ed.undo());
+console.log('redo:', ed.redo(), snap());
+console.log('redo:', ed.redo(), snap());
+ed.execute(new InsertCommand(buf, 6, 'x'));
+console.log(snap());
+console.log('redo after new:', ed.redo());
+ed.execute(new ReplaceCommand(buf, 0, 3, 'XYZ'));
+console.log(snap());
+console.log('undo replace:', ed.undo(), snap());
+
+// bounded history: max 5, push 4 entries
+const buf2 = new TextBuffer();
+const ed2 = new Editor(buf2, 3);
+for (let i = 0; i < 4; i++) ed2.execute(new InsertCommand(buf2, buf2.getText().length, `${i}`));
+console.log('depth after 4 (max 3):', ed2.undoDepth);
+let n = 0;
+while (ed2.undo()) n++;
+console.log('max undone:', n, '"' + ed2.getText() + '"');
+```
+
+## Demo output
+
+```text
+"abc" @3
+"abcdef" @6
+"abef" @2
+undo: true "abcdef" @4
+undo: true "abc" @3
+undo: true "" @0
+undo empty: false
+redo: true "abc" @3
+redo: true "abcdef" @6
+"abcdefx" @7
+redo after new: false
+"XYZdefx" @3
+undo replace: true "abcdefx" @3
+depth after 4 (max 3): 3
+max undone: 3 "0"
+```
+
+Three things to read carefully: (1) after `undo` of `delete([2,4))`, the cursor is at 4 (end of the restored region, per `DeleteCommand.undo`); (2) after the new `InsertCommand`, `redo()` returns false because the redo stack was cleared; (3) after undoing 3 commands of the 4 pushed (max = 3, so command 0 was evicted), the remaining text is `"0"` — the insert of `"0"` is now unrecoverable.
+
+## Concurrency
+
+Single-threaded JavaScript makes `execute`, `undo` and `redo` atomic as long as they are synchronous. The hard problem is **collaborative editing** where two users type at the same time.
+
+The classic example: the document is `"ab"`, user A inserts `"x"` at position 1 (→ `"axb"`), and simultaneously user B deletes position 1 (→ `"a"`). Naively applying A's command to B's state gives `"ax"`, not `"axb"`.
+
+The two main solutions are:
+
+- **Operational Transformation (OT):** transform incoming operations against local ones before applying. Used by Google Docs (Wave era). Complex to implement correctly; a peer-reviewed reference is the `jupiter` paper.
+- **CRDTs (Conflict-free Replicated Data Types):** each character gets a unique stable ID; insertions and deletions refer to IDs, not positions. Position conflicts are resolved by a stable total order. Simpler to implement correctly; used by Figma, Notion and most modern collaborative editors.
+
+For an interview, naming both approaches and saying "OT is hard to get right for n parties; CRDTs are preferred for new systems" is the right level of depth.
+
+## Extensions & follow-ups
+
+| Extension | Change needed |
+|---|---|
+| **Macro recording** | `MacroCommand` holds a list of commands and delegates `execute`/`undo` to each in order. **Implemented below.** |
+| **Persistent undo** | Serialize the undo stack (each command stores its type and parameters) and restore on app start. `DeleteCommand` must also store the `removed` text at construction time if the buffer is not available during restore. |
+| **Rope or piece-table** | Replace `TextBuffer`'s string with a rope for O(log n) insert/delete. The command interface does not change. |
+| **Clipboard** | `CutCommand = DeleteCommand` + `CopyCommand` (no buffer mutation) + `PasteCommand = InsertCommand`. All are undoable. |
+| **Unicode grapheme clusters** | Wrap the string in an `Intl.Segmenter` to iterate clusters. Positions become cluster indices, not byte offsets. |
+
+**Macro command (group of commands undone as one).**
+
+```ts
+class MacroCommand implements Command {
+  private readonly steps: Command[];
+  get description(): string { return `macro [${this.steps.map(c => c.description).join('; ')}]`; }
+  constructor(...steps: Command[]) { this.steps = steps; }
+  execute(): void { for (const s of this.steps) s.execute(); }
+  undo(): void { for (const s of [...this.steps].reverse()) s.undo(); }
+}
+```
+
+## Edge cases
+
+- `insert` at position 0 and at `text.length` (both valid; the latter appends).
+- `delete(n, n)` is a no-op (empty range); `delete(5, 3)` throws `InvalidRangeError`.
+- `undo` on an empty stack returns `false`; callers should not throw on `false`.
+- Redo after undo then new edit: the redo stack must be completely cleared, even if it had multiple entries.
+- History overflow: the *oldest* entry is evicted, not the newest. After overflow, the oldest edit is gone forever — `undo` cannot reach it.
+- `ReplaceCommand` where `start === end` is equivalent to `InsertCommand`; where `newText === ''` it is equivalent to `DeleteCommand`. Both degenerate correctly.
+
+## Complexity
+
+| Operation | Time | Space |
+|---|---|---|
+| `insert(pos, s)` | O(n) string copy | O(n) |
+| `delete(start, end)` | O(n) string copy | O(removed length) in command |
+| `execute(cmd)` | O(1) stack push + cmd cost | O(1) amortised (O(n) on overflow shift) |
+| `undo()` / `redo()` | O(1) + cmd undo/execute cost | — |
+| Max memory for history | O(maxHistory × avgCommandSize) | Bounded by cap |
+
+Using a **rope** for the buffer makes `insert`/`delete` O(log n + change size) and reduces memory copies.
+
+## What graders look for / common mistakes
+
+- ✅ `DeleteCommand` captures the removed text in `execute()`, not in the constructor (the text is not known at construction time).
+- ✅ `redoStack` is cleared on every `execute`, not only when the undo stack is non-empty.
+- ✅ `undo`/`redo` returns a boolean and does not throw when the stack is empty.
+- ✅ Bounded history that evicts the *oldest* command (FIFO).
+- ❌ Storing the entire buffer state as the memento on every command (O(n²) memory).
+- ❌ A `type` field on a single `Command` class that requires a `switch` to undo (defeats polymorphism).
+- ❌ Forgetting redo invalidation: calling `undo` then `undo` then `redo` then a new `execute` should leave the redo stack empty.
+- ❌ Cursor not updated on undo — the user's caret jumps.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---|---|
+| 0–8 | Clarify: which operations are undoable, redo semantics, bounded vs unlimited history. |
+| 8–18 | Sketch the Command interface, the three concrete commands, and `Editor`. State the Memento-in-Command idea. |
+| 18–40 | Implement `TextBuffer`, then `InsertCommand` and `DeleteCommand`. |
+| 40–55 | Implement `Editor` with both stacks, redo invalidation and the history cap. |
+| 55–70 | Driver: happy path, undo/redo, overflow, redo-after-new-edit. |
+| 70–80 | `ReplaceCommand` + edge cases (`delete(n,n)`, cursor positions). |
+| 80–90 | MacroCommand sketch; mention rope, CRDTs; tidy names. |
+
+## Interview Q&A
+
+<details>
+<summary>Q1. Why Command + Memento rather than just keeping a stack of whole-document snapshots?</summary>
+
+Snapshots cost O(n) memory per edit; a 10 MB document with 500 history entries uses 5 GB. Commands store only the change: an insert stores the inserted string (a few bytes), and a delete stores the removed fragment. The total cost is O(sum of edit sizes), which is far smaller. Snapshots are fine for tiny documents or when the edit format is too complex to reverse; for a general editor, per-command deltas are the right trade-off.
+
+</details>
+
+<details>
+<summary>Q2. How would you add multi-user cursors without breaking the undo model?</summary>
+
+Each user gets their own undo stack. Operations from other users are applied via Operational Transformation or CRDTs — they are not pushed onto the local undo stack. Local undo reverses only local commands, and the positions in stored commands are transformed against remote operations before replay, so they still refer to the right text after remote edits.
+
+</details>
+
+<details>
+<summary>Q3. The interviewer asks for "branching history" instead of redo invalidation. What changes?</summary>
+
+Store a tree of commands instead of a linear stack. Each `execute` creates a new branch from the current node. `undo` moves up to the parent; `redo` can move to any child (usually the most recent, but a UI can let the user pick). Vim's `:undotree` is a real implementation of this. The tree requires garbage collection for old branches to keep memory bounded.
+
+</details>
+
+<details>
+<summary>Q4. How does `ReplaceCommand` handle the case where the selection is empty?</summary>
+
+`delete(start, start)` is a no-op that returns `""`, so `removed` is `""`. On undo, inserting `""` back is also a no-op. The command degenerates to a pure insert. No special casing needed — it falls out of the implementation.
+
+</details>

@@ -1,0 +1,317 @@
+---
+title: "7.10 Retry with exponential backoff and jitter, and the Circuit Breaker"
+---
+
+## 7.10.1 Retry done right
+
+Retries turn transient failures (timeouts, 503s, connection resets) into successes. Done badly, they turn a slow dependency into a dead one: 10,000 clients retrying in lockstep every 100 ms is a DDoS you launched yourself. The rules:
+
+1. Retry only **retryable** errors (timeouts, 429/503). Never retry validation errors or "insufficient funds".
+2. Retry only **idempotent** operations, or pass an idempotency key (section 7.8.8).
+3. **Exponential backoff:** `base × 2^(attempt-1)`, capped at `maxDelay`.
+4. **Jitter** spreads the retries out. *Full jitter* picks `random(0, backoff)`. Inject `random` so tests are deterministic.
+5. Cap the **number of attempts** (and ideally the total time budget), and honor `Retry-After`.
+
+```ts
+type Sleep = (ms: number) => Promise<void>;
+
+interface RetryOptions {
+  maxAttempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  random: () => number; // [0, 1)
+  sleep: Sleep;
+  isRetryable: (err: unknown) => boolean;
+  onRetry?: (attempt: number, delayMs: number, err: unknown) => void;
+}
+
+/** Full jitter: random(0, min(cap, base * 2^(attempt-1))) */
+function backoffDelay(attempt: number, o: Pick<RetryOptions, 'baseDelayMs' | 'maxDelayMs' | 'random'>): number {
+  const exp = Math.min(o.maxDelayMs, o.baseDelayMs * 2 ** (attempt - 1));
+  return Math.floor(o.random() * exp);
+}
+
+class RetryExhaustedError extends Error {}
+
+async function retry<T>(fn: (attempt: number) => Promise<T>, o: RetryOptions): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      if (!o.isRetryable(err)) throw err;
+      if (attempt >= o.maxAttempts) {
+        throw new RetryExhaustedError(`failed after ${attempt} attempts`, { cause: err });
+      }
+      const delayMs = backoffDelay(attempt, o);
+      o.onRetry?.(attempt, delayMs, err);
+      await o.sleep(delayMs);
+    }
+  }
+}
+
+// ---- errors ----
+class TransientError extends Error {}
+class RejectedOrderError extends Error {}
+const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+// ---- deterministic test doubles ----
+const slept: number[] = [];
+const fakeSleep: Sleep = async ms => {
+  slept.push(ms);
+};
+const realSleep: Sleep = ms => new Promise(resolve => setTimeout(resolve, ms)); // production
+const options: RetryOptions = {
+  maxAttempts: 5,
+  baseDelayMs: 100,
+  maxDelayMs: 1_000,
+  random: () => 0.5, // Math.random in production
+  sleep: fakeSleep,
+  isRetryable: err => err instanceof TransientError,
+  onRetry: (attempt, delayMs, err) => console.log(`  attempt ${attempt} failed (${msg(err)}), retrying in ${delayMs}ms`),
+};
+
+console.log(`uncapped delays for attempts 1..6 at random=0.5: ${[1, 2, 3, 4, 5, 6].map(a => backoffDelay(a, options)).join(',')}`);
+console.log(`real sleep is injectable too: ${typeof realSleep}`);
+
+console.log('flaky exchange API (fails twice):');
+let calls = 0;
+const orderId = await retry(async attempt => {
+  calls++;
+  if (attempt <= 2) throw new TransientError('503 from exchange');
+  return 'EXCH-7781';
+}, options);
+console.log(`  -> ${orderId} after ${calls} calls, slept ${slept.join('+')}ms`);
+
+console.log('non-retryable error:');
+try {
+  await retry(async () => {
+    throw new RejectedOrderError('price outside circuit limits');
+  }, options);
+} catch (err) {
+  console.log(`  -> ${err instanceof RejectedOrderError ? 'RejectedOrderError' : 'other'}: ${msg(err)} (no retries)`);
+}
+
+console.log('always failing:');
+slept.length = 0;
+try {
+  await retry(async () => {
+    throw new TransientError('timeout');
+  }, { ...options, maxAttempts: 3, onRetry: undefined });
+} catch (err) {
+  const cause = err instanceof Error ? err.cause : undefined;
+  console.log(`  -> ${msg(err)}; last cause: ${msg(cause)}; slept ${slept.join('+')}ms`);
+}
+```
+
+```text
+uncapped delays for attempts 1..6 at random=0.5: 50,100,200,400,500,500
+real sleep is injectable too: function
+flaky exchange API (fails twice):
+  attempt 1 failed (503 from exchange), retrying in 50ms
+  attempt 2 failed (503 from exchange), retrying in 100ms
+  -> EXCH-7781 after 3 calls, slept 50+100ms
+non-retryable error:
+  -> RejectedOrderError: price outside circuit limits (no retries)
+always failing:
+  -> failed after 3 attempts; last cause: timeout; slept 50+100ms
+```
+
+Other jitter variants worth naming: **equal jitter** (`exp/2 + random(0, exp/2)`, which never waits zero) and **decorrelated jitter** (`min(cap, random(base, prev × 3))`). Also be wary of **retry amplification**: if every layer retries 3×, a single user request becomes 27 calls at the bottom layer. Retry at one layer only.
+
+## 7.10.2 Circuit Breaker as a state machine
+
+A retry helps with a *blip*. When a dependency is **down**, retries just pile load onto it and tie up your threads and sockets. A circuit breaker **fails fast** while the dependency is unhealthy and probes it now and then to see if it has recovered.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> CLOSED
+  CLOSED --> OPEN: consecutive failures >= threshold
+  OPEN --> HALF_OPEN: openDuration elapsed (checked on next call)
+  HALF_OPEN --> CLOSED: successThreshold probes succeed
+  HALF_OPEN --> OPEN: any probe fails`} />
+
+- **CLOSED:** calls pass through, and failures are counted (a success resets the count).
+- **OPEN:** calls are rejected immediately with `CircuitOpenError` until `openDurationMs` has passed.
+- **HALF_OPEN:** only a limited number of probe calls go through. Enough successes close the circuit, and one failure opens it again.
+
+```ts
+interface Clock {
+  now(): number;
+}
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number {
+    return this.t;
+  }
+  advance(ms: number): void {
+    this.t += ms;
+  }
+}
+
+type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
+interface BreakerOptions {
+  failureThreshold: number;
+  openDurationMs: number;
+  halfOpenMaxCalls: number;
+  successThreshold: number;
+}
+
+class CircuitOpenError extends Error {}
+
+class CircuitBreaker {
+  private state: CircuitState = 'CLOSED';
+  private failures = 0;
+  private openedAt = 0;
+  private probesInFlight = 0;
+  private probeSuccesses = 0;
+
+  constructor(
+    private readonly name: string,
+    private readonly opts: BreakerOptions,
+    private readonly clock: Clock,
+    private readonly onTransition: (from: CircuitState, to: CircuitState) => void = () => {},
+  ) {}
+
+  get currentState(): CircuitState {
+    return this.state;
+  }
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    const isProbe = this.admit();
+    try {
+      const result = await fn();
+      this.onSuccess(isProbe);
+      return result;
+    } catch (err) {
+      this.onFailure(isProbe);
+      throw err;
+    }
+  }
+
+  private admit(): boolean {
+    if (this.state === 'OPEN') {
+      const waited = this.clock.now() - this.openedAt;
+      if (waited < this.opts.openDurationMs) {
+        throw new CircuitOpenError(`${this.name} is OPEN, retry in ${this.opts.openDurationMs - waited}ms`);
+      }
+      this.transition('HALF_OPEN');
+    }
+    if (this.state === 'HALF_OPEN') {
+      if (this.probesInFlight >= this.opts.halfOpenMaxCalls) {
+        throw new CircuitOpenError(`${this.name} is HALF_OPEN, probe limit reached`);
+      }
+      this.probesInFlight++;
+      return true;
+    }
+    return false;
+  }
+
+  private onSuccess(isProbe: boolean): void {
+    if (!isProbe) {
+      this.failures = 0;
+      return;
+    }
+    this.probesInFlight--;
+    if (this.state !== 'HALF_OPEN') return;
+    if (++this.probeSuccesses >= this.opts.successThreshold) this.transition('CLOSED');
+  }
+
+  private onFailure(isProbe: boolean): void {
+    if (isProbe) {
+      this.probesInFlight--;
+      if (this.state === 'HALF_OPEN') this.transition('OPEN');
+      return;
+    }
+    if (this.state === 'CLOSED' && ++this.failures >= this.opts.failureThreshold) this.transition('OPEN');
+  }
+
+  private transition(to: CircuitState): void {
+    const from = this.state;
+    this.state = to;
+    this.failures = 0;
+    this.probeSuccesses = 0;
+    if (to === 'OPEN') this.openedAt = this.clock.now();
+    if (to !== 'HALF_OPEN') this.probesInFlight = 0;
+    this.onTransition(from, to);
+  }
+}
+
+// ---- simulation: a KYC provider that goes down and comes back ----
+const clock = new FakeClock();
+let providerUp = true;
+let providerCalls = 0;
+const kycCheck = async (pan: string): Promise<string> => {
+  providerCalls++;
+  if (!providerUp) throw new Error('KYC provider 503');
+  return `${pan}: verified`;
+};
+
+const breaker = new CircuitBreaker(
+  'kyc',
+  { failureThreshold: 3, openDurationMs: 10_000, halfOpenMaxCalls: 1, successThreshold: 2 },
+  clock,
+  (from, to) => console.log(`    [t=${clock.now()}] ${from} -> ${to}`),
+);
+
+async function call(label: string): Promise<void> {
+  try {
+    console.log(`${label}: ${await breaker.execute(() => kycCheck('ABCDE1234F'))}`);
+  } catch (err) {
+    const kind = err instanceof CircuitOpenError ? 'fast-fail' : 'error';
+    console.log(`${label}: ${kind} - ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+await call('c1');
+providerUp = false;
+for (const label of ['c2', 'c3', 'c4']) await call(label);
+const before = providerCalls;
+await call('c5');
+console.log(`  provider calls during OPEN: ${providerCalls - before}`);
+
+clock.advance(10_000);
+await call('c6 probe'); // still down -> back to OPEN
+clock.advance(4_000);
+await call('c7');
+
+clock.advance(6_000);
+providerUp = true;
+// two concurrent callers while HALF_OPEN: only one probe is allowed
+await Promise.all([call('c8 probe'), call('c9')]);
+await call('c10 probe');
+await call('c11');
+console.log(`final state: ${breaker.currentState}, provider calls: ${providerCalls}`);
+```
+
+```text
+c1: ABCDE1234F: verified
+c2: error - KYC provider 503
+c3: error - KYC provider 503
+    [t=0] CLOSED -> OPEN
+c4: error - KYC provider 503
+c5: fast-fail - kyc is OPEN, retry in 10000ms
+  provider calls during OPEN: 0
+    [t=10000] OPEN -> HALF_OPEN
+    [t=10000] HALF_OPEN -> OPEN
+c6 probe: error - KYC provider 503
+c7: fast-fail - kyc is OPEN, retry in 6000ms
+    [t=20000] OPEN -> HALF_OPEN
+c9: fast-fail - kyc is HALF_OPEN, probe limit reached
+c8 probe: ABCDE1234F: verified
+    [t=20000] HALF_OPEN -> CLOSED
+c10 probe: ABCDE1234F: verified
+c11: ABCDE1234F: verified
+final state: CLOSED, provider calls: 8
+```
+
+## Production notes
+
+- Count failures in a **rolling window** (for example, "50% of the last 20 calls" or "5 failures in 30 s") rather than as a consecutive count. Opossum, Resilience4j and Polly all support this.
+- Decide **what counts as a failure**: timeouts and 5xx do, but a 4xx caused by the caller usually shouldn't open the breaker.
+- Keep **one breaker per dependency** (or per host), and don't share one across unrelated endpoints.
+- Combine the pieces in the right order: **timeout → retry (with backoff) → circuit breaker → fallback** (cached price, "try again later"), plus a **bulkhead** (a semaphore) so a slow dependency can't use up every connection.
+- Emit a metric on every transition. A breaker that opens silently is an outage nobody notices.
+
+## How to say it in an interview
+
+> "Retries handle blips: exponential backoff with full jitter, only for idempotent calls and retryable errors, and at only one layer. The circuit breaker handles outages. After N failures it opens and fails fast, then after a cool-down it lets a limited number of probes through in half-open, and closes after enough successes. The clock is injected, so the whole state machine is unit-tested without sleeping."

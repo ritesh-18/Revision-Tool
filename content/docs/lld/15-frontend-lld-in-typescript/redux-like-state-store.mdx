@@ -1,0 +1,402 @@
+---
+title: "15.5 Redux-like State Store"
+---
+
+## Problem & where it's asked
+
+"Build a mini-Redux" is one of the most common non-attributed frontend system design questions. Redux itself is only about 200 lines of source code — the interesting part is *why* it is built the way it is.
+
+In a broking app the state store is the central fact table: watchlist, positions, PnL, active order IDs. React components subscribe, render on change, and dispatch actions. An interviewer who asks this is checking whether you understand the data flow, not just whether you can spell `createStore`.
+
+## Requirements
+
+**Functional**
+- `Store<S, A>`: generic over state and a discriminated-union action type.
+- `dispatch(action)` runs the reducer and notifies subscribers only when the new state reference differs.
+- `subscribe(fn)` returns an `Unsubscribe` handle; safe to call during notification.
+- `getHistory()` returns the action/state log.
+- `travelTo(index)` jumps to any snapshot; dispatching from there erases future history ("branch").
+- Middleware: `(api) => (next) => (action) => void` — compose several in left-to-right order.
+- `createSelector` and `createSelector2`: memoize a pure derivation by reference-equality on inputs.
+- `withThunk`: allows dispatching a function `(dispatch, getState) => void`.
+
+**Non-functional**
+- No `any`.
+- Reference equality for state change detection (copy-on-write in the reducer, not deep equality).
+- Notification on `travelTo` always fires (even if state ref happens to be the same as current).
+
+**Public API (written first)**
+
+```ts
+type AnyAction = { readonly type: string };
+type Reducer<S, A> = (state: S, action: A) => S;
+type Unsubscribe = () => void;
+type MiddlewareFn<S, A extends AnyAction> =
+  (api: { getState(): S; dispatch(a: A): void }) =>
+  (next: (a: A) => void) => (a: A) => void;
+
+declare class Store<S, A extends AnyAction> {
+  dispatch: (action: A) => void;
+  getState(): S;
+  subscribe(fn: () => void): Unsubscribe;
+  travelTo(index: number): void;
+  get present(): number;
+}
+declare function createSelector<S, R, O>(
+  input: (s: S) => R, result: (r: R) => O): (s: S) => O;
+declare function withThunk<S, A extends AnyAction>(
+  store: Store<S, A>): (a: A | ((d: (a: A) => void, gs: () => S) => void)) => void;
+```
+
+## Design
+
+**State model.** `states: S[]` holds every snapshot (`states[0]` = initial, `states[i+1]` = after `_actions[i]`). An integer `idx` marks the current position. Dispatching from a past `idx` splices the arrays before the push — implementing time travel without a separate undo stack.
+
+<Mermaid chart={`classDiagram
+    class Store~S,A~ {
+        -states S[]
+        -_actions A[]
+        -idx number
+        -listeners Set
+        +dispatch(action) void
+        +getState() S
+        +subscribe(fn) Unsubscribe
+        +travelTo(index) void
+        +getHistory() ReadonlyArray
+    }
+    class Middleware {
+        <<type>>
+        api → next → action → void
+    }
+    Store --> Middleware : composed via reduceRight`} />
+
+**Copy-on-write state.** The reducer produces a new object when anything changes (spread operator on the parts that changed, reuse unchanged references). `coreDispatch` checks `newState !== prevState` — object identity — before notifying listeners. A `WATCH_ADD` for a symbol already in the list returns the original state reference; no listeners fire.
+
+**Memoized selectors.** `createSelector(inputFn, resultFn)` stores the last input value and last output. On the next call, if `Object.is(newInput, lastInput)` the cached output is returned without rerunning `resultFn`. Useful for computing derived data (e.g. total portfolio value) that re-renders would otherwise recompute on every keystroke.
+
+**Middleware.** Composed with `reduceRight` so the first middleware in the array is outermost (wraps everything). Each middleware calls `next(action)` to pass control. Logger middleware compares pre- and post-dispatch state to avoid logging no-op dispatches.
+
+**Patterns.** Observer (subscribe/notify), Reducer (pure state machine), Decorator/Chain of Responsibility (middleware), Memento (state history / time travel).
+
+## Implementation
+
+```ts
+// ---- Types ---------------------------------------------------------------
+type AnyAction = { readonly type: string };
+type Reducer<S, A> = (state: S, action: A) => S;
+type Unsubscribe = () => void;
+type MiddlewareAPI<S, A> = { getState(): S; dispatch(action: A): void };
+type MiddlewareFn<S, A> = (api: MiddlewareAPI<S, A>) => (next: (action: A) => void) => (action: A) => void;
+
+interface HistoryEntry<S, A> {
+  readonly action: A;
+  readonly state: S;   // state AFTER applying action
+}
+
+class Store<S, A extends AnyAction> {
+  private states: S[];       // states[0] = initial; states[i+1] = after actions[i]
+  private readonly _actions: A[];
+  private idx: number;       // current position (0 = initial)
+  private readonly listeners = new Set<() => void>();
+  private readonly reducer: Reducer<S, A>;
+  readonly dispatch: (action: A) => void;
+
+  constructor(reducer: Reducer<S, A>, initial: S, middlewares: ReadonlyArray<MiddlewareFn<S, A>> = []) {
+    this.reducer = reducer;
+    this.states = [initial];
+    this._actions = [];
+    this.idx = 0;
+
+    const api: MiddlewareAPI<S, A> = {
+      getState: () => this.getState(),
+      dispatch: (action: A) => this.coreDispatch(action),
+    };
+    const chain = middlewares.map((m) => m(api));
+    this.dispatch = chain.reduceRight(
+      (next, mw) => (action: A) => mw(next)(action),
+      (action: A) => this.coreDispatch(action),
+    );
+  }
+
+  getState(): S {
+    return this.states[this.idx];
+  }
+
+  subscribe(listener: () => void): Unsubscribe {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  getHistory(): ReadonlyArray<HistoryEntry<S, A>> {
+    return this._actions.map((action, i) => ({ action, state: this.states[i + 1] }));
+  }
+
+  get present(): number { return this.idx; }
+
+  travelTo(index: number): void {
+    const clamped = Math.max(0, Math.min(index, this._actions.length));
+    if (clamped === this.idx) return;
+    this.idx = clamped;
+    for (const l of [...this.listeners]) l();
+  }
+
+  private coreDispatch(action: A): void {
+    const prevState = this.getState();
+    const newState = this.reducer(prevState, action);
+    // Erase future if time-traveling
+    if (this.idx < this._actions.length) {
+      this.states.splice(this.idx + 1);
+      this._actions.splice(this.idx);
+    }
+    this._actions.push(action);
+    this.states.push(newState);
+    this.idx = this._actions.length;
+    // Only notify listeners when state actually changed
+    if (newState !== prevState) {
+      for (const l of [...this.listeners]) l();
+    }
+  }
+}
+
+// ---- Memoized selectors --------------------------------------------------
+function createSelector<S, R1, O>(
+  input1: (s: S) => R1,
+  resultFn: (r1: R1) => O,
+): (s: S) => O {
+  let lastIn1: R1;
+  let lastOut: O;
+  let initialized = false;
+  return (state: S): O => {
+    const i1 = input1(state);
+    if (!initialized || !Object.is(i1, lastIn1)) {
+      lastOut = resultFn(i1);
+      lastIn1 = i1;
+      initialized = true;
+    }
+    return lastOut;
+  };
+}
+
+function createSelector2<S, R1, R2, O>(
+  input1: (s: S) => R1,
+  input2: (s: S) => R2,
+  resultFn: (r1: R1, r2: R2) => O,
+): (s: S) => O {
+  let lastIn1: R1;
+  let lastIn2: R2;
+  let lastOut: O;
+  let initialized = false;
+  return (state: S): O => {
+    const i1 = input1(state);
+    const i2 = input2(state);
+    if (!initialized || !Object.is(i1, lastIn1) || !Object.is(i2, lastIn2)) {
+      lastOut = resultFn(i1, i2);
+      lastIn1 = i1;
+      lastIn2 = i2;
+      initialized = true;
+    }
+    return lastOut;
+  };
+}
+
+// ---- Middlewares ---------------------------------------------------------
+function loggerMiddleware<S, A extends AnyAction>(
+  log: (msg: string) => void,
+): MiddlewareFn<S, A> {
+  return (api) => (next) => (action) => {
+    const prev = JSON.stringify(api.getState());
+    next(action);
+    const curr = JSON.stringify(api.getState());
+    if (prev !== curr) log(`[${action.type}] ${prev.slice(0, 60)}...`);
+  };
+}
+
+// Async-thunk: a dispatch wrapper outside the store middleware system
+type AsyncThunk<S, A> = (dispatch: (a: A) => void, getState: () => S) => void | Promise<void>;
+function withThunk<S, A extends AnyAction>(store: Store<S, A>): (action: A | AsyncThunk<S, A>) => void {
+  const thunkDispatch = (action: A | AsyncThunk<S, A>): void => {
+    if (typeof action === 'function') {
+      (action as AsyncThunk<S, A>)(thunkDispatch as (a: A) => void, () => store.getState());
+    } else {
+      store.dispatch(action);
+    }
+  };
+  return thunkDispatch;
+}
+
+// ---- Domain model --------------------------------------------------------
+interface Position {
+  readonly symbol: string;
+  readonly qty: number;
+  readonly avgPrice: number;
+}
+
+interface TradingState {
+  readonly watchlist: readonly string[];
+  readonly positions: readonly Position[];
+  readonly loading: boolean;
+  readonly error: string | null;
+}
+
+type TradingAction =
+  | { type: 'WATCH_ADD'; payload: string }
+  | { type: 'WATCH_REMOVE'; payload: string }
+  | { type: 'POSITION_SET'; payload: Position }
+  | { type: 'SET_LOADING'; payload: boolean }
+  | { type: 'SET_ERROR'; payload: string | null };
+
+const initial: TradingState = { watchlist: [], positions: [], loading: false, error: null };
+
+function tradingReducer(state: TradingState, action: TradingAction): TradingState {
+  switch (action.type) {
+    case 'WATCH_ADD':
+      return state.watchlist.includes(action.payload)
+        ? state  // same reference: no listener notification
+        : { ...state, watchlist: [...state.watchlist, action.payload] };
+    case 'WATCH_REMOVE':
+      return { ...state, watchlist: state.watchlist.filter((s) => s !== action.payload) };
+    case 'POSITION_SET': {
+      const idx = state.positions.findIndex((p) => p.symbol === action.payload.symbol);
+      const positions = idx >= 0
+        ? state.positions.map((p, i) => (i === idx ? action.payload : p))
+        : [...state.positions, action.payload];
+      return { ...state, positions };
+    }
+    case 'SET_LOADING':
+      return state.loading === action.payload ? state : { ...state, loading: action.payload };
+    case 'SET_ERROR':
+      return { ...state, error: action.payload };
+  }
+}
+
+// ---- Selectors -----------------------------------------------------------
+const selectWatchlist = (s: TradingState): readonly string[] => s.watchlist;
+const selectPositions = (s: TradingState): readonly Position[] => s.positions;
+
+const selectWatchlistCount = createSelector(selectWatchlist, (wl) => wl.length);
+const selectTotalValue = createSelector(selectPositions, (positions) =>
+  positions.reduce((sum, p) => sum + p.qty * p.avgPrice, 0),
+);
+const selectWatchlistInPositions = createSelector2(
+  selectWatchlist,
+  selectPositions,
+  (wl, positions) => {
+    const inPos = new Set(positions.map((p) => p.symbol));
+    return wl.filter((s) => inPos.has(s));
+  },
+);
+
+// ---- Demo ----------------------------------------------------------------
+const logLines: string[] = [];
+const store = new Store<TradingState, TradingAction>(
+  tradingReducer,
+  initial,
+  [loggerMiddleware<TradingState, TradingAction>((msg) => logLines.push(msg))],
+);
+const dispatch = withThunk(store);
+
+let renders = 0;
+const unsub = store.subscribe(() => renders++);
+
+console.log('1) dispatch and idempotent guard');
+dispatch({ type: 'WATCH_ADD', payload: 'RELIANCE' });
+dispatch({ type: 'WATCH_ADD', payload: 'INFY' });
+const rendersBefore = renders;
+dispatch({ type: 'WATCH_ADD', payload: 'RELIANCE' }); // duplicate: reducer returns same ref
+const rendersAfter = renders;
+console.log(`  watchlist: ${store.getState().watchlist.join(', ')}`);
+console.log(`  idempotent add triggered listeners: ${rendersBefore !== rendersAfter}`);
+
+dispatch({ type: 'POSITION_SET', payload: { symbol: 'RELIANCE', qty: 10, avgPrice: 2940 } });
+dispatch({ type: 'POSITION_SET', payload: { symbol: 'INFY', qty: 5, avgPrice: 1600 } });
+const snap1 = store.getState();
+console.log(`  positions: ${snap1.positions.map((p) => `${p.symbol}×${p.qty}@${p.avgPrice}`).join(', ')}`);
+
+console.log('2) memoized selectors');
+const val1 = selectTotalValue(store.getState());
+const val2 = selectTotalValue(store.getState()); // same input → cached
+dispatch({ type: 'POSITION_SET', payload: { symbol: 'RELIANCE', qty: 10, avgPrice: 2960 } });
+const val3 = selectTotalValue(store.getState()); // input changed → recomputes
+console.log(`  totalValue before: ${val1}, after RELIANCE update: ${val3}`);
+console.log(`  inPositions: ${selectWatchlistInPositions(store.getState()).join(', ')}`);
+
+console.log('3) async thunk');
+dispatch((d, getState) => {
+  d({ type: 'SET_LOADING', payload: true });
+  d({ type: 'WATCH_ADD', payload: 'TCS' });
+  d({ type: 'SET_LOADING', payload: false }); // SET_LOADING false→false if already false... but it's true
+  console.log(`  thunk read watchlist length=${getState().watchlist.length}`);
+});
+console.log(`  watchlist: ${store.getState().watchlist.join(', ')}`);
+
+console.log('4) time travel');
+const presentIdx = store.present;
+console.log(`  history length: ${store.getHistory().length}, present: ${presentIdx}`);
+store.travelTo(2); // after 2 dispatches: watchlist=['RELIANCE','INFY'], no positions
+console.log(`  at t=2: watchlist=${JSON.stringify(store.getState().watchlist)}, positions=${store.getState().positions.length}`);
+store.travelTo(0);
+const at0 = store.getState();
+console.log(`  at t=0: ${JSON.stringify(at0)}`);
+store.travelTo(presentIdx);
+console.log(`  restored to present: watchlist=${store.getState().watchlist.join(', ')}`);
+// Branch from t=5 (after both positions were set)
+store.travelTo(5);
+const stateBeforeBranch = store.getState();
+dispatch({ type: 'WATCH_REMOVE', payload: 'RELIANCE' });
+console.log(`  branch from t=5: watchlist=${store.getState().watchlist.join(', ')}, history=${store.getHistory().length}`);
+
+console.log('5) logger (first 2 entries)');
+logLines.slice(0, 2).forEach((l) => console.log(`  ${l}`));
+
+console.log('6) checks');
+unsub(); // stop counting renders
+const rendersBranch = renders;
+dispatch({ type: 'WATCH_ADD', payload: 'HDFC' }); // no more listener
+const check = (label: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${label}`);
+check('idempotent dispatch does not notify (ref equality)', !( rendersBefore !== rendersAfter ));
+check('cached selector returned same ref', val1 === val2);
+check('selector recomputes after input change', val3 !== val1);
+check('watchlist count selector', selectWatchlistCount(snap1) === 2);
+check('time travel to t=0 gives initial state', JSON.stringify(at0) === JSON.stringify({ watchlist: [], positions: [], loading: false, error: null }));
+check('branch erased future history', store.getHistory().length < presentIdx);
+check('unsubscribe stops render counting', renders === rendersBranch);
+// snap1 was captured before we branched — structural sharing keeps it intact
+check('snap1 immutable after branch', snap1.positions.length === 2 && snap1.watchlist.includes('RELIANCE'));
+check('stateBeforeBranch at t=5 had 2 positions', stateBeforeBranch.positions.length === 2);
+```
+
+```text
+1) dispatch and idempotent guard
+  watchlist: RELIANCE, INFY
+  idempotent add triggered listeners: false
+  positions: RELIANCE×10@2940, INFY×5@1600
+2) memoized selectors
+  totalValue before: 37400, after RELIANCE update: 37600
+  inPositions: RELIANCE, INFY
+3) async thunk
+  thunk read watchlist length=3
+  watchlist: RELIANCE, INFY, TCS
+4) time travel
+  history length: 9, present: 9
+  at t=2: watchlist=["RELIANCE","INFY"], positions=0
+  at t=0: {"watchlist":[],"positions":[],"loading":false,"error":null}
+  restored to present: watchlist=RELIANCE, INFY, TCS
+  branch from t=5: watchlist=INFY, history=6
+5) logger (first 2 entries)
+  [WATCH_ADD] {"watchlist":[],"positions":[],"loading":false,"error":null}...
+  [WATCH_ADD] {"watchlist":["RELIANCE"],"positions":[],"loading":false,"er...
+6) checks
+  PASS idempotent dispatch does not notify (ref equality)
+  PASS cached selector returned same ref
+  PASS selector recomputes after input change
+  PASS watchlist count selector
+  PASS time travel to t=0 gives initial state
+  PASS branch erased future history
+  PASS unsubscribe stops render counting
+  PASS snap1 immutable after branch
+  PASS stateBeforeBranch at t=5 had 2 positions
+```
+
+## What we built
+
+A 200-line Redux clone that covers the parts interviewers actually probe: reference-equality change detection, middleware as a composed decorator chain, memoized selectors as a pure cache keyed on input identity, and time-travel by maintaining a complete state array rather than undo deltas. The `withThunk` wrapper shows the boundary between sync middleware (which runs inside `dispatch`) and async orchestration (which lives outside it).

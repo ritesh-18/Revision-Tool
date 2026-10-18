@@ -1,0 +1,750 @@
+---
+title: "19. Monitoring and Observability"
+description: "Observability is the property that lets you ask new questions about a running system without redeploying it. The traditional pillars are metrics, logs, and..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth added to a topic the chapter already covers.
+  - ➕ **Beyond the handbook**: a topic the chapter does not cover, added because a GenAI engineer should know it.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams.
+</Callout>
+
+## 19.1 Concept Explanation
+
+Observability is the property that lets you ask new questions about a running system without redeploying it. The traditional pillars are metrics, logs, and traces. GenAI adds three more: evaluations, costs, and safety signals.
+
+A GenAI system without observability is a dare. You will not know which model version is degrading, which prompt is hallucinating, which tenant is burning budget, which retrieval path is failing. The cost of building observability is small; the cost of not having it is invisible until it is enormous.
+
+## 19.2 The Three Plus Three Pillars
+
+<Mermaid chart={`flowchart LR
+  subgraph TR["Traditional"]
+    M["Metrics<br/>numerical time series<br/>(latency, error rate, QPS)"]
+    L["Logs<br/>text records of events"]
+    T["Traces<br/>request paths across services"]
+  end
+  subgraph GA["GenAI additions"]
+    E["Evals<br/>quality scores against expected behavior"]
+    C["Cost<br/>per-request and aggregate spend"]
+    S["Safety<br/>refusals, harmful outputs, injection attempts"]
+  end
+  TR ~~~ GA`} />
+
+Each pillar has tools. Mature stacks treat all six as first-class.
+
+## 19.3 Prometheus
+
+Prometheus is the dominant open-source metrics system. It scrapes time-series data from instrumented services, stores it efficiently, and supports a powerful query language (PromQL).
+
+For GenAI, scrape every service: app servers (latency, tokens), inference servers (KV cache, GPU utilization via DCGM exporter), vector DBs (query latency), gateways (request rate). Aggregate to dashboards and alerts.
+
+Strengths: open source, ubiquitous, strong ecosystem. Weaknesses: long-term storage requires extensions (Thanos, Mimir, VictoriaMetrics), cardinality blow-up is easy.
+
+## 19.4 Grafana
+
+Grafana is the dominant visualization tool. Connect it to Prometheus, Loki, Tempo, and many other backends; build dashboards and alerts.
+
+For GenAI: one dashboard per service, one dashboard per AI feature, one dashboard for the LLM gateway. The discipline is making each dashboard small and answerable at a glance.
+
+## 19.5 Loki
+
+Loki is Grafana Labs' log aggregation system. Indexes only metadata, stores log lines compressed in object storage. Cheap, scalable.
+
+For GenAI, log structured events per request: trace ID, user ID, model, tokens, cost, latency, retrieval IDs, tool calls. Avoid logging full prompts and completions unless redacted or sampled — they balloon cost and risk PII.
+
+## 19.6 ELK Stack
+
+Elasticsearch + Logstash + Kibana — the classic enterprise logging stack. Powerful full-text search, rich aggregations, mature. More expensive than Loki at scale but better for complex investigative queries.
+
+OpenSearch (the AWS-led fork) is functionally equivalent and Apache-licensed.
+
+## 19.7 OpenTelemetry
+
+OpenTelemetry is the open standard for instrumentation. One set of SDKs, one wire protocol, many backends (Prometheus, Tempo, Jaeger, Datadog, Honeycomb).
+
+Adopt OpenTelemetry early. It decouples instrumentation from any specific vendor; you can swap backends without re-instrumenting your code.
+
+For GenAI: emit a span for every LLM call with attributes (model, tokens, prompt hash, retrieval IDs, cost). The trace becomes a complete record of what the system did.
+
+### The OpenTelemetry GenAI semantic conventions 🔧
+
+The span-per-LLM-call advice above works best when every service uses the same attribute names, and OpenTelemetry now defines them. General OpenTelemetry setup (SDKs, the Collector, sampling) is covered in [Backend: Logging, Monitoring and Observability](/docs/backend-first-principles/18-logging-monitoring-observability). This section is only the GenAI part.
+
+#### Status and where the spec lives (as of October 2026)
+
+The GenAI conventions moved out of the main semantic-conventions repository into a dedicated [semantic-conventions-genai](https://github.com/open-telemetry/semantic-conventions-genai) repository in 2026. Every GenAI span, metric and attribute there is still marked **Development**, which means names can still change. Two renames already caught many teams: `gen_ai.system` became `gen_ai.provider.name`, and the single `gen_ai.client.token.usage` histogram (broken down by `gen_ai.token.type`) was replaced by separate token counters such as `gen_ai.client.inference.usage.input_tokens`. Pin the convention version your dashboards expect, and keep the attribute names in one module so a rename is a one-line change.
+
+#### What a compliant inference span looks like
+
+- **Name:** `{gen_ai.operation.name} {gen_ai.request.model}`, for example `chat claude-x-2026-05-01`.
+- **Kind:** `CLIENT` for a remote provider.
+- **Required:** `gen_ai.operation.name` (`chat`, `embeddings`, `retrieval`, `execute_tool`, `invoke_agent` and others) and `gen_ai.provider.name` (`anthropic`, `openai`, `aws.bedrock`, `gcp.vertex_ai` and others).
+- **Conditionally required or recommended:** `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.response.finish_reasons`, `gen_ai.conversation.id`, `gen_ai.prompt.name` and `gen_ai.prompt.version`, `gen_ai.request.stream`, `gen_ai.response.time_to_first_chunk`, and `error.type` on failure.
+- **Opt-in only:** `gen_ai.system_instructions`, `gen_ai.input.messages`, `gen_ai.output.messages`. Instrumentations should not capture content by default (see 19.18).
+
+#### Instrumenting a streaming call in Node
+
+Auto-instrumentation packages exist for popular provider SDKs, but they differ in which convention version they emit and they cannot see your prompt version or tenant. A thin wrapper around your own gateway client gives you full control.
+
+```ts
+import { trace, metrics, SpanKind, SpanStatusCode } from '@opentelemetry/api';
+
+const tracer = trace.getTracer('llm-gateway', '1.0.0');
+const meter = metrics.getMeter('llm-gateway', '1.0.0');
+
+const opDuration = meter.createHistogram('gen_ai.client.operation.duration', {
+  unit: 's',
+  advice: { explicitBucketBoundaries: [0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92] },
+});
+const ttft = meter.createHistogram('gen_ai.client.operation.time_to_first_chunk', {
+  unit: 's',
+  // include your SLO threshold (2 s here) as a boundary, see 19.20
+  advice: { explicitBucketBoundaries: [0.1, 0.25, 0.5, 1, 1.5, 2, 3, 5, 10] },
+});
+const inputTokens = meter.createCounter('gen_ai.client.inference.usage.input_tokens', { unit: '{token}' });
+const outputTokens = meter.createCounter('gen_ai.client.inference.usage.output_tokens', { unit: '{token}' });
+
+type Chunk = { text?: string; model?: string; finishReason?: string;
+  usage?: { input: number; output: number; cacheRead?: number } };
+type ChatReq = { provider: string; model: string; maxTokens: number; temperature: number;
+  conversationId: string; prompt: { name: string; version: string } };
+
+export function tracedChat(req: ChatReq, open: () => AsyncIterable<Chunk>, onText: (t: string) => void) {
+  const base = { 'gen_ai.operation.name': 'chat', 'gen_ai.provider.name': req.provider, 'gen_ai.request.model': req.model };
+  return tracer.startActiveSpan(`chat ${req.model}`, {
+    kind: SpanKind.CLIENT,
+    attributes: {
+      ...base,
+      'gen_ai.request.max_tokens': req.maxTokens,
+      'gen_ai.request.temperature': req.temperature,
+      'gen_ai.request.stream': true,
+      'gen_ai.conversation.id': req.conversationId,
+      'gen_ai.prompt.name': req.prompt.name,
+      'gen_ai.prompt.version': req.prompt.version,
+    },
+  }, async (span) => {
+    const start = performance.now();
+    let first = true;
+    let last: Chunk = {};
+    try {
+      for await (const chunk of open()) {
+        if (first && chunk.text) {
+          const s = (performance.now() - start) / 1000;
+          span.setAttribute('gen_ai.response.time_to_first_chunk', s);
+          ttft.record(s, base);
+          first = false;
+        }
+        if (chunk.text) onText(chunk.text);
+        last = { ...last, ...chunk };
+      }
+      const u = last.usage;
+      span.setAttributes({
+        'gen_ai.response.model': last.model ?? req.model,
+        'gen_ai.response.finish_reasons': last.finishReason ? [last.finishReason] : [],
+        'gen_ai.usage.input_tokens': u?.input ?? 0,
+        'gen_ai.usage.output_tokens': u?.output ?? 0,
+        'gen_ai.usage.cache_read.input_tokens': u?.cacheRead ?? 0,
+      });
+      if (u) {
+        inputTokens.add(u.input, base);
+        outputTokens.add(u.output, base);
+      }
+      opDuration.record((performance.now() - start) / 1000, base);
+      return last;
+    } catch (err) {
+      const errorType = (err as { name?: string }).name ?? 'Error';
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      span.setAttribute('error.type', errorType);
+      opDuration.record((performance.now() - start) / 1000, { ...base, 'error.type': errorType });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+```
+
+#### Edge cases
+- **Usage arrives last.** Most providers report token usage in the final stream event. If the client disconnects and you abort, you may never receive it, yet the provider still bills what it generated. Record an estimate (count tokens you streamed) and flag it as estimated.
+- **Retries.** The spec says the span covers the logical operation including automatic retries. If your gateway retries or fails over to another provider, add a child span per attempt so the parent stays one logical call.
+- **Label cardinality.** Never put `gen_ai.conversation.id`, user IDs or prompt hashes on metric attributes. They belong on spans and logs. Metric attributes should be low-cardinality: provider, model, operation, feature, error type.
+
+## 19.8 Jaeger and Tempo
+
+Distributed tracing backends. Jaeger is the classic open-source choice; Tempo is Grafana Labs' newer, cheaper alternative (uses object storage).
+
+Traces are the single most useful artifact when debugging a degraded request. You see exactly where time went, which service slowed, which retrieval missed, which tool failed.
+
+### Tracing an agent run 🔧
+
+Traces are most valuable for agents, where one user request becomes a loop of model calls and tool calls, so the span structure needs to reflect that loop.
+
+#### The span tree
+
+**Problem.** An agent request took 40 seconds and cost a dollar. A flat list of LLM spans does not show which step looped, which tool was slow, or why the agent kept going.
+
+**Mechanism.** Use the GenAI agent conventions: one `invoke_agent {agent name}` span for the run, a `chat {model}` child for each model turn, and an `execute_tool {tool name}` child for each tool call (with `gen_ai.tool.name`, `gen_ai.tool.call.id` and `gen_ai.tool.type`). Retrieval inside a tool gets its own `retrieval` span.
+
+<Mermaid chart={`flowchart TD
+  A["invoke_agent support-agent<br/>(INTERNAL, whole run)"] --> B["chat model<br/>turn 1: decides to search"]
+  A --> C["execute_tool search_kb"]
+  C --> C1["retrieval<br/>(vector DB query)"]
+  A --> D["chat model<br/>turn 2: decides to create ticket"]
+  A --> E["execute_tool create_ticket"]
+  E --> E1["HTTP POST ticketing API<br/>(auto-instrumented)"]
+  A --> F["chat model<br/>turn 3: final answer"]`} />
+
+```ts
+import { trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
+const tracer = trace.getTracer('support-agent', '1.0.0');
+
+export async function runAgent(input: string, deps: AgentDeps, maxSteps = 8) {
+  return tracer.startActiveSpan('invoke_agent support-agent', {
+    kind: SpanKind.INTERNAL,
+    attributes: { 'gen_ai.operation.name': 'invoke_agent', 'gen_ai.agent.name': 'support-agent',
+                  'gen_ai.provider.name': deps.provider },
+  }, async (agentSpan) => {
+    const messages: Msg[] = [{ role: 'user', content: input }];
+    let toolCalls = 0;
+    try {
+      for (let step = 0; step < maxSteps; step++) {
+        const turn = await deps.chat(messages); // wrapped with tracedChat from 19.7
+        if (!turn.toolCalls.length) return turn.text;
+        for (const call of turn.toolCalls) {
+          toolCalls++;
+          const result = await tracer.startActiveSpan(`execute_tool ${call.name}`, {
+            kind: SpanKind.INTERNAL,
+            attributes: { 'gen_ai.operation.name': 'execute_tool', 'gen_ai.tool.name': call.name,
+                          'gen_ai.tool.call.id': call.id, 'gen_ai.tool.type': 'function' },
+          }, async (toolSpan) => {
+            try { return await deps.tools[call.name](call.args); }
+            catch (e) { toolSpan.recordException(e as Error); toolSpan.setStatus({ code: SpanStatusCode.ERROR }); return { error: String(e) }; }
+            finally { toolSpan.end(); }
+          });
+          messages.push({ role: 'tool', toolCallId: call.id, content: JSON.stringify(result) });
+        }
+      }
+      agentSpan.setAttribute('app.agent.stop_reason', 'max_steps'); // custom namespace
+      return 'I could not finish this request.';
+    } finally {
+      agentSpan.setAttribute('app.agent.tool_calls', toolCalls);
+      agentSpan.end();
+    }
+  });
+}
+```
+
+#### Crossing queue boundaries
+
+**Problem.** Long agent tasks run in BullMQ workers. The worker's spans start a new trace, so the request and its background work are disconnected.
+
+**Mechanism.** Inject the trace context into the job data when enqueuing and extract it in the worker. This uses the standard W3C `traceparent` format.
+
+```ts
+import { context, propagation, trace } from '@opentelemetry/api';
+
+// producer
+const carrier: Record<string, string> = {};
+propagation.inject(context.active(), carrier);
+await agentQueue.add('run', { input, otel: carrier });
+
+// worker
+new Worker('agent', async (job) => {
+  const parent = propagation.extract(context.active(), job.data.otel);
+  return context.with(parent, () => runAgent(job.data.input, deps));
+}, { connection });
+```
+
+#### Edge cases
+- **Huge traces.** An agent that loops 50 times produces hundreds of spans. Cap steps (as above), and record the step count and stop reason on the root span so you can query for runaway runs.
+- **Tool arguments and results** are content (`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` are opt-in). They often contain user data. Apply the same redaction rules as prompts (19.18).
+- **Tail sampling.** Head sampling at 10 percent drops 90 percent of failed agent runs. Use tail-based sampling in the Collector to keep all traces with errors, high cost or high latency (19.24).
+
+## 19.9 LangSmith
+
+LangSmith (from LangChain) is a specialized observability platform for LLM applications. It captures every LLM call with prompts, completions, latencies, costs, eval scores, and a UI tuned for prompt iteration.
+
+Strengths: prompt-aware, integrated with LangChain and most major LLM SDKs, eval features. Weaknesses: yet another vendor, hosted SaaS by default.
+
+## 19.10 Phoenix
+
+Arize Phoenix is open-source observability and evaluation for LLMs and traditional ML. Strong on drift detection, retrieval evaluation, and embedding visualization.
+
+## 19.11 Langfuse, Helicone, Portkey
+
+Other LLM-focused observability tools:
+- **Langfuse.** Open source, self-hostable, prompt management included.
+- **Helicone.** Proxy-style observability — point your LLM client at Helicone, get full visibility.
+- **Portkey.** Combines LLM gateway, caching, and observability.
+
+These tools overlap with each other. Pick one and standardize.
+
+## 19.12 What to Monitor — Application Metrics
+
+- **Throughput.** Requests per second, by endpoint and model.
+- **Latency.** p50, p95, p99 of total response time and time-to-first-token.
+- **Error rate.** By type (timeouts, 5xx, model refusals, format failures).
+- **Active connections.** Especially for streaming endpoints.
+- **Cache hit rate.** Raw cache and semantic cache.
+- **Token counts.** Input, output, total. By model, by feature, by tenant.
+
+## 19.13 What to Monitor — Model Metrics
+
+- **Time-to-first-token.** Most important perceived-latency metric.
+- **Tokens per second** during decode.
+- **Refusal rate** (model declined to answer).
+- **Tool call rate** and tool call success rate.
+- **Hallucination rate** — measured via LLM-as-judge or retrieval-grounded checks.
+- **Output schema validation rate** for structured outputs.
+
+## 19.14 What to Monitor — Cost
+
+- **Cost per request, per user, per tenant, per feature.**
+- **Cost per resolved task** — the business-meaningful denominator.
+- **Cost by model.** Useful for routing decisions.
+- **Cost trend.** Daily, weekly, monthly. Set anomaly alerts on sudden spikes.
+- **Budget burn rate** vs allocated.
+
+### Computing cost per tenant without breaking Prometheus 🔧
+
+The cost metrics above need per-tenant numbers, and the obvious implementation (a `tenant_id` label on a Prometheus counter) is exactly the cardinality trap 19.24 warns about, so cost needs two paths.
+
+#### Two paths for two questions
+
+**Problem.** Finance wants cost per tenant per month for 20,000 tenants. On-call wants to know within minutes that spend is spiking.
+
+**Why it happens.** Prometheus stores one time series per unique label combination. 20,000 tenants × 10 models × 5 features is a million series, which is expensive and slow. Billing questions, on the other hand, do not need second-level freshness.
+
+**Mechanism.**
+- **Metrics path (real time, low cardinality):** a cost counter labelled by model, feature and tenant tier (`free`, `pro`, `enterprise`). Alert on its rate.
+- **Event path (exact, high cardinality):** one usage event per call with tenant ID, trace ID, token counts and computed cost, written to Kafka or a Postgres table and rolled up into the warehouse with dbt (18.12). Per-tenant dashboards and invoices read from here.
+
+```ts
+// `meter` and `trace` as in the 19.7 example. Prices are data with a version, not constants in code.
+type Price = { inputPerMTok: number; cachedInputPerMTok: number; outputPerMTok: number };
+const PRICES: Record<string, { version: string; price: Price }> = {
+  'support-answer@7': { version: '2026-09-01', price: { inputPerMTok: 3, cachedInputPerMTok: 0.3, outputPerMTok: 15 } },
+};
+
+const costCounter = meter.createCounter('app.llm.cost', { unit: 'USD' });
+
+export async function recordUsage(e: { tenantId: string; tier: string; feature: string; modelConfig: string;
+  traceId: string; input: number; cachedInput: number; output: number; estimated: boolean }) {
+  const { version, price } = PRICES[e.modelConfig];
+  const usd = ((e.input - e.cachedInput) * price.inputPerMTok
+             + e.cachedInput * price.cachedInputPerMTok
+             + e.output * price.outputPerMTok) / 1_000_000;
+  costCounter.add(usd, { 'app.tenant.tier': e.tier, 'app.feature': e.feature, 'gen_ai.request.model': e.modelConfig });
+  trace.getActiveSpan()?.setAttribute('app.llm.cost_usd', usd);
+  await usageQueue.add('usage', { ...e, usd, priceVersion: version }); // BullMQ -> Postgres/warehouse
+}
+```
+
+#### Edge cases
+- **Cached and reasoning tokens.** Cached input is billed at a discount and reasoning tokens are usually billed as output. Per the conventions, `gen_ai.usage.input_tokens` includes cached tokens, which is why the code subtracts them before applying the full price.
+- **Price changes.** Store the price version on each usage event so historical cost does not change when you update the table, and reconcile monthly against the provider invoice.
+- **Retries and failovers** are billed. Record usage per attempt, not per logical request.
+- **Embeddings, rerankers, vector DB and GPU time** are part of cost per resolved task too. A chat-only cost metric under-reports agentic and RAG features. See [Chapter 25](/docs/genai-handbook/25-cost-optimization) for cost reduction.
+
+## 19.15 What to Monitor — Quality / Evals
+
+- **Eval scores** by prompt version, model version, dataset.
+- **User feedback rate** (thumbs up/down ratio).
+- **Regeneration rate.**
+- **Edit acceptance rate** (for code or content suggestions).
+- **Citation accuracy rate** in RAG.
+
+### Sampling production traffic for evaluation 🔧
+
+Eval scores in production come from scoring a sample of live responses, and the sampler and judge must stay off the request path and inside a budget.
+
+#### Deterministic, stratified sampling
+
+**Problem.** Scoring every response with a judge model roughly doubles LLM cost. Random 1 percent sampling misses rare but important slices (a small enterprise tenant, a new feature).
+
+**Mechanism.** Sample by hashing the trace ID (so the decision is reproducible and consistent across services), with a rate per feature, and always include responses with negative feedback or safety flags. Enqueue a job after the response is sent, and enforce a daily judge budget in the worker.
+
+```ts
+import { createHash } from 'node:crypto';
+
+const RATES: Record<string, number> = { 'support-chat': 0.02, 'contract-summary': 0.2 }; // low-volume, high-risk gets more
+
+export function shouldEvaluate(traceId: string, feature: string, flags: { thumbsDown?: boolean; safetyFlag?: boolean }) {
+  if (flags.thumbsDown || flags.safetyFlag) return true;
+  const h = createHash('sha256').update(traceId).digest().readUInt32BE(0) / 0xffffffff;
+  return h < (RATES[feature] ?? 0.01);
+}
+
+// Worker: judge with a rubric, store the score, emit a low-cardinality metric
+new Worker('online-eval', async (job) => {
+  if (!(await budget.tryConsume('judge', 1))) return { skipped: 'budget' }; // Redis counter, resets daily
+  const rec = await loadRedactedGeneration(job.data.traceId); // input, context chunks, output
+  const verdict = await judge(rec); // { grounded: 0|1, helpful: 1..5, reason }
+  await saveScore(job.data.traceId, verdict, rec.promptVersion, rec.modelConfig);
+  qualityHistogram.record(verdict.helpful, { 'app.feature': rec.feature, 'gen_ai.prompt.version': rec.promptVersion });
+}, { connection, concurrency: 4 });
+```
+
+#### Reading the numbers
+
+**Problem.** The daily groundedness score drops from 0.91 to 0.88. Is that real?
+
+**Mechanism.** At 500 samples per day, the standard error of a proportion near 0.9 is about √(0.9 × 0.1 / 500) ≈ 0.013, so a 3-point drop is just past two standard errors: worth a look, not a page. Alert on sustained drops over several days or on drops within one prompt version, and always break scores down by prompt version, model config and feature, since an average across a rollout hides the regression.
+
+#### Edge cases
+- **Biased sample.** Over-sampling thumbs-down responses is good for finding failures but biases the average. Compute headline scores from the random sample only.
+- **Judge drift.** If the judge model changes, every score shifts. Pin the judge's model snapshot and re-calibrate (19.19) when you change it.
+- **Privacy.** The judge sees user content. Use the redacted copy, and make sure the judge provider is covered by the same data-processing terms as the main model.
+
+## 19.15a Drift Detection for Queries and Embeddings ➕
+
+Chapter 17 (17.17) explains why drift matters for LLM apps; this section shows how to measure it in production from data you already have: query embeddings and retrieval scores.
+
+### Measuring query drift with embedding clusters ➕
+
+**Problem.** A new product launch brings a wave of questions the corpus does not cover. Quality scores drop slowly and nobody notices for weeks.
+
+**Why it happens.** Users' intents shift, but averaged metrics (latency, overall score) do not move until the new intent becomes a large share of traffic.
+
+**Mechanism.** Cluster a baseline window of query embeddings (k-means into, say, 50 clusters), assign each new window's queries to the nearest cluster, and compare the cluster distributions with the Population Stability Index (PSI), the sum over clusters of `(p - q) * ln(p / q)`. Common rules of thumb read PSI below 0.1 as stable, 0.1 to 0.25 as moderate shift, and above 0.25 as major shift. Also track the share of queries whose distance to their nearest centroid exceeds the baseline's 95th percentile: these are new intents, and a sample of them is exactly what to read and add to the golden set.
+
+```python
+import numpy as np
+from sklearn.cluster import KMeans
+
+def fit_baseline(base_emb: np.ndarray, k: int = 50, seed: int = 0):
+    km = KMeans(n_clusters=k, n_init="auto", random_state=seed).fit(base_emb)
+    d = np.min(km.transform(base_emb), axis=1)
+    return km, np.percentile(d, 95)
+
+def drift_report(km, novelty_cutoff, base_emb, new_emb, eps=1e-4):
+    k = km.n_clusters
+    p = np.bincount(km.predict(base_emb), minlength=k) / len(base_emb)
+    q = np.bincount(km.predict(new_emb), minlength=k) / len(new_emb)
+    p, q = p + eps, q + eps                      # avoid log(0) on empty clusters
+    psi = float(np.sum((q - p) * np.log(q / p)))
+    novel = np.min(km.transform(new_emb), axis=1) > novelty_cutoff
+    return {"psi": psi, "novel_share": float(novel.mean()),
+            "grown_clusters": np.argsort(q - p)[-5:][::-1].tolist()}
+```
+
+Embeddings should be L2-normalized before clustering so that Euclidean k-means approximates cosine similarity.
+
+### Retrieval-score drift as a coverage signal ➕
+
+**Problem.** You want to know when users ask things the corpus cannot answer, before the answers get bad.
+
+**Mechanism.** Log the top-1 retrieval similarity per query (it is already in the retrieval span). A falling median, or a growing share of queries below a "no good match" threshold, means coverage is dropping. This is cheaper than any judge and often moves first.
+
+### Edge cases ➕
+- **Embedding model changes reset the baseline.** Vectors from different models are not comparable. Refit the baseline after any embedding migration.
+- **Seasonality.** Monday traffic differs from Saturday traffic. Compare like with like (same weekday, or a rolling four-week baseline).
+- **Small windows.** With 200 queries and 50 clusters, PSI is dominated by noise. Use fewer clusters or longer windows for low-traffic features.
+- **Privacy.** Query embeddings are derived from user text (see 18.15c on inversion). Store them with the same retention and access rules as the queries.
+
+## 19.16 What to Monitor — Safety
+
+- **Refusals** — both count and pattern.
+- **Detected prompt injection attempts.**
+- **PII detection events.**
+- **Toxicity flags** from content classifiers.
+- **Tool calls to sensitive endpoints** for human review.
+
+## 19.17 What to Monitor — Infrastructure
+
+- **GPU utilization** via NVIDIA DCGM exporter.
+- **GPU memory** usage and fragmentation.
+- **Inference server** KV cache utilization, queue depth, admission rate.
+- **Pod health** — restarts, OOM events, readiness flips.
+- **Network** between services and to external providers.
+
+## 19.18 Logging Discipline
+
+Logs are expensive and risky. Discipline:
+
+- **Structured logs.** JSON, not free text. Searchable, parseable.
+- **Trace IDs** in every log line.
+- **No raw prompts or completions** unless explicitly enabled and redacted.
+- **Sample** verbose logs to a fraction; do not log every token.
+- **Rate-limit** error logs; one error storm should not blow up storage cost.
+- **Retention policies** per log type.
+
+### Logging prompts safely when you need them 🔧
+
+The "no raw prompts unless enabled and redacted" rule above leaves open how to enable it safely, which matters because debugging quality problems without seeing the prompt is close to impossible.
+
+#### Separate the content store from operational telemetry
+
+**Problem.** Engineers need prompts and completions to debug hallucinations. Putting them in Loki or on spans means everyone with dashboard access can read customer data, and log retention is set for operations, not privacy.
+
+**Mechanism.** This is the pattern the OpenTelemetry GenAI conventions recommend for production: keep content out of spans and logs, write it to a separate store with its own access control and retention, and put only a reference on the span.
+
+```ts
+import { trace } from '@opentelemetry/api';
+
+const CAPTURE = process.env.GENAI_CAPTURE_CONTENT === 'true'; // off by default
+
+export async function captureContent(traceId: string, tenant: { id: string; allowsContentLogging: boolean },
+                                     input: Msg[], output: string) {
+  if (!CAPTURE || !tenant.allowsContentLogging) return; // per-tenant contract setting
+  const record = {
+    traceId,
+    tenantId: tenant.id,
+    input: input.map((m) => ({ role: m.role, content: redact(m.content) })),
+    output: redact(output),
+    expiresAt: new Date(Date.now() + 14 * 24 * 3600 * 1000), // short retention, enforced by a TTL job
+  };
+  const key = `genai-content/${tenant.id}/${traceId}.json`;
+  await contentStore.put(key, JSON.stringify(record)); // encrypted bucket, separate IAM role
+  trace.getActiveSpan()?.setAttribute('app.genai.content_ref', key);
+}
+```
+
+#### Redaction that runs on the hot path
+
+**Problem.** Running an NER model on every log line adds latency and cost.
+
+**Mechanism.** Use fast regex-based redaction for structured identifiers inline (emails, phone numbers, card numbers with a Luhn check, API keys), and run the slower NER pass (Presidio, see 18.15c) asynchronously on the stored content before anyone can query it.
+
+```ts
+const PATTERNS: [RegExp, string][] = [
+  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<EMAIL>'],
+  [/\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{16,}\b/g, '<API_KEY>'],
+  [/\+?\d[\d\s().-]{8,}\d/g, '<PHONE>'],
+];
+
+function luhnOk(digits: string) {
+  let sum = 0;
+  for (let i = 0; i < digits.length; i++) {
+    let d = Number(digits[digits.length - 1 - i]);
+    if (i % 2 === 1) { d *= 2; if (d > 9) d -= 9; }
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+
+export function redact(text: string): string {
+  let out = text.replace(/\b(?:\d[ -]?){13,19}\b/g, (m) => (luhnOk(m.replace(/\D/g, '')) ? '<CARD>' : m));
+  for (const [re, label] of PATTERNS) out = out.replace(re, label);
+  return out;
+}
+```
+
+#### Edge cases
+- **Order matters.** Redact cards before phone numbers, or the phone pattern eats card numbers and the Luhn check never runs.
+- **Secrets in prompts.** Users paste API keys and passwords into chat. The API-key pattern above catches common prefixes only. Add patterns for the providers your users use, and consider a secret scanner on the async pass.
+- **Access is itself an event.** Every read of the content store should be audit-logged with who and why (19.25).
+- **Deletion.** A user deletion request must reach the content store. Key it by tenant and user so it can be found (see 18.14).
+
+## 19.19 LLM-as-Judge Evaluation
+
+For open-ended outputs, traditional accuracy does not apply. LLM-as-judge uses a strong LLM to grade outputs against a rubric.
+
+Best practices:
+- Use a different (often stronger) model as the judge than the model under test.
+- Provide a structured rubric with examples.
+- Sample carefully — judging every output is expensive.
+- Validate against human ratings periodically; LLM judges drift.
+
+Frameworks: RAGAS, TruLens, Phoenix, LangSmith evals, Braintrust.
+
+### Calibrating the judge against human labels 🔧
+
+"Validate against human ratings periodically" is the practice that decides whether every judge score above can be trusted, so it needs a concrete procedure.
+
+#### Measuring agreement
+
+**Problem.** The judge says 92 percent of answers are grounded. Nobody knows whether the judge is right.
+
+**Why it happens.** A judge is a classifier with its own error rate and biases. Without a labelled reference set, its score is an unmeasured instrument.
+
+**Mechanism.** Have two or more humans label a stratified sample (200 to 500 items is typical) with the same rubric the judge uses. First measure human-to-human agreement: that is the ceiling. Then measure judge-to-human agreement with Cohen's kappa (agreement corrected for chance), and look at the confusion matrix, because the errors are rarely symmetric.
+
+```python
+import pandas as pd
+from sklearn.metrics import cohen_kappa_score, confusion_matrix
+
+df = pd.read_csv("calibration_set.csv")  # columns: id, human_a, human_b, judge (0 = ungrounded, 1 = grounded)
+
+human_kappa = cohen_kappa_score(df.human_a, df.human_b)
+df = df[df.human_a == df.human_b]          # keep items the humans agree on as gold
+judge_kappa = cohen_kappa_score(df.human_a, df.judge)
+tn, fp, fn, tp = confusion_matrix(df.human_a, df.judge, labels=[0, 1]).ravel()
+
+print(f"human-human kappa {human_kappa:.2f}, judge-human kappa {judge_kappa:.2f}")
+print(f"judge misses {fp / (fp + tn):.0%} of ungrounded answers (false 'grounded')")
+```
+
+For ordinal scales (1 to 5), use weighted kappa (`weights="quadratic"`). A judge whose kappa with humans is close to the human-human kappa is about as reliable as another human reviewer. If it is much lower, fix the rubric before trusting any dashboard.
+
+#### Known judge biases and how to test for them
+- **Position bias** in pairwise comparisons: the judge prefers whichever answer comes first. Run each pair in both orders and count only consistent verdicts.
+- **Verbosity bias:** longer answers score higher. Check the correlation between score and length on the calibration set.
+- **Self-preference:** judges tend to favour outputs from their own model family. Use a different family from the model under test, as the handbook advises.
+- **Rubric ambiguity:** most disagreements trace back to an undefined term ("complete", "concise"). Add examples of borderline cases to the rubric.
+
+#### Edge cases
+- **Recalibrate on change.** A new judge model, rubric, or product domain invalidates the old calibration. Keep the calibration set versioned and re-run it as part of the judge's own CI.
+- **Score correction.** If the judge has a measured false-positive rate, report corrected estimates (or at least the error bars) rather than the raw judge rate.
+
+## 19.20 SLOs and Alerting
+
+Service Level Objectives are the targets the system promises to meet. Alerts fire when SLOs are at risk.
+
+For GenAI products, useful SLOs:
+- p95 time-to-first-token below X seconds.
+- p99 total response below X seconds.
+- Quality eval score above X.
+- Cost per query below X.
+- Availability above X%.
+
+Alert on burn rate, not raw metric values — "we are burning the latency error budget 10x faster than allowed" is more actionable than "p99 went over 5 seconds once."
+
+### A TTFT SLO with burn-rate alerts 🔧
+
+Burn-rate alerting is easy to describe and easy to get wrong in PromQL, so here is a worked example for the first SLO in the list above.
+
+#### Defining the SLO as a ratio
+
+**Problem.** "p95 TTFT below 2 seconds" computed from a histogram quantile cannot be turned into an error budget directly, and quantile estimates between bucket boundaries are interpolated guesses.
+
+**Mechanism.** Restate it as a ratio of good events: "95 percent of streaming requests receive their first token within 2 seconds, over 30 days". The error budget is the remaining 5 percent. This requires a histogram bucket boundary at exactly 2 seconds, which is why the 19.7 example sets explicit boundaries.
+
+#### Multi-window burn-rate alerts
+
+**Mechanism.** The burn rate is the observed bad ratio divided by the budget (0.05). A burn rate of 14.4 sustained for one hour consumes 2 percent of a 30-day budget, so page on it. A short window (5 minutes) confirms the problem is still happening, which makes the alert reset quickly after recovery.
+
+```yaml
+# prometheus-rules.yml. Metric names depend on your OTLP-to-Prometheus translation:
+# the classic translation turns dots into underscores and adds the unit suffix.
+groups:
+  - name: ttft-slo
+    rules:
+      - record: slo:ttft_bad_ratio:rate5m
+        expr: |
+          1 - (
+            sum(rate(gen_ai_client_operation_time_to_first_chunk_seconds_bucket{le=~"2|2.0"}[5m]))
+            /
+            sum(rate(gen_ai_client_operation_time_to_first_chunk_seconds_count[5m]))
+          )
+      - record: slo:ttft_bad_ratio:rate1h
+        expr: |
+          1 - (
+            sum(rate(gen_ai_client_operation_time_to_first_chunk_seconds_bucket{le=~"2|2.0"}[1h]))
+            /
+            sum(rate(gen_ai_client_operation_time_to_first_chunk_seconds_count[1h]))
+          )
+      - alert: TTFTErrorBudgetFastBurn
+        expr: slo:ttft_bad_ratio:rate1h > (14.4 * 0.05) and slo:ttft_bad_ratio:rate5m > (14.4 * 0.05)
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "TTFT SLO burning budget at more than 14x"
+```
+
+Add a second, slower pair (for example a burn rate of 6 over 6 hours and 30 minutes) as a ticket-level alert for slow degradation.
+
+#### Edge cases
+- **Errors are not fast.** A request that fails before any token never records a TTFT, so it silently disappears from this SLO. Either record failures as "bad" in a separate counter and add them to the numerator, or keep a separate availability SLO.
+- **The `le` label format.** Prometheus 3 normalizes classic histogram `le` values to float form (`2.0`), older versions keep the exposed text (`2`). The regex above matches both.
+- **Per-model SLOs.** A fallback to a slower model can be correct behaviour. Split the SLO by model class or route, or the fallback path will burn the budget of the primary.
+- **Low traffic.** At 50 requests per hour, three slow requests are a 6 percent bad ratio. Require a minimum request rate in the alert expression for low-volume features.
+
+## 19.21 Real-User Monitoring (RUM)
+
+Backend metrics tell you what the server did. RUM tells you what the user experienced. For GenAI, this often diverges — slow networks, sluggish browsers, and partial renders matter.
+
+Tools: Sentry, Datadog RUM, PostHog, custom OpenTelemetry browser SDKs.
+
+Capture: page load time, time-to-first-interactive, time-to-first-token-rendered, errors, user actions (stop, regenerate, copy), session replay where appropriate.
+
+## 19.22 Production Architecture
+
+<Mermaid chart={`flowchart TD
+  S["Services emit OpenTelemetry signals"] --> C["OTel Collector<br/>(aggregates, samples, routes)"]
+  C -- Metrics --> M["Prometheus / Mimir"]
+  C -- Logs --> L["Loki / OpenSearch"]
+  C -- Traces --> T["Tempo / Jaeger"]
+  C -- "LLM evals" --> E["LangSmith / Phoenix / Langfuse"]
+  M --> G["Grafana (and AI-specific UIs)<br/>for visualization"]
+  L --> G
+  T --> G
+  E --> G
+  G --> A["Alertmanager / PagerDuty / Opsgenie"]`} />
+
+## 19.23 Tradeoffs
+
+| Choice | Win | Cost |
+|---|---|---|
+| Managed observability (Datadog) | Less ops | High at scale |
+| Self-hosted (Prom + Grafana + Loki + Tempo) | Cheap at scale | Ops burden |
+| LLM-specific (LangSmith, Phoenix) | Prompt-aware | Another vendor |
+| Sampling traces | Lower cost | Miss some events |
+| Storing every trace | Full visibility | Storage cost |
+
+## 19.24 Scaling Challenges
+
+- High cardinality metrics (per-user labels) blow up Prometheus storage.
+- Log volume scales with traffic; sample aggressively.
+- Trace storage scales with QPS; use tail-based sampling for full traces of important events.
+- Eval cost scales with model size; sample production traffic for continuous eval.
+
+## 19.25 Security Concerns
+
+- Redact PII in logs, traces, and evals.
+- Tenant isolation in observability — one tenant's logs should not be visible to another.
+- Audit observability access; admins seeing prompts must be tracked.
+- Encrypt at rest.
+
+## 19.26 Cost Optimization
+
+- Sample traces and logs.
+- Drop low-value metrics.
+- Tier old data to cold storage.
+- Self-host above a cost threshold.
+- Audit observability stack cost quarterly; it grows quietly.
+
+## 19.27 Interview Questions
+
+- Walk through the six pillars of GenAI observability.
+- Why is time-to-first-token the most important latency metric?
+- How do you avoid logging PII?
+- Design an alerting strategy for an LLM chat product.
+- Compare LangSmith, Phoenix, and Langfuse.
+- ➕ Which OpenTelemetry attributes identify an LLM call, and how stable are they? **`gen_ai.operation.name` and `gen_ai.provider.name` are required, with `gen_ai.request.model` and the `gen_ai.usage.*` token counts recommended. As of October 2026 they are all still at Development status in the dedicated GenAI conventions repo, so pin a version and centralise the names.**
+- ➕ How do you trace an agent that hands work to a background worker? **One `invoke_agent` root span with `chat` and `execute_tool` children, and W3C trace context injected into the job payload and extracted in the worker so the trace stays connected.**
+- ➕ How do you report cost per tenant for 20,000 tenants? **Not with a tenant label on a Prometheus metric. Use a low-cardinality cost counter (model, feature, tier) for alerting, and per-call usage events with tenant ID rolled up in the warehouse for exact numbers.**
+- ➕ How do you know your LLM judge is trustworthy? **Label a stratified sample with two humans, compare judge-human kappa against human-human kappa, inspect the confusion matrix, and test for position, verbosity and self-preference bias.**
+- ➕ How would you detect that users have started asking about things the corpus does not cover? **Track falling top-1 retrieval similarity and the share of queries far from every baseline embedding cluster, and compare cluster distributions over time with PSI.**
+
+## 19.28 Hands-on Exercises
+
+1. Design the dashboard for a chat product on one screen.
+2. List the alerts that should page on-call for a frontier AI feature.
+3. Plan the LLM-as-judge eval for a customer-facing summarizer.
+
+## 19.29 Common Mistakes
+
+- Logging full prompts and completions, then leaking PII.
+- High-cardinality labels in Prometheus.
+- Alerting on every metric, paging too often, alert fatigue.
+- No continuous evaluation; quality drifts silently.
+- Observability stack treated as someone else's problem.
+
+## 19.30 Enterprise Best Practices
+
+OpenTelemetry from day one. Three pillars plus three GenAI pillars. SLOs documented per feature. On-call rotations defined. Quarterly observability reviews. Regular fire drills. Dashboards owned and curated, not auto-generated.
+
+## Sources
+
+- OpenTelemetry, [semantic-conventions-genai repository](https://github.com/open-telemetry/semantic-conventions-genai): [GenAI spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md), [agent spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md), [metrics](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md) and [token metrics](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-token-metrics.md). All at Development status, checked October 2026. The old [opentelemetry.io GenAI page](https://opentelemetry.io/docs/specs/semconv/gen-ai/) now points to this repository.
+- OpenTelemetry, [JavaScript API: metrics instrument advice](https://opentelemetry.io/docs/languages/js/instrumentation/) and [context propagation](https://opentelemetry.io/docs/concepts/context-propagation/).
+- W3C, [Trace Context](https://www.w3.org/TR/trace-context/).
+- Google, [The Site Reliability Workbook: Alerting on SLOs](https://sre.google/workbook/alerting-on-slos/) (multi-window, multi-burn-rate alerts, the 14.4 factor).
+- Prometheus, [3.0 migration guide](https://prometheus.io/docs/prometheus/latest/migration/) (`le` label normalization).
+- scikit-learn, [`cohen_kappa_score`](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.cohen_kappa_score.html).
+- Zheng et al., [Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena](https://arxiv.org/abs/2306.05685), NeurIPS 2023 (position, verbosity and self-enhancement bias).
+- Siddiqi, *Credit Risk Scorecards*, Wiley, 2006 (Population Stability Index and its usual thresholds).

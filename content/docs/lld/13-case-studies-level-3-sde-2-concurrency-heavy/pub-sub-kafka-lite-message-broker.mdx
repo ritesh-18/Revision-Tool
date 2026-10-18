@@ -1,0 +1,1098 @@
+---
+title: "13.2 Pub-Sub / Kafka-lite Message Broker"
+---
+
+## Problem & where it's asked
+
+Design an in-memory message broker. Producers publish messages to **topics**. A topic is split into **partitions** (append-only logs). **Consumer groups** read from the topic, and each partition is processed by exactly one member of a group at a time. Every group tracks its own **offsets**, so it can resume after a restart or replay from an earlier point. Delivery is **at-least-once**, with retries and a **dead-letter topic** for poison messages.
+
+**Where it's asked:**
+
+- **Reported:** Razorpay (persistent, guaranteed, in-order delivery to every subscriber of a topic). PhonePe (a "message queuing system" machine-coding round). Salesforce 2026, in two versions: (1) a single FIFO queue where a subscriber only receives messages published *after* it subscribed, and (2) Kafka-like topics with partitions. It also appears in Uber, Walmart and Goldman Sachs lists.
+- **Uncertain:** Angel One and Zerodha lean on Kafka and streaming in their system-design discussions (reported as snippets only). A broker LLD is a plausible deep-dive there, but no machine-coding report confirms it.
+- Graders look for the Observer/pub-sub structure, **ordering guarantees**, offset management and thread safety.
+
+You have built Kafka and BullMQ pipelines, so this is the question where you can show that you know *why* Kafka has partitions and consumer groups, not just how to call `consumer.run()`.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Push or pull delivery? | **Pull** (consumers fetch batches), like Kafka. This gives natural backpressure. Push is discussed |
+| Ordering guarantee? | Per partition only. Messages with the same key go to the same partition, so **per-key order** is preserved |
+| Delivery semantics? | At-least-once: process first, then commit. Consumers must be idempotent |
+| What happens when a handler keeps failing? | Retry with exponential backoff up to N attempts, then publish to `<topic>.DLT` and move on |
+| Where does a new group start? | Configurable: `earliest` (from offset 0) or `latest` (only new messages). This covers Salesforce's "only after subscribing" variant |
+| Replay? | Yes: `seek(partition, offset)` per group |
+| Persistence and retention? | In memory, unlimited retention. Retention and compaction are discussed as extensions |
+| How many consumers per group? | Any number. Partitions are split across members (round-robin) and rebalanced on join or leave |
+
+## Requirements
+
+**Functional**
+
+1. Create topics with N partitions. Reject duplicate or invalid names.
+2. Producer `send(topic, key, value, headers)` returns `(partition, offset)`. Messages with the same key always go to the same partition. Keyless messages are spread round-robin.
+3. Consumer groups subscribe to a topic. Members join and leave, and partitions are rebalanced.
+4. `pollOnce` / `drain` fetch up to `maxPollRecords` per partition, process them in order, and commit offsets.
+5. Retries with backoff. After the last attempt, dead-letter the message with error metadata.
+6. Per-group committed offsets, `seek` for replay, and a lag metric.
+7. The offset reset policy (`earliest` / `latest`) applies to new groups.
+
+**Non-functional**
+
+- **Ordering:** strictly sequential within a partition. Partitions are processed in parallel.
+- **No double processing by two members at once:** a partition is leased to one worker at a time.
+- **Commit safety:** offsets only move forward on commit. Moving backwards requires an explicit `seek`.
+- Deterministic tests: injected clock and sleeper.
+
+**Out of scope:** disk persistence, replication/ISR, exactly-once transactions, network protocol, multi-topic groups (easy to add).
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|---|---|---|
+| `Message` | Immutable record: topic, partition, offset, key, value, headers, timestamp | stored in a PartitionLog |
+| `PartitionLog` | Append-only array. `append`, `read(from, max)`, `endOffset` | belongs to a Topic |
+| `Topic` | Name + fixed array of partitions | owned by Broker |
+| `Partitioner` | Strategy: key → partition index | used by Producer |
+| `Broker` | Topic registry, fetch/append, **committed offsets per (group, topic, partition)** | shared by producers and groups |
+| `Producer` | Chooses a partition and appends | uses Broker + Partitioner |
+| `ConsumerGroup` | Membership, partition assignment, leases, the retry → DLT pipeline, lag | reads from Broker; many members |
+| `Handler` | `(message, ctx) => Promise<void>`, the user's business logic | one per member |
+| `RetryPolicy` | `maxAttempts`, `backoffMs(attempt)` | used by ConsumerGroup |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Broker {
+        -topics Map
+        -committed Map
+        +createTopic(name, partitions) Topic
+        +append(topic, partition, key, value, headers) Message
+        +fetch(topic, partition, offset, max) Message[]
+        +commit(group, topic, partition, offset)
+        +seek(group, topic, partition, offset)
+    }
+    class Topic {
+        +name
+        +partitions PartitionLog[]
+    }
+    class PartitionLog {
+        -entries Message[]
+        +append(key, value, headers) Message
+        +read(from, max) Message[]
+        +endOffset number
+    }
+    class Partitioner {
+        <<interface>>
+        +choose(key, count) number
+    }
+    class KeyHashPartitioner
+    class Producer {
+        +send(topic, key, value, headers) SendResult
+    }
+    class ConsumerGroup {
+        -members Map
+        -assignment Map
+        -leases Set
+        +join(consumerId, handler)
+        +leave(consumerId)
+        +pollOnce() number
+        +drain() number
+        +seek(partition, offset)
+        +lag() number
+    }
+    class RetryPolicy {
+        <<interface>>
+        +maxAttempts number
+        +backoffMs(attempt) number
+    }
+    Broker *-- Topic
+    Topic *-- PartitionLog
+    Producer --> Broker
+    Producer --> Partitioner
+    KeyHashPartitioner ..|> Partitioner
+    ConsumerGroup --> Broker
+    ConsumerGroup --> RetryPolicy`} />
+
+**Main flow: produce, then consume with a retry and a dead letter**
+
+<Mermaid chart={`sequenceDiagram
+    participant P as Producer
+    participant B as Broker
+    participant G as ConsumerGroup
+    participant H as Handler
+    P->>B: append(orders, p=hash(key) % n)
+    B-->>P: partition, offset
+    G->>G: lease partition
+    G->>B: fetch(p, committedOffset, max)
+    B-->>G: batch
+    loop each message in order
+        G->>H: handle(msg, attempt)
+        alt success
+            G->>B: commit(offset + 1)
+        else failure and attempts left
+            G->>G: sleep(backoff), retry
+        else attempts exhausted
+            G->>B: append(orders.DLT, msg + error headers)
+            G->>B: commit(offset + 1)
+        end
+    end
+    G->>G: release lease`} />
+
+**Message delivery states (from the consumer's point of view)**
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> Fetched
+    Fetched --> Processing
+    Processing --> Committed: handler ok
+    Processing --> Backoff: handler failed, attempts left
+    Backoff --> Processing: retry
+    Processing --> DeadLettered: attempts exhausted
+    DeadLettered --> Committed
+    Committed --> [*]`} />
+
+## Design decisions & patterns
+
+1. **A log, not a queue.** Messages are never removed when consumed. Each group has its own cursor (offset). This one decision gives you replay, several independent subscribers (billing and analytics both read `orders`) and simple persistence. A classic queue (like BullMQ or SQS) deletes on ack, so replay is impossible.
+2. **Partitions are the unit of ordering and of parallelism.** Order across a whole topic would mean one consumer at a time, which doesn't scale. Order per partition plus key-based partitioning gives "all events for user u1 are in order", and that is what business logic actually needs.
+3. **Partitioner is a Strategy.** The default is FNV-1a hash mod N for keyed messages and round-robin for keyless ones. Alternatives: sticky partitioning (batch keyless messages together), or custom partitioning (VIP tenants on dedicated partitions).
+4. **Commit after processing** gives at-least-once delivery. Committing *before* processing would give at-most-once, which loses messages on a crash. Exactly-once needs transactions or idempotent sinks. We choose at-least-once and **require idempotent handlers**, and the demo shows how.
+5. **Leases per partition.** A synchronous `if (leases.has(p)) return; leases.add(p)` is an atomic claim, so two overlapping polls can never process the same partition. During a rebalance, the worker also checks that it still owns the partition before each message.
+6. **Monotonic `commit`, explicit `seek`.** A slow, stale worker must not move the offset backwards by accident. Replay is a deliberate operation.
+7. **The retry → DLT pipeline lives in the group, not in handlers.** Every consumer gets the same failure semantics, and handlers stay pure business logic (Template Method-ish). The retry policy is injected (Strategy).
+8. **Pull-based consumption is the backpressure mechanism.** A slow consumer simply fetches less often. The log absorbs the burst, and lag grows, which is observable. With push, the broker has to track in-flight windows per subscriber. The bounded-channel extension shows backpressure between in-process stages.
+
+## Implementation
+
+**Part 1: foundations.** Errors, time and a hash function. `FakeTime.sleep` advances virtual time immediately, so retry backoff doesn't slow the demo.
+
+```ts
+class BrokerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends BrokerError {}
+class TopicNotFoundError extends BrokerError {}
+class OffsetOutOfRangeError extends BrokerError {}
+
+interface Clock {
+  now(): number;
+}
+interface Sleeper {
+  sleep(ms: number): Promise<void>;
+}
+class FakeTime implements Clock, Sleeper {
+  private current = 0;
+  readonly sleeps: number[] = [];
+  now(): number {
+    return this.current;
+  }
+  async sleep(ms: number): Promise<void> {
+    this.sleeps.push(ms);
+    this.current += ms;
+  }
+}
+
+/** FNV-1a 32-bit: small, fast, stable across runs (unlike object identity). */
+function fnv1a(text: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
+const errMsg = (e: unknown): string => (e instanceof Error ? `${e.name}: ${e.message}` : String(e));
+```
+
+**Part 2: storage.** A topic is a fixed array of append-only partition logs. A message's offset is simply its index in the partition array.
+
+```ts
+type Headers = Readonly<Record<string, string>>;
+
+interface Message {
+  readonly topic: string;
+  readonly partition: number;
+  readonly offset: number;
+  readonly key: string | null;
+  readonly value: string;
+  readonly headers: Headers;
+  readonly timestamp: number;
+}
+
+class PartitionLog {
+  private readonly entries: Message[] = [];
+
+  constructor(readonly topic: string, readonly index: number) {}
+
+  get endOffset(): number {
+    return this.entries.length;
+  }
+
+  append(key: string | null, value: string, headers: Headers, timestamp: number): Message {
+    const message: Message = Object.freeze({
+      topic: this.topic,
+      partition: this.index,
+      offset: this.entries.length,
+      key,
+      value,
+      headers: Object.freeze({ ...headers }),
+      timestamp,
+    });
+    this.entries.push(message);
+    return message;
+  }
+
+  read(from: number, max: number): readonly Message[] {
+    if (!Number.isInteger(from) || from < 0 || from > this.entries.length) {
+      throw new OffsetOutOfRangeError(`${this.topic}/${this.index}: offset ${from} not in [0, ${this.entries.length}]`);
+    }
+    return this.entries.slice(from, from + max);
+  }
+}
+
+class Topic {
+  readonly partitions: readonly PartitionLog[];
+  constructor(readonly name: string, partitionCount: number) {
+    this.partitions = Array.from({ length: partitionCount }, (_, i) => new PartitionLog(name, i));
+  }
+  partition(index: number): PartitionLog {
+    const p = this.partitions[index];
+    if (!p) throw new ValidationError(`${this.name} has no partition ${index}`);
+    return p;
+  }
+}
+```
+
+**Part 3: partitioning and the broker.** The broker owns the committed offsets, keyed by `group|topic|partition`. It is the single source of truth, so a consumer that restarts or a new group member can pick up where the last one stopped.
+
+```ts
+interface Partitioner {
+  choose(key: string | null, partitionCount: number): number;
+}
+
+class KeyHashPartitioner implements Partitioner {
+  private nextKeyless = 0;
+  choose(key: string | null, partitionCount: number): number {
+    if (key === null) return this.nextKeyless++ % partitionCount;
+    return fnv1a(key) % partitionCount;
+  }
+}
+
+class Broker {
+  private readonly topics = new Map<string, Topic>();
+  private readonly committed = new Map<string, number>();
+
+  constructor(private readonly clock: Clock) {}
+
+  createTopic(name: string, partitions: number): Topic {
+    if (!/^[a-z0-9._-]{1,100}$/i.test(name)) throw new ValidationError(`invalid topic name "${name}"`);
+    if (!Number.isInteger(partitions) || partitions < 1) throw new ValidationError('partitions must be a positive integer');
+    if (this.topics.has(name)) throw new ValidationError(`topic ${name} already exists`);
+    const topic = new Topic(name, partitions);
+    this.topics.set(name, topic);
+    return topic;
+  }
+
+  hasTopic(name: string): boolean {
+    return this.topics.has(name);
+  }
+
+  topic(name: string): Topic {
+    const topic = this.topics.get(name);
+    if (!topic) throw new TopicNotFoundError(`topic ${name} does not exist`);
+    return topic;
+  }
+
+  append(topic: string, partition: number, key: string | null, value: string, headers: Headers = {}): Message {
+    return this.topic(topic).partition(partition).append(key, value, headers, this.clock.now());
+  }
+
+  fetch(topic: string, partition: number, offset: number, max: number): readonly Message[] {
+    return this.topic(topic).partition(partition).read(offset, max);
+  }
+
+  endOffset(topic: string, partition: number): number {
+    return this.topic(topic).partition(partition).endOffset;
+  }
+
+  committedOffset(group: string, topic: string, partition: number): number | undefined {
+    return this.committed.get(this.key(group, topic, partition));
+  }
+
+  /** Forward-only: a stale worker can never rewind a group. */
+  commit(group: string, topic: string, partition: number, nextOffset: number): void {
+    const current = this.committedOffset(group, topic, partition) ?? 0;
+    if (nextOffset < current) return;
+    this.seek(group, topic, partition, nextOffset);
+  }
+
+  /** Explicit reposition (replay or skip). */
+  seek(group: string, topic: string, partition: number, offset: number): void {
+    const end = this.endOffset(topic, partition);
+    if (!Number.isInteger(offset) || offset < 0 || offset > end) {
+      throw new OffsetOutOfRangeError(`${topic}/${partition}: offset ${offset} not in [0, ${end}]`);
+    }
+    this.committed.set(this.key(group, topic, partition), offset);
+  }
+
+  private key(group: string, topic: string, partition: number): string {
+    return `${group}|${topic}|${partition}`;
+  }
+}
+
+interface SendResult {
+  readonly partition: number;
+  readonly offset: number;
+}
+
+class Producer {
+  constructor(private readonly broker: Broker, private readonly partitioner: Partitioner) {}
+
+  async send(topic: string, key: string | null, value: string, headers: Headers = {}): Promise<SendResult> {
+    const count = this.broker.topic(topic).partitions.length;
+    const partition = this.partitioner.choose(key, count);
+    const { offset } = this.broker.append(topic, partition, key, value, headers);
+    return { partition, offset };
+  }
+}
+```
+
+`send` is `async` even though the in-memory append is synchronous. A real producer batches and waits for acks, and keeping the signature async now means callers won't need to change later.
+
+**Part 4: consumer groups.** Membership and rebalancing, leases, ordered processing, and the retry → dead-letter pipeline.
+
+```ts
+interface DeliveryContext {
+  readonly consumerId: string;
+  readonly attempt: number;
+}
+type Handler = (message: Message, ctx: DeliveryContext) => Promise<void>;
+
+interface RetryPolicy {
+  readonly maxAttempts: number;
+  backoffMs(attempt: number): number;
+}
+function exponentialBackoff(baseMs: number, maxAttempts: number, capMs: number): RetryPolicy {
+  if (maxAttempts < 1) throw new ValidationError('maxAttempts must be >= 1');
+  return { maxAttempts, backoffMs: (attempt) => Math.min(capMs, baseMs * 2 ** (attempt - 1)) };
+}
+
+type OffsetReset = 'earliest' | 'latest';
+interface GroupOptions {
+  readonly maxPollRecords: number;
+  readonly retry: RetryPolicy;
+  readonly offsetReset: OffsetReset;
+}
+
+class ConsumerGroup {
+  private readonly members = new Map<string, Handler>();
+  private assignment = new Map<string, number[]>();
+  private readonly leases = new Set<number>();
+  readonly stats = { delivered: 0, retries: 0, deadLettered: 0 };
+  readonly deadLetterTopic: string;
+
+  constructor(
+    private readonly broker: Broker,
+    private readonly sleeper: Sleeper,
+    readonly groupId: string,
+    readonly topicName: string,
+    private readonly options: GroupOptions,
+  ) {
+    if (options.maxPollRecords < 1) throw new ValidationError('maxPollRecords must be >= 1');
+    const topic = broker.topic(topicName);
+    this.deadLetterTopic = `${topicName}.DLT`;
+    if (!broker.hasTopic(this.deadLetterTopic)) broker.createTopic(this.deadLetterTopic, 1);
+    // Subscription time: "latest" groups start at the current end of each partition.
+    for (const p of topic.partitions) {
+      if (broker.committedOffset(groupId, topicName, p.index) === undefined) {
+        broker.seek(groupId, topicName, p.index, options.offsetReset === 'latest' ? p.endOffset : 0);
+      }
+    }
+  }
+
+  join(consumerId: string, handler: Handler): void {
+    if (this.members.has(consumerId)) throw new ValidationError(`${consumerId} already in ${this.groupId}`);
+    this.members.set(consumerId, handler);
+    this.rebalance();
+  }
+
+  leave(consumerId: string): void {
+    if (!this.members.delete(consumerId)) throw new ValidationError(`${consumerId} is not in ${this.groupId}`);
+    this.rebalance();
+  }
+
+  describeAssignment(): string {
+    return [...this.assignment].map(([id, parts]) => `${id}=[${parts.join(',')}]`).join(' ');
+  }
+
+  seek(partition: number, offset: number): void {
+    this.broker.seek(this.groupId, this.topicName, partition, offset);
+  }
+
+  position(partition: number): number {
+    return this.broker.committedOffset(this.groupId, this.topicName, partition) ?? 0;
+  }
+
+  lag(): number {
+    return this.broker
+      .topic(this.topicName)
+      .partitions.reduce((sum, p) => sum + (p.endOffset - this.position(p.index)), 0);
+  }
+
+  /** One round: every member processes one batch from each of its partitions, in parallel. */
+  async pollOnce(): Promise<number> {
+    const work: Promise<number>[] = [];
+    for (const [consumerId, partitions] of this.assignment) {
+      for (const p of partitions) work.push(this.processPartition(consumerId, p));
+    }
+    const counts = await Promise.all(work);
+    return counts.reduce((a, b) => a + b, 0);
+  }
+
+  async drain(maxRounds = 1_000): Promise<number> {
+    let total = 0;
+    for (let round = 0; round < maxRounds; round++) {
+      const n = await this.pollOnce();
+      if (n === 0) return total;
+      total += n;
+    }
+    throw new BrokerError(`${this.groupId} did not drain within ${maxRounds} rounds`);
+  }
+
+  private rebalance(): void {
+    const ids = [...this.members.keys()].sort();
+    const next = new Map<string, number[]>(ids.map((id) => [id, []]));
+    const count = this.broker.topic(this.topicName).partitions.length;
+    for (let p = 0; p < count && ids.length > 0; p++) next.get(ids[p % ids.length]!)!.push(p);
+    this.assignment = next;
+  }
+
+  private owns(consumerId: string, partition: number): boolean {
+    return this.assignment.get(consumerId)?.includes(partition) ?? false;
+  }
+
+  private async processPartition(consumerId: string, partition: number): Promise<number> {
+    if (this.leases.has(partition)) return 0; // someone is already on it
+    this.leases.add(partition); // claimed synchronously => atomic
+    try {
+      const batch = this.broker.fetch(this.topicName, partition, this.position(partition), this.options.maxPollRecords);
+      let done = 0;
+      for (const message of batch) {
+        if (!this.owns(consumerId, partition)) break; // rebalanced away mid-batch
+        await this.deliver(consumerId, message);
+        this.broker.commit(this.groupId, this.topicName, partition, message.offset + 1);
+        done++;
+      }
+      return done;
+    } finally {
+      this.leases.delete(partition);
+    }
+  }
+
+  private async deliver(consumerId: string, message: Message): Promise<void> {
+    const handler = this.members.get(consumerId);
+    if (!handler) throw new BrokerError(`${consumerId} left the group`);
+    const { maxAttempts } = this.options.retry;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await handler(message, { consumerId, attempt });
+        this.stats.delivered++;
+        return;
+      } catch (e) {
+        if (attempt >= maxAttempts) {
+          this.deadLetter(message, e, attempt);
+          return;
+        }
+        this.stats.retries++;
+        await this.sleeper.sleep(this.options.retry.backoffMs(attempt));
+      }
+    }
+  }
+
+  private deadLetter(message: Message, error: unknown, attempts: number): void {
+    this.stats.deadLettered++;
+    this.broker.append(this.deadLetterTopic, 0, message.key, message.value, {
+      ...message.headers,
+      'x-origin': `${message.topic}/${message.partition}@${message.offset}`,
+      'x-group': this.groupId,
+      'x-attempts': String(attempts),
+      'x-error': error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+```
+
+A few details to call out in the interview:
+
+- `rebalance` sorts member IDs, so the assignment is deterministic. That makes debugging and tests much easier than relying on `Map` insertion order.
+- `drain(maxRounds)` has a safety valve, so a bug can't spin forever.
+- The DLT message keeps the original key and headers and adds `x-origin`, so an operator can find the source message and re-drive it later.
+
+**Part 5: the demo.** The billing handler is **idempotent**: it keys each charge by `order id`, so a replay doesn't double-charge.
+
+```ts
+const time = new FakeTime();
+const broker = new Broker(time);
+const producer = new Producer(broker, new KeyHashPartitioner());
+broker.createTopic('orders', 3);
+
+console.log('1) produce (same key -> same partition)');
+const orders: Array<[string, string]> = [
+  ['u1', 'order-1'], ['u2', 'order-2'], ['u1', 'order-3'], ['u3', 'poison'],
+  ['u4', 'flaky'], ['u2', 'order-6'], ['u1', 'order-7'],
+];
+for (const [key, value] of orders) {
+  const r = await producer.send('orders', key, value, { source: 'checkout' });
+  console.log(`  ${key}:${value} -> p${r.partition}@${r.offset}`);
+}
+
+const charged = new Set<string>();
+const billingHandler: Handler = async (m, ctx) => {
+  console.log(`  ${ctx.consumerId} p${m.partition}@${m.offset} ${m.key}:${m.value} attempt ${ctx.attempt}`);
+  if (m.value === 'poison') throw new Error('cannot parse payload');
+  if (m.value === 'flaky' && ctx.attempt < 3) throw new Error('payment service 503');
+  if (charged.has(m.value)) {
+    console.log(`    (idempotent) ${m.value} already charged, skipping`);
+    return;
+  }
+  charged.add(m.value);
+};
+
+const billing = new ConsumerGroup(broker, time, 'billing', 'orders', {
+  maxPollRecords: 2,
+  retry: exponentialBackoff(100, 3, 1_000),
+  offsetReset: 'earliest',
+});
+billing.join('c1', billingHandler);
+billing.join('c2', billingHandler);
+console.log(`2) billing assignment: ${billing.describeAssignment()}`);
+
+console.log('3) drain billing');
+const processed = await billing.drain();
+console.log(`  processed=${processed} stats=${JSON.stringify(billing.stats)} backoffs=${time.sleeps.join(',')}ms lag=${billing.lag()}`);
+const offsets = [0, 1, 2].map((p) => `p${p}=${billing.position(p)}`).join(' ');
+console.log(`  committed: ${offsets}`);
+for (const m of broker.fetch('orders.DLT', 0, 0, 10)) {
+  console.log(`  DLT@${m.offset}: ${m.key}:${m.value} origin=${m.headers['x-origin']} attempts=${m.headers['x-attempts']} error="${m.headers['x-error']}"`);
+}
+
+console.log('4) late subscriber with offsetReset=latest');
+const audit = new ConsumerGroup(broker, time, 'audit', 'orders', {
+  maxPollRecords: 10,
+  retry: exponentialBackoff(100, 1, 100),
+  offsetReset: 'latest',
+});
+audit.join('a1', async (m, ctx) => console.log(`  ${ctx.consumerId} sees ${m.key}:${m.value}`));
+console.log(`  audit lag before new message: ${audit.lag()}`);
+await producer.send('orders', 'u2', 'order-8');
+await audit.drain();
+console.log(`  billing lag now: ${billing.lag()}`);
+await billing.drain();
+
+console.log('5) replay u1 partition from offset 0 (at-least-once => handler must be idempotent)');
+const u1Partition = new KeyHashPartitioner().choose('u1', 3);
+billing.seek(u1Partition, 0);
+await billing.drain();
+
+console.log('6) c2 leaves -> rebalance');
+billing.leave('c2');
+console.log(`  billing assignment: ${billing.describeAssignment()}`);
+
+console.log('7) errors');
+const attempts: Array<[string, () => unknown]> = [
+  ['unknown topic', () => broker.fetch('payments', 0, 0, 1)],
+  ['bad partitions', () => broker.createTopic('x', 0)],
+  ['duplicate topic', () => broker.createTopic('orders', 3)],
+  ['seek past end', () => billing.seek(0, 99)],
+  ['duplicate member', () => billing.join('c1', billingHandler)],
+];
+for (const [label, run] of attempts) {
+  try {
+    run();
+    console.log(`  ${label}: unexpectedly ok`);
+  } catch (e) {
+    console.log(`  ${label}: ${errMsg(e)}`);
+  }
+}
+```
+
+## Demo output
+
+```text
+1) produce (same key -> same partition)
+  u1:order-1 -> p0@0
+  u2:order-2 -> p2@0
+  u1:order-3 -> p0@1
+  u3:poison -> p1@0
+  u4:flaky -> p0@2
+  u2:order-6 -> p2@1
+  u1:order-7 -> p0@3
+2) billing assignment: c1=[0,2] c2=[1]
+3) drain billing
+  c1 p0@0 u1:order-1 attempt 1
+  c1 p2@0 u2:order-2 attempt 1
+  c2 p1@0 u3:poison attempt 1
+  c1 p0@1 u1:order-3 attempt 1
+  c1 p2@1 u2:order-6 attempt 1
+  c2 p1@0 u3:poison attempt 2
+  c2 p1@0 u3:poison attempt 3
+  c1 p0@2 u4:flaky attempt 1
+  c1 p0@2 u4:flaky attempt 2
+  c1 p0@2 u4:flaky attempt 3
+  c1 p0@3 u1:order-7 attempt 1
+  processed=7 stats={"delivered":6,"retries":4,"deadLettered":1} backoffs=100,200,100,200ms lag=0
+  committed: p0=4 p1=1 p2=2
+  DLT@0: u3:poison origin=orders/1@0 attempts=3 error="cannot parse payload"
+4) late subscriber with offsetReset=latest
+  audit lag before new message: 0
+  a1 sees u2:order-8
+  billing lag now: 1
+  c1 p2@2 u2:order-8 attempt 1
+5) replay u1 partition from offset 0 (at-least-once => handler must be idempotent)
+  c1 p0@0 u1:order-1 attempt 1
+    (idempotent) order-1 already charged, skipping
+  c1 p0@1 u1:order-3 attempt 1
+    (idempotent) order-3 already charged, skipping
+  c1 p0@2 u4:flaky attempt 1
+  c1 p0@2 u4:flaky attempt 2
+  c1 p0@2 u4:flaky attempt 3
+    (idempotent) flaky already charged, skipping
+  c1 p0@3 u1:order-7 attempt 1
+    (idempotent) order-7 already charged, skipping
+6) c2 leaves -> rebalance
+  billing assignment: c1=[0,1,2]
+7) errors
+  unknown topic: TopicNotFoundError: topic payments does not exist
+  bad partitions: ValidationError: partitions must be a positive integer
+  duplicate topic: ValidationError: topic orders already exists
+  seek past end: OffsetOutOfRangeError: orders/0: offset 99 not in [0, 4]
+  duplicate member: ValidationError: c1 already in billing
+```
+
+How to read this output:
+
+- **Step 1:** every `u1` message landed on p0 at increasing offsets, so per-key order is guaranteed. `u4` happens to hash to p0 as well. Partitions are shared by many keys.
+- **Step 3:** c1 works on p0 and p2 while c2 works on p1, and the log lines interleave because partitions run in parallel. Inside p0 the order is strict: `order-7` waits until `flaky` finishes its three attempts. That is **head-of-line blocking**, the price of ordering (see the failure-handling section for how to limit it). `poison` went to the DLT after 3 attempts with 100 ms and 200 ms backoffs, and its offset was committed, so the partition didn't get stuck.
+- **Step 4:** the `audit` group started with lag 0 and saw only the message published after it subscribed (Salesforce's variant). `billing` independently picked up the same message. Groups don't affect each other.
+- **Step 5:** the replay re-delivered four messages. The handler ran again (note that `flaky` retried again too), but the idempotency check stopped any double charge. Any at-least-once system behaves this way, so say it before the interviewer asks.
+
+## Concurrency deep-dive
+
+Two separate bugs show up in almost every first attempt:
+
+1. **Two workers process the same partition** (overlapping polls, or a rebalance where the old owner is still running). Every message is applied twice.
+2. **Parallelism inside a partition** ("let's `Promise.all` the batch for speed"). A fast message overtakes a slow one, so ordering breaks.
+
+The account below receives `deposit 500`, then `withdraw 300`, then `withdraw 100`. The correct final balance is **100**. Each message's `latency` simulates a slow or fast handler.
+
+```ts
+const tick = async (n: number): Promise<void> => {
+  for (let i = 0; i < n; i++) await Promise.resolve();
+};
+
+interface Msg {
+  readonly offset: number;
+  readonly op: 'deposit' | 'withdraw';
+  readonly amount: number;
+  readonly latency: number;
+}
+const partitionLog: readonly Msg[] = [
+  { offset: 0, op: 'deposit', amount: 500, latency: 3 },
+  { offset: 1, op: 'withdraw', amount: 300, latency: 1 },
+  { offset: 2, op: 'withdraw', amount: 100, latency: 1 },
+];
+
+class Account {
+  balance = 0;
+  readonly journal: string[] = [];
+  async apply(m: Msg, worker: string): Promise<void> {
+    await tick(m.latency); // handler I/O
+    if (m.op === 'withdraw' && this.balance < m.amount) {
+      this.journal.push(`${worker}:REJECT-${m.amount}`);
+      return;
+    }
+    this.balance += m.op === 'deposit' ? m.amount : -m.amount;
+    this.journal.push(`${worker}:${m.op}-${m.amount}`);
+  }
+}
+
+// Bug 1: no partition lease - two overlapping polls both start from the committed offset.
+class NoLeaseConsumer {
+  committed = 0;
+  constructor(private readonly account: Account) {}
+  async poll(worker: string): Promise<void> {
+    const batch = partitionLog.slice(this.committed); // both read committed = 0
+    for (const m of batch) {
+      await this.account.apply(m, worker);
+      this.committed = m.offset + 1;
+    }
+  }
+}
+const acc1 = new Account();
+const c1 = new NoLeaseConsumer(acc1);
+await Promise.all([c1.poll('w1'), c1.poll('w2')]);
+console.log(`no lease     : ${acc1.journal.join(' ')}`);
+console.log(`               balance=${acc1.balance} (expected 100) -> every message applied twice`);
+
+// Bug 2: parallel processing inside one partition.
+const acc2 = new Account();
+await Promise.all(partitionLog.map((m) => acc2.apply(m, 'w1')));
+console.log(`parallel batch: ${acc2.journal.join(' ')}`);
+console.log(`               balance=${acc2.balance} (expected 100) -> withdrawals overtook the deposit`);
+```
+
+```text
+no lease     : w1:deposit-500 w2:deposit-500 w1:withdraw-300 w2:withdraw-300 w1:withdraw-100 w2:withdraw-100
+               balance=200 (expected 100) -> every message applied twice
+parallel batch: w1:REJECT-300 w1:REJECT-100 w1:deposit-500
+               balance=500 (expected 100) -> withdrawals overtook the deposit
+```
+
+The fix is the two rules from the broker. **Claim the partition synchronously** before any `await` (a lease), and **process sequentially inside the partition**. Parallelism comes from having *more partitions*, not from a parallel batch. The forward-only commit protects against a stale worker rewinding the offset.
+
+```ts
+const tick = async (n: number): Promise<void> => {
+  for (let i = 0; i < n; i++) await Promise.resolve();
+};
+
+interface Msg {
+  readonly offset: number;
+  readonly op: 'deposit' | 'withdraw';
+  readonly amount: number;
+  readonly latency: number;
+}
+const partitionLog: readonly Msg[] = [
+  { offset: 0, op: 'deposit', amount: 500, latency: 3 },
+  { offset: 1, op: 'withdraw', amount: 300, latency: 1 },
+  { offset: 2, op: 'withdraw', amount: 100, latency: 1 },
+];
+
+class Account {
+  balance = 0;
+  readonly journal: string[] = [];
+  async apply(m: Msg, worker: string): Promise<void> {
+    await tick(m.latency);
+    if (m.op === 'withdraw' && this.balance < m.amount) {
+      this.journal.push(`${worker}:REJECT-${m.amount}`);
+      return;
+    }
+    this.balance += m.op === 'deposit' ? m.amount : -m.amount;
+    this.journal.push(`${worker}:${m.op}-${m.amount}`);
+  }
+}
+
+class LeasedConsumer {
+  private committed = 0;
+  private leased = false;
+  readonly skipped: string[] = [];
+  constructor(private readonly account: Account) {}
+
+  async poll(worker: string): Promise<void> {
+    if (this.leased) {
+      this.skipped.push(worker);
+      return;
+    }
+    this.leased = true; // claim before any await
+    try {
+      for (const m of partitionLog.slice(this.committed)) {
+        await this.account.apply(m, worker); // strictly sequential
+        this.commit(m.offset + 1);
+      }
+    } finally {
+      this.leased = false;
+    }
+  }
+
+  private commit(next: number): void {
+    this.committed = Math.max(this.committed, next); // forward-only
+  }
+}
+
+const account = new Account();
+const consumer = new LeasedConsumer(account);
+await Promise.all([consumer.poll('w1'), consumer.poll('w2')]);
+console.log(`leased+ordered: ${account.journal.join(' ')}`);
+console.log(`                balance=${account.balance} (expected 100), skipped polls: ${consumer.skipped.join(',')}`);
+await consumer.poll('w2'); // nothing left to do: offset already committed
+console.log(`                after a second poll: journal size=${account.journal.length}`);
+```
+
+```text
+leased+ordered: w1:deposit-500 w1:withdraw-300 w1:withdraw-100
+                balance=100 (expected 100), skipped polls: w2
+                after a second poll: journal size=3
+```
+
+**Talking points across stacks:**
+
+| Concern | Kafka / Java / Go / Redis equivalent |
+|---|---|
+| One worker per partition | Kafka's group coordinator assigns partitions. `KafkaConsumer` is **not thread-safe**, so use one consumer per thread. In Java you might hand each partition to a single-threaded executor. In Go, one goroutine per partition reading from a channel |
+| Parallelism without losing key order | More partitions. Or a "parallel consumer" that fans out by **key** inside a partition (per-key queues) and commits only the lowest completed offset (e.g. Confluent Parallel Consumer) |
+| Stale owner after rebalance | Kafka uses generation IDs / **fencing**: commits from an old generation are rejected. Our `owns()` check before each message is the in-memory analogue |
+| Commit safety | `commitSync` after processing (at-least-once). Store offsets **in the same DB transaction** as the side effect for effectively-once |
+| Redis Streams | `XREADGROUP` + `XACK`. Pending entries (`XPENDING`/`XCLAIM`) act as leases that another consumer can steal after an idle timeout |
+| Thread-safe log | Java: `ReentrantReadWriteLock` around the partition array, or a single writer thread per partition. Go: a mutex per partition, and readers take snapshot slices |
+
+## Failure handling
+
+| Failure | Behaviour | Production note |
+|---|---|---|
+| Transient handler error (503) | Retry with exponential backoff (100, 200, … capped) | Add **jitter** so a fleet of consumers doesn't retry in lockstep. Our demo omits it for determinism |
+| Poison message (can never succeed) | After `maxAttempts`, publish to `<topic>.DLT` with `x-origin`, `x-error`, `x-attempts`, then commit and move on | Alert on DLT growth. Provide a "re-drive" tool that republishes after a fix |
+| Retry blocks the partition (head-of-line) | Our in-place retry keeps order but delays the messages behind it | Kafka-style **retry topics** (`orders.retry.1m`, `orders.retry.10m`) free the partition, at the cost of per-key order. Choose per use case: payments usually need order, notifications don't |
+| Consumer crashes mid-batch | Uncommitted messages are re-delivered to the next owner | That's why handlers must be idempotent (dedupe on message ID or business key) |
+| Consumer is slow | Lag grows. Nothing is lost, because the log absorbs the burst | Alert on lag. Scale consumers up to the partition count |
+| Handler hangs forever | Not handled in the core | Wrap the handler in a timeout (see §13.3). Kafka's `max.poll.interval.ms` kicks a stuck consumer out of the group |
+| Producer retry creates duplicates | Two identical messages at different offsets | Idempotent producer (producer ID + sequence number, deduped by the broker), or consumer-side dedupe |
+| DLT publish itself fails | Here it can't (in memory) | Don't commit if the DLT write fails. Retry, or block the partition, and never drop silently |
+
+## Extensions & follow-ups
+
+Interviewers typically continue with: *"implement backpressure"*, *"push-based subscribers"*, *"retention by time or size"*, *"log compaction by key"*, *"exactly-once"*, *"a consumer that subscribes to multiple topics"*, *"message filtering / wildcard topics"*.
+
+**Backpressure with a bounded channel.** Between two in-process stages (a fetcher and a processing pool, or an HTTP ingest and a producer), an async bounded channel makes a fast producer wait when the buffer is full, rather than growing memory without limit. This is the same idea as Go's buffered channels and Java's `ArrayBlockingQueue.put`.
+
+```ts
+class ChannelClosedError extends Error {
+  override readonly name = 'ChannelClosedError';
+}
+
+class BoundedChannel<T> {
+  private readonly buffer: T[] = [];
+  private readonly waitingSenders: Array<() => void> = [];
+  private readonly waitingReceivers: Array<(value: T | undefined) => void> = [];
+  private closed = false;
+  highWater = 0;
+
+  constructor(readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity < 1) throw new RangeError('capacity must be a positive integer');
+  }
+
+  get size(): number {
+    return this.buffer.length;
+  }
+
+  async send(value: T): Promise<void> {
+    if (this.closed) throw new ChannelClosedError('send on a closed channel');
+    const receiver = this.waitingReceivers.shift();
+    if (receiver) {
+      receiver(value); // hand-off, no buffering
+      return;
+    }
+    while (this.buffer.length >= this.capacity) {
+      await new Promise<void>((resolve) => this.waitingSenders.push(resolve));
+      if (this.closed) throw new ChannelClosedError('channel closed while waiting');
+    }
+    this.buffer.push(value);
+    this.highWater = Math.max(this.highWater, this.buffer.length);
+  }
+
+  /** Resolves undefined once the channel is closed and drained. */
+  receive(): Promise<T | undefined> {
+    if (this.buffer.length > 0) {
+      const [value] = this.buffer.splice(0, 1);
+      this.waitingSenders.shift()?.(); // room for one more
+      return Promise.resolve(value);
+    }
+    if (this.closed) return Promise.resolve(undefined);
+    return new Promise((resolve) => this.waitingReceivers.push(resolve));
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const r of this.waitingReceivers.splice(0)) r(undefined);
+    for (const s of this.waitingSenders.splice(0)) s();
+  }
+}
+
+const tick = async (n: number): Promise<void> => {
+  for (let i = 0; i < n; i++) await Promise.resolve();
+};
+
+const channel = new BoundedChannel<string>(2);
+const events: string[] = [];
+
+async function producer(): Promise<void> {
+  for (let i = 1; i <= 6; i++) {
+    const msg = `m${i}`;
+    if (channel.size >= channel.capacity) events.push(`P blocks on ${msg}`);
+    await channel.send(msg);
+    events.push(`P sent ${msg} (buf=${channel.size})`);
+  }
+  channel.close();
+  events.push('P closed');
+}
+
+async function slowConsumer(): Promise<void> {
+  for (;;) {
+    const msg = await channel.receive();
+    if (msg === undefined) break;
+    events.push(`C got ${msg}`);
+    await tick(4); // slow processing
+  }
+  events.push('C done');
+}
+
+await Promise.all([producer(), slowConsumer()]);
+for (const e of events) console.log(e);
+console.log(`high-water mark ${channel.highWater} <= capacity ${channel.capacity}`);
+try {
+  await channel.send('late');
+} catch (e) {
+  console.log(`late send: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`);
+}
+```
+
+```text
+P sent m1 (buf=0)
+C got m1
+P sent m2 (buf=1)
+P sent m3 (buf=2)
+P blocks on m4
+C got m2
+P sent m4 (buf=2)
+P blocks on m5
+C got m3
+P sent m5 (buf=2)
+P blocks on m6
+C got m4
+P sent m6 (buf=2)
+P closed
+C got m5
+C got m6
+C done
+high-water mark 2 <= capacity 2
+late send: ChannelClosedError: send on a closed channel
+```
+
+The producer spent most of its time blocked and memory never exceeded two buffered items. In a broker you would place such a channel between the fetch loop and a worker pool, sized as `workers × maxPollRecords`.
+
+Other extensions, briefly:
+
+- **Push subscribers:** keep `maxInFlight` per subscriber (like RabbitMQ's `prefetch`). Only push when in-flight &lt; limit, and decrement on ack.
+- **Retention:** store `baseOffset` per partition and drop old segments by time or size. `fetch` below `baseOffset` then throws `OffsetOutOfRange`, and the reset policy applies.
+- **Compaction:** keep only the latest value per key (tombstone = `null` value). This is useful for "current state" topics such as user profiles.
+- **Exactly-once:** idempotent producer + transactional "consume-transform-produce" that commits the offsets and output messages atomically. In an LLD round it's enough to say: "at-least-once + idempotent consumer = effectively once".
+- **Wildcard subscriptions:** match topic names against a pattern when a topic is created, and extend the group's partition list.
+
+## Edge cases
+
+- A new group with `latest` on a topic that already has messages: lag starts at 0, and only new messages are delivered.
+- Keyless messages: round-robin, so no ordering guarantee between them.
+- More consumers than partitions: the extra members get `[]` and sit idle. That's expected, and it's worth saying.
+- A member leaves mid-batch: `owns()` stops it at the next message boundary. The uncommitted remainder goes to the new owner.
+- `seek` beyond the end, a negative offset, or a non-integer offset: `OffsetOutOfRangeError`. Seeking to exactly `endOffset` is valid ("skip everything").
+- A commit that would move backwards: ignored. Use `seek` for that.
+- A handler that throws a non-`Error` value: stringified into `x-error`.
+- Creating a topic named `orders.DLT` manually before the group: reused, not recreated.
+- Zero partitions, or a duplicate topic name: rejected.
+
+## Complexity
+
+Let `N` be the number of partitions, `B` the batch size, and `G` the number of groups.
+
+| Operation | Time | Notes |
+|---|---|---|
+| `send` | O(1) amortised (+ O(len(key)) hash) | Append to an array |
+| `fetch` | O(B) | `slice` copies the batch |
+| `commit` / `seek` / `committedOffset` | O(1) | Map keyed by group+topic+partition |
+| `pollOnce` | O(N·B) handler calls | Partitions run in parallel |
+| `rebalance` | O(M log M + N) | M members, sorted for determinism |
+| `lag` | O(N) | |
+| Space | O(total messages + G·N offsets) | Retention would bound the first term |
+
+## What graders look for / common mistakes
+
+**They look for:**
+
+- A log + offsets model (not delete-on-consume) and a clear explanation of consumer groups.
+- A key → partition strategy and an explicit statement: "ordering is per partition".
+- Commit-after-process, the at-least-once semantics named correctly, and idempotent handlers.
+- Retries with backoff, a DLT, and not letting a poison message block the partition forever.
+- Concurrency: one worker per partition, no parallelism inside a partition, safe commits.
+- Extensibility: `Partitioner` and `RetryPolicy` as strategies.
+
+**Common mistakes:**
+
+- One global array of messages with `shift()` on consume, which makes multiple subscribers and replay impossible.
+- Calling subscribers synchronously in `publish` (a pure Observer). One slow subscriber then blocks the publisher, and a failure leaves no retry state.
+- Committing before processing, then calling it "guaranteed delivery".
+- Running `Promise.all` over a batch and breaking per-key order.
+- Retrying forever inside the handler, so a poison message stalls the partition.
+- Offsets stored on the consumer object, so they are lost on restart or rebalance.
+
+## 90-minute plan
+
+| Time | What to do |
+|---|---|
+| 0–10 | Clarify: pull or push, ordering scope, delivery semantics, replay, new-subscriber start position |
+| 10–20 | Entities + class diagram. State the guarantee: "ordered per partition, at-least-once" |
+| 20–35 | `PartitionLog`, `Topic`, `Broker` (append, fetch, commit, seek), `Partitioner`, `Producer` |
+| 35–55 | `ConsumerGroup`: join/leave/rebalance, `pollOnce` with leases, sequential delivery, commit |
+| 55–65 | Retry policy + DLT + offset reset policy |
+| 65–75 | Demo: keyed ordering, poison message, late subscriber, replay with an idempotent handler |
+| 75–85 | Concurrency discussion: the double-processing and reordering bugs, fencing, Kafka equivalents |
+| 85–90 | Extensions: backpressure, retry topics, retention/compaction |
+
+## Interview Q&A
+
+**Q1. How do you guarantee ordering, and what's the cost?**
+
+<details>
+<summary>Answer</summary>
+
+Only per partition. The partitioner sends all messages with the same key to the same partition, and a partition is processed by exactly one worker, strictly sequentially. The costs are: (1) parallelism is capped by the partition count; (2) head-of-line blocking, where a slow or failing message delays everything behind it in that partition, including unrelated keys that share the partition; (3) changing the partition count remaps keys, which breaks ordering during the transition. For global order you need a single partition, and throughput then equals that of one consumer.
+
+</details>
+
+**Q2. At-least-once, at-most-once, exactly-once: which does your design give, and how would you change it?**
+
+<details>
+<summary>Answer</summary>
+
+It gives at-least-once, because we commit after the handler succeeds, so a crash before the commit means redelivery. Committing before the handler gives at-most-once (possible loss). Exactly-once *processing* needs the side effect and the offset commit to be atomic: store the offset in the same DB transaction as the business write, or use Kafka transactions for consume-transform-produce. In practice most teams use at-least-once plus idempotent consumers (a dedupe table keyed by message ID, or naturally idempotent upserts).
+
+</details>
+
+**Q3. A consumer takes 30 seconds per message and the lag keeps growing. What do you do?**
+
+<details>
+<summary>Answer</summary>
+
+First measure where the time goes. Then: scale consumers up to the partition count, and increase partitions if needed (plan for key remapping). If order only matters per key, use a key-aware parallel consumer inside each partition. Move slow external calls to async batch APIs. Reduce `maxPollRecords` so rebalances and leases don't time out. If some messages are inherently slow, route them to a separate topic so they don't block fast ones. Pull-based consumption means the broker is never overwhelmed. Only the lag grows, so alert on lag and time-to-drain.
+
+</details>
+
+**Q4. How does your design prevent two consumers from processing the same partition during a rebalance?**
+
+<details>
+<summary>Answer</summary>
+
+There are two layers. A synchronous lease (`leases` set) means no two `processPartition` calls run for one partition at the same time within the process. The `owns()` check before each message makes a worker stop at the next message boundary once the partition is reassigned. The forward-only commit means a stale worker can't rewind the offset. In a distributed broker, the equivalent is a generation ID (epoch) attached to every fetch and commit, so the coordinator rejects commits from an older generation. This is called fencing.
+
+</details>
+
+**Q5. Why not just use the Observer pattern: `topic.subscribe(fn)` and call every `fn` on publish?**
+
+<details>
+<summary>Answer</summary>
+
+That is a fine answer for the basic in-process event bus, and Salesforce's v1 is close to it. It breaks down on the SDE-2 requirements: no persistence or replay, a slow subscriber blocks the publisher, a failed subscriber has no retry state, there is no consumer-group load sharing, and no backpressure. The log + offset design keeps the Observer *idea* (publishers don't know the subscribers) while decoupling them in time. Subscribers pull at their own pace from a durable log.
+
+</details>
+
+**Q6. Where would the dead-letter topic be a bad idea?**
+
+<details>
+<summary>Answer</summary>
+
+When skipping a message breaks correctness for later messages with the same key. For example, dropping `account-opened` to the DLT and then processing `deposit` for that account. There the right policy is to **block the key or partition** and alert, or to park every later message for that key until the poison one is fixed. Make the policy per topic: `DEAD_LETTER` for independent events like notifications, and `BLOCK` for ordered state changes like ledgers.
+
+</details>

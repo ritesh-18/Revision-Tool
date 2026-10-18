@@ -1,0 +1,472 @@
+---
+title: "12.5 ATM"
+---
+
+## Problem & where it's asked
+
+Design an ATM: a machine that accepts a card, verifies a PIN, and lets a customer check their balance, withdraw cash and make a deposit. The cash dispenser breaks the requested amount into real denominations. Bad PIN attempts are counted; after three failures the session is terminated.
+
+- **Walmart (reported, 2026):** "Design an ATM system." Follow-up reported: "How would you add support for multiple accounts on one card?" and "What happens when the machine runs out of ₹500 notes?"
+- **Common guide/prep question (reported as a prompt in several LLD lists, company association uncertain):** Frequently appears with the explicit instruction to use the State pattern for the ATM lifecycle and Chain of Responsibility for the cash dispenser.
+- **Graded on:** correct use of the **State** pattern (no `if (state === 'CARD_INSERTED')` switches), a clean **Chain of Responsibility** for denominations, a `BankService` interface, and typed errors for each failure mode.
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| How many wrong PINs before lockout? | 3. On lockout the card is auto-ejected (session reset). |
+| Denominations? | ₹2000, ₹500, ₹100, ₹50, ₹20, ₹10 (standard Indian ATM). |
+| Minimum withdrawal unit? | ₹10 (must be a multiple of ₹10 = 1000 paise). |
+| Deposit — how does cash enter? | Modelled as a direct credit; the physical acceptor is out of scope. |
+| Bank service — sync or async? | Synchronous for the in-round design; async handling discussed in concurrency. |
+| Transaction limits? | Out of scope for core; follow-up. |
+| Timeout for no input? | Out of scope for core; follow-up. |
+
+## Requirements
+
+**Functional:** `insertCard(cardId)`, `enterPIN(pin)`, `checkBalance()`, `withdraw(amountPaise)`, `deposit(amountPaise)`, `eject()`. Withdrawal returns a breakdown of notes dispensed.
+
+**Non-functional:** every invalid action on a state throws a typed error; denomination breakdown is greedy (largest first); PIN lock-out auto-ejects; `BankService` is an interface so the ATM can be tested without a real bank.
+
+**Out of scope:** network retries, card encryption, receipt printing, multi-account cards.
+
+## Entities & relationships
+
+| Entity | Role | Relationship |
+|---|---|---|
+| `Atm` | Context: delegates every user action to the current state | Has a `BankService`, a `CashDispenser` and an `AtmState` |
+| `AtmState` | State interface | Implemented by `IdleState`, `CardInsertedState`, `AuthenticatedState` |
+| `CashDispenser` | Applies the CoR logic over denominations | Has a stock map; used by `Atm.withdraw` |
+| `BankService` | Interface: `verifyPIN`, `getBalance`, `debit`, `credit` | Injected into `Atm` |
+| `MockBank` | Test double: in-memory accounts | Implements `BankService` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Atm {
+        +insertCard(cardId) void
+        +enterPIN(pin) void
+        +checkBalance() number
+        +withdraw(paise) Map
+        +deposit(paise) void
+        +eject() void
+        -state AtmState
+        -cardId string
+        -pinAttempts number
+    }
+    class AtmState {
+        <<interface>>
+        +name AtmStateName
+        +insertCard(atm, cardId) void
+        +enterPIN(atm, pin) void
+        +checkBalance(atm) number
+        +withdraw(atm, paise) Map
+        +deposit(atm, paise) void
+        +eject(atm) void
+    }
+    class IdleState
+    class CardInsertedState
+    class AuthenticatedState
+    class CashDispenser {
+        +load(denomPaise, count) void
+        +canDispense(paise) boolean
+        +dispense(paise) Map
+    }
+    class BankService {
+        <<interface>>
+        +verifyPIN(cardId, pin) boolean
+        +getBalance(cardId) number
+        +debit(cardId, amount) void
+        +credit(cardId, amount) void
+    }
+    Atm --> AtmState
+    Atm --> CashDispenser
+    Atm --> BankService
+    AtmState <|.. IdleState
+    AtmState <|.. CardInsertedState
+    AtmState <|.. AuthenticatedState`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> IDLE
+    IDLE --> CARD_INSERTED : insertCard
+    CARD_INSERTED --> AUTHENTICATED : enterPIN (correct)
+    CARD_INSERTED --> IDLE : eject / PIN locked (3 failures)
+    AUTHENTICATED --> AUTHENTICATED : checkBalance / withdraw / deposit
+    AUTHENTICATED --> IDLE : eject`} />
+
+## Design decisions & patterns
+
+**1. State pattern.** Each `AtmState` implementation throws `InvalidStateError` for every operation that is illegal in that state, and delegates to the ATM context for operations that are legal. The `Atm` context keeps a `state` field; calling `setState` switches behaviour for all subsequent operations. The alternative — a `switch(this.state)` in every method — creates a combinatorial explosion as states and operations grow.
+
+**2. Chain of Responsibility for denominations.** The dispenser tries each denomination in decreasing order. The `dispensePlan` function embodies the chain: it iterates the denomination list, greedily takes as many notes as available and requested, and passes the remainder to the next denomination. In a class-based version, each `DenominationHandler` calls `this.next.handle(remaining)`. Here the function is equivalent and shorter; a class chain is the right form when handlers need configuration or different algorithms (e.g., a "minimum notes" strategy instead of "largest first").
+
+**3. BankService interface.** The ATM does not import a real banking library; it calls `verifyPIN`, `debit` and `credit` on an injected interface. In production the implementation talks to a payment network; in tests it is `MockBank`. This is Dependency Inversion, and it is the only way to write deterministic tests for an ATM.
+
+**4. Auto-eject on PIN lockout.** When `pinAttempts` reaches 3, the state resets to `IDLE` *before* throwing the error. This means the caller (the ATM screen) can catch the error and show "Your card has been blocked", and the machine is immediately ready for the next user.
+
+**5. Paise throughout.** `getBalance`, `debit`, `credit` and `withdraw` all deal in integer paise. Denominations are also stored as paise values (₹2000 = 200 000 paise). This eliminates floating-point rounding and lets you write `if (amount % 1000 !== 0)` to check "multiple of ₹10" without a decimal comparison.
+
+## Implementation
+
+**Part 1: errors, money helpers and bank service.**
+
+```ts
+class AtmError extends Error {
+  constructor(message: string) { super(message); this.name = new.target.name; }
+}
+class InvalidStateError extends AtmError {}
+class AuthError extends AtmError {}
+class InsufficientFundsError extends AtmError {}
+class InsufficientCashError extends AtmError {}
+
+const formatPaise = (p: number): string => {
+  const abs = Math.abs(p);
+  return `${p < 0 ? '-' : ''}₹${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
+};
+
+interface BankService {
+  verifyPIN(cardId: string, pin: string): boolean;
+  getBalance(cardId: string): number;
+  debit(cardId: string, amount: number): void;
+  credit(cardId: string, amount: number): void;
+}
+
+class MockBank implements BankService {
+  private readonly accounts = new Map<string, { pin: string; balance: number }>();
+  addAccount(cardId: string, pin: string, balance: number): void {
+    this.accounts.set(cardId, { pin, balance });
+  }
+  verifyPIN(cardId: string, pin: string): boolean {
+    return this.accounts.get(cardId)?.pin === pin;
+  }
+  getBalance(cardId: string): number {
+    const acc = this.accounts.get(cardId);
+    if (!acc) throw new AtmError(`Card ${cardId} not found`);
+    return acc.balance;
+  }
+  debit(cardId: string, amount: number): void {
+    const acc = this.accounts.get(cardId)!;
+    if (acc.balance < amount)
+      throw new InsufficientFundsError(`Insufficient funds: need ${formatPaise(amount)}, have ${formatPaise(acc.balance)}`);
+    acc.balance -= amount;
+  }
+  credit(cardId: string, amount: number): void {
+    this.accounts.get(cardId)!.balance += amount;
+  }
+}
+```
+
+**Part 2: cash dispenser (Chain of Responsibility logic).**
+
+```ts
+/** Denomination values in paise, largest first. */
+const DENOM_PAISE = [200000, 50000, 10000, 5000, 2000, 1000];
+
+/** Returns a note-count map, or null if exact change is impossible. */
+function dispensePlan(amountPaise: number, stock: Map<number, number>): Map<number, number> | null {
+  if (amountPaise % 1000 !== 0) return null;
+  const notes = new Map<number, number>();
+  let remaining = amountPaise;
+  for (const denom of DENOM_PAISE) {
+    const avail = stock.get(denom) ?? 0;
+    const use = Math.min(Math.floor(remaining / denom), avail);
+    if (use > 0) notes.set(denom, use);
+    remaining -= use * denom;
+  }
+  return remaining === 0 ? notes : null;
+}
+
+class CashDispenser {
+  private readonly stock = new Map<number, number>();
+
+  load(denomPaise: number, count: number): void {
+    this.stock.set(denomPaise, (this.stock.get(denomPaise) ?? 0) + count);
+  }
+  canDispense(amountPaise: number): boolean {
+    return dispensePlan(amountPaise, this.stock) !== null;
+  }
+  dispense(amountPaise: number): Map<number, number> {
+    const plan = dispensePlan(amountPaise, this.stock);
+    if (!plan) throw new InsufficientCashError(`Cannot dispense ${formatPaise(amountPaise)} with current stock`);
+    for (const [denom, count] of plan)
+      this.stock.set(denom, (this.stock.get(denom) ?? 0) - count);
+    return plan;
+  }
+  describe(): string {
+    return [...this.stock.entries()]
+      .filter(([, c]) => c > 0)
+      .map(([d, c]) => `${c}×${formatPaise(d)}`)
+      .join(' ');
+  }
+}
+```
+
+**Part 3: ATM states.**
+
+```ts
+type AtmStateName = 'IDLE' | 'CARD_INSERTED' | 'AUTHENTICATED';
+
+interface AtmState {
+  readonly name: AtmStateName;
+  insertCard(atm: Atm, cardId: string): void;
+  enterPIN(atm: Atm, pin: string): void;
+  checkBalance(atm: Atm): number;
+  withdraw(atm: Atm, amountPaise: number): Map<number, number>;
+  deposit(atm: Atm, amountPaise: number): void;
+  eject(atm: Atm): void;
+}
+
+class Atm {
+  private state: AtmState = new IdleState();
+  cardId: string | null = null;
+  pinAttempts = 0;
+  static readonly MAX_PIN_ATTEMPTS = 3;
+
+  constructor(readonly bank: BankService, readonly dispenser: CashDispenser) {}
+
+  getStateName(): AtmStateName { return this.state.name; }
+  setState(s: AtmState): void { this.state = s; }
+  resetSession(): void { this.cardId = null; this.pinAttempts = 0; this.setState(new IdleState()); }
+
+  insertCard(cardId: string): void { this.state.insertCard(this, cardId); }
+  enterPIN(pin: string): void { this.state.enterPIN(this, pin); }
+  checkBalance(): number { return this.state.checkBalance(this); }
+  withdraw(amountPaise: number): Map<number, number> { return this.state.withdraw(this, amountPaise); }
+  deposit(amountPaise: number): void { this.state.deposit(this, amountPaise); }
+  eject(): void { this.state.eject(this); }
+}
+
+class IdleState implements AtmState {
+  readonly name: AtmStateName = 'IDLE';
+  insertCard(atm: Atm, cardId: string): void {
+    atm.cardId = cardId; atm.pinAttempts = 0; atm.setState(new CardInsertedState());
+  }
+  enterPIN(_a: Atm, _p: string): void { throw new InvalidStateError('No card inserted'); }
+  checkBalance(_a: Atm): number { throw new InvalidStateError('No card inserted'); }
+  withdraw(_a: Atm, _n: number): Map<number, number> { throw new InvalidStateError('No card inserted'); }
+  deposit(_a: Atm, _n: number): void { throw new InvalidStateError('No card inserted'); }
+  eject(_a: Atm): void { throw new InvalidStateError('No card inserted'); }
+}
+
+class CardInsertedState implements AtmState {
+  readonly name: AtmStateName = 'CARD_INSERTED';
+  insertCard(_a: Atm, _c: string): void { throw new InvalidStateError('Card already inserted'); }
+  enterPIN(atm: Atm, pin: string): void {
+    atm.pinAttempts++;
+    if (atm.bank.verifyPIN(atm.cardId!, pin)) {
+      atm.setState(new AuthenticatedState());
+    } else if (atm.pinAttempts >= Atm.MAX_PIN_ATTEMPTS) {
+      atm.resetSession();
+      throw new AuthError(`PIN locked after ${Atm.MAX_PIN_ATTEMPTS} failed attempts`);
+    } else {
+      throw new AuthError(`Wrong PIN (${atm.pinAttempts}/${Atm.MAX_PIN_ATTEMPTS} attempts)`);
+    }
+  }
+  checkBalance(_a: Atm): number { throw new InvalidStateError('Not authenticated'); }
+  withdraw(_a: Atm, _n: number): Map<number, number> { throw new InvalidStateError('Not authenticated'); }
+  deposit(_a: Atm, _n: number): void { throw new InvalidStateError('Not authenticated'); }
+  eject(atm: Atm): void { atm.resetSession(); }
+}
+
+class AuthenticatedState implements AtmState {
+  readonly name: AtmStateName = 'AUTHENTICATED';
+  insertCard(_a: Atm, _c: string): void { throw new InvalidStateError('Card already inserted'); }
+  enterPIN(_a: Atm, _p: string): void { throw new InvalidStateError('Already authenticated'); }
+  checkBalance(atm: Atm): number { return atm.bank.getBalance(atm.cardId!); }
+  withdraw(atm: Atm, amountPaise: number): Map<number, number> {
+    if (amountPaise <= 0 || amountPaise % 1000 !== 0)
+      throw new AtmError(`Amount must be a positive multiple of ₹10, got ${formatPaise(amountPaise)}`);
+    if (!atm.dispenser.canDispense(amountPaise))
+      throw new InsufficientCashError(`ATM cannot dispense ${formatPaise(amountPaise)}`);
+    atm.bank.debit(atm.cardId!, amountPaise);
+    return atm.dispenser.dispense(amountPaise);
+  }
+  deposit(atm: Atm, amountPaise: number): void {
+    if (amountPaise <= 0 || amountPaise % 1000 !== 0)
+      throw new AtmError('Deposit must be a positive multiple of ₹10');
+    atm.bank.credit(atm.cardId!, amountPaise);
+  }
+  eject(atm: Atm): void { atm.resetSession(); }
+}
+```
+
+**Part 4: driver.**
+
+```ts
+const bank = new MockBank();
+bank.addAccount('CARD-001', '1234', 1_000_000); // ₹10,000
+bank.addAccount('CARD-002', '9999', 50_000);    // ₹500
+
+const dispenser = new CashDispenser();
+dispenser.load(200000, 5);  // 5×₹2000
+dispenser.load(50000, 10);  // 10×₹500
+dispenser.load(10000, 20);  // 20×₹100
+dispenser.load(5000, 10);   // 10×₹50
+dispenser.load(2000, 5);    // 5×₹20
+dispenser.load(1000, 10);   // 10×₹10
+
+const atm = new Atm(bank, dispenser);
+
+function act(label: string, fn: () => unknown): void {
+  try {
+    const result = fn();
+    if (result instanceof Map) {
+      const notes = [...result.entries()].map(([d, c]) => `${c}×${formatPaise(d)}`).join(' + ');
+      console.log(`${label} -> ${notes}`);
+    } else if (typeof result === 'number') {
+      console.log(`${label} -> ${formatPaise(result)}`);
+    } else {
+      console.log(`${label} -> ok [${atm.getStateName()}]`);
+    }
+  } catch (err) {
+    console.log(`${label} -> ${(err as Error).name}: ${(err as Error).message}`);
+  }
+}
+
+act('insertCard CARD-001', () => atm.insertCard('CARD-001'));
+act('wrong PIN', () => atm.enterPIN('0000'));
+act('correct PIN', () => atm.enterPIN('1234'));
+act('balance', () => atm.checkBalance());
+act('withdraw ₹4380', () => atm.withdraw(438000));
+act('balance after', () => atm.checkBalance());
+act('deposit ₹200', () => atm.deposit(20000));
+act('balance after deposit', () => atm.checkBalance());
+act('eject', () => atm.eject());
+
+act('insert CARD-002', () => atm.insertCard('CARD-002'));
+act('wrong PIN 1', () => atm.enterPIN('1111'));
+act('wrong PIN 2', () => atm.enterPIN('2222'));
+act('wrong PIN 3 (lockout)', () => atm.enterPIN('3333'));
+act('insert after lockout', () => atm.insertCard('CARD-001'));
+act('insert again before reset', () => atm.eject());
+act('balance without card', () => atm.checkBalance());
+
+act('insert CARD-002', () => atm.insertCard('CARD-002'));
+act('PIN', () => atm.enterPIN('9999'));
+act('overdraw', () => atm.withdraw(100_000));
+act('eject', () => atm.eject());
+
+console.log('cash left:', dispenser.describe());
+```
+
+## Demo output
+
+```text
+insertCard CARD-001 -> ok [CARD_INSERTED]
+wrong PIN -> AuthError: Wrong PIN (1/3 attempts)
+correct PIN -> ok [AUTHENTICATED]
+balance -> ₹10000.00
+withdraw ₹4380 -> 2×₹2000.00 + 3×₹100.00 + 1×₹50.00 + 1×₹20.00 + 1×₹10.00
+balance after -> ₹5620.00
+deposit ₹200 -> ok [AUTHENTICATED]
+balance after deposit -> ₹5820.00
+eject -> ok [IDLE]
+insert CARD-002 -> ok [CARD_INSERTED]
+wrong PIN 1 -> AuthError: Wrong PIN (1/3 attempts)
+wrong PIN 2 -> AuthError: Wrong PIN (2/3 attempts)
+wrong PIN 3 (lockout) -> AuthError: PIN locked after 3 failed attempts
+insert after lockout -> ok [CARD_INSERTED]
+insert again before reset -> ok [IDLE]
+balance without card -> InvalidStateError: No card inserted
+insert CARD-002 -> ok [CARD_INSERTED]
+PIN -> ok [AUTHENTICATED]
+overdraw -> InsufficientFundsError: Insufficient funds: need ₹1000.00, have ₹500.00
+eject -> ok [IDLE]
+cash left: 3×₹2000.00 10×₹500.00 17×₹100.00 9×₹50.00 4×₹20.00 9×₹10.00
+```
+
+The dispense of ₹4380: greedy picks 2×₹2000 (₹4000), leaving ₹380. No ₹500 fits; 3×₹100 (₹300), leaving ₹80; 1×₹50, leaving ₹30; 1×₹20, leaving ₹10; 1×₹10. Total notes: 8.
+
+## Concurrency
+
+In a synchronous design, `debit` and `dispense` happen in the same call stack and cannot interleave. The race appears when `debit` is an `await` (a real bank network call):
+
+1. Customer A calls `withdraw(500)`. Thread checks balance = ₹1000 (enough).
+2. Customer B calls `withdraw(700)` on the *same account* (joint account from two ATMs).
+3. A's `await debit(500)` suspends.
+4. B's `await debit(700)` runs, sees ₹1000, debits ₹700, balance = ₹300.
+5. A's debit resumes, debits ₹500, balance = −₹200. **Overdraft.**
+
+The bank's core banking system prevents this with an `UPDATE accounts SET balance = balance - ? WHERE balance >= ?` under serialisable isolation. The ATM never checks balance itself for authorisation — it just calls `debit` and handles the `InsufficientFundsError` the bank throws.
+
+A second race is the **dispenser**: two withdrawals approved by the bank should not both try to take the last ₹500 note. The fix is to lock the dispenser or to check stock inside the same transaction as the bank debit. Here, checking `canDispense` before `debit` avoids charging a customer when the machine is empty, but not the concurrent-depletion case.
+
+## Extensions & follow-ups
+
+| Extension | Design change |
+|---|---|
+| **Session timeout** | Inject a `Clock`; add a `lastActivity` timestamp on the context; a background sweep calls `atm.eject()` if `clock.now() - lastActivity > TTL`. |
+| **Multiple accounts on one card** | `AuthenticatedState` gains a `selectAccount(accountId)` transition; or `checkBalance`/`withdraw`/`deposit` accept an optional `accountId`. |
+| **Non-greedy note selection ("minimum notes" algorithm)** | Replace `dispensePlan` with a dynamic programming solution: `dp[amount] = minimum notes to make amount`. For typical ATM amounts and six denominations, this runs in negligible time. |
+| **Maintenance mode** | A fourth state `MaintenanceState` rejects all user actions; an admin can reload the dispenser and exit maintenance. |
+| **Audit log** | An `AuditListener` interface, notified on every state transition and transaction — similar to the Observer in the FlipMed case study. |
+
+## Edge cases
+
+- Withdrawal not a multiple of ₹10 is rejected before the bank is called (`amount % 1000 !== 0`).
+- `canDispense` is checked *before* `debit`: if the machine is empty, the customer is told before any debit is attempted. This avoids a refund flow.
+- PIN locked: the card is auto-ejected (state reset) before the error is thrown. The state machine is back to `IDLE` even in the error path.
+- Deposit of 0 or a non-multiple of ₹10 throws before the bank is called.
+- `eject` on an already-idle machine throws `InvalidStateError` — callers should not call `eject` if no card is present.
+- The `AuthenticatedState.withdraw` checks the dispenser *and then* debits. If `debit` throws (insufficient funds), no notes are given. If `dispense` somehow throws after a successful `debit`, that is a compensating-transaction scenario: the bank should credit back, which requires a try/catch around `dispense`.
+
+## Complexity
+
+| Operation | Cost |
+|---|---|
+| Any state transition | O(1) |
+| `dispensePlan` | O(D) where D = number of denominations (6) |
+| `CashDispenser.load` | O(1) |
+| All bank operations | O(1) in-memory; real bank: O(network RTT) |
+
+## What graders look for / common mistakes
+
+- ✅ Every illegal action throws a named error, not a generic `Error('not allowed')`.
+- ✅ PIN lockout auto-ejects; state is clean even in the error path.
+- ✅ `BankService` is an interface; `Atm` never `new`s the bank.
+- ✅ CoR logic is separate from the dispenser's stock management.
+- ❌ A `currentState: string` field with `if/else if` chains in `withdraw()`. This is exactly what State eliminates.
+- ❌ Hard-coding denominations inside `Atm.withdraw()` instead of delegating to `CashDispenser`.
+- ❌ Calling `bank.debit()` before checking `canDispense()`, which charges the customer even when the machine cannot give cash.
+- ❌ Not resetting `pinAttempts` on a successful PIN or on eject.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---|---|
+| 0–8 | Clarify states, PIN rules, denominations, bank-service contract. Draw the state diagram. |
+| 8–20 | Entities: `Atm` context, `AtmState` interface, three concrete states on paper. |
+| 20–40 | Implement `BankService` interface + `MockBank`, then `CashDispenser` + `dispensePlan`. |
+| 40–65 | Implement the three states and the `Atm` context. |
+| 65–80 | Driver: happy path, wrong PIN, lockout, overdraft, empty machine edge case. |
+| 80–90 | Mention timeout extension, non-greedy dispensing, and async debit race. |
+
+## Interview Q&A
+
+<details>
+<summary>Q1. Why not a `switch(this.state)` in each method?</summary>
+
+With three states and six operations you already have 18 branches. Add a fourth state (Maintenance) and you touch every method. With the State pattern, adding a state is one new class; existing methods are untouched (Open/Closed). The `switch` also makes it easy to forget a case — the TypeScript compiler will not warn you — while an interface forces you to implement every method.
+
+</details>
+
+<details>
+<summary>Q2. How would you implement "minimum notes" dispensing?</summary>
+
+Dynamic programming: `dp[i]` = minimum notes to dispense exactly `i` paise. Initialise `dp[0] = 0`, everything else `Infinity`. For each `i` from 1 to `amount`, try each denomination `d` where `d ≤ i` and `dp[i-d] + 1 < dp[i]`. The answer is `dp[amount]`; backtrack to find which notes were used. For six denominations and amounts up to ₹20 000, this runs in microseconds.
+
+</details>
+
+<details>
+<summary>Q3. The bank `debit` call is async. How do you prevent a double-spend?</summary>
+
+The bank's own database must enforce it with a serialisable transaction or an optimistic lock (`UPDATE … WHERE balance >= amount`). The ATM should not check balance and then debit in two separate calls — it must send one atomic `debit(amount)` command and let the bank reject it with `InsufficientFundsError`. This is the "never check-then-act across a network boundary" rule.
+
+</details>
+
+<details>
+<summary>Q4. What is the compensating transaction if `dispense` throws after `debit` succeeds?</summary>
+
+Call `bank.credit(cardId, amount)` in a `finally` or `catch` block around `dispense`. Log both events for the reconciliation process. In practice, ATMs are engineered so that `dispense` almost never fails after the door opens, but the hardware can jam; the `credit` is the reversal. This is the same Saga pattern used in microservices: each step has a compensating action.
+
+</details>

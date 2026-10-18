@@ -1,0 +1,820 @@
+---
+title: "10. Retrieval Augmented Generation (RAG)"
+description: "Retrieval Augmented Generation is the architecture pattern where an LLM is given relevant context — documents, passages, structured data — fetched from an..."
+---
+
+<Callout type="info">
+  How to read this chapter:
+  - 📘 **Handbook**: the original chapter text, unchanged apart from diagrams redrawn as Mermaid.
+  - 🔧 **Going deeper**: code and extra depth on topics the handbook already covers.
+  - ➕ **Beyond the handbook**: topics the original chapter does not cover at all.
+</Callout>
+
+## 10.1 Concept Explanation
+
+Retrieval Augmented Generation is the architecture pattern where an LLM is given relevant context — documents, passages, structured data — fetched from an external store at query time, instead of relying solely on what was baked into its weights during training. RAG is the single most important pattern in production GenAI. It makes models accurate about facts they were not trained on, scalable across data that updates daily, and auditable because every claim can be traced to a source.
+
+The slogan: "Don't fine-tune knowledge into the model; retrieve it." Fine-tuning teaches behavior; retrieval supplies facts. Conflating the two is the most common architectural mistake in early-stage GenAI projects.
+
+## 10.2 RAG Architecture
+
+<Mermaid chart={`flowchart TD
+  subgraph ING["INGESTION (offline, batch)"]
+    direction LR
+    D1["Documents"] --> D2["Loaders"] --> D3["Chunker"] --> D4["Enricher"] --> D5["Embedder"]
+    D5 --> V1["Vector DB"]
+    D5 --> V2["BM25 index"]
+    D5 --> V3["Knowledge graph"]
+  end
+  subgraph QRY["QUERY (online, latency-sensitive)"]
+    Q1["User question"] --> Q2["Optional: query rewriter / decomposer"]
+    Q2 --> Q3["Retriever<br/>(vector + BM25 + filters)"]
+    Q3 --> Q4["Reranker (cross-encoder)"]
+    Q4 --> Q5["Context assembler<br/>(top-k chunks + system prompt + user question)"]
+    Q5 --> Q6["LLM"]
+    Q6 --> Q7["Response with citations"]
+    Q7 --> Q8["Optional: validator / hallucination check"]
+    Q8 --> Q9["Return to user"]
+  end
+  V1 -.-> Q3
+  V2 -.-> Q3
+  V3 -.-> Q3`} />
+
+Every box on this diagram is a tunable component. Production RAG is the discipline of measuring each box and improving the weakest.
+
+## 10.3 Document Ingestion
+
+Source documents come in PDFs, HTML, Word, Markdown, Notion, Confluence, Slack, SharePoint, Google Drive, code repositories, customer support tickets, transcripts, audio, images, scanned PDFs. Each format has its own extraction quirks.
+
+Tools commonly used:
+- **Unstructured.io** — robust multi-format parser, handles tables and layout.
+- **LlamaParse / LlamaIndex parsers** — strong for PDFs.
+- **PyMuPDF, pdfplumber** — programmatic PDF parsing.
+- **Apache Tika** — broad format support, JVM-based.
+- **OCR (Tesseract, AWS Textract, Google Document AI)** — for scanned documents.
+- **Whisper** — audio transcription.
+
+Tables, headers, footers, and footnotes are the failure points. A good ingestion pipeline preserves structure (tables as tables, lists as lists) instead of flattening everything to plain text. Modern systems often retain page numbers, headings, and bounding boxes for richer citations.
+
+## 10.4 Chunking — The Most Underrated Lever
+
+A chunk is a unit of retrievable content. Too small and chunks lack context; too big and the model wastes tokens on irrelevant text.
+
+Strategies:
+- **Fixed-size chunking.** Split every N tokens. Simple, fast, naive.
+- **Sliding window with overlap.** N tokens per chunk with M tokens overlap. Reduces information lost at boundaries.
+- **Sentence or paragraph chunking.** Respects natural boundaries.
+- **Semantic chunking.** Group sentences whose embeddings are similar; split where similarity drops.
+- **Structure-aware chunking.** Use document structure (headings, sections, code blocks, table rows) to define chunks.
+- **Hierarchical chunking.** Store small chunks for matching, but retrieve and pass larger parent sections to the LLM ("parent-document retrieval").
+
+Best practice for most workloads: structure-aware chunking with reasonable size (300–800 tokens) and modest overlap (10–20%). Add parent-document retrieval if accuracy demands more context.
+
+## 10.4a Parent-child and small-to-big retrieval 🔧
+
+The last chunking strategy above, hierarchical chunking, resolves the "too small vs too big" tension, and this section shows how to build it.
+
+### The problem
+
+Small chunks (one or two paragraphs) embed precisely: the vector is about one thing, so similarity search finds it. But a small chunk often lacks what the LLM needs to answer: the definition two paragraphs up, the table header, the exception in the next paragraph. Large chunks carry the context but embed vaguely, because one vector has to average several topics.
+
+### Why it happens (first principles)
+
+The two jobs want different units. *Matching* wants the smallest span that carries one idea, so the query-to-chunk similarity is not diluted. *Reading* wants the span a human would read to answer confidently, which is usually a whole section. A single chunk size is a compromise between two different optima.
+
+### Mechanism
+
+Index small **child** chunks for matching. Each child stores a pointer to its **parent** (the section it came from). At query time:
+1. Vector (or hybrid) search over children, over-fetching (for example 40).
+2. Group hits by parent and score each parent by its best child (and optionally by how many children hit).
+3. Send the top few parents to the LLM.
+
+A variant, **sentence-window** or small-to-big expansion, skips explicit parents: return the matched child plus its `n` neighbors on each side, using an ordinal position stored per child.
+
+### Implementation (Postgres + pgvector)
+
+```sql
+CREATE TABLE parent_sections (
+  id         text PRIMARY KEY,
+  doc_id     text NOT NULL,
+  heading    text,
+  text       text NOT NULL,
+  token_count int NOT NULL
+);
+
+CREATE TABLE child_chunks (
+  id         text PRIMARY KEY,
+  parent_id  text NOT NULL REFERENCES parent_sections(id) ON DELETE CASCADE,
+  tenant_id  uuid NOT NULL,
+  ordinal    int  NOT NULL,          -- position inside the parent, for window expansion
+  text       text NOT NULL,
+  embedding  vector(1024) NOT NULL
+);
+CREATE INDEX ON child_chunks USING hnsw (embedding vector_cosine_ops);
+
+-- Match on children, return parents ranked by their best child.
+WITH hits AS (
+  SELECT parent_id, embedding <=> $1 AS distance
+  FROM child_chunks
+  WHERE tenant_id = $2
+  ORDER BY embedding <=> $1
+  LIMIT 40
+),
+best AS (
+  SELECT parent_id, MIN(distance) AS distance, COUNT(*) AS child_hits
+  FROM hits GROUP BY parent_id
+)
+SELECT p.id, p.heading, p.text, b.distance, b.child_hits
+FROM best b JOIN parent_sections p ON p.id = b.parent_id
+ORDER BY b.distance
+LIMIT 5;
+```
+
+Building the two levels at ingestion time (a simplified structure-aware splitter for Markdown):
+
+```ts
+type Parent = { id: string; heading: string; text: string };
+type Child = { id: string; parentId: string; ordinal: number; text: string };
+
+export function splitParentsAndChildren(docId: string, markdown: string, maxChildChars = 1200) {
+  const parents: Parent[] = [];
+  const children: Child[] = [];
+  // Parents = sections under level-1 to level-3 headings.
+  const sections = markdown.split(/\n(?=#{1,3} )/);
+  sections.forEach((section, si) => {
+    const heading = section.match(/^#{1,3} (.*)/)?.[1] ?? '';
+    const parentId = `${docId}#${si}`;
+    parents.push({ id: parentId, heading, text: section });
+    // Children = paragraphs, merged until they reach maxChildChars.
+    let buf = '';
+    let ordinal = 0;
+    for (const para of section.split(/\n{2,}/)) {
+      if (buf && buf.length + para.length > maxChildChars) {
+        children.push({ id: `${parentId}:${ordinal}`, parentId, ordinal: ordinal++, text: buf });
+        buf = '';
+      }
+      buf = buf ? `${buf}\n\n${para}` : para;
+    }
+    if (buf) children.push({ id: `${parentId}:${ordinal}`, parentId, ordinal, text: buf });
+  });
+  return { parents, children };
+}
+```
+
+### Edge cases and failure modes
+
+- **Parents too big for the budget.** A 6,000-token section times five parents can blow the context budget (10.10). Cap parent size at ingestion (split huge sections into sub-parents), or fall back to window expansion for oversized parents.
+- **Rerank which level?** Reranking children is cheap but ignores the context the LLM will see. Reranking parents is more accurate but costs more, since cross-encoder cost grows with text length and most cross-encoders truncate around 512 tokens. A common compromise: rerank children, then expand.
+- **Citations get coarser.** Citing a whole parent section is less useful than citing the paragraph. Keep the matched child IDs and show those spans as the citation, even though the LLM read the parent.
+- **Child text without context.** The child is embedded alone, so "It must be renewed annually" has no subject. Prepend the parent heading to the child text before embedding, or use contextual retrieval (10.5a).
+- **Stable IDs.** IDs based on position (`docId#3:2`) change when a section is inserted above. That breaks evaluation labels and causes needless re-embedding. Hash-based IDs or content hashes (10.6a) are more stable.
+
+## 10.5 Metadata Enrichment
+
+Every chunk should carry metadata: source document ID, document title, section heading, page number, last modified date, author, ACL tags, language, content type. This metadata enables filtering, ranking signals, and citation rendering.
+
+Generated metadata helps too: an LLM can write a one-sentence summary of each chunk that serves as an extra retrieval signal. Tags ("legal opinion," "API reference," "incident report") improve filtering precision. The cost is one-time at ingestion; the benefit is per-query.
+
+## 10.5a Contextual retrieval: giving each chunk its document context ➕
+
+Metadata and summaries describe a chunk from the outside. Contextual retrieval goes further and rewrites what gets embedded and indexed, so the chunk carries its own context.
+
+### The problem
+
+Chunks lose the information that made them meaningful. A chunk from a quarterly report reads "Revenue grew 3% over the previous quarter." It does not say which company or which quarter. A query for "ACME Q2 2023 revenue growth" may not retrieve it by embedding or by BM25, because the words that identify it live elsewhere in the document.
+
+### Why it happens (first principles)
+
+Both retrievers score the chunk text alone. The embedding of a context-free sentence sits in a generic region of vector space ("revenue grew"), and BM25 cannot match terms that are not in the chunk. Prepending the title or heading helps, but titles rarely carry everything (the period, the product line, the entity being discussed).
+
+### Mechanism
+
+Anthropic described the technique in September 2024. For each chunk, an LLM reads the whole document and the chunk, and writes a short context (typically 50 to 100 tokens) that situates the chunk, for example "This chunk is from ACME's Q2 2023 SEC filing. The previous quarter's revenue was $314M." The context is prepended to the chunk before **both** embedding and BM25 indexing.
+
+In their experiments (failure rate measured as `1 - recall@20`, over several datasets), contextual embeddings cut retrieval failures by 35% (5.7% to 3.7%), adding contextual BM25 cut them by 49% (to 2.9%), and adding a reranker on top cut them by 67% (to 1.9%). Treat these as evidence that it works, and measure your own gain.
+
+The cost is one LLM call per chunk, each with the whole document in the prompt. **Prompt caching** makes this affordable: the document is the same for every chunk of that document, so it is cached once and each later call pays only the cached-read rate plus the chunk. Anthropic estimated about $1.02 per million document tokens with caching, at 2024 prices.
+
+### Implementation (Anthropic TypeScript SDK)
+
+```ts
+import Anthropic from '@anthropic-ai/sdk';
+
+const anthropic = new Anthropic();
+const CONTEXT_MODEL = 'claude-haiku-4-5'; // a small, cheap model is enough for this job
+
+export async function contextualize(docText: string, chunks: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const chunk of chunks) {               // sequential per document keeps the cache warm
+    const res = await anthropic.messages.create({
+      model: CONTEXT_MODEL,
+      max_tokens: 200,
+      system: [
+        { type: 'text', text: 'You write short retrieval context for document chunks.' },
+        {
+          type: 'text',
+          text: `<document>\n${docText}\n</document>`,
+          cache_control: { type: 'ephemeral' },   // the document is the cached prefix
+        },
+      ],
+      messages: [{
+        role: 'user',
+        content:
+          `<chunk>\n${chunk}\n</chunk>\n` +
+          'In one or two sentences, say where this chunk sits in the document and name the ' +
+          'entities, dates and terms it depends on but does not state. Reply with the context only.',
+      }],
+    });
+    const text = res.content.flatMap((b) => (b.type === 'text' ? [b.text] : [])).join('').trim();
+    out.push(text);
+  }
+  return out;
+}
+
+// What gets embedded AND written to the tsvector column:
+// `${context}\n\n${chunk}`   while the original chunk is kept separately for display and citations.
+```
+
+Check `res.usage.cache_read_input_tokens` on the second and later chunks of a document. If it stays at zero, the cached prefix is not identical between calls or is below the model's minimum cacheable length.
+
+### Edge cases and failure modes
+
+- **Documents longer than the context window, or very long ones.** Use the enclosing section (from 10.4a) instead of the whole document. It is cheaper and usually enough.
+- **Short documents do not cache.** Prompt caching has a model-dependent minimum prefix length. Below it, every call pays full price, which is fine because those documents are short anyway.
+- **The context can be wrong.** The LLM may misattribute an entity. Keep it short, store it in its own column, and never show it to users as part of the source quote. Citations should point at the original chunk text.
+- **Edits invalidate every chunk's context.** The context depends on the whole document, so changing one paragraph can change what the right context is for other chunks. Decide whether to regenerate all contexts on any edit (correct, costly) or only for changed chunks (cheap, slowly drifting). See 10.6a.
+- **Offline work, so use batch pricing.** Contextualization is not latency-sensitive. A batch API (Anthropic and OpenAI both offer one at a discount) cuts cost further, at the price of hours of turnaround.
+- **Permissions.** The context is derived from the whole document, so it inherits that document's ACL (see 10.20a).
+
+## 10.6 Embedding and Indexing
+
+Covered in Chapter 8 (embedding models) and Chapter 9 (vector databases). The choice of embedding model determines retrieval quality; the choice of vector DB determines operational characteristics.
+
+## 10.6a Freshness and incremental ingestion ➕
+
+Indexing is not a one-time event, and keeping the index in sync with sources that change every day is its own design problem.
+
+### The problem
+
+A policy page was updated on Monday, and on Thursday the assistant still quotes the old version. A document was deleted from SharePoint, and its chunks still appear in answers. Or the opposite failure: to stay fresh, the team re-ingests everything nightly and pays to re-embed millions of unchanged chunks.
+
+### Why it happens (first principles)
+
+The index is a derived copy of many source systems, and every derived copy goes stale unless something propagates changes. Three kinds of change need different handling:
+- **Content edits**: the text changed, so affected chunks need new embeddings.
+- **Deletes**: the source no longer has the document. Most source APIs report what exists or what changed, not what disappeared, so deletes are the change most often missed.
+- **Metadata-only changes**: permissions, title, or location changed but the text did not. Re-embedding is wasted work, but the metadata must still be updated (permissions especially, see 10.20a).
+
+### Mechanism
+
+1. **Detect changes** per source, in order of preference: push events (webhooks, change data capture from a database), a "changed since" cursor in the source API, or a periodic full listing compared with what you have indexed.
+2. **Detect deletes** by comparing the full set of source IDs with indexed IDs on a schedule, even if you also use events, because events get lost.
+3. **Diff at chunk level.** Re-chunk the changed document, hash each chunk, and only embed chunks whose hash is new. Delete chunks whose hash disappeared (9.12a covers the database side).
+4. **Track freshness as a metric.** Indexing lag = time the change happened in the source minus time it became searchable. Set an SLA per source.
+
+<Mermaid chart={`flowchart TD
+  S["Source system"] -->|"webhook or changed-since cursor"| C["Change queue"]
+  S -->|"scheduled full listing"| L["Delete detector<br/>(source IDs vs indexed IDs)"]
+  C --> P["Fetch + parse + chunk"]
+  P --> H{"Chunk hash<br/>already indexed?"}
+  H -->|"yes"| M["Update metadata only"]
+  H -->|"no"| E["Embed + upsert"]
+  P --> R["Delete chunks whose hash vanished"]
+  L --> X["Delete all chunks of missing docs"]
+  E --> I["Index"]
+  M --> I
+  R --> I
+  X --> I`} />
+
+### Implementation (TypeScript sketch of one sync run)
+
+```ts
+type SourceDoc = { id: string; modifiedAt: Date; acl: string[]; text: string };
+
+export async function syncSource(sourceId: string) {
+  const state = await db.getSyncState(sourceId);           // { cursor: Date }
+  const overlap = 5 * 60_000;                               // re-read 5 min to absorb clock skew
+  const since = new Date(state.cursor.getTime() - overlap);
+  let maxSeen = state.cursor;
+
+  for await (const doc of source.listChangedSince(since)) {
+    const newChunks = chunk(doc.text).map((text) => ({ text, hash: sha256(text) }));
+    const oldHashes = new Set(await db.chunkHashesForDoc(doc.id));
+    const newHashes = new Set(newChunks.map((c) => c.hash));
+
+    const toEmbed = newChunks.filter((c) => !oldHashes.has(c.hash));
+    const toDelete = [...oldHashes].filter((h) => !newHashes.has(h));
+
+    const vectors = await embedBatch(toEmbed.map((c) => c.text)); // 8.6
+    await db.transaction(async (tx) => {
+      await tx.deleteChunksByHash(doc.id, toDelete);
+      await tx.insertChunks(doc.id, toEmbed, vectors);
+      await tx.updateDocMetadata(doc.id, { acl: doc.acl, modifiedAt: doc.modifiedAt }); // always
+    });
+    metrics.histogram('index_lag_ms', Date.now() - doc.modifiedAt.getTime());
+    if (doc.modifiedAt > maxSeen) maxSeen = doc.modifiedAt;
+  }
+  await db.setSyncState(sourceId, { cursor: maxSeen });    // advance only after success
+}
+
+export async function detectDeletes(sourceId: string) {
+  const live = new Set(await source.listAllIds());          // scheduled, e.g. nightly
+  for (const id of await db.indexedDocIds(sourceId)) {
+    if (!live.has(id)) await db.deleteDocument(id);         // removes all its chunks
+  }
+}
+```
+
+### Edge cases and failure modes
+
+- **Clock skew and same-timestamp edits.** A strict "modified after cursor" query misses edits stamped a moment before the cursor. Re-read an overlap window and rely on hashes to make the repeat work free.
+- **Out-of-order events.** Two webhooks for the same document can arrive reversed. Store the source's version or modified time per document and ignore older events.
+- **Moves and renames.** If the document ID is its path, a move looks like a delete plus a new document. Prefer the source's stable ID.
+- **A failing delete detector deletes everything.** If the source listing call fails or returns an empty page, a naive comparison removes the whole corpus. Refuse to delete more than a set fraction in one run without a human check.
+- **Derived data.** Contextual headers (10.5a), summaries, graph entities and cached answers are also derived from the document. Changes must invalidate them too, or they keep serving stale facts after the chunks are fixed.
+
+## 10.7 Query Processing
+
+The user's raw question is often suboptimal. Two improvements:
+
+**Query rewriting.** An LLM rewrites the question to be retrieval-friendly. "Hey can you tell me how to reset my password I forgot it" becomes "password reset procedure." HyDE (Hypothetical Document Embeddings) goes further — generate a hypothetical answer and embed *that* for retrieval, on the theory that the answer is more semantically similar to the source than the question.
+
+**Query decomposition.** Complex questions become multiple sub-queries. "Compare our pricing to Salesforce's last quarter" becomes "our pricing tiers" + "Salesforce pricing tiers Q4." Retrieve for each, merge contexts. Essential for multi-hop questions.
+
+## 10.8 Retrieval
+
+Vector search returns the top-k chunks by embedding similarity. BM25 returns the top-k by keyword overlap. Filters restrict to allowed documents. Combine signals via score fusion or Reciprocal Rank Fusion (RRF).
+
+Hybrid retrieval (vector + BM25) routinely outperforms either alone, especially on queries containing identifiers, codes, or rare terms.
+
+**🔧 Code:** RRF in TypeScript and as a single Postgres query is in [9.9a](/docs/genai-handbook/09-vector-databases). How filters interact with ANN search, and why a restrictive filter can return almost nothing, is in 9.10a of the same chapter.
+
+## 10.9 Reranking
+
+The vector index returns approximate candidates; a reranker provides a more accurate second-pass ranking. Cross-encoders read the query and each candidate jointly and output a precise relevance score.
+
+Popular rerankers: Cohere Rerank (managed), BGE-Reranker (open-source), Jina Reranker, mxbai-rerank. They cost more per call (cross-encoders cannot be precomputed) but you only run them on the top 50–100 candidates from the first stage, not the whole corpus.
+
+Reranking typically lifts top-3 recall by 10–30 points. It is the single highest-ROI step in a RAG pipeline after hybrid retrieval.
+
+## 10.10 Context Assembly
+
+After retrieval and reranking, you have N relevant chunks. Assembling them into a prompt is an art.
+
+- **Order matters.** LLMs attend more to the start and end of long contexts ("lost in the middle"). Put the most important chunks at the start or end.
+- **Citations matter.** Number each chunk; instruct the model to cite by number.
+- **Token budget matters.** Reserve room for the system prompt, the question, and the answer. Truncate or summarize aggressively if the budget is tight.
+- **Diversity matters.** Retrieving five near-duplicate chunks wastes the budget. Use Maximum Marginal Relevance (MMR) to balance relevance and diversity.
+
+### MMR in code 🔧
+
+The diversity bullet names MMR, and since it is short to implement, here it is with its failure modes.
+
+**Problem.** Corpora are full of near-duplicates: the same paragraph in five versions of a policy, or a FAQ copied into three help pages. Top-k by similarity returns all of them, and the context budget is spent on one fact.
+
+**Why it happens.** Similarity ranking scores each candidate independently against the query. It has no notion of "I already have this information".
+
+**Mechanism.** MMR (Carbonell and Goldstein, 1998) picks chunks one at a time. Each step chooses the candidate that is most similar to the query *minus* its similarity to anything already chosen:
+
+```text
+next = argmax over candidates d of   λ × sim(q, d)  -  (1 - λ) × max over selected s of sim(d, s)
+```
+
+`λ = 1` is plain relevance ranking; `λ = 0.5` to `0.7` is the usual range.
+
+**Implementation.**
+
+```ts
+type Cand = { id: string; vec: number[]; text: string };
+const dot = (a: number[], b: number[]) => a.reduce((s, x, i) => s + x * b[i], 0); // unit vectors
+
+export function mmr(query: number[], cands: Cand[], k: number, lambda = 0.6): Cand[] {
+  const selected: Cand[] = [];
+  const rest = [...cands];
+  const rel = new Map(rest.map((c) => [c.id, dot(query, c.vec)]));
+  while (selected.length < k && rest.length > 0) {
+    let bestIdx = 0;
+    let bestScore = -Infinity;
+    rest.forEach((c, i) => {
+      const redundancy = selected.length
+        ? Math.max(...selected.map((s) => dot(c.vec, s.vec)))
+        : 0;
+      const score = lambda * rel.get(c.id)! - (1 - lambda) * redundancy;
+      if (score > bestScore) { bestScore = score; bestIdx = i; }
+    });
+    selected.push(rest.splice(bestIdx, 1)[0]);
+  }
+  return selected;
+}
+```
+
+**Edge cases and failure modes.**
+- **Run it after reranking, on a small pool.** The cost is `O(k × n)` similarity computations, which is fine for 50 candidates and wasteful for 5,000.
+- **Relevance scale.** If you replace `sim(q, d)` with reranker scores, put them on the same scale as cosine (for example min-max normalize per query), or `λ` stops meaning what you think.
+- **Diversity is not always wanted.** For "show me every clause about termination", near-duplicates from different contracts are each relevant. Exact duplicates are better removed by hash at ingestion, which leaves MMR for semantic near-duplicates.
+- **Order after selection.** MMR returns chunks in selection order. Re-order them for the "lost in the middle" effect described above before building the prompt.
+
+## 10.11 Generation with Citations
+
+The system prompt instructs the model to answer using only the provided context and cite which chunks it used. Failure to find an answer in the context should produce "I don't know" rather than a hallucination.
+
+Citations are valuable for trust, debugging, and audit. They are also a partial defense against hallucination — when forced to point at evidence, models hallucinate less.
+
+## 10.11a Verifying citations 🔧
+
+Citations help only if they are correct, and this section covers how to check them automatically before the answer reaches the user (one of the "post-generation validators" in 10.18).
+
+### The problem
+
+The model writes "Refunds are available for 60 days [3]", but chunk 3 says 30 days. Or it cites `[7]` when only six chunks were provided. Users see a citation and trust the claim more, so a wrong citation is worse than none.
+
+### Why it happens (first principles)
+
+The model generates citation markers as tokens, the same way it generates everything else. It learns that claims are followed by bracketed numbers, and it usually attaches the right one, but nothing in decoding forces the marker to point to text that supports the claim. Errors increase when several chunks are similar, when the answer merges facts from several chunks, and when the answer goes beyond the context.
+
+### Mechanism: three checks, cheapest first
+
+1. **Structural.** Every cited ID exists in the set you provided. Free and deterministic.
+2. **Coverage.** Every factual sentence has at least one citation. Sentences without one are either connective text or unsupported claims.
+3. **Support.** For each (sentence, cited chunk) pair, ask whether the chunk entails the sentence. A natural-language-inference (NLI) cross-encoder does this cheaply. An LLM judge is more accurate on paraphrase and numbers but slower.
+
+Then apply a policy: remove unsupported sentences, regenerate with feedback, or show the answer with a warning. Log every failure, since the rate is a quality metric (10.17).
+
+### Implementation
+
+Structural and coverage checks in TypeScript:
+
+```ts
+type Finding = { sentence: string; cited: number[]; problem?: 'invalid-id' | 'uncited' };
+
+export function checkCitations(answer: string, providedIds: Set<number>): Finding[] {
+  const sentences = answer.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0);
+  return sentences.map((sentence) => {
+    const cited = [...sentence.matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1]));
+    if (cited.some((id) => !providedIds.has(id))) return { sentence, cited, problem: 'invalid-id' };
+    if (cited.length === 0 && /\d|\b(is|are|must|will|can)\b/i.test(sentence)) {
+      return { sentence, cited, problem: 'uncited' };     // crude "looks factual" heuristic
+    }
+    return { sentence, cited };
+  });
+}
+```
+
+Support check with an NLI cross-encoder (Python, run as a small service):
+
+```python
+from sentence_transformers import CrossEncoder
+
+nli = CrossEncoder("cross-encoder/nli-deberta-v3-base")
+LABELS = ["contradiction", "entailment", "neutral"]      # this model's label order
+
+def supported(claim: str, evidence: str, threshold: float = 0.5) -> tuple[bool, str]:
+    probs = nli.predict([(evidence, claim)], apply_softmax=True)[0]   # (premise, hypothesis)
+    label = LABELS[int(probs.argmax())]
+    return label == "entailment" and probs[1] >= threshold, label
+
+print(supported("Refunds are available for 60 days.",
+                "Customers may request a refund within 30 days of purchase."))
+# (False, 'contradiction')
+```
+
+Some model APIs can return citations as structured data instead of bracketed text. For example, the Anthropic Messages API can attach `citations` with the exact `cited_text` span to each part of the answer when documents are passed as document blocks with citations enabled. That removes the parsing step and the invalid-ID failure, but not the need for a support check on paraphrased claims.
+
+### Edge cases and failure modes
+
+- **Multi-chunk claims.** "Plan A costs $10 and includes SSO [2][5]" may be supported only by the two chunks together. Check against the concatenation of all cited chunks, not each one alone.
+- **NLI input limits.** Most NLI cross-encoders read about 512 tokens. Long chunks get truncated, and the supporting sentence may be cut off. Split evidence into sentences and take the best-scoring one.
+- **Numbers and negation.** Small NLI models are weak on arithmetic, units and dates. Route sentences containing numbers to the LLM judge, or compare extracted numbers directly.
+- **Over-strict policy.** Dropping every "neutral" sentence removes harmless connective text and makes answers choppy. Apply the strict policy only to sentences that make factual claims.
+- **Latency.** Checks run after generation, which delays a streamed answer. Options: stream, then append a warning or correction; or verify in the background and log, using the results for evaluation rather than blocking.
+
+## 10.12 Graph RAG
+
+Graph RAG augments document retrieval with a knowledge graph. Entities and relationships are extracted from documents at ingestion time and stored as a graph. At query time, the system traverses the graph to find related entities, then retrieves their associated documents.
+
+Strength: handles multi-hop, relational questions ("who reports to the engineer who built the payments service"). Weakness: graph construction quality is the ceiling; bad extraction produces bad answers.
+
+Microsoft's GraphRAG, Neo4j's LLM Graph Builder, and LangChain's graph utilities are the typical building blocks.
+
+## 10.13 Multi-Hop RAG
+
+Some questions require chained retrievals. "Find me the latest contract with Acme, then check whether their data sharing terms changed." This is two retrievals with a dependency.
+
+Implementation: an LLM (or planner) decomposes the question, executes retrieval iteratively, feeds intermediate results back as context for the next retrieval. This is where RAG meets agentic patterns (Chapter 11).
+
+## 10.14 Agentic RAG
+
+Instead of a fixed retrieve-then-generate flow, an agent decides when and what to retrieve. The model itself calls a "retrieve" tool, possibly multiple times with refined queries, before producing the final answer.
+
+Strength: dynamic, adaptive to question complexity. Weakness: higher latency, harder to debug, more expensive (more LLM calls).
+
+A common middle ground: a fixed pipeline for simple queries, an agentic path for complex ones, routed by an initial classifier.
+
+## 10.15 Memory Systems
+
+Long-running assistants accumulate user-specific context. Memory systems store this and retrieve it like any other RAG corpus.
+
+- **Episodic memory** — past conversations.
+- **Semantic memory** — distilled facts about the user.
+- **Procedural memory** — preferences and patterns of working.
+
+Typical implementation: every conversation is summarized into a few sentences and embedded. At new conversation start, retrieve the top relevant memories and prepend to context. Update memories asynchronously after each session.
+
+The pitfall is privacy. Memories are sensitive. Encrypt at rest, scope by user, allow deletion. Honor the right to be forgotten.
+
+## 10.16 Production RAG Architecture
+
+<Mermaid chart={`flowchart LR
+  subgraph ING["Ingestion"]
+    direction LR
+    A1["Connectors"] --> A2["Parsers"] --> A3["Chunker"] --> A4["Enricher"] --> A5["Embedder"]
+    A5 --> S["Vector DB + BM25 + Graph"]
+  end
+  subgraph QRY["Query"]
+    direction LR
+    B1["Client"] --> B2["Query rewriter"] --> B3["Retriever"] --> B4["Reranker"]
+    B4 --> B5["Context assembler"] --> B6["LLM"] --> B7["Validator"] --> B8["Response w/ citations"]
+  end
+  S -.-> B3`} />
+
+Every box has metrics. The discipline is treating each as a measurable, replaceable component.
+
+## 10.17 RAG Evaluation
+
+You cannot improve what you do not measure. Build an evaluation set: questions, ideal answers, and the source chunks that should be retrieved.
+
+Metrics:
+- **Retrieval metrics.** Recall@k (did we retrieve the right chunks), MRR (where in the ranking did they appear), nDCG (graded relevance).
+- **Generation metrics.** Faithfulness (does the answer follow from the context), answer relevance (does it address the question), context precision (how much of retrieved context was actually used), groundedness (does every claim trace to a source).
+- **End-to-end metrics.** Helpfulness, factual accuracy, user satisfaction.
+
+LLM-as-judge automates much of this. Frameworks: RAGAS, TruLens, Phoenix, LangSmith evaluations.
+
+## 10.17a RAG evaluation in practice 🔧
+
+The metrics above are the vocabulary, and this section turns them into a working evaluation loop: build the set, compute the metrics, judge faithfulness, and trust the judge only as far as it has been checked.
+
+### Building the golden set
+
+**Problem.** Teams either have no evaluation set or have 20 questions written by the engineer who built the system, which mostly test what already works.
+
+**Why it matters.** Every later decision (chunk size, model, reranker, prompt) is a comparison between two versions. Without a fixed set, comparisons are anecdotes, and regressions ship unnoticed.
+
+**Mechanism.** Mix three sources: real user queries from logs (the distribution you actually serve), questions written by subject-matter experts (the hard cases), and synthetic questions generated from chunks (cheap coverage, filtered by a human). Label each with the reference answer and the evidence. Cover categories on purpose: simple lookup, multi-hop, comparison, questions whose answer is "not in the corpus", and questions that a given user is *not allowed* to answer (to test 10.20a). A first set of 100 to 300 items is enough to catch large regressions; grow it from production failures.
+
+**Implementation.** One JSON object per line:
+
+```json
+{"id": "q-0142", "question": "How long do customers have to request a refund on annual plans?",
+ "category": "lookup", "user": "support-agent-eu",
+ "reference_answer": "30 days from purchase; annual plans are prorated after that.",
+ "evidence": [{"doc_id": "refund-policy", "quote": "within 30 days of purchase"}]}
+```
+
+**Edge cases.** Label evidence by document and quoted text, not by chunk ID: chunk IDs change every time you re-chunk, which silently breaks every label. Match a retrieved chunk as relevant when it contains the quote. Keep a held-out slice you never tune on, or the set stops measuring generalization.
+
+### Retrieval metrics in code
+
+**Mechanism.** Recall@k asks whether the evidence was retrieved at all. MRR asks how high the first relevant chunk was ranked. nDCG rewards relevant chunks near the top with a logarithmic discount, and supports graded relevance.
+
+```python
+import math
+
+def recall_at_k(retrieved: list[str], relevant: set[str], k: int) -> float:
+    return len(set(retrieved[:k]) & relevant) / len(relevant) if relevant else 0.0
+
+def mrr(retrieved: list[str], relevant: set[str]) -> float:
+    for i, doc in enumerate(retrieved, start=1):
+        if doc in relevant:
+            return 1.0 / i
+    return 0.0
+
+def ndcg_at_k(retrieved: list[str], gains: dict[str, float], k: int) -> float:
+    dcg = sum(gains.get(d, 0.0) / math.log2(i + 1) for i, d in enumerate(retrieved[:k], start=1))
+    ideal = sorted(gains.values(), reverse=True)[:k]
+    idcg = sum(g / math.log2(i + 1) for i, g in enumerate(ideal, start=1))
+    return dcg / idcg if idcg > 0 else 0.0
+```
+
+**Edge cases.** Report metrics per category, not only the average: a change that helps lookups and breaks multi-hop questions can leave the mean flat. Exclude "not in corpus" questions from recall (there is nothing to retrieve) and score them on whether the system declined to answer.
+
+### Context precision and context recall
+
+**Problem.** Retrieval metrics need labeled evidence for every question. Context metrics estimate the same things using the reference answer, which is easier to label.
+
+**Mechanism** (as defined in RAGAS and similar tools):
+- **Context recall**: split the *reference answer* into statements, and ask what fraction of them can be attributed to the retrieved context. Low recall means the retriever missed evidence.
+- **Context precision**: for each retrieved chunk, judge whether it was relevant to producing the reference answer, then compute a rank-weighted precision, so relevant chunks at the top count more. Low precision means noise is crowding the context.
+
+**Edge cases.** Both are LLM-judged, so they inherit the judge biases below. They also depend on the reference answer being complete: if the reference omits a detail the context contains, precision is underestimated.
+
+### Faithfulness with an LLM judge
+
+**Problem.** The answer can be fluent, relevant, and wrong relative to the context. Faithfulness asks: is every claim in the answer supported by the retrieved context?
+
+**Mechanism.** Two steps, because judges are more reliable on small binary decisions than on one overall score: (1) split the answer into atomic claims, (2) for each claim, ask whether the context supports it. Faithfulness = supported claims / total claims.
+
+**Implementation** (Anthropic Python SDK; any capable model works, ideally from a different family than the generator):
+
+```python
+import json
+import anthropic
+
+client = anthropic.Anthropic()
+JUDGE_MODEL = "claude-sonnet-5-5"
+
+def _ask(prompt: str) -> str:
+    msg = client.messages.create(model=JUDGE_MODEL, max_tokens=4000,
+                                 messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in msg.content if b.type == "text")
+
+def faithfulness(answer: str, contexts: list[str]) -> dict:
+    claims = json.loads(_ask(
+        "Split the answer into short, self-contained factual claims. "
+        "Return only a JSON array of strings.\n\nAnswer:\n" + answer))
+    ctx = "\n\n".join(f"[{i + 1}] {c}" for i, c in enumerate(contexts))
+    verdicts = []
+    for claim in claims:
+        v = json.loads(_ask(
+            "Context:\n" + ctx + "\n\nClaim: " + claim + "\n\n"
+            "Is the claim fully supported by the context? Do not use outside knowledge. "
+            'Return only JSON: {"supported": true or false, "evidence": "<chunk number or none>"}'))
+        verdicts.append({"claim": claim, **v})
+    score = sum(v["supported"] for v in verdicts) / len(verdicts) if verdicts else 1.0
+    return {"faithfulness": score, "verdicts": verdicts}
+```
+
+**Edge cases.** Parse failures happen; retry once, then record the item as "judge error" rather than counting it as pass or fail. An answer of "I don't know" has zero claims, so score it separately (correct refusal or missed answer). Faithful is not the same as correct: an answer can be fully faithful to a wrong or outdated chunk, which is why answer correctness against the reference is measured too.
+
+### LLM-as-judge biases and how to calibrate ➕
+
+**Problem.** The judge is itself a model, with systematic errors. If you do not measure them, your metrics have unknown error bars.
+
+**Why it happens.** Zheng et al. (2023), in the MT-Bench study, documented several biases that later work has repeatedly confirmed:
+- **Position bias**: in pairwise comparisons, judges favor the answer shown first (or second, depending on the model).
+- **Verbosity bias**: longer, more detailed answers are rated higher even when they add nothing correct.
+- **Self-preference**: a judge tends to rate outputs from its own model family higher.
+- **Leniency on scales**: on 1-to-10 scales, scores bunch at the top and small differences are noise.
+
+**Mechanism: mitigations.**
+- Prefer binary, per-claim questions (as in the faithfulness code) over holistic scores.
+- In pairwise comparisons, run both orders and count only consistent verdicts.
+- Use a judge from a different model family than the generator.
+- **Calibrate against humans**: have people label 100 to 200 items, run the judge on the same items, and measure agreement. Re-check whenever you change the judge model or prompt.
+
+```python
+from sklearn.metrics import cohen_kappa_score
+
+human = [1, 1, 0, 1, 0, 0, 1, 1, 0, 1]   # 1 = supported, from human review
+judge = [1, 1, 0, 1, 1, 0, 1, 1, 0, 1]
+print(cohen_kappa_score(human, judge))   # agreement corrected for chance; about 0.8 here
+```
+
+Raw agreement can look high just because most items are "supported". Cohen's kappa corrects for that. As a rough guide, kappa below about 0.6 means the judge needs a better prompt or a stronger model before you rely on it.
+
+**Edge cases.** Calibration is specific to the domain and the prompt: a judge calibrated on HR policies may be unreliable on medical text. Judges also drift when the provider updates the model, so pin the model version where possible and re-run calibration on upgrades.
+
+### Gating changes in CI
+
+**Mechanism.** Run the golden set on every change to prompts, chunking, models or retrieval settings, and compare with the last accepted baseline. Fail the build on a regression larger than the run-to-run noise (measure the noise by running the unchanged system twice). Store every run's per-item results so a regression can be traced to specific questions.
+
+**Edge cases.** LLM-judged metrics are noisy; a 1-point drop on 150 items is usually noise. Gate on deterministic retrieval metrics strictly and on judged metrics with a wider margin. Evaluation also costs money, so run the full set nightly and a smaller smoke set per pull request.
+
+## 10.18 Hallucination Mitigation
+
+Layered defense:
+1. Strong retrieval (relevant context narrows the model's guesswork).
+2. Citation prompts force the model to ground claims.
+3. Lower temperature reduces drift.
+4. Refusal training — "if not in context, say I don't know."
+5. Post-generation validators check claims against retrieved chunks.
+6. LLM-as-judge or human review on a sample.
+
+No single layer suffices. Production RAG layers them and measures the residual hallucination rate.
+
+## 10.19 Scaling Challenges
+
+- **Ingestion throughput** for billions of documents.
+- **Query latency** under p99 — reranking adds 100–500ms.
+- **Index refresh** for frequently changing corpora.
+- **Cross-region replication** for global products.
+- **Cost** of embeddings for huge corpora and rerankers for high QPS.
+
+## 10.20 Security Concerns
+
+- **ACL enforcement.** Retrieval must respect user permissions. Filter by ACL tags or use per-user indices.
+- **PII handling.** Documents contain sensitive data; decide what is allowed in prompts.
+- **Indirect prompt injection.** A poisoned document can instruct the model to misbehave. Treat retrieved content as untrusted.
+- **Tenant isolation.** One tenant's documents must never leak into another's prompt.
+
+## 10.20a Permission-aware retrieval 🔧
+
+The ACL bullet above is the security requirement RAG systems most often get wrong, so this section works through how to enforce it inside retrieval. (Tenant-level isolation is in [9.14a](/docs/genai-handbook/09-vector-databases). This section is about permissions *within* a tenant, where users can see different documents. Broader GenAI security is in [Security for GenAI](/docs/genai-handbook/20-security-for-genai).)
+
+### The problem
+
+An employee asks the HR assistant about salary bands and gets an answer drawn from a document only HR managers can open. No prompt injection was needed; retrieval simply returned the most similar chunks, and the model used them.
+
+### Why it happens (first principles)
+
+Embeddings and similarity know nothing about permissions. Once a chunk is in the prompt, the model treats it as usable fact, and no instruction reliably stops it from using or paraphrasing it. Filtering the *answer* afterwards is too late, because the content has already shaped it. So permissions must be enforced **before** chunks enter the context, as part of the retrieval query.
+
+### Mechanism
+
+1. **Copy ACLs at ingestion.** Store, on each chunk, the principals allowed to read its source document: user IDs and group IDs, as the source system defines them.
+2. **Resolve the user's principals at query time**: their user ID plus every group they belong to, from your identity provider (cached briefly).
+3. **Filter in the retrieval query**: a chunk is visible if its allowed principals overlap the user's principals. This is a pre-filter (9.10), so apply the filtered-search techniques from 9.10a.
+4. **Keep ACLs fresh.** Permission changes arrive through the same sync pipeline as content (10.6a), as metadata-only updates.
+5. **Optional late check.** For highly sensitive sources, re-check the final top results against the source system's live permission API before building the prompt. This catches revocations that the sync has not picked up yet.
+
+### Implementation (Postgres + pgvector)
+
+```sql
+ALTER TABLE chunks ADD COLUMN allowed_principals text[] NOT NULL DEFAULT '{}';
+CREATE INDEX chunks_acl_gin ON chunks USING gin (allowed_principals);
+
+-- Ingestion copies the document ACL, e.g. {'user:alice', 'group:hr-managers'}
+```
+
+```ts
+export async function retrieveForUser(userId: string, qv: number[], k = 20) {
+  const groups = await identity.groupsFor(userId);        // cached for ~1 minute
+  const principals = [`user:${userId}`, ...groups.map((g) => `group:${g}`)];
+
+  return withTenant(currentTenant(), async (client) => {   // 9.14a: RLS for the tenant
+    await client.query("SET LOCAL hnsw.iterative_scan = 'relaxed_order'");
+    const { rows } = await client.query(
+      `SELECT id, doc_id, text
+         FROM chunks
+        WHERE allowed_principals && $2::text[]             -- array overlap
+        ORDER BY embedding <=> $1
+        LIMIT $3`,
+      [pgvector.toSql(qv), principals, k],
+    );
+    return rows;
+  });
+}
+```
+
+### Edge cases and failure modes
+
+- **Revocation lag.** Between a permission change in the source and the next sync, the index still grants access. Measure this lag like content freshness, and use the late check for sources where minutes matter.
+- **Group explosion.** Some users belong to thousands of groups, and nested groups multiply that. Expand nesting at ingestion or in the identity cache, and watch query plans, since a large overlap array changes how selective the filter looks to the planner.
+- **Inherited and deny rules.** Many systems inherit permissions from folders and support explicit denies. Flatten them into an allow list at ingestion; a filter that only understands allows cannot express "everyone in engineering except contractors" otherwise.
+- **Derived data leaks.** Contextual headers (10.5a), summaries, knowledge-graph entities (10.12), memories (10.15) and cached answers are all derived from documents. Each must carry the most restrictive ACL of everything it was derived from. A graph node built from a public and a restricted document is restricted.
+- **Answer caches.** A cached answer for "what are the salary bands?" generated for an HR manager must not be served to an engineer. Key answer caches by the user's principal set (or a hash of it), not only by the question.
+- **Evaluation.** Add golden-set questions asked as low-privilege users whose correct answer is "I can't find that" (10.17a). Permission bugs rarely show up in quality metrics otherwise.
+
+## 10.21 Cost Optimization
+
+- Cache embeddings; do not re-embed unchanged content.
+- Cache full retrieved-then-generated answers when queries repeat.
+- Use smaller embedding models if quality allows.
+- Use cheaper LLMs for first-pass generation, escalate to frontier models only for hard cases.
+- Compress chunks before sending to the LLM.
+
+## 10.22 Interview Questions
+
+- Why RAG over fine-tuning?
+- Compare chunking strategies.
+- Explain hybrid retrieval and why it outperforms pure vector.
+- Walk through reranking and when it matters.
+- How do you evaluate a RAG system?
+- Design a multi-tenant RAG for an enterprise SaaS.
+- ➕ What is contextual retrieval and why does it need prompt caching? **An LLM writes a short context for each chunk from the whole document, and the context is prepended before embedding and BM25 indexing. Every call for a document repeats that document, so caching it makes the per-chunk cost small.**
+- ➕ Why match on small chunks but send large ones? **Small chunks embed one idea precisely; the LLM needs the surrounding section to answer. Parent-child retrieval searches children and returns their parents.**
+- ➕ How do you detect deleted source documents? **Periodically compare the source's full ID list with indexed IDs, and refuse runs that would delete an unusual fraction of the corpus. Change events alone miss deletes.**
+- ➕ Where must document permissions be enforced in RAG? **In the retrieval query, before chunks reach the prompt, using ACLs copied onto chunks and the user's resolved principals. Also on every derived artifact and answer cache.**
+- ➕ Name two LLM-as-judge biases and a mitigation. **Position bias and verbosity bias (also self-preference). Use binary per-claim judgments, swap orders in pairwise tests, and calibrate against human labels with Cohen's kappa.**
+- ➕ Why label golden-set evidence by quote rather than chunk ID? **Chunk IDs change whenever you re-chunk, which silently invalidates every label. Quotes survive re-chunking.**
+
+## 10.23 Hands-on Exercises
+
+1. Sketch the full RAG pipeline for a customer support knowledge base.
+2. Design the evaluation set: how many questions, what categories, how labeled.
+3. Estimate ingestion cost for 1M documents averaging 5 pages each.
+4. Plan a multi-tenant setup with 1,000 organizations sharing one vector DB.
+
+## 10.24 Common Mistakes
+
+- Chunking by fixed size without respecting structure.
+- Skipping reranking; pure vector recall is mediocre.
+- No evaluation set; flying blind on quality.
+- Letting one tenant's documents leak into another's context.
+- Using the same RAG path for trivial and complex queries; both suffer.
+
+## 10.25 Enterprise Best Practices
+
+Build the evaluation set before building the system. Treat retrieval, generation, and post-processing as separately observable components. Version chunks and embeddings. Audit citation accuracy. Have a documented re-ingestion process for when embedding models change. Establish per-tenant data residency requirements early.
+
+## Sources
+
+- Anthropic, [Introducing Contextual Retrieval](https://www.anthropic.com/news/contextual-retrieval), September 2024 (method, failure-rate reductions, cost estimate with prompt caching).
+- Anthropic docs, [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching) and [Citations](https://platform.claude.com/docs/en/build-with-claude/citations). Checked October 2026.
+- Carbonell and Goldstein, [The Use of MMR, Diversity-Based Reranking for Reordering Documents and Producing Summaries](https://dl.acm.org/doi/10.1145/290941.291025), SIGIR 1998.
+- Liu et al., [Lost in the Middle: How Language Models Use Long Contexts](https://arxiv.org/abs/2307.03172), TACL 2024.
+- Zheng et al., [Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena](https://arxiv.org/abs/2306.05685), NeurIPS 2023 (position, verbosity and self-enhancement bias).
+- Es et al., [RAGAS: Automated Evaluation of Retrieval Augmented Generation](https://arxiv.org/abs/2309.15217), 2023, and the [Ragas metrics documentation](https://docs.ragas.io/) (faithfulness, context precision, context recall).
+- [cross-encoder/nli-deberta-v3-base model card](https://huggingface.co/cross-encoder/nli-deberta-v3-base) (label order, premise/hypothesis input).
+- [pgvector README](https://github.com/pgvector/pgvector) (filtering and iterative index scans).
+- Cohen, J., A Coefficient of Agreement for Nominal Scales, Educational and Psychological Measurement, 1960; [scikit-learn `cohen_kappa_score`](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.cohen_kappa_score.html).

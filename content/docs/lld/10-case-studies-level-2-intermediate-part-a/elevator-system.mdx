@@ -1,0 +1,744 @@
+---
+title: "10.4 Elevator System"
+---
+
+## Problem & where it's asked
+
+Design the control software for a bank of elevators in a building. People press **hall buttons** (floor + direction) and **car buttons** (destination floor inside a car). A controller decides which car serves each hall call, and each car moves floor by floor, opening doors at its stops. The design should make it easy to swap the **dispatch algorithm** and to reason about each car's **state**.
+
+**Reported** at **Microsoft** (2026: a single lift that accepts or rejects requests based on capacity and must reach each destination within a stop limit), **Salesforce** (2026), **Amazon**, **MakeMyTrip**, and in CodeZym's top lists associated with **Adobe** and **Oracle**. The Adobe and Oracle attributions come from aggregated lists without first-hand write-ups, so treat them as **uncertain**.
+
+Graded on: the **State pattern** (Idle, MovingUp/Down, DoorsOpen), a **Strategy for scheduling/dispatch**, and new commitments not breaking existing ones.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Real-time or simulated? | **Tick-based simulation**: each `step()` = one time unit. Moving one floor = 1 tick, doors stay open for 1 tick. This makes the design deterministic and testable. |
+| How many cars and floors? | Configurable: N cars, floors `0..F-1`. |
+| Hall call direction matters? | Yes, for dispatch cost. A car moving up past floor 5 is a good match for "5 UP", not for "5 DOWN". |
+| Scheduling inside a car? | LOOK: keep going in the current direction while there are stops ahead, then reverse. |
+| Capacity / weight? | Tracked as an extension (Microsoft's variant). |
+| What if no car is available (all in maintenance)? | The call waits in a pending queue and is retried every tick. |
+| Emergency / fire mode? | Out of scope; mentioned as an extension. |
+| Can a hall call be cancelled? | No (real buttons can't be un-pressed). |
+
+## Requirements
+
+**Functional**
+
+1. `requestPickup(floor, direction)` assigns the call to a car using the configured `DispatchStrategy`.
+2. `selectFloor(carId, floor)` adds a destination inside a car.
+3. `step()` advances the simulation: cars move, stop, open and close doors.
+4. Cars follow LOOK ordering and never skip a requested floor they pass in their direction.
+5. Maintenance mode per car (only when the car is idle and empty of stops).
+6. Emit events (arrived, doors opened, idle) to listeners.
+7. Validate floors, directions (no UP at the top floor) and car ids.
+
+**Non-functional**
+
+- Dispatch algorithm swappable at runtime.
+- Deterministic, testable without real time.
+- Each car's behaviour in each state is isolated (easy to add states).
+
+**Out of scope**
+
+Physical motors and sensors, door obstruction, fire mode, VIP floors, energy optimisation.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `ElevatorSystem` | Facade/controller: validates requests, dispatches, ticks cars, pending queue | Has many `Elevator`s, one `DispatchStrategy`, listeners |
+| `Elevator` | A car: floor, direction, stops, current state | Has one `ElevatorState` at a time |
+| `ElevatorState` | Behaviour for one tick in that state | `IdleState`, `MovingState`, `DoorsOpenState`, `MaintenanceState` |
+| `HallCall` | `{ floor, direction }` | Assigned to one elevator |
+| `DispatchStrategy` | Picks the best car for a hall call | `NearestCarStrategy`, `LeastBusyStrategy` |
+| `ElevatorEvent` | What happened, where, when | Sent to `ElevatorListener`s |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class ElevatorSystem {
+      +requestPickup(floor, direction)
+      +selectFloor(carId, floor)
+      +step()
+      +setStrategy(strategy)
+      +setMaintenance(carId, on)
+    }
+    class Elevator {
+      +string id
+      +number floor
+      +Direction direction
+      +Set stops
+      +addStop(floor)
+      +tick()
+      +transitionTo(state)
+    }
+    class ElevatorState {
+      <<interface>>
+      +name
+      +tick(car)
+    }
+    class IdleState
+    class MovingState
+    class DoorsOpenState
+    class MaintenanceState
+    class DispatchStrategy {
+      <<interface>>
+      +select(cars, call) Elevator
+    }
+    class NearestCarStrategy
+    class LeastBusyStrategy
+    ElevatorSystem "1" o-- "many" Elevator
+    ElevatorSystem --> DispatchStrategy
+    Elevator --> ElevatorState
+    ElevatorState <|.. IdleState
+    ElevatorState <|.. MovingState
+    ElevatorState <|.. DoorsOpenState
+    ElevatorState <|.. MaintenanceState
+    DispatchStrategy <|.. NearestCarStrategy
+    DispatchStrategy <|.. LeastBusyStrategy`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> Idle
+    Idle --> DoorsOpen: stop at current floor
+    Idle --> Moving: stop above or below
+    Moving --> Moving: no stop at this floor
+    Moving --> DoorsOpen: reached a stop
+    DoorsOpen --> Moving: more stops
+    DoorsOpen --> Idle: no stops left
+    Idle --> Maintenance: set maintenance
+    Maintenance --> Idle: clear maintenance`} />
+
+## Design decisions & patterns
+
+- **State pattern for a car.** "What does a car do in one tick?" depends entirely on its state. Without State, `tick()` becomes a nested `if (doorsOpen) ... else if (moving && direction === 'UP') ...` that nobody wants to extend. With State, adding `EmergencyStopState` is a new class. States are stateless singletons (per-car data such as the door timer lives on `Elevator`), so we don't allocate on every transition.
+- **One `MovingState` with a direction field on the car**, instead of separate `MovingUp`/`MovingDown` classes. The behaviour is identical apart from `±1`. Mention that splitting it is fine if the interviewer prefers the explicit version.
+- **Strategy for dispatch.** Dispatch policies differ between buildings (offices at 9 a.m. vs hospitals). `NearestCarStrategy` uses a cost function. `LeastBusyStrategy` balances load. They can be swapped at runtime with `setStrategy`.
+- **LOOK scheduling inside the car.** It's simple, never starves a floor, and matches how real lifts behave. SCAN (always go to the end) wastes travel. "Nearest stop first" (SSTF) can starve far floors.
+- **Tick-based simulation + events (Observer).** The controller never sleeps. Tests call `step()` N times and inspect events. A UI or logger subscribes as a listener.
+- **Pending queue.** If the strategy returns no car, the call isn't lost. That's the "new commitments must not break existing ones" point: an assignment is only made to a car that can accept it.
+- **Rejected:** a thread per elevator (hard to test, and pointless in Node); letting the strategy mutate cars (it only *selects*; the controller assigns); a global sorted list of all requests (loses per-car LOOK order).
+
+## Implementation
+
+**Part 1: types, errors, events.**
+
+```ts
+type Direction = 'UP' | 'DOWN';
+type Heading = Direction | 'NONE';
+type StateName = 'IDLE' | 'MOVING' | 'DOORS_OPEN' | 'MAINTENANCE';
+
+class ElevatorError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ElevatorError';
+  }
+}
+
+interface HallCall {
+  readonly floor: number;
+  readonly direction: Direction;
+}
+
+type ElevatorEventType = 'ASSIGNED' | 'ARRIVED' | 'DOORS_OPEN' | 'IDLE' | 'PENDING';
+interface ElevatorEvent {
+  tick: number;
+  carId: string;
+  type: ElevatorEventType;
+  floor: number;
+}
+type ElevatorListener = (event: ElevatorEvent) => void;
+```
+
+**Part 2: the car and its states.** `Elevator` holds data and delegates `tick()` to its current state. Only states call `transitionTo`.
+
+```ts
+interface ElevatorState {
+  readonly name: StateName;
+  tick(car: Elevator): void;
+}
+
+class Elevator {
+  floor: number;
+  heading: Heading = 'NONE';
+  doorTicksLeft = 0;
+  readonly stops = new Set<number>();
+  private state: ElevatorState = IDLE;
+
+  constructor(
+    readonly id: string,
+    readonly minFloor: number,
+    readonly maxFloor: number,
+    private readonly emit: (type: ElevatorEventType, car: Elevator) => void,
+    startFloor = minFloor,
+  ) {
+    this.floor = startFloor;
+  }
+
+  get stateName(): StateName {
+    return this.state.name;
+  }
+
+  addStop(floor: number): void {
+    if (floor < this.minFloor || floor > this.maxFloor) {
+      throw new ElevatorError(`Floor ${floor} is outside ${this.minFloor}..${this.maxFloor}`);
+    }
+    if (this.state.name === 'MAINTENANCE') throw new ElevatorError(`${this.id} is under maintenance`);
+    if (floor === this.floor && this.state.name === 'DOORS_OPEN') return; // already open here
+    this.stops.add(floor);
+  }
+
+  hasStopsTowards(direction: Direction): boolean {
+    for (const s of this.stops) {
+      if (direction === 'UP' ? s > this.floor : s < this.floor) return true;
+    }
+    return false;
+  }
+
+  /** LOOK: keep the current heading while stops remain ahead, otherwise turn around. */
+  chooseHeading(): Heading {
+    if (this.heading !== 'NONE' && this.hasStopsTowards(this.heading)) return this.heading;
+    if (this.hasStopsTowards('UP')) return 'UP';
+    if (this.hasStopsTowards('DOWN')) return 'DOWN';
+    return 'NONE';
+  }
+
+  openDoors(): void {
+    this.stops.delete(this.floor);
+    this.doorTicksLeft = 1;
+    this.transitionTo(DOORS_OPEN);
+    this.emit('DOORS_OPEN', this);
+  }
+
+  transitionTo(state: ElevatorState): void {
+    this.state = state;
+    if (state.name === 'IDLE') {
+      this.heading = 'NONE';
+      this.emit('IDLE', this);
+    }
+  }
+
+  notify(type: ElevatorEventType): void {
+    this.emit(type, this);
+  }
+
+  tick(): void {
+    this.state.tick(this);
+  }
+
+  describe(): string {
+    const stops = [...this.stops].sort((a, b) => a - b).join(',');
+    return `${this.id}@${this.floor} ${this.stateName}${this.heading === 'NONE' ? '' : ` ${this.heading}`} stops=[${stops}]`;
+  }
+}
+
+const IDLE: ElevatorState = {
+  name: 'IDLE',
+  tick(car) {
+    if (car.stops.has(car.floor)) return car.openDoors();
+    const heading = car.chooseHeading();
+    if (heading === 'NONE') return;
+    car.heading = heading;
+    car.transitionTo(MOVING);
+    MOVING.tick(car); // start moving in this same tick
+  },
+};
+
+const MOVING: ElevatorState = {
+  name: 'MOVING',
+  tick(car) {
+    car.floor += car.heading === 'UP' ? 1 : -1;
+    if (car.stops.has(car.floor)) {
+      car.notify('ARRIVED');
+      car.openDoors();
+    }
+  },
+};
+
+const DOORS_OPEN: ElevatorState = {
+  name: 'DOORS_OPEN',
+  tick(car) {
+    car.doorTicksLeft -= 1;
+    if (car.doorTicksLeft > 0) return;
+    const heading = car.chooseHeading();
+    if (heading === 'NONE') {
+      car.transitionTo(IDLE);
+    } else {
+      car.heading = heading;
+      car.transitionTo(MOVING);
+    }
+  },
+};
+
+const MAINTENANCE: ElevatorState = {
+  name: 'MAINTENANCE',
+  tick() {
+    // out of service: does nothing until released
+  },
+};
+```
+
+Notice the `const` state objects are declared *after* the class that references them. That's fine: they're only read when a method runs, by which time the module has finished initialising.
+
+**Part 3: dispatch strategies.** Each returns the chosen car or `undefined`. The cost function is the heart of `NearestCarStrategy`, so explain it out loud in the round.
+
+```ts
+interface DispatchStrategy {
+  readonly name: string;
+  select(cars: readonly Elevator[], call: HallCall): Elevator | undefined;
+}
+
+function available(cars: readonly Elevator[]): Elevator[] {
+  return cars.filter((c) => c.stateName !== 'MAINTENANCE');
+}
+
+function pickCheapest(cars: readonly Elevator[], cost: (car: Elevator) => number): Elevator | undefined {
+  let best: Elevator | undefined;
+  let bestCost = Number.POSITIVE_INFINITY;
+  for (const car of cars) {
+    const c = cost(car);
+    if (c < bestCost || (c === bestCost && best !== undefined && car.id < best.id)) {
+      best = car;
+      bestCost = c;
+    }
+  }
+  return best;
+}
+
+class NearestCarStrategy implements DispatchStrategy {
+  readonly name = 'nearest-car';
+  select(cars: readonly Elevator[], call: HallCall): Elevator | undefined {
+    return pickCheapest(available(cars), (car) => {
+      const distance = Math.abs(car.floor - call.floor);
+      if (car.heading === 'NONE') return distance;
+      const onTheWay =
+        car.heading === call.direction &&
+        (car.heading === 'UP' ? call.floor >= car.floor : call.floor <= car.floor);
+      if (onTheWay) return distance;
+      // Must finish its current sweep first: go to the farthest stop, then come back.
+      const stops = [...car.stops];
+      const turnAt = car.heading === 'UP' ? Math.max(car.floor, ...stops) : Math.min(car.floor, ...stops);
+      return Math.abs(turnAt - car.floor) + Math.abs(turnAt - call.floor) + 1;
+    });
+  }
+}
+
+class LeastBusyStrategy implements DispatchStrategy {
+  readonly name = 'least-busy';
+  select(cars: readonly Elevator[], call: HallCall): Elevator | undefined {
+    // Stops dominate; distance only breaks ties (weight 100 > any building height here).
+    return pickCheapest(available(cars), (car) => car.stops.size * 100 + Math.abs(car.floor - call.floor));
+  }
+}
+```
+
+**Part 4: the controller.**
+
+```ts
+class ElevatorSystem {
+  private readonly cars: Elevator[] = [];
+  private readonly pending: HallCall[] = [];
+  private readonly listeners: ElevatorListener[] = [];
+  private tickCount = 0;
+
+  constructor(
+    private readonly floors: number,
+    startFloors: readonly number[],
+    private strategy: DispatchStrategy,
+  ) {
+    if (floors < 2 || startFloors.length < 1) throw new ElevatorError('Need at least 2 floors and 1 car');
+    startFloors.forEach((start, i) => {
+      this.checkFloor(start);
+      const emit = (type: ElevatorEventType, car: Elevator) => this.publish(type, car.id, car.floor);
+      this.cars.push(new Elevator(`E${i + 1}`, 0, floors - 1, emit, start));
+    });
+  }
+
+  get now(): number {
+    return this.tickCount;
+  }
+
+  subscribe(listener: ElevatorListener): void {
+    this.listeners.push(listener);
+  }
+
+  setStrategy(strategy: DispatchStrategy): void {
+    this.strategy = strategy;
+  }
+
+  requestPickup(floor: number, direction: Direction): void {
+    this.checkFloor(floor);
+    if (floor === this.floors - 1 && direction === 'UP') throw new ElevatorError('No UP button on the top floor');
+    if (floor === 0 && direction === 'DOWN') throw new ElevatorError('No DOWN button on the ground floor');
+    this.dispatch({ floor, direction });
+  }
+
+  selectFloor(carId: string, floor: number): void {
+    this.checkFloor(floor);
+    this.car(carId).addStop(floor);
+  }
+
+  setMaintenance(carId: string, on: boolean): void {
+    const car = this.car(carId);
+    if (on) {
+      if (car.stateName !== 'IDLE' || car.stops.size > 0) {
+        throw new ElevatorError(`${carId} must be idle with no stops before maintenance`);
+      }
+      car.transitionTo(MAINTENANCE);
+    } else if (car.stateName === 'MAINTENANCE') {
+      car.transitionTo(IDLE);
+    }
+  }
+
+  step(): void {
+    this.tickCount++;
+    const waiting = this.pending.splice(0);
+    for (const call of waiting) this.dispatch(call);
+    for (const car of this.cars) car.tick();
+  }
+
+  status(): string {
+    return this.cars.map((c) => c.describe()).join(' | ');
+  }
+
+  private dispatch(call: HallCall): void {
+    const car = this.strategy.select(this.cars, call);
+    if (!car) {
+      this.pending.push(call);
+      this.publish('PENDING', '-', call.floor);
+      return;
+    }
+    car.addStop(call.floor);
+    this.publish('ASSIGNED', car.id, call.floor);
+  }
+
+  private car(carId: string): Elevator {
+    const car = this.cars.find((c) => c.id === carId);
+    if (!car) throw new ElevatorError(`Unknown car ${carId}`);
+    return car;
+  }
+
+  private checkFloor(floor: number): void {
+    if (!Number.isInteger(floor) || floor < 0 || floor >= this.floors) {
+      throw new ElevatorError(`Invalid floor ${floor}`);
+    }
+  }
+
+  private publish(type: ElevatorEventType, carId: string, floor: number): void {
+    for (const l of this.listeners) l({ tick: this.tickCount, carId, type, floor });
+  }
+}
+```
+
+**Part 5: demo.** Ten floors (0–9), two cars: `E1` parked at the ground floor, `E2` at floor 8. A logger listener prints events.
+
+```ts
+const building = new ElevatorSystem(10, [0, 8], new NearestCarStrategy());
+building.subscribe((e) => {
+  if (e.type !== 'IDLE') console.log(`  [t${e.tick}] ${e.type} ${e.carId} floor ${e.floor}`);
+});
+
+function run(ticks: number): void {
+  for (let i = 0; i < ticks; i++) building.step();
+  console.log(`t=${building.now}: ${building.status()}`);
+}
+
+console.log('pickup 6 DOWN, pickup 2 UP');
+building.requestPickup(6, 'DOWN');
+building.requestPickup(2, 'UP');
+run(3);
+building.selectFloor('E1', 7); // boarded at 2, going to 7
+building.selectFloor('E2', 1); // boarded at 6, going to 1
+run(1);
+console.log('pickup 4 UP (E1 is below 4 going up, E2 is going down)');
+building.requestPickup(4, 'UP');
+run(2);
+building.selectFloor('E1', 5); // boarded at 4, going to 5
+run(6);
+
+console.log('--- switch strategy + maintenance ---');
+building.setStrategy(new LeastBusyStrategy());
+building.setMaintenance('E1', true);
+building.requestPickup(3, 'UP');
+building.setMaintenance('E2', false); // no-op: E2 is not in maintenance
+run(1);
+
+console.log('--- invalid requests ---');
+const attempts: [string, () => void][] = [
+  ['floor 12', () => building.requestPickup(12, 'UP')],
+  ['top floor UP', () => building.requestPickup(9, 'UP')],
+  ['E1 in maintenance', () => building.selectFloor('E1', 4)],
+  ['busy car maintenance', () => building.setMaintenance('E2', true)],
+  ['unknown car', () => building.selectFloor('E9', 1)],
+];
+for (const [label, attempt] of attempts) {
+  try {
+    attempt();
+  } catch (err) {
+    console.log(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+```
+
+## Demo output
+
+```text
+pickup 6 DOWN, pickup 2 UP
+  [t0] ASSIGNED E2 floor 6
+  [t0] ASSIGNED E1 floor 2
+  [t2] ARRIVED E1 floor 2
+  [t2] DOORS_OPEN E1 floor 2
+  [t2] ARRIVED E2 floor 6
+  [t2] DOORS_OPEN E2 floor 6
+t=3: E1@2 IDLE stops=[] | E2@6 IDLE stops=[]
+t=4: E1@3 MOVING UP stops=[7] | E2@5 MOVING DOWN stops=[1]
+pickup 4 UP (E1 is below 4 going up, E2 is going down)
+  [t4] ASSIGNED E1 floor 4
+  [t5] ARRIVED E1 floor 4
+  [t5] DOORS_OPEN E1 floor 4
+t=6: E1@4 MOVING UP stops=[7] | E2@3 MOVING DOWN stops=[1]
+  [t7] ARRIVED E1 floor 5
+  [t7] DOORS_OPEN E1 floor 5
+  [t8] ARRIVED E2 floor 1
+  [t8] DOORS_OPEN E2 floor 1
+  [t10] ARRIVED E1 floor 7
+  [t10] DOORS_OPEN E1 floor 7
+t=12: E1@7 IDLE stops=[] | E2@1 IDLE stops=[]
+--- switch strategy + maintenance ---
+  [t12] ASSIGNED E2 floor 3
+t=13: E1@7 MAINTENANCE stops=[] | E2@2 MOVING UP stops=[3]
+--- invalid requests ---
+floor 12: Invalid floor 12
+top floor UP: No UP button on the top floor
+E1 in maintenance: E1 is under maintenance
+busy car maintenance: E2 must be idle with no stops before maintenance
+unknown car: Unknown car E9
+```
+
+Walk through the key moment at `t=4`. `E1` is at floor 3 heading up, and the call is "4 UP", so it's *on the way*: cost 1. `E2` is at floor 5 heading **down** to 1, so it must finish its sweep first: 4 floors down to 1, 3 floors back up to 4, plus 1 for the turn, giving cost 8. `E1` wins and stops at 4 without any detour. Also notice that `E1` serves 4, 5 and 7 in one upward sweep even though 5 was requested after 7 (LOOK). Being able to explain a trace like this is what interviewers mean by "reason about your scheduler".
+
+## Concurrency
+
+Real controllers receive button presses from many panels at once. In Node, each `requestPickup` runs to completion, so two presses can't corrupt a car's `stops` set. The danger appears when **dispatch becomes async**, for example when the controller must `await` fresh car positions from the hardware gateway. Two calls read the same snapshot ("E1 is idle and closest"), both pick E1, and E2 sits idle.
+
+The fix is to make the controller an **actor**: all commands go through one queue and are processed one at a time, so each dispatch sees the effect of the previous one.
+
+```ts
+interface CarSnapshot {
+  id: string;
+  floor: number;
+  assigned: number;
+}
+
+class CarRegistry {
+  private readonly cars: CarSnapshot[] = [
+    { id: 'E1', floor: 0, assigned: 0 },
+    { id: 'E2', floor: 1, assigned: 0 },
+  ];
+  async snapshot(): Promise<CarSnapshot[]> {
+    const reading = this.cars.map((c) => ({ ...c })); // state as of the moment we asked
+    await new Promise((resolve) => setTimeout(resolve, 2)); // hardware gateway round-trip
+    return reading;
+  }
+  assign(id: string): void {
+    const car = this.cars.find((c) => c.id === id);
+    if (car) car.assigned++;
+  }
+  summary(): string {
+    return this.cars.map((c) => `${c.id}:${c.assigned}`).join(' ');
+  }
+}
+
+async function dispatch(registry: CarRegistry, floor: number): Promise<string> {
+  const cars = await registry.snapshot();
+  // cost = pending assignments first, then distance
+  cars.sort((a, b) => a.assigned - b.assigned || Math.abs(a.floor - floor) - Math.abs(b.floor - floor));
+  registry.assign(cars[0].id);
+  return cars[0].id;
+}
+
+/** Serialises async commands: each one starts only after the previous one finished. */
+class CommandQueue {
+  private tail: Promise<unknown> = Promise.resolve();
+  submit<T>(command: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(command);
+    this.tail = result.catch(() => undefined);
+    return result;
+  }
+}
+
+const racy = new CarRegistry();
+const racyPicks = await Promise.all([3, 4].map((f) => dispatch(racy, f)));
+console.log(`racy: picks=${racyPicks.join(',')} load=${racy.summary()}`);
+
+const safe = new CarRegistry();
+const queue = new CommandQueue();
+const safePicks = await Promise.all([3, 4].map((f) => queue.submit(() => dispatch(safe, f))));
+console.log(`actor queue: picks=${safePicks.join(',')} load=${safe.summary()}`);
+```
+
+```text
+racy: picks=E2,E2 load=E1:0 E2:2
+actor queue: picks=E2,E1 load=E1:1 E2:1
+```
+
+In Java, you'd get the same effect with a single-threaded executor for the controller, or a lock around "snapshot + assign". The principle is identical: **decide and commit atomically**.
+
+## Extensions & follow-ups
+
+| Follow-up (source) | Design change |
+|--------------------|---------------|
+| Capacity: accept or reject requests (Microsoft 2026, reported) | Track `load` per car. The strategy filters out full cars. Boarding that would exceed capacity is rejected. Shown below. |
+| Reach each destination within a stop limit (Microsoft 2026, reported) | Before accepting, simulate the car's LOOK order with the new stop and check no existing passenger's stop count exceeds the limit ("new commitments must not break existing ones"). |
+| Multiple dispatch strategies (reported) | Already a `DispatchStrategy`. Add zoning (cars 1–2 serve floors 0–10) as another class. |
+| Destination dispatch (people type the floor in the lobby) | The hall call carries the destination, so the strategy can group people going to similar floors. |
+| Emergency / fire mode | New `EmergencyState`: go to the ground floor, open doors, ignore calls. Controller broadcasts it to all cars. |
+| Peak-hour behaviour | A strategy that parks idle cars at the lobby in the morning. |
+
+A capacity-aware dispatch with boarding validation (compact and self-contained):
+
+```ts
+class CapacityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CapacityError';
+  }
+}
+
+class Car {
+  load = 0;
+  constructor(readonly id: string, public floor: number, readonly capacity: number) {}
+  board(people: number): void {
+    if (people <= 0) throw new CapacityError('people must be positive');
+    if (this.load + people > this.capacity) {
+      throw new CapacityError(`${this.id} has ${this.capacity - this.load} spaces, ${people} tried to board`);
+    }
+    this.load += people;
+  }
+  alight(people: number): void {
+    this.load = Math.max(0, this.load - people);
+  }
+}
+
+interface Dispatch {
+  select(cars: readonly Car[], floor: number, groupSize: number): Car | undefined;
+}
+
+/** Decorator: wraps any strategy and hides cars that can't fit the group. */
+class CapacityFilter implements Dispatch {
+  constructor(private readonly inner: Dispatch) {}
+  select(cars: readonly Car[], floor: number, groupSize: number): Car | undefined {
+    return this.inner.select(cars.filter((c) => c.capacity - c.load >= groupSize), floor, groupSize);
+  }
+}
+
+const nearest: Dispatch = {
+  select: (cars, floor) =>
+    [...cars].sort((a, b) => Math.abs(a.floor - floor) - Math.abs(b.floor - floor))[0],
+};
+
+const cars = [new Car('E1', 2, 8), new Car('E2', 7, 8)];
+cars[0].board(6);
+const dispatcher = new CapacityFilter(nearest);
+for (const [floor, group] of [[3, 2], [3, 3], [3, 9]] as const) {
+  const car = dispatcher.select(cars, floor, group);
+  console.log(`group of ${group} at ${floor} -> ${car ? car.id : 'no car fits, keep pending'}`);
+}
+try {
+  cars[0].board(3);
+} catch (err) {
+  console.log(`${err instanceof Error ? err.name : 'Error'}: ${err instanceof Error ? err.message : String(err)}`);
+}
+```
+
+```text
+group of 2 at 3 -> E1
+group of 3 at 3 -> E2
+group of 9 at 3 -> no car fits, keep pending
+CapacityError: E1 has 2 spaces, 3 tried to board
+```
+
+`CapacityFilter` is a **Decorator** over the strategy: capacity handling is added to *any* dispatch algorithm without editing it.
+
+## Edge cases
+
+- Hall call at the floor where an idle car already is: doors open on the next tick without moving.
+- A car call for the floor where doors are currently open: ignored (already there).
+- UP at the top floor / DOWN at the ground floor: rejected.
+- All cars in maintenance: the call is kept pending, not dropped.
+- Maintenance requested while a car has stops: rejected (or: finish stops first, then enter maintenance).
+- A new stop *behind* a moving car: served after the car reverses (LOOK), never by an instant U-turn.
+- Duplicate requests for the same floor: the `Set` deduplicates stops.
+- Ties in cost: broken deterministically by car id, so tests are stable.
+
+## Complexity
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `requestPickup` | O(C · S) | C cars, S stops per car (cost computes max/min of stops) |
+| `selectFloor` | O(1) | Set insert |
+| `step` | O(C · S) | `chooseHeading` scans stops. Use two sorted sets (up/down) for O(log S) |
+| Memory | O(C · F) worst case | Each car has at most F stops |
+
+## What graders look for / common mistakes
+
+- ✅ Clear state machine with named states and legal transitions (a diagram helps a lot).
+- ✅ Dispatch as a Strategy, with a cost function you can explain.
+- ✅ Deterministic simulation (`step()`), and tests that don't sleep.
+- ❌ One god class `Elevator` with `if` chains on `isMoving`/`isDoorOpen` booleans (impossible state combinations such as moving with doors open).
+- ❌ Serving requests strictly FIFO (the lift zig-zags across the building).
+- ❌ Losing a request when no car is available.
+- ❌ `setInterval` with real time in the core logic.
+- ❌ Not validating floors and directions.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–10 | Clarify: hall vs car calls, tick model, number of cars, capacity? Draw the state diagram first. |
+| 10–20 | Types, `Elevator` data, `ElevatorState` interface. |
+| 20–40 | The four states and LOOK `chooseHeading`. Test a single car via `step()`. |
+| 40–55 | `DispatchStrategy` + `NearestCarStrategy`, controller with validation and the pending queue. |
+| 55–70 | Driver with a scenario; print status each few ticks; fix bugs. |
+| 70–80 | Second strategy, maintenance, events. |
+| 80–90 | Walk through the trace; discuss capacity and concurrency. |
+
+## Interview Q&A
+
+**Q1. Why State pattern rather than an enum and a `switch`?**
+
+<details>
+<summary>Answer</summary>
+
+With four states an enum + `switch` is readable. The State pattern pays off as states grow (emergency, overload, door-obstructed, inspection): each state's rules stay in one place, transitions are explicit, and you can add a state without touching the others. In an interview, it also shows you recognise the pattern the problem is designed around. Mention the trade-off: more classes and indirection.
+
+</details>
+
+**Q2. How does your design stop a floor from being starved?**
+
+<details>
+<summary>Answer</summary>
+
+LOOK serves every stop in the current direction before reversing, so any stop is reached within at most two sweeps of the building. Nearest-stop-first could keep serving floors near the car and starve a distant floor. Starvation is also a dispatch concern: the pending queue is retried every tick, and a waiting-time penalty can be added to the cost function.
+
+</details>
+
+**Q3. How would you test this?**
+
+<details>
+<summary>Answer</summary>
+
+Because time is a `step()` call, tests are plain: build a system, issue calls, step N times, assert on `status()` or the events collected by a listener. Unit-test `chooseHeading` with hand-built stop sets, and test each strategy's `select` with fake cars. No sleeps, no timers, no flakiness.
+
+</details>
+
+**Q4. How would you support zoning (cars 1–2 serve floors 0–10, cars 3–4 serve 11–20)?**
+
+<details>
+<summary>Answer</summary>
+
+Give each `Elevator` a served range (it already has `minFloor`/`maxFloor`), and write a `ZonedStrategy` decorator that filters cars whose range contains the call floor before delegating to the inner strategy. `addStop` already rejects floors outside the car's range, so a mis-assignment fails loudly.
+
+</details>

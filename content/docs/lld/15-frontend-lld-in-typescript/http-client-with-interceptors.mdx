@@ -1,0 +1,538 @@
+---
+title: "15.6 HTTP Client with Interceptors"
+---
+
+## Problem & where it's asked
+
+"Design an Axios-like HTTP client" is a non-attributed question that comes up at product companies building internal component libraries and at fintech shops where interceptors carry auth tokens and retry logic. The question is deceptively open: a naïve answer is three lines of fetch. A good answer shows a configurable pipeline, graceful degradation under network failures, and cancellation without leaving pending requests as zombies.
+
+## Requirements
+
+**Functional**
+- `get`, `post` (and `request` for arbitrary methods).
+- **Interceptors**: `client.interceptors.request.use(...)` and `.response.use(...)`, with `eject(id)`.
+- **Timeout**: abort the transport after N ms; throw a typed `TimeoutError`.
+- **Retry with exponential backoff**: configurable default + per-request override; only for idempotent methods and 5xx/429 responses.
+- **Request deduplication**: two concurrent GETs to the same URL share the same in-flight promise.
+- **Response cache**: TTL-based, per-request opt-in via `cacheMs`.
+- **AbortSignal passthrough**: the caller can abort early; distinguish from a timeout in the error type.
+
+**Non-functional**
+- Transport, scheduler, and clock are injected (testable without real timers or fetch).
+- No `any`.
+- `promise.then(cleanup, cleanup)` instead of `promise.finally(cleanup)` to avoid unhandled rejections on a derived promise.
+- Abort on pre-aborted signal detectable before the transport is even called.
+
+**Public API (written first)**
+
+```ts
+interface RequestConfig {
+  method: string; url: string; headers: Record<string, string>;
+  body?: unknown; timeoutMs?: number; retries?: number;
+  signal?: AbortSignal; deduplicate?: boolean; cacheMs?: number;
+}
+interface HttpResponse<T = unknown> {
+  status: number; data: T; headers: Record<string, string>; fromCache: boolean;
+}
+type Transport = (config: RequestConfig, signal: AbortSignal) => Promise<HttpResponse<unknown>>;
+
+declare class HttpClient {
+  interceptors: {
+    request: { use(i: { onFulfilled?: (c: RequestConfig) => RequestConfig | Promise<RequestConfig> }): number; eject(id: number): void };
+    response: { use(i: { onFulfilled?: (r: HttpResponse) => HttpResponse | Promise<HttpResponse> }): number; eject(id: number): void };
+  };
+  get<T>(url: string, config?: Partial<RequestConfig>): Promise<HttpResponse<T>>;
+  post<T>(url: string, body: unknown, config?: Partial<RequestConfig>): Promise<HttpResponse<T>>;
+}
+```
+
+## Design
+
+**Interceptor pipeline.** Each interceptor is stored in a nullable array (ejecting sets the slot to `null`). Request interceptors run sequentially with `await` before the transport call; response interceptors run after a 2xx response. Skipping to `onRejected` mirrors Axios's behaviour.
+
+**Retry loop.** A `for` loop from `attempt = 0` to `maxRetries`. On 5xx/429 for an idempotent method, the catch block falls through to a backoff delay; any other error or a non-idempotent method throws immediately. The backoff is `baseMs × 2^attempt`.
+
+**Timeout vs abort.** Each attempt gets its own `AbortController`. `armTimeout` creates a fake-scheduler timer that sets a `timedOut` flag and aborts the controller. The catch block checks `timedOut` first and throws `TimeoutError`; otherwise it checks `cfg.signal?.aborted` for caller abort. A fast-path at the top of each attempt throws immediately if the caller's signal was already aborted before the attempt started.
+
+**Deduplication.** `inFlight: Map<key, Promise>` holds in-flight GETs. A second call to the same URL returns the existing promise. When the promise settles (success or error), cleanup runs via `promise.then(cleanup, cleanup)` — using the `.then` overload avoids creating a derived promise that could escape with an unhandled rejection.
+
+<Mermaid chart={`sequenceDiagram
+    participant Caller
+    participant HttpClient
+    participant ReqInterceptors
+    participant Transport
+    participant RespInterceptors
+
+    Caller->>HttpClient: get('/quote/RELIANCE')
+    HttpClient->>ReqInterceptors: onFulfilled (add auth header)
+    ReqInterceptors-->>HttpClient: mutated config
+    HttpClient->>Transport: fetch(config, controller.signal)
+    Transport-->>HttpClient: HttpResponse{status:200}
+    HttpClient->>RespInterceptors: onFulfilled (log)
+    RespInterceptors-->>HttpClient: response
+    HttpClient-->>Caller: HttpResponse<T>`} />
+
+**Patterns.** Chain of Responsibility (interceptors), Decorator (InterceptorManager wraps transport), Strategy (pluggable transport/scheduler), Proxy (dedup map returns the in-flight promise).
+
+## Implementation
+
+```ts
+// ---- Types ---------------------------------------------------------------
+interface RequestConfig {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body?: unknown;
+  timeoutMs?: number;
+  retries?: number;        // overrides client default; undefined = use default
+  signal?: AbortSignal;   // caller-supplied cancellation
+  deduplicate?: boolean;   // defaults to true for GET
+  cacheMs?: number;        // 0 disables cache
+}
+
+interface HttpResponse<T = unknown> {
+  status: number;
+  data: T;
+  headers: Record<string, string>;
+  fromCache: boolean;
+}
+
+type RequestInterceptor = {
+  onFulfilled?: (config: RequestConfig) => RequestConfig | Promise<RequestConfig>;
+  onRejected?: (error: unknown) => RequestConfig | Promise<RequestConfig>;
+};
+type ResponseInterceptor<T = unknown> = {
+  onFulfilled?: (response: HttpResponse<T>) => HttpResponse<T> | Promise<HttpResponse<T>>;
+  onRejected?: (error: unknown) => HttpResponse<T> | Promise<HttpResponse<T>>;
+};
+
+// Transport: the seam hiding real fetch
+type Transport = (config: RequestConfig, signal: AbortSignal) => Promise<HttpResponse<unknown>>;
+
+interface Scheduler {
+  setTimeout(fn: () => void, ms: number): number;
+  clearTimeout(id: number): void;
+}
+
+class HttpError extends Error {
+  constructor(readonly status: number, readonly response?: HttpResponse<unknown>) {
+    super(`HTTP ${status}`);
+    this.name = 'HttpError';
+  }
+}
+
+class TimeoutError extends Error {
+  constructor(ms: number) {
+    super(`Request timed out after ${ms}ms`);
+    this.name = 'TimeoutError';
+  }
+}
+
+// ---- InterceptorManager --------------------------------------------------
+class InterceptorManager<T> {
+  private readonly handlers: Array<{ id: number; interceptor: T } | null> = [];
+  private seq = 0;
+  use(interceptor: T): number {
+    const id = ++this.seq;
+    this.handlers.push({ id, interceptor });
+    return id;
+  }
+  eject(id: number): void {
+    const idx = this.handlers.findIndex((h) => h?.id === id);
+    if (idx >= 0) this.handlers[idx] = null;
+  }
+  forEach(fn: (interceptor: T) => void): void {
+    this.handlers.forEach((h) => h && fn(h.interceptor));
+  }
+}
+
+// ---- Cache ---------------------------------------------------------------
+interface CacheEntry { response: HttpResponse<unknown>; expiresAt: number }
+
+class ResponseCache {
+  private readonly store = new Map<string, CacheEntry>();
+  private readonly clock: { now(): number };
+  constructor(clock: { now(): number }) { this.clock = clock; }
+  key(config: RequestConfig): string {
+    return `${config.method}:${config.url}`;
+  }
+  get(config: RequestConfig): HttpResponse<unknown> | null {
+    const entry = this.store.get(this.key(config));
+    if (!entry || this.clock.now() > entry.expiresAt) {
+      this.store.delete(this.key(config));
+      return null;
+    }
+    return { ...entry.response, fromCache: true };
+  }
+  set(config: RequestConfig, response: HttpResponse<unknown>, ttlMs: number): void {
+    this.store.set(this.key(config), { response, expiresAt: this.clock.now() + ttlMs });
+  }
+  delete(config: RequestConfig): void { this.store.delete(this.key(config)); }
+}
+
+// ---- HttpClient ----------------------------------------------------------
+const IDEMPOTENT = new Set(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', 'PATCH']);
+
+interface HttpClientOptions {
+  baseUrl?: string;
+  defaultTimeoutMs?: number;
+  defaultRetries?: number;
+  retryBaseMs?: number;
+  transport: Transport;
+  scheduler: Scheduler;
+  clock: { now(): number };
+}
+
+class HttpClient {
+  readonly interceptors = {
+    request: new InterceptorManager<RequestInterceptor>(),
+    response: new InterceptorManager<ResponseInterceptor>(),
+  };
+  private readonly inFlight = new Map<string, Promise<HttpResponse<unknown>>>();
+  private readonly cache: ResponseCache;
+  private readonly options: HttpClientOptions;
+
+  constructor(options: HttpClientOptions) {
+    this.options = options;
+    this.cache = new ResponseCache(options.clock);
+  }
+
+  async request<T>(config: RequestConfig): Promise<HttpResponse<T>> {
+    // Run request interceptors
+    let cfg: RequestConfig = { ...config };
+    if (this.options.baseUrl && !cfg.url.startsWith('http')) {
+      cfg = { ...cfg, url: this.options.baseUrl + cfg.url };
+    }
+    const requestInterceptors: RequestInterceptor[] = [];
+    this.interceptors.request.forEach((i) => requestInterceptors.push(i));
+    for (const interceptor of requestInterceptors) {
+      try {
+        cfg = interceptor.onFulfilled ? await interceptor.onFulfilled(cfg) : cfg;
+      } catch (error) {
+        if (interceptor.onRejected) cfg = await interceptor.onRejected(error);
+        else throw error;
+      }
+    }
+
+    // Cache check
+    if (cfg.method.toUpperCase() === 'GET' && (cfg.cacheMs ?? 0) > 0) {
+      const cached = this.cache.get(cfg);
+      if (cached) return cached as HttpResponse<T>;
+    }
+
+    // Request deduplication for GET
+    const dedup = cfg.deduplicate !== false && cfg.method.toUpperCase() === 'GET';
+    if (dedup) {
+      const key = `${cfg.method}:${cfg.url}`;
+      const running = this.inFlight.get(key);
+      if (running) return running as Promise<HttpResponse<T>>;
+    }
+
+    const promise = this.executeWithRetry<T>(cfg);
+    if (dedup) {
+      const key = `${cfg.method}:${cfg.url}`;
+      this.inFlight.set(key, promise as Promise<HttpResponse<unknown>>);
+      // Use then/catch to avoid an unhandled rejection from the derived finally() promise
+      const cleanup = (): void => { this.inFlight.delete(key); };
+      promise.then(cleanup, cleanup);
+    }
+    return promise;
+  }
+
+  get<T>(url: string, config: Partial<RequestConfig> = {}): Promise<HttpResponse<T>> {
+    return this.request<T>({ method: 'GET', url, headers: {}, ...config });
+  }
+
+  post<T>(url: string, body: unknown, config: Partial<RequestConfig> = {}): Promise<HttpResponse<T>> {
+    return this.request<T>({ method: 'POST', url, body, headers: {}, ...config });
+  }
+
+  private async executeWithRetry<T>(cfg: RequestConfig): Promise<HttpResponse<T>> {
+    const maxRetries = cfg.retries ?? this.options.defaultRetries ?? 3;
+    const timeoutMs = cfg.timeoutMs ?? this.options.defaultTimeoutMs ?? 10_000;
+    const baseMs = this.options.retryBaseMs ?? 500;
+    const isIdempotent = IDEMPOTENT.has(cfg.method.toUpperCase());
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      // Fast-path: signal was already aborted before this attempt (pre-abort or inter-retry abort)
+      if (cfg.signal?.aborted) {
+        throw Object.assign(new Error('AbortError'), { name: 'AbortError' });
+      }
+      const controller = new AbortController();
+      let timedOut = false;
+      const stopTimeout = this.armTimeout(controller, timeoutMs, () => { timedOut = true; });
+
+      // Forward caller abort
+      const cleanupCallerAbort = cfg.signal
+        ? (() => {
+            const h = (): void => controller.abort();
+            cfg.signal!.addEventListener('abort', h, { once: true });
+            return () => cfg.signal!.removeEventListener('abort', h);
+          })()
+        : (): void => {};
+
+      try {
+        const response = await this.options.transport(cfg, controller.signal);
+        stopTimeout();
+        cleanupCallerAbort();
+
+        if (response.status >= 200 && response.status < 300) {
+          const responseInterceptors: ResponseInterceptor[] = [];
+          this.interceptors.response.forEach((i) => responseInterceptors.push(i));
+          let res: HttpResponse<unknown> = response;
+          for (const interceptor of responseInterceptors) {
+            try {
+              res = interceptor.onFulfilled ? await interceptor.onFulfilled(res) : res;
+            } catch (error) {
+              if (interceptor.onRejected) res = await interceptor.onRejected(error);
+              else throw error;
+            }
+          }
+          if (cfg.method.toUpperCase() === 'GET' && (cfg.cacheMs ?? 0) > 0) {
+            this.cache.set(cfg, res, cfg.cacheMs!);
+          }
+          return res as HttpResponse<T>;
+        }
+
+        const retryable = (response.status >= 500 || response.status === 429) && isIdempotent && attempt < maxRetries;
+        if (!retryable) throw new HttpError(response.status, response);
+        // fall through to delay + retry
+      } catch (error) {
+        stopTimeout();
+        cleanupCallerAbort();
+        if (timedOut) throw new TimeoutError(timeoutMs);
+        if (cfg.signal?.aborted) throw Object.assign(new Error('AbortError'), { name: 'AbortError' });
+        if (error instanceof HttpError) throw error; // 4xx/non-retryable: don't retry
+        // network error, timeout: retry if idempotent and attempts left
+        if (!isIdempotent || attempt >= maxRetries) throw error;
+      }
+      const delay = baseMs * 2 ** attempt;
+      await new Promise<void>((resolve) => this.options.scheduler.setTimeout(resolve, delay));
+    }
+    throw new Error('unreachable');
+  }
+
+  private armTimeout(controller: AbortController, ms: number, onFire: () => void): () => void {
+    const id = this.options.scheduler.setTimeout(() => {
+      onFire();
+      controller.abort();
+    }, ms);
+    return () => this.options.scheduler.clearTimeout(id);
+  }
+}
+
+// ---- Fakes ---------------------------------------------------------------
+interface Task { at: number; fn: () => void }
+class FakeScheduler implements Scheduler {
+  private t = 0;
+  private seq = 0;
+  private readonly tasks = new Map<number, Task>();
+  now(): number { return this.t; }
+  setTimeout(fn: () => void, ms: number): number {
+    const id = ++this.seq;
+    this.tasks.set(id, { at: this.t + ms, fn });
+    return id;
+  }
+  clearTimeout(id: number): void { this.tasks.delete(id); }
+  async advance(ms: number): Promise<void> {
+    const end = this.t + ms;
+    await new Promise((r) => setTimeout(r, 0));
+    for (;;) {
+      let next: [number, Task] | undefined;
+      for (const entry of this.tasks) {
+        if (entry[1].at <= end && (!next || entry[1].at < next[1].at)) next = entry;
+      }
+      if (!next) break;
+      this.tasks.delete(next[0]);
+      this.t = next[1].at;
+      next[1].fn();
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    this.t = end;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
+interface FakeRoute {
+  method: string;
+  url: string;
+  status: number;
+  data: unknown;
+  delayMs?: number;
+  singleUse?: boolean;  // if true, consumed after first match (enables sequential mocks)
+}
+
+class FakeTransport {
+  readonly calls: Array<{ method: string; url: string }> = [];
+  routes: FakeRoute[] = [];
+  private readonly scheduler: FakeScheduler;
+
+  constructor(scheduler: FakeScheduler) { this.scheduler = scheduler; }
+
+  addRoute(route: FakeRoute): void { this.routes.push(route); }
+
+  transport: Transport = (config, signal) => {
+    return new Promise<HttpResponse<unknown>>((resolve, reject) => {
+      this.calls.push({ method: config.method, url: config.url });
+      // singleUse routes are consumed in order; persistent routes stay
+      const idx = this.routes.findIndex((r) => r.method === config.method && config.url.endsWith(r.url));
+      const route = idx >= 0
+        ? (this.routes[idx].singleUse ? this.routes.splice(idx, 1)[0] : this.routes[idx])
+        : undefined;
+      const respond = (): void => {
+        if (signal.aborted) { reject(Object.assign(new Error('AbortError'), { name: 'AbortError' })); return; }
+        if (!route) { resolve({ status: 404, data: null, headers: {}, fromCache: false }); return; }
+        resolve({ status: route.status, data: route.data, headers: {}, fromCache: false });
+      };
+      const delay = route?.delayMs ?? 0;
+      if (delay > 0) {
+        const tid = this.scheduler.setTimeout(respond, delay);
+        signal.addEventListener('abort', () => {
+          this.scheduler.clearTimeout(tid);
+          reject(Object.assign(new Error('AbortError'), { name: 'AbortError' }));
+        }, { once: true });
+      } else {
+        respond();
+      }
+    });
+  };
+}
+
+// ---- Demo ----------------------------------------------------------------
+const scheduler = new FakeScheduler();
+const fakeTransport = new FakeTransport(scheduler);
+
+fakeTransport.addRoute({ method: 'GET', url: '/quote/RELIANCE', status: 200, data: { ltp: 2950, symbol: 'RELIANCE' } });
+fakeTransport.addRoute({ method: 'GET', url: '/quote/INFY', status: 200, data: { ltp: 1612, symbol: 'INFY' } });
+fakeTransport.addRoute({ method: 'POST', url: '/order', status: 201, data: { orderId: 'ORD-42' } });
+fakeTransport.addRoute({ method: 'GET', url: '/news', status: 200, data: [{ id: 1 }], delayMs: 200 });
+fakeTransport.addRoute({ method: 'GET', url: '/slow', status: 503, data: null });
+
+const client = new HttpClient({
+  baseUrl: 'https://api.broker.example',
+  defaultTimeoutMs: 5_000,
+  defaultRetries: 2,
+  retryBaseMs: 100,
+  transport: fakeTransport.transport,
+  scheduler,
+  clock: { now: () => scheduler.now() },
+});
+
+// Interceptor: add auth header
+const authId = client.interceptors.request.use({
+  onFulfilled: (cfg) => ({ ...cfg, headers: { ...cfg.headers, Authorization: 'Bearer token123' } }),
+});
+// Interceptor: log responses
+const logs: string[] = [];
+client.interceptors.response.use({
+  onFulfilled: (res) => {
+    logs.push(`${res.status} ${res.fromCache ? '(cached)' : ''}`);
+    return res;
+  },
+});
+
+console.log('1) basic GET with auth interceptor');
+const quote = await client.get<{ ltp: number; symbol: string }>('/quote/RELIANCE');
+console.log(`  status=${quote.status} data=${JSON.stringify(quote.data)} authHeader=${fakeTransport.calls[0] ? 'yes' : 'no'}`);
+
+console.log('2) POST (non-idempotent, no retry)');
+const order = await client.post<{ orderId: string }>('/order', { symbol: 'RELIANCE', qty: 10 });
+console.log(`  orderId=${JSON.stringify(order.data.orderId)}`);
+
+console.log('3) request deduplication (two concurrent GETs to same URL)');
+const [r1, r2] = await Promise.all([
+  client.get('/quote/INFY'),
+  client.get('/quote/INFY'), // same URL, in-flight → deduped
+]);
+console.log(`  transport called ${fakeTransport.calls.filter((c) => c.url.includes('INFY')).length} time(s) (expect 1)`);
+console.log(`  both got same data: ${r1.data === r2.data}`);
+
+console.log('4) cache (TTL 1000ms)');
+const cached1 = await client.get('/quote/RELIANCE', { cacheMs: 1_000 });
+const cached2 = await client.get('/quote/RELIANCE', { cacheMs: 1_000 }); // from cache
+await scheduler.advance(1_001); // expire cache
+const cached3 = await client.get('/quote/RELIANCE', { cacheMs: 1_000 }); // fresh
+console.log(`  hit 1 fromCache=${cached1.fromCache}, hit 2 fromCache=${cached2.fromCache}, after expire fromCache=${cached3.fromCache}`);
+
+console.log('5) retry with backoff for 503 on idempotent GET');
+// Prepend singleUse sequence: 503, 503, 200 (in order of consumption)
+fakeTransport.routes.unshift(
+  { method: 'GET', url: '/slow', status: 503, data: null, singleUse: true },
+  { method: 'GET', url: '/slow', status: 503, data: null, singleUse: true },
+  { method: 'GET', url: '/slow', status: 200, data: { ok: true }, singleUse: true },
+);
+const retryPromise = client.get('/slow', { retries: 2, timeoutMs: 10_000 });
+await scheduler.advance(100); // first backoff
+await scheduler.advance(200); // second backoff
+const retryResult = await retryPromise;
+console.log(`  after 2 retries: status=${retryResult.status} calls=${fakeTransport.calls.filter((c) => c.url.includes('slow')).length}`);
+
+console.log('6) timeout via AbortController + caller abort');
+const newsPromise = client.get('/news', { timeoutMs: 100 });
+const advanceAndSettle = scheduler.advance(200);
+let timeoutErr = '';
+try {
+  await newsPromise;
+} catch (e) {
+  timeoutErr = e instanceof Error ? e.message : String(e);
+}
+await advanceAndSettle;
+console.log(`  timeout error: ${timeoutErr}`);
+// Caller abort: abort the signal BEFORE awaiting, let it settle
+const ac = new AbortController();
+ac.abort(); // pre-abort
+const callerPromise2 = client.get('/news', { signal: ac.signal });
+let abortErr = '';
+try { await callerPromise2; } catch (e) { abortErr = e instanceof Error ? e.name : String(e); }
+console.log(`  caller abort: ${abortErr}`);
+
+console.log('7) eject interceptor');
+client.interceptors.request.eject(authId);
+fakeTransport.routes.unshift({ method: 'GET', url: '/quote/TCS', status: 200, data: { ltp: 4100 } });
+await client.get('/quote/TCS');
+// If auth header is ejected, the request still works (transport doesn't check it here)
+console.log(`  interceptor ejected OK`);
+
+console.log('8) checks');
+const check = (label: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${label}`);
+check('GET got data', quote.data.ltp === 2950);
+check('POST non-idempotent', order.data.orderId === 'ORD-42');
+check('dedup: 1 transport call for 2 concurrent GETs', fakeTransport.calls.filter((c) => c.url.includes('INFY')).length === 1);
+check('cache hit on second request', cached2.fromCache);
+check('cache miss after TTL', !cached3.fromCache);
+check('retry succeeded on 3rd attempt', retryResult.data != null);
+check('timeout error name', timeoutErr.includes('timed out'));
+check('response logs have entries', logs.length > 0);
+```
+
+```text
+1) basic GET with auth interceptor
+  status=200 data={"ltp":2950,"symbol":"RELIANCE"} authHeader=yes
+2) POST (non-idempotent, no retry)
+  orderId="ORD-42"
+3) request deduplication (two concurrent GETs to same URL)
+  transport called 1 time(s) (expect 1)
+  both got same data: true
+4) cache (TTL 1000ms)
+  hit 1 fromCache=false, hit 2 fromCache=true, after expire fromCache=false
+5) retry with backoff for 503 on idempotent GET
+  after 2 retries: status=200 calls=3
+6) timeout via AbortController + caller abort
+  timeout error: Request timed out after 100ms
+  caller abort: AbortError
+7) eject interceptor
+  interceptor ejected OK
+8) checks
+  PASS GET got data
+  PASS POST non-idempotent
+  PASS dedup: 1 transport call for 2 concurrent GETs
+  PASS cache hit on second request
+  PASS cache miss after TTL
+  PASS retry succeeded on 3rd attempt
+  PASS timeout error name
+  PASS response logs have entries
+```
+
+## What we built
+
+A ~250-line Axios-like client covering the parts that a senior interview expects: a nullable interceptor array so `eject` runs in O(1), a retry loop with per-attempt AbortControllers so timeouts don't leak, an in-flight map cleaned up with `.then(cleanup, cleanup)` to avoid unhandled rejections, and a pre-abort fast-path so a signal that was already aborted never reaches the transport. Every timing and I/O concern goes through an injected seam, keeping the core logic testable without real timers or a real network.

@@ -1,0 +1,1134 @@
+---
+title: "14.1 Stock Exchange / Order Matching Engine"
+---
+
+## Problem & where it's asked
+
+Design the core of an exchange. Traders submit buy and sell orders for a symbol, and the engine matches them and produces trades. According to the research notes, **Groww asked a version of this in an SDE-3 machine-coding round (Dec 2024, 2 hours)**. Buyers and sellers place bids, a buy executes at or below its bid, a sell executes at or above its ask, and the candidate had to run the code on the interviewer's examples. The notes also list it for Zeta and Goldman Sachs (2026), and "Design Zerodha" practice repos include it. A Groww HLD round reportedly covered buy, sell and stop-loss events arriving through a queue with a tight latency budget. That is a hint about the concurrency follow-up. All of these come from snippets.
+
+Of all the problems in this chapter, this is the one most likely to be run live, so treat a working demo as mandatory.
+
+## Clarifying questions
+
+| Question | Assumption we'll make |
+|----------|----------------------|
+| One symbol or many? | Many symbols. Each symbol has its own independent order book. |
+| Which order types? | LIMIT and MARKET. Time-in-force is DAY (rest until cancelled) or IOC. Stop-loss comes later as an extension. |
+| At what price does a trade execute? | At the resting (maker) order's price. |
+| Partial fills? | Yes. The leftover of a LIMIT/DAY order rests in the book. The leftover of a MARKET or IOC order is cancelled. |
+| Cancel / modify? | Yes. Reducing quantity keeps time priority. Changing price or increasing quantity loses it (the order goes to the back of the queue). |
+| Price representation? | Integer paise. Each instrument has a tick size and a lot size. |
+| Concurrency? | Orders for different symbols can be processed in parallel. Orders for the same symbol must be processed strictly one at a time, in arrival order. |
+| Persistence, auth, risk checks? | Out of scope. The broker does risk checks before an order reaches the exchange (see 14.2). |
+| Output? | Trade events delivered to subscribers, plus a book snapshot on demand. |
+
+## Requirements
+
+**Functional**
+
+- List instruments with a tick size and lot size.
+- Place LIMIT and MARKET orders with side, quantity, and optional IOC.
+- Match using price-time priority and produce trades, including partial fills.
+- Cancel and modify resting orders.
+- Publish trade and order-update events to listeners.
+- Return a depth snapshot (top N price levels on each side, with total quantity and order count).
+
+**Non-functional**
+
+- Matching must be deterministic: the same input sequence always produces the same trades.
+- Best-price lookup and inserts should be about O(log P), where P is the number of price levels, and matching should cost O(1) per fill.
+- Processing is single-writer per symbol, with no lost updates and no overfills.
+- A failing listener must never corrupt the book.
+
+**Out of scope:** auctions (pre-open), circuit limits and price bands, self-trade prevention (discussed later), persistence and recovery, market-data dissemination at scale.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|---------------|---------------|
+| `Instrument` | Symbol, tick size, lot size | One per `OrderBook` |
+| `Order` | Identity, side, type, TIF, price, qty, filled qty, status, sequence number | Rests in exactly one `PriceLevel` while open |
+| `Trade` | Immutable execution record (price, qty, buy/sell order ids, aggressor) | References two orders |
+| `PriceLevel` | FIFO queue of resting orders at one price, plus aggregate qty | Belongs to a `BookSide` |
+| `BookSide` | Price levels for bids or asks, and a heap of prices for best-price lookup | Two per `OrderBook` |
+| `OrderBook` | Matching algorithm, cancel/modify for one symbol | Owns two `BookSide`s |
+| `SymbolExecutor` | Serializes all work for one symbol (single writer) | Used by `Exchange` |
+| `Exchange` | Facade: validation, routing to books, listener fan-out | Owns books, executor, listeners |
+| `ExchangeListener` | Observer receiving trades and order updates | Many per `Exchange` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class Exchange {
+        -Map books
+        -SymbolExecutor executor
+        +listInstrument(instrument)
+        +subscribe(listener)
+        +placeOrder(req) Promise
+        +cancelOrder(symbol, orderId) Promise
+        +modifyOrder(symbol, orderId, changes) Promise
+        +snapshot(symbol, depth) Promise
+    }
+    class OrderBook {
+        -BookSide bids
+        -BookSide asks
+        +submit(order) Trade[]
+        +cancel(orderId) Order
+        +modify(orderId, changes) Trade[]
+    }
+    class BookSide {
+        -Map levels
+        -BinaryHeap prices
+        +add(order, price)
+        +bestLevel() PriceLevel
+        +fill(resting, qty)
+        +detach(orderId) Resting
+    }
+    class PriceLevel {
+        +price
+        +openQty
+        +enqueue(resting)
+        +front() Resting
+    }
+    class Order {
+        +id
+        +side
+        +type
+        +price
+        +qty
+        +filledQty
+        +status
+        +applyFill(qty)
+    }
+    class ExchangeListener {
+        <<interface>>
+        +onTrade(trade)
+        +onOrderUpdate(order)
+    }
+    class SymbolExecutor {
+        +run(key, task) Promise
+    }
+    Exchange --> OrderBook : one per symbol
+    Exchange --> SymbolExecutor
+    Exchange --> ExchangeListener : notifies
+    OrderBook --> BookSide : bids and asks
+    BookSide --> PriceLevel : many
+    PriceLevel --> Order : FIFO`} />
+
+**Sequence: an aggressive buy that fills against two resting sells**
+
+<Mermaid chart={`sequenceDiagram
+    participant C as Client
+    participant E as Exchange
+    participant X as SymbolExecutor
+    participant B as OrderBook
+    participant L as Listener
+    C->>E: placeOrder(BUY 120 @ 2500)
+    E->>X: run(RELIANCE, task)
+    X->>B: validate + submit(order)
+    B->>B: bestLevel(asks) = 2500
+    B->>B: fill 100 vs S1 (FIFO head)
+    B-->>L: onTrade(T1)
+    B->>B: fill 20 vs S2
+    B-->>L: onTrade(T2)
+    B-->>X: trades, order FILLED
+    X-->>E: result
+    E-->>C: orderId, FILLED, 120/120`} />
+
+**Order states inside the exchange**
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> OPEN : accepted
+    [*] --> REJECTED : validation fails
+    OPEN --> PARTIALLY_FILLED : some qty matched
+    OPEN --> FILLED : all qty matched
+    PARTIALLY_FILLED --> PARTIALLY_FILLED : more fills
+    PARTIALLY_FILLED --> FILLED : remaining matched
+    OPEN --> CANCELLED : cancel or IOC leftover
+    PARTIALLY_FILLED --> CANCELLED : cancel or IOC leftover
+    FILLED --> [*]
+    CANCELLED --> [*]
+    REJECTED --> [*]`} />
+
+## Design decisions & patterns
+
+**1. The price index: a heap of prices plus a map of levels.** Each side keeps a `Map<price, PriceLevel>` and a binary heap of prices: max-heap for bids, min-heap for asks. Finding the best price is O(1) with `peek`, and adding a new level is O(log P). When a level empties we delete it from the map and leave its price in the heap as a *stale* entry. `bestLevel()` pops stale entries lazily. This avoids an O(P) "remove arbitrary element from heap".
+
+*Alternatives:*
+
+- **Sorted array of levels.** O(log P) search but O(P) insert. Fine in practice, because real books have a few hundred active levels and inserts cluster near the top.
+- **Balanced BST / skip list** (Java's `TreeMap`, C++ `std::map`). O(log P) for everything, plus ordered iteration for depth snapshots. This is the textbook answer, but TypeScript has no built-in one, and writing a red-black tree in 90 minutes is a trap.
+- **Price-indexed array.** Prices are ticks inside a band, so an array indexed by `(price - lowerBand) / tick` gives O(1) access. Production engines often use this, and it is a great talking point.
+
+**2. FIFO within a level: an array queue with a head pointer and lazy deletion.** Cancelling from the middle of a queue is common. Instead of splicing (O(n)), we mark the entry inactive and skip it when it reaches the head. The queue compacts itself when the dead prefix grows. A doubly linked list with an `orderId → node` map gives true O(1) removal and is worth mentioning.
+
+**3. Single writer per symbol.** Matching is a read-modify-write sequence over the book, so two orders for the same symbol must never interleave. `SymbolExecutor` chains each symbol's tasks on a promise tail. It works like a mailbox per symbol (the actor model), and different symbols still run independently. This mirrors real engines, which typically run one matching thread per partition of instruments.
+
+**4. Observer for trades and order updates.** The book doesn't know who is listening: market data, the clearing system, or a broker's order-update stream. Every listener call is wrapped in try/catch, so a bad subscriber can't break matching halfway through.
+
+**5. Facade.** `Exchange` is the only public entry point. It validates the request, routes it to the right book, and serializes the work. `OrderBook` is pure and synchronous, which makes it easy to unit-test.
+
+**6. Injected `Clock` and `IdGenerator`.** Sequence numbers and ids are deterministic, so tests and demos can be replayed exactly. Real exchanges depend on the same property: replaying the input journal must rebuild the same book.
+
+**Trade-off summary:** the heap-and-map design is simple and fast for the operations that matter most (best price, match, cancel). The cost is O(P log P) depth snapshots, which we accept because snapshots are rare compared with order flow.
+
+## Implementation
+
+**Part 1: money, errors, clock and ids.** Everything stays in paise. `formatINR` is the only place where paise become a display string.
+
+```ts
+type Paise = number;
+
+function formatINR(paise: Paise): string {
+  const sign = paise < 0 ? '-' : '';
+  const abs = Math.abs(paise);
+  const whole = Math.trunc(abs / 100).toLocaleString('en-IN');
+  const fraction = String(abs % 100).padStart(2, '0');
+  return `${sign}₹${whole}.${fraction}`;
+}
+
+class ExchangeError extends Error {
+  override name = 'ExchangeError';
+}
+class ValidationError extends ExchangeError {
+  override name = 'ValidationError';
+}
+class UnknownOrderError extends ExchangeError {
+  override name = 'UnknownOrderError';
+}
+class UnknownSymbolError extends ExchangeError {
+  override name = 'UnknownSymbolError';
+}
+
+function describeError(err: unknown): string {
+  return err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+}
+
+interface Clock {
+  now(): number;
+}
+/** Monotonic logical clock: every call returns the next tick. */
+class TickClock implements Clock {
+  private t: number;
+  constructor(start = 1) {
+    this.t = start;
+  }
+  now(): number {
+    return this.t++;
+  }
+}
+
+interface IdGenerator {
+  next(prefix: string): string;
+}
+class SequentialIdGenerator implements IdGenerator {
+  private readonly counters = new Map<string, number>();
+  next(prefix: string): string {
+    const n = (this.counters.get(prefix) ?? 0) + 1;
+    this.counters.set(prefix, n);
+    return `${prefix}${n}`;
+  }
+}
+```
+
+**Part 2: a generic binary heap.** The `before(a, b)` comparator decides which element is closer to the top, so the same class serves both the max-heap (bids) and the min-heap (asks).
+
+```ts
+class BinaryHeap<T> {
+  private readonly items: T[] = [];
+  constructor(private readonly before: (a: T, b: T) => boolean) {}
+
+  get size(): number {
+    return this.items.length;
+  }
+  peek(): T | undefined {
+    return this.items[0];
+  }
+  push(item: T): void {
+    this.items.push(item);
+    let i = this.items.length - 1;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      if (!this.before(this.items[i], this.items[parent])) break;
+      this.swap(i, parent);
+      i = parent;
+    }
+  }
+  pop(): T | undefined {
+    const top = this.items[0];
+    const last = this.items.pop();
+    if (this.items.length > 0 && last !== undefined) {
+      this.items[0] = last;
+      this.siftDown(0);
+    }
+    return top;
+  }
+  private siftDown(start: number): void {
+    const n = this.items.length;
+    let i = start;
+    for (;;) {
+      const l = 2 * i + 1;
+      const r = l + 1;
+      let best = i;
+      if (l < n && this.before(this.items[l], this.items[best])) best = l;
+      if (r < n && this.before(this.items[r], this.items[best])) best = r;
+      if (best === i) return;
+      this.swap(i, best);
+      i = best;
+    }
+  }
+  private swap(a: number, b: number): void {
+    const tmp = this.items[a];
+    this.items[a] = this.items[b];
+    this.items[b] = tmp;
+  }
+}
+```
+
+**Part 3: the domain model.** `Order` owns its fill arithmetic, so no other class can set `filledQty` to something inconsistent.
+
+```ts
+type Side = 'BUY' | 'SELL';
+type OrderType = 'LIMIT' | 'MARKET';
+type TimeInForce = 'DAY' | 'IOC';
+type OrderStatus = 'OPEN' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELLED' | 'REJECTED';
+
+interface Instrument {
+  readonly symbol: string;
+  readonly tickSize: Paise;
+  readonly lotSize: number;
+}
+
+interface OrderRequest {
+  userId: string;
+  symbol: string;
+  side: Side;
+  type: OrderType;
+  qty: number;
+  price?: Paise;
+  tif?: TimeInForce;
+}
+
+class Order {
+  filledQty = 0;
+  status: OrderStatus = 'OPEN';
+  constructor(
+    readonly id: string,
+    readonly userId: string,
+    readonly symbol: string,
+    readonly side: Side,
+    readonly type: OrderType,
+    readonly tif: TimeInForce,
+    public price: Paise | undefined,
+    public qty: number,
+    public seq: number,
+  ) {}
+
+  get remaining(): number {
+    return this.qty - this.filledQty;
+  }
+  get isLive(): boolean {
+    return this.status === 'OPEN' || this.status === 'PARTIALLY_FILLED';
+  }
+  applyFill(qty: number): void {
+    if (qty <= 0 || qty > this.remaining) {
+      throw new ExchangeError(`Invalid fill ${qty} for ${this.id} (remaining ${this.remaining})`);
+    }
+    this.filledQty += qty;
+    this.status = this.remaining === 0 ? 'FILLED' : 'PARTIALLY_FILLED';
+  }
+}
+
+interface Trade {
+  readonly id: string;
+  readonly symbol: string;
+  readonly price: Paise;
+  readonly qty: number;
+  readonly buyOrderId: string;
+  readonly sellOrderId: string;
+  readonly aggressor: Side;
+  readonly seq: number;
+}
+
+function validateRequest(req: OrderRequest, inst: Instrument): void {
+  if (!Number.isInteger(req.qty) || req.qty <= 0) {
+    throw new ValidationError(`Quantity must be a positive integer, got ${req.qty}`);
+  }
+  if (req.qty % inst.lotSize !== 0) {
+    throw new ValidationError(`Quantity ${req.qty} is not a multiple of lot size ${inst.lotSize}`);
+  }
+  if (req.type === 'LIMIT') {
+    validatePrice(req.price, inst);
+  } else if (req.price !== undefined) {
+    throw new ValidationError('Market orders must not carry a price');
+  }
+}
+
+function validatePrice(price: Paise | undefined, inst: Instrument): asserts price is Paise {
+  if (price === undefined || !Number.isInteger(price) || price <= 0) {
+    throw new ValidationError('Limit orders need a positive integer price in paise');
+  }
+  if (price % inst.tickSize !== 0) {
+    throw new ValidationError(
+      `Price ${formatINR(price)} is not a multiple of tick size ${formatINR(inst.tickSize)}`,
+    );
+  }
+}
+```
+
+**Part 4: price levels and book sides.** `Resting` is the queue entry. Because it carries its own `active` flag, a modified order that moves to another level leaves a dead entry behind rather than showing up twice.
+
+```ts
+interface Resting {
+  readonly order: Order;
+  readonly level: PriceLevel;
+  active: boolean;
+}
+
+class PriceLevel {
+  private readonly queue: Resting[] = [];
+  private head = 0;
+  openQty = 0;
+  liveCount = 0;
+  constructor(readonly price: Paise) {}
+
+  enqueue(entry: Resting): void {
+    this.queue.push(entry);
+    this.openQty += entry.order.remaining;
+    this.liveCount++;
+  }
+  /** Oldest active entry (time priority). Skips entries that were cancelled or moved. */
+  front(): Resting | undefined {
+    while (this.head < this.queue.length && !this.queue[this.head].active) this.head++;
+    if (this.head > 32 && this.head * 2 > this.queue.length) {
+      this.queue.splice(0, this.head); // amortised compaction
+      this.head = 0;
+    }
+    return this.head < this.queue.length ? this.queue[this.head] : undefined;
+  }
+  get isEmpty(): boolean {
+    return this.liveCount === 0;
+  }
+}
+
+class BookSide {
+  private readonly levels = new Map<Paise, PriceLevel>();
+  private readonly prices: BinaryHeap<Paise>;
+  private readonly resting = new Map<string, Resting>();
+
+  constructor(readonly side: Side) {
+    this.prices = new BinaryHeap<Paise>(side === 'BUY' ? (a, b) => a > b : (a, b) => a < b);
+  }
+
+  add(order: Order, price: Paise): void {
+    let level = this.levels.get(price);
+    if (!level) {
+      level = new PriceLevel(price);
+      this.levels.set(price, level);
+      this.prices.push(price);
+    }
+    const entry: Resting = { order, level, active: true };
+    level.enqueue(entry);
+    this.resting.set(order.id, entry);
+  }
+
+  find(orderId: string): Resting | undefined {
+    return this.resting.get(orderId);
+  }
+
+  /** Best non-empty level; pops stale heap entries lazily. */
+  bestLevel(): PriceLevel | undefined {
+    for (;;) {
+      const price = this.prices.peek();
+      if (price === undefined) return undefined;
+      const level = this.levels.get(price);
+      if (level && !level.isEmpty) return level;
+      this.prices.pop();
+    }
+  }
+
+  fill(entry: Resting, qty: number): void {
+    entry.order.applyFill(qty);
+    entry.level.openQty -= qty;
+    if (entry.order.remaining === 0) this.detach(entry.order.id);
+  }
+
+  reduce(entry: Resting, by: number): void {
+    entry.order.qty -= by;
+    entry.level.openQty -= by;
+  }
+
+  /** Removes an order from its level; the caller decides the order's new status. */
+  detach(orderId: string): Resting {
+    const entry = this.resting.get(orderId);
+    if (!entry) throw new UnknownOrderError(`Order ${orderId} is not resting`);
+    entry.active = false;
+    entry.level.openQty -= entry.order.remaining;
+    entry.level.liveCount--;
+    this.resting.delete(orderId);
+    if (entry.level.isEmpty) this.levels.delete(entry.level.price);
+    return entry;
+  }
+
+  depth(n: number): PriceLevel[] {
+    const dir = this.side === 'BUY' ? -1 : 1;
+    return [...this.levels.values()]
+      .filter((l) => !l.isEmpty)
+      .sort((a, b) => dir * (a.price - b.price))
+      .slice(0, n);
+  }
+}
+```
+
+**Part 5: the matching algorithm.** It is synchronous and deterministic. `OrderBook` knows nothing about promises, listeners or other symbols. It only reports events through the small `EventSink` interface.
+
+```ts
+interface EventSink {
+  trade(trade: Trade): void;
+  orderUpdated(order: Order): void;
+}
+
+interface OrderChanges {
+  qty?: number;
+  price?: Paise;
+}
+
+class OrderBook {
+  private readonly bids = new BookSide('BUY');
+  private readonly asks = new BookSide('SELL');
+
+  constructor(
+    readonly instrument: Instrument,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+    private readonly events: EventSink,
+  ) {}
+
+  submit(order: Order): Trade[] {
+    const trades = this.match(order);
+    if (order.remaining > 0) {
+      if (order.type === 'LIMIT' && order.tif === 'DAY' && order.price !== undefined) {
+        this.sideOf(order.side).add(order, order.price);
+      } else {
+        order.status = 'CANCELLED'; // MARKET / IOC leftovers never rest
+      }
+    }
+    this.events.orderUpdated(order);
+    return trades;
+  }
+
+  cancel(orderId: string): Order {
+    const entry = this.findResting(orderId);
+    this.sideOf(entry.order.side).detach(orderId);
+    entry.order.status = 'CANCELLED';
+    this.events.orderUpdated(entry.order);
+    return entry.order;
+  }
+
+  modify(orderId: string, changes: OrderChanges): Trade[] {
+    const entry = this.findResting(orderId);
+    const order = entry.order;
+    const newQty = changes.qty ?? order.qty;
+    const newPrice = changes.price ?? order.price;
+    validatePrice(newPrice, this.instrument);
+    if (!Number.isInteger(newQty) || newQty <= order.filledQty || newQty % this.instrument.lotSize !== 0) {
+      throw new ValidationError(`New quantity ${newQty} must be a valid lot above filled ${order.filledQty}`);
+    }
+    const side = this.sideOf(order.side);
+    if (newPrice === order.price && newQty <= order.qty) {
+      side.reduce(entry, order.qty - newQty); // same price, smaller: keep time priority
+      this.events.orderUpdated(order);
+      return [];
+    }
+    side.detach(orderId); // price change or size increase: back of the queue
+    order.qty = newQty;
+    order.price = newPrice;
+    order.seq = this.clock.now();
+    return this.submit(order);
+  }
+
+  depth(n: number): { bids: PriceLevel[]; asks: PriceLevel[] } {
+    return { bids: this.bids.depth(n), asks: this.asks.depth(n) };
+  }
+
+  private match(taker: Order): Trade[] {
+    const opposite = taker.side === 'BUY' ? this.asks : this.bids;
+    const trades: Trade[] = [];
+    while (taker.remaining > 0) {
+      const level = opposite.bestLevel();
+      if (!level || !this.crosses(taker, level.price)) break;
+      const maker = level.front();
+      if (!maker) break;
+      const qty = Math.min(taker.remaining, maker.order.remaining);
+      taker.applyFill(qty);
+      opposite.fill(maker, qty);
+      const trade: Trade = {
+        id: this.ids.next('T'),
+        symbol: this.instrument.symbol,
+        price: level.price, // maker's price
+        qty,
+        buyOrderId: taker.side === 'BUY' ? taker.id : maker.order.id,
+        sellOrderId: taker.side === 'SELL' ? taker.id : maker.order.id,
+        aggressor: taker.side,
+        seq: this.clock.now(),
+      };
+      trades.push(trade);
+      this.events.trade(trade);
+      this.events.orderUpdated(maker.order);
+    }
+    return trades;
+  }
+
+  private crosses(taker: Order, bestOpposite: Paise): boolean {
+    if (taker.price === undefined) return true; // market order
+    return taker.side === 'BUY' ? bestOpposite <= taker.price : bestOpposite >= taker.price;
+  }
+
+  private sideOf(side: Side): BookSide {
+    return side === 'BUY' ? this.bids : this.asks;
+  }
+
+  private findResting(orderId: string): Resting {
+    const entry = this.bids.find(orderId) ?? this.asks.find(orderId);
+    if (!entry) throw new UnknownOrderError(`Order ${orderId} is not open on ${this.instrument.symbol}`);
+    return entry;
+  }
+}
+```
+
+**Part 6: the single-writer executor and the `Exchange` facade.** `SymbolExecutor.run` appends a task to that symbol's promise chain. Tasks for one symbol run strictly one after another, while tasks for different symbols never wait on each other.
+
+```ts
+class SymbolExecutor {
+  private readonly tails = new Map<string, Promise<unknown>>();
+
+  run<T>(key: string, task: () => T): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    const next = prev.then(task);
+    const tail = next.catch(() => undefined);
+    this.tails.set(key, tail);
+    void tail.then(() => {
+      if (this.tails.get(key) === tail) this.tails.delete(key); // avoid unbounded growth
+    });
+    return next;
+  }
+}
+
+interface ExchangeListener {
+  onTrade?(trade: Trade): void;
+  onOrderUpdate?(order: Order): void;
+}
+
+interface PlaceResult {
+  orderId: string;
+  status: OrderStatus;
+  filledQty: number;
+  trades: number;
+}
+
+class Exchange {
+  private readonly books = new Map<string, OrderBook>();
+  private readonly orderSymbol = new Map<string, string>();
+  private readonly executor = new SymbolExecutor();
+  private readonly listeners: ExchangeListener[] = [];
+  private readonly sink: EventSink = {
+    trade: (t) => this.notify((l) => l.onTrade?.(t)),
+    orderUpdated: (o) => this.notify((l) => l.onOrderUpdate?.(o)),
+  };
+
+  constructor(
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+  ) {}
+
+  listInstrument(instrument: Instrument): void {
+    if (instrument.tickSize <= 0 || instrument.lotSize <= 0) {
+      throw new ValidationError(`Bad instrument config for ${instrument.symbol}`);
+    }
+    this.books.set(instrument.symbol, new OrderBook(instrument, this.clock, this.ids, this.sink));
+  }
+
+  subscribe(listener: ExchangeListener): void {
+    this.listeners.push(listener);
+  }
+
+  async placeOrder(req: OrderRequest): Promise<PlaceResult> {
+    const book = this.bookFor(req.symbol);
+    return this.executor.run(req.symbol, () => {
+      validateRequest(req, book.instrument);
+      const order = new Order(
+        this.ids.next('O'), req.userId, req.symbol, req.side, req.type,
+        req.type === 'MARKET' ? 'IOC' : (req.tif ?? 'DAY'),
+        req.price, req.qty, this.clock.now(),
+      );
+      this.orderSymbol.set(order.id, req.symbol);
+      const trades = book.submit(order);
+      return { orderId: order.id, status: order.status, filledQty: order.filledQty, trades: trades.length };
+    });
+  }
+
+  async cancelOrder(orderId: string): Promise<Order> {
+    const symbol = this.symbolOf(orderId);
+    return this.executor.run(symbol, () => this.bookFor(symbol).cancel(orderId));
+  }
+
+  async modifyOrder(orderId: string, changes: OrderChanges): Promise<Trade[]> {
+    const symbol = this.symbolOf(orderId);
+    return this.executor.run(symbol, () => this.bookFor(symbol).modify(orderId, changes));
+  }
+
+  /** Serialized too, so a snapshot never observes a half-matched book. */
+  async snapshot(symbol: string, levels: number): Promise<string[]> {
+    const book = this.bookFor(symbol);
+    return this.executor.run(symbol, () => {
+      const { bids, asks } = book.depth(levels);
+      const row = (tag: string, l: PriceLevel) =>
+        `  ${tag} ${formatINR(l.price).padStart(10)} x ${String(l.openQty).padStart(4)} (${l.liveCount} order${l.liveCount === 1 ? '' : 's'})`;
+      return [
+        `  --- ${symbol} book ---`,
+        ...[...asks].reverse().map((l) => row('ASK', l)),
+        ...(asks.length + bids.length === 0 ? ['  (empty)'] : []),
+        ...bids.map((l) => row('BID', l)),
+      ];
+    });
+  }
+
+  private bookFor(symbol: string): OrderBook {
+    const book = this.books.get(symbol);
+    if (!book) throw new UnknownSymbolError(`Symbol ${symbol} is not listed`);
+    return book;
+  }
+
+  private symbolOf(orderId: string): string {
+    const symbol = this.orderSymbol.get(orderId);
+    if (!symbol) throw new UnknownOrderError(`Unknown order ${orderId}`);
+    return symbol;
+  }
+
+  private notify(call: (l: ExchangeListener) => void): void {
+    for (const l of this.listeners) {
+      try {
+        call(l);
+      } catch (err) {
+        console.log(`  (listener failed, book unaffected: ${describeError(err)})`);
+      }
+    }
+  }
+}
+```
+
+**Part 7: a deterministic demo.** RELIANCE uses a ₹0.05 tick. We build a book, sweep it with a limit order and then a market order, try an invalid tick, modify, run an IOC, and cancel.
+
+```ts
+const exchange = new Exchange(new TickClock(), new SequentialIdGenerator());
+exchange.listInstrument({ symbol: 'RELIANCE', tickSize: 5, lotSize: 1 });
+exchange.subscribe({
+  onTrade: (t) =>
+    console.log(`  TRADE ${t.id}: ${t.qty} @ ${formatINR(t.price)} (buy ${t.buyOrderId}, sell ${t.sellOrderId}, aggressor ${t.aggressor})`),
+});
+exchange.subscribe({
+  onTrade: (t) => {
+    if (t.qty === 70) throw new Error('downstream analytics crashed');
+  },
+});
+
+async function place(label: string, req: Omit<OrderRequest, 'symbol'>): Promise<string | undefined> {
+  const px = req.price === undefined ? 'MKT' : formatINR(req.price);
+  console.log(`> ${label}: ${req.userId} ${req.side} ${req.qty} @ ${px}${req.tif === 'IOC' ? ' IOC' : ''}`);
+  try {
+    const r = await exchange.placeOrder({ ...req, symbol: 'RELIANCE' });
+    console.log(`  => ${r.orderId} ${r.status}, filled ${r.filledQty}/${req.qty}`);
+    return r.orderId;
+  } catch (err) {
+    console.log(`  => REJECTED ${describeError(err)}`);
+    return undefined;
+  }
+}
+
+async function showBook(): Promise<void> {
+  console.log((await exchange.snapshot('RELIANCE', 5)).join('\n'));
+}
+
+await place('S1', { userId: 'alice', side: 'SELL', type: 'LIMIT', qty: 100, price: 250000 });
+await place('S2', { userId: 'bob', side: 'SELL', type: 'LIMIT', qty: 50, price: 250000 });
+const s3 = await place('S3', { userId: 'carol', side: 'SELL', type: 'LIMIT', qty: 200, price: 250100 });
+const b1 = await place('B1', { userId: 'dave', side: 'BUY', type: 'LIMIT', qty: 30, price: 249900 });
+await place('B2', { userId: 'dave', side: 'BUY', type: 'LIMIT', qty: 10, price: 249900 });
+await showBook();
+
+await place('B3', { userId: 'erin', side: 'BUY', type: 'LIMIT', qty: 120, price: 250500 });
+await place('M1', { userId: 'frank', side: 'BUY', type: 'MARKET', qty: 100 });
+await place('BAD', { userId: 'frank', side: 'BUY', type: 'LIMIT', qty: 5, price: 250003 });
+await place('BAD', { userId: 'frank', side: 'BUY', type: 'MARKET', qty: 0 });
+await showBook();
+
+if (b1 && s3) {
+  await exchange.modifyOrder(b1, { qty: 20 });
+  console.log(`> modify ${b1}: qty 30 -> 20 (same price, keeps priority)`);
+  await place('IOC', { userId: 'gita', side: 'SELL', type: 'LIMIT', qty: 50, price: 249900, tif: 'IOC' });
+  const cancelled = await exchange.cancelOrder(s3);
+  console.log(`> cancel ${s3}: ${cancelled.status}, filled ${cancelled.filledQty}/${cancelled.qty}`);
+  try {
+    await exchange.cancelOrder(s3);
+  } catch (err) {
+    console.log(`> cancel ${s3} again: ${describeError(err)}`);
+  }
+}
+try {
+  await exchange.placeOrder({ userId: 'x', symbol: 'ACME', side: 'BUY', type: 'MARKET', qty: 1 });
+} catch (err) {
+  console.log(`> unknown symbol: ${describeError(err)}`);
+}
+await showBook();
+```
+
+## Demo output
+
+```text
+> S1: alice SELL 100 @ ₹2,500.00
+  => O1 OPEN, filled 0/100
+> S2: bob SELL 50 @ ₹2,500.00
+  => O2 OPEN, filled 0/50
+> S3: carol SELL 200 @ ₹2,501.00
+  => O3 OPEN, filled 0/200
+> B1: dave BUY 30 @ ₹2,499.00
+  => O4 OPEN, filled 0/30
+> B2: dave BUY 10 @ ₹2,499.00
+  => O5 OPEN, filled 0/10
+  --- RELIANCE book ---
+  ASK  ₹2,501.00 x  200 (1 order)
+  ASK  ₹2,500.00 x  150 (2 orders)
+  BID  ₹2,499.00 x   40 (2 orders)
+> B3: erin BUY 120 @ ₹2,505.00
+  TRADE T1: 100 @ ₹2,500.00 (buy O6, sell O1, aggressor BUY)
+  TRADE T2: 20 @ ₹2,500.00 (buy O6, sell O2, aggressor BUY)
+  => O6 FILLED, filled 120/120
+> M1: frank BUY 100 @ MKT
+  TRADE T3: 30 @ ₹2,500.00 (buy O7, sell O2, aggressor BUY)
+  TRADE T4: 70 @ ₹2,501.00 (buy O7, sell O3, aggressor BUY)
+  (listener failed, book unaffected: Error: downstream analytics crashed)
+  => O7 FILLED, filled 100/100
+> BAD: frank BUY 5 @ ₹2,500.03
+  => REJECTED ValidationError: Price ₹2,500.03 is not a multiple of tick size ₹0.05
+> BAD: frank BUY 0 @ MKT
+  => REJECTED ValidationError: Quantity must be a positive integer, got 0
+  --- RELIANCE book ---
+  ASK  ₹2,501.00 x  130 (1 order)
+  BID  ₹2,499.00 x   40 (2 orders)
+> modify O4: qty 30 -> 20 (same price, keeps priority)
+> IOC: gita SELL 50 @ ₹2,499.00 IOC
+  TRADE T5: 20 @ ₹2,499.00 (buy O4, sell O8, aggressor SELL)
+  TRADE T6: 10 @ ₹2,499.00 (buy O5, sell O8, aggressor SELL)
+  => O8 CANCELLED, filled 30/50
+> cancel O3: CANCELLED, filled 70/200
+> cancel O3 again: UnknownOrderError: Order O3 is not open on RELIANCE
+> unknown symbol: UnknownSymbolError: Symbol ACME is not listed
+  --- RELIANCE book ---
+  (empty)
+```
+
+Walk through it the way you would for an interviewer:
+
+- **B3** bids up to ₹2,505.00 but pays ₹2,500.00, the maker's price. It takes all 100 from S1 first because S1 arrived before S2 (time priority), then 20 from S2.
+- **M1** has no price, so it sweeps the remaining 30 of S2 at ₹2,500.00 and then 70 of S3 at ₹2,501.00. The second listener crashes on the 70-lot trade, and matching carries on anyway.
+- **Modify** reduces B1 in place, so B1 is still ahead of B2 at ₹2,499.00. The IOC sell therefore fills B1's 20 first, then B2's 10, and cancels its unfilled 20.
+
+## Concurrency deep-dive
+
+In Node, the book is only at risk when an `await` sits inside the read-modify-write section, for example "write to a journal, then update the book". The naive version below reads the resting quantity, yields while journaling, and then writes back a value computed from that stale read.
+
+```ts
+class NaiveBook {
+  askQty = 100; // one resting sell order of 100 shares
+  traded = 0;
+
+  async buy(label: string, qty: number): Promise<void> {
+    const available = this.askQty; // read
+    await this.journal(label); // yield: the other buy runs here
+    const fill = Math.min(qty, available); // decide using a stale read
+    this.askQty = available - fill; // write
+    this.traded += fill;
+    console.log(`${label} filled ${fill}`);
+  }
+
+  private async journal(label: string): Promise<void> {
+    await Promise.resolve(`journal ${label}`);
+  }
+}
+
+const book = new NaiveBook();
+await Promise.all([book.buy('B1', 100), book.buy('B2', 100)]);
+console.log(`Resting sell was 100 shares; total traded = ${book.traded}; ask left = ${book.askQty}`);
+console.log(book.traded > 100 ? 'BUG: the seller was filled twice (overfill)' : 'ok');
+```
+
+```text
+B1 filled 100
+B2 filled 100
+Resting sell was 100 shares; total traded = 200; ask left = 0
+BUG: the seller was filled twice (overfill)
+```
+
+The fix is the same single-writer executor the engine uses. Each symbol has a promise chain, and each task runs to completion (journal included) before the next task starts.
+
+```ts
+class SymbolExecutor {
+  private readonly tails = new Map<string, Promise<unknown>>();
+  run<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    const next = prev.then(task);
+    this.tails.set(key, next.catch(() => undefined));
+    return next;
+  }
+}
+
+class SafeBook {
+  askQty = 100;
+  traded = 0;
+  private readonly executor = new SymbolExecutor();
+
+  buy(label: string, qty: number): Promise<void> {
+    return this.executor.run('RELIANCE', async () => {
+      const available = this.askQty;
+      await Promise.resolve(`journal ${label}`);
+      const fill = Math.min(qty, available);
+      this.askQty = available - fill;
+      this.traded += fill;
+      console.log(`${label} filled ${fill}`);
+    });
+  }
+}
+
+const book = new SafeBook();
+await Promise.all([book.buy('B1', 100), book.buy('B2', 100)]);
+console.log(`Resting sell was 100 shares; total traded = ${book.traded}; ask left = ${book.askQty}`);
+```
+
+```text
+B1 filled 100
+B2 filled 0
+Resting sell was 100 shares; total traded = 100; ask left = 0
+```
+
+**Talking points beyond Node**
+
+- **Java:** one `SingleThreadExecutor` per symbol, or per shard of symbols chosen by `hash(symbol) % N`. The LMAX Disruptor pattern goes further: a ring buffer feeds one business-logic thread with no locks at all. A `ReentrantLock` per book also works, but it adds contention and makes latency less predictable.
+- **Go:** one goroutine per symbol, owning its book and reading from a channel. "Don't communicate by sharing memory; share memory by communicating."
+- **Kafka:** partition the order topic by symbol. Each partition has exactly one consumer in the group, so ordering per symbol comes for free. This fits the Groww HLD hint about events arriving through a queue.
+- **Database:** `SELECT ... FOR UPDATE` on the resting order row, or optimistic locking with a `version` column. Both are too slow for a real matching engine, but they are fine for a broker's order table.
+- **Redis:** a Lua script runs atomically, so a small book kept in sorted sets (`ZADD` with price as the score) can be matched inside one script.
+- **Why not a global lock?** Throughput would collapse to one symbol at a time. Per-symbol single writers scale horizontally, because symbols are independent.
+
+## Failure handling
+
+- **Validation failures** (bad tick, bad lot, unknown symbol) are rejected synchronously with a typed error. The order is never created and no sequence number is used up.
+- **Listener failures** are isolated with try/catch around each listener. In production, trades are written to a durable journal *before* they are published, so a crashed consumer can replay them from an offset.
+- **Crash recovery:** the engine is deterministic, so you can rebuild the book by replaying the input journal (the ordered order and cancel events) from the last snapshot. This is event sourcing, and it only works because ids and sequence numbers are injected rather than random.
+- **Duplicate submissions:** the exchange usually receives orders from brokers carrying a broker-side order reference. Deduplicating on `(brokerId, clientRef)` guards against a broker retry creating two orders. Section 14.2 shows how.
+- **Cancel racing with fill:** since both run on the same single-writer queue, one of them wins cleanly. If the fill wins, the cancel gets `UnknownOrderError` ("not open"), which the broker must treat as "too late to cancel", not as a system error.
+
+## Extensions & follow-ups
+
+Common follow-ups: stop-loss orders, self-trade prevention, market-data (L1/L2) feeds, circuit breakers and price bands, iceberg orders, and a pre-open auction. Stop-loss is the one reported for Groww and Upstox, so we implement it here.
+
+A **stop order** waits outside the book until the last traded price (LTP) crosses its trigger. It is then released as a market order. A buy stop triggers when LTP ≥ trigger, and a sell stop when LTP ≤ trigger. Each side is kept sorted so that the next order to trigger sits at the end of its array, which makes the trigger check O(1) per trade. A released order can itself produce a trade that triggers further stops (a cascade), so we queue releases and drain them in a loop instead of recursing.
+
+```ts
+type Paise = number;
+const formatINR = (p: Paise): string =>
+  `₹${Math.trunc(p / 100).toLocaleString('en-IN')}.${String(p % 100).padStart(2, '0')}`;
+
+interface StopOrder {
+  id: string;
+  side: 'BUY' | 'SELL';
+  trigger: Paise;
+  qty: number;
+}
+
+class StopOrderBook {
+  // buyStops sorted DESC by trigger -> the lowest trigger is at the end.
+  private readonly buyStops: StopOrder[] = [];
+  // sellStops sorted ASC by trigger -> the highest trigger is at the end.
+  private readonly sellStops: StopOrder[] = [];
+
+  add(order: StopOrder): void {
+    const list = order.side === 'BUY' ? this.buyStops : this.sellStops;
+    const goesBefore = (x: StopOrder) =>
+      order.side === 'BUY' ? x.trigger < order.trigger : x.trigger > order.trigger;
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (goesBefore(list[mid])) hi = mid;
+      else lo = mid + 1;
+    }
+    list.splice(lo, 0, order);
+  }
+
+  /** Returns every stop order that the new last traded price triggers. */
+  triggered(ltp: Paise): StopOrder[] {
+    const out: StopOrder[] = [];
+    while (this.buyStops.length && this.buyStops[this.buyStops.length - 1].trigger <= ltp) {
+      out.push(this.buyStops.pop()!);
+    }
+    while (this.sellStops.length && this.sellStops[this.sellStops.length - 1].trigger >= ltp) {
+      out.push(this.sellStops.pop()!);
+    }
+    return out;
+  }
+}
+
+/** A toy "engine": each released market sell knocks the price down by ₹5 * qty/100. */
+class ToyMarket {
+  ltp: Paise = 250000;
+  constructor(private readonly stops: StopOrderBook) {}
+
+  onTrade(price: Paise): void {
+    const pending: StopOrder[] = [];
+    this.ltp = price;
+    pending.push(...this.stops.triggered(price));
+    while (pending.length) {
+      const o = pending.shift()!;
+      const impact = Math.trunc((500 * o.qty) / 100);
+      this.ltp += o.side === 'SELL' ? -impact : impact;
+      console.log(`  released ${o.id} (${o.side} ${o.qty}, trigger ${formatINR(o.trigger)}) -> filled, LTP now ${formatINR(this.ltp)}`);
+      pending.push(...this.stops.triggered(this.ltp)); // cascade, handled iteratively
+    }
+  }
+}
+
+const stops = new StopOrderBook();
+stops.add({ id: 'SL-alice', side: 'SELL', trigger: 248000, qty: 100 });
+stops.add({ id: 'SL-bob', side: 'SELL', trigger: 247500, qty: 50 });
+stops.add({ id: 'SL-dev', side: 'SELL', trigger: 246000, qty: 10 });
+stops.add({ id: 'SB-carol', side: 'BUY', trigger: 251000, qty: 40 });
+
+const market = new ToyMarket(stops);
+for (const px of [249500, 248000, 252000]) {
+  console.log(`trade @ ${formatINR(px)}`);
+  market.onTrade(px);
+}
+```
+
+```text
+trade @ ₹2,495.00
+trade @ ₹2,480.00
+  released SL-alice (SELL 100, trigger ₹2,480.00) -> filled, LTP now ₹2,475.00
+  released SL-bob (SELL 50, trigger ₹2,475.00) -> filled, LTP now ₹2,472.50
+trade @ ₹2,520.00
+  released SB-carol (BUY 40, trigger ₹2,510.00) -> filled, LTP now ₹2,522.00
+```
+
+The ₹2,480.00 trade triggers alice. Her market sell pushes LTP down to ₹2,475.00, which triggers bob in the same loop: a cascade with no recursion. Dev's trigger (₹2,460.00) is never reached. In a real engine, released orders go back into the *same* per-symbol queue, which keeps ordering deterministic.
+
+Other follow-ups you should be able to talk through:
+
+- **Self-trade prevention:** before filling, check `maker.userId === taker.userId`. Common policies are "cancel newest", "cancel oldest" or "cancel both". Make it a Strategy.
+- **L2 market data:** after each task, publish the changed levels (price, new aggregate qty). `PriceLevel.openQty` already holds this.
+- **Price bands / circuit limits:** a validator that rejects prices outside ±X% of the reference price. With price bands in place, a price-indexed array becomes feasible.
+- **Iceberg orders:** show only `displayQty`. When the visible part fills, re-queue the next slice at the *back* of the level.
+
+## Edge cases
+
+- A market order against an empty opposite side: filled 0, status CANCELLED (some venues reject instead; say which one you chose).
+- A limit order priced exactly at the best opposite price must match (use `<=` / `>=`, not `<` / `>`).
+- Modify to a quantity ≤ filled qty is rejected. Modify to the same price and qty is a no-op that keeps priority.
+- Cancelling a filled or already-cancelled order returns a clear "not open" error.
+- A price level that empties and is re-created at the same price leaves a duplicate stale entry in the heap, which the lazy pop handles.
+- Very large quantities: JS numbers are exact up to 2^53. For notional values (price × qty in paise) that is still roughly ₹90 trillion, but say you'd use `bigint` or a decimal library if limits were unknown.
+- Tick size and lot size must be positive, and are validated when the instrument is listed.
+- A listener that throws must not stop the remaining fills.
+
+## Complexity
+
+| Operation | Cost | Notes |
+|-----------|------|-------|
+| Best bid / best ask | O(1) amortised | Heap peek plus lazy pops of stale prices |
+| Add resting order at a new level | O(log P) | Heap push |
+| Add at an existing level | O(1) | Queue push |
+| Each fill during matching | O(1) amortised | Queue head plus counters; O(log P) when a level empties |
+| Cancel | O(1) | Map lookup plus lazy deletion flag |
+| Modify (reduce qty) | O(1) | Keeps priority |
+| Modify (price / increase) | O(log P) | Detach plus re-submit |
+| Depth snapshot | O(P log P) | Sort levels; a TreeMap would make this O(depth) |
+
+Space is O(N + P) for N resting orders and P price levels, plus stale heap entries, which are bounded by the number of level creations.
+
+## What graders look for / common mistakes
+
+**They look for:**
+
+- Price-time priority stated up front and implemented correctly: the trade happens at the maker's price, with FIFO inside a level.
+- Separate `BookSide` / `PriceLevel` abstractions instead of a single giant sorted array of orders.
+- Partial fills, and correct handling of the remainder for LIMIT vs MARKET vs IOC.
+- Integer money and tick validation.
+- A clear concurrency story (single writer per symbol) and the ability to explain why per-symbol beats a global lock.
+- A running demo that uses the interviewer's examples, with readable output.
+
+**Common mistakes:**
+
+- Sorting the whole order array on every insert (O(N log N) per order).
+- Trading at the taker's price.
+- Forgetting to remove filled makers, which leaves zero-quantity ghosts at the top of the book.
+- Floats for prices (`0.1 + 0.2`).
+- `Array.shift()` on large queues without thinking about its cost, and `splice` on cancel inside a hot loop.
+- Letting a market order rest in the book.
+- Modifying price without resetting time priority (unfair to others at that level).
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–10 | Clarify: order types, trade price rule, partial fills, cancel/modify semantics, concurrency expectations. Write down the assumptions. |
+| 10–20 | Entities and the class sketch: `Order`, `Trade`, `PriceLevel`, `BookSide`, `OrderBook`, `Exchange`. Name the data structures and give their complexity. |
+| 20–55 | Code the core: heap, level queue, `match`, `submit`. Then a demo with 4–5 orders. Get it **running** early. |
+| 55–70 | Cancel, modify, IOC/market leftovers, validation with typed errors. |
+| 70–80 | Listeners and the per-symbol executor. Show a two-order concurrency example. |
+| 80–90 | Walk through the output, complexity, and extensions (stop-loss, STP, L2). |
+
+## Interview Q&A
+
+**Q1. Why does the trade happen at the resting order's price and not the incoming one?**
+
+<details>
+<summary>Answer</summary>
+
+The resting order was already publicly visible at its price, and the incoming order chose to cross it. Giving the aggressor the maker's price rewards the order that supplied liquidity and gives the aggressor **price improvement** when it was willing to pay more. It also makes the outcome deterministic: the book shows exactly what you will get.
+
+</details>
+
+**Q2. Your heap never removes an empty price. Isn't that a memory leak?**
+
+<details>
+<summary>Answer</summary>
+
+These are stale entries, and they are bounded. Each one corresponds to a level that was created once, and `bestLevel()` removes them the first time they reach the top. In the worst case, a long-running book with many levels that never reach the top could accumulate them. Fixes include periodic heap rebuilds when `heap.size > 2 × levels.size`, an indexed heap with decrease-key/remove, or a balanced tree / price-indexed array where deletion is exact.
+
+</details>
+
+**Q3. How would you process 10,000 symbols on multiple cores?**
+
+<details>
+<summary>Answer</summary>
+
+Shard the symbols: `shard = hash(symbol) % cores`. Each shard is one thread (or process, since Node would use worker threads) that owns the books for its symbols and consumes from its own queue or Kafka partition. Symbols never share state, so nothing needs to be locked across shards. Hot symbols like RELIANCE or NIFTY options can get dedicated shards. Ordering is guaranteed within a symbol, which is all fairness requires.
+
+</details>
+
+**Q4. How do you guarantee the book can be rebuilt after a crash?**
+
+<details>
+<summary>Answer</summary>
+
+Persist every *input* (order, cancel, modify) to an append-only journal before or as it enters the single-writer queue, and make matching a pure function of those inputs. Ids, sequence numbers and time come from the input or an injected deterministic source, never from random or wall-clock calls inside the matcher. On restart, load the latest snapshot and replay the journal after it. Downstream consumers deduplicate trades by trade id.
+
+</details>
+
+**Q5. What changes if modify is allowed to increase quantity while keeping priority?**
+
+<details>
+<summary>Answer</summary>
+
+It would be unfair: a trader could place a 1-share order early to hold the front of the queue, then raise it to 10,000 once the market moves. That's why exchanges generally send a size increase or price change to the back of the queue. Our implementation does this by detaching and re-submitting with a new sequence number. Only a size *decrease* at the same price keeps the order's place.
+
+</details>

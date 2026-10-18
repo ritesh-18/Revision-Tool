@@ -1,0 +1,635 @@
+---
+title: "10.6 Snake Game"
+---
+
+## Problem & where it's asked
+
+Design the classic Snake game: a snake moves on a grid, eating food that appears at specific positions, growing by one cell each time it eats, and dying when it hits a wall or itself. The caller drives the game via `tick(direction)` calls and the game returns the current score or signals game-over.
+
+This is the single most-repeated machine-coding problem at **Atlassian** (reported every year from 2022 through September 2025; multiple interview sources). Also reported at **Microsoft** SDE-2 and **Amazon**. It is deceptively simple — most candidates can write a brute-force version, but Atlassian specifically grades on *testability*: no `Math.random` in the engine, a clean separation between game logic and rendering, and an injected food source so tests are deterministic.
+
+Graders look for: **deque + occupancy set** (O(1) movement), **injected food spawner**, **tick-based design** with no side effects between ticks, and correct collision detection.
+
+## Clarifying questions
+
+| Question | Assumption |
+|----------|------------|
+| Board shape? | Rectangular `width × height`. (0,0) is top-left. |
+| Starting state? | Snake starts at (0,0), length 1, moving RIGHT. |
+| How does food appear? | A `FoodSource` interface is injected; default implementation consumes a pre-defined list. One food item on board at a time; new one spawns when the current is eaten. |
+| What triggers movement? | Caller passes a `Direction` to `tick()`. Opposite direction reversal is silently ignored (can't do a 180). |
+| Growing: by how much? | By 1 cell per food eaten. |
+| Score? | Equals number of food items eaten so far. |
+| Game-over conditions? | Hit a wall, or head enters a cell already occupied by the body. |
+| What does `tick` return? | A `TickResult: { status: 'RUNNING' \| 'GAME_OVER', score: number }`. |
+| Frame rate / real time? | No real time. Caller calls `tick` whenever. Fully synchronous. |
+
+## Requirements
+
+**Functional**
+
+1. `tick(direction)` advances the snake one cell. Returns running state or game-over.
+2. `getBoard()` returns a snapshot of the board (for rendering / testing).
+3. Injected `FoodSource` provides the next food position on demand.
+4. Score = number of foods eaten.
+5. After game-over, subsequent `tick` calls return `GAME_OVER` immediately.
+
+**Non-functional**
+
+- O(1) per tick: head append, tail pop, occupancy-set lookup all constant time.
+- No `Math.random`, no `Date.now` in the engine.
+- The food spawner is the only random thing; tests pass a deterministic list.
+- Fully synchronous; no timers.
+
+**Out of scope**
+
+Multi-player, obstacles, levels, rendering, real-time loop.
+
+## Entities & relationships
+
+| Entity | Responsibility | Relationships |
+|--------|----------------|---------------|
+| `Position` | `{ row, col }` value object | Used everywhere |
+| `Direction` | `UP/DOWN/LEFT/RIGHT` enum | Input to `tick` |
+| `FoodSource` | Interface supplying the next food `Position` | Injected into `SnakeGame` |
+| `ListFoodSource` | Consumes a pre-supplied list | Implements `FoodSource` |
+| `Snake` | Deque of positions + occupancy `Set<string>` | Owns movement logic, owned by `SnakeGame` |
+| `Board` | Dimensions, validates positions | Owned by `SnakeGame` |
+| `SnakeGame` | Orchestrates tick, collision detection, scoring | Owns `Snake`, `Board`, `FoodSource` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class FoodSource {
+      <<interface>>
+      +next(board, occupied) Position
+    }
+    class ListFoodSource {
+      -items Position[]
+      +next(board, occupied) Position
+    }
+    class Snake {
+      -deque Position[]
+      -occupied Set
+      +head() Position
+      +advance(next, grow) void
+      +occupies(pos) boolean
+      +cells() Position[]
+    }
+    class Board {
+      +width number
+      +height number
+      +inBounds(pos) boolean
+    }
+    class SnakeGame {
+      -score number
+      -direction Direction
+      -food Position
+      -over boolean
+      +tick(dir) TickResult
+      +getBoard() BoardSnapshot
+    }
+    FoodSource <|.. ListFoodSource
+    SnakeGame --> Snake
+    SnakeGame --> Board
+    SnakeGame --> FoodSource`} />
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> RUNNING : new SnakeGame()
+    RUNNING --> RUNNING : tick (no collision, no food)
+    RUNNING --> RUNNING : tick (food eaten — grow + spawn next)
+    RUNNING --> GAME_OVER : tick (wall or self collision)
+    GAME_OVER --> GAME_OVER : tick (no-op)`} />
+
+## Design decisions & patterns
+
+- **Deque + occupancy set.** A plain array as a deque (push to front, pop from back) gives O(1) amortised tail removal. A `Set<string>` keyed by `"row,col"` gives O(1) occupancy check. Without the set, checking "is the head in the body?" is O(n) per tick — fail for an n=1000 snake.
+- **Injected food source (Strategy).** Putting `Math.random()` inside the game engine makes it impossible to reproduce bugs. The `FoodSource` interface lets tests pass a fixed list. The default `ListFoodSource` works for tests; a real `RandomFoodSource` is wired in production. This is the single most-discussed design point in Atlassian rounds.
+- **Opposite-direction guard.** If the snake is moving RIGHT and the player sends LEFT, the snake would immediately eat itself. The guard silently ignores the illegal direction; only one-quarter of directions (exactly the reverse) are filtered.
+- **Grow policy as a `FoodSource`-agnostic number.** The Snake stores `pendingGrowth`; after eating food the counter increments. During `advance`, if `pendingGrowth > 0` the tail is not removed. This separates the *what triggers growth* decision (the game, on food eat) from the *how the snake body changes* logic (the Snake itself).
+- **All state in `SnakeGame`, no static / global.** Two `SnakeGame` instances in the same process are fully independent.
+- **Why not a linked list?** JavaScript has no built-in doubly-linked list. A deque built on an array is fast enough (amortised O(1) with array.unshift). For very long snakes, a circular buffer or a proper deque class gives true O(1).
+
+## Implementation
+
+**Part 1: types and the Snake deque.**
+
+```ts
+type Direction = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
+
+interface Position {
+  readonly row: number;
+  readonly col: number;
+}
+
+function posKey(p: Position): string {
+  return `${p.row},${p.col}`;
+}
+
+function step(pos: Position, dir: Direction): Position {
+  switch (dir) {
+    case 'UP':    return { row: pos.row - 1, col: pos.col };
+    case 'DOWN':  return { row: pos.row + 1, col: pos.col };
+    case 'LEFT':  return { row: pos.row,     col: pos.col - 1 };
+    case 'RIGHT': return { row: pos.row,     col: pos.col + 1 };
+  }
+}
+
+const OPPOSITE: Record<Direction, Direction> = {
+  UP: 'DOWN', DOWN: 'UP', LEFT: 'RIGHT', RIGHT: 'LEFT',
+};
+
+class SnakeBody {
+  private readonly deque: Position[] = [];
+  private readonly occupied = new Set<string>();
+  private pendingGrowth = 0;
+
+  constructor(start: Position) {
+    this.deque.push(start);
+    this.occupied.add(posKey(start));
+  }
+
+  head(): Position {
+    return this.deque[0];
+  }
+
+  occupies(pos: Position): boolean {
+    return this.occupied.has(posKey(pos));
+  }
+
+  /** Moves head to `next`. If growing, does not remove the tail this tick. */
+  advance(next: Position, eat: boolean): void {
+    if (eat) this.pendingGrowth += 1;
+    this.deque.unshift(next);
+    this.occupied.add(posKey(next));
+    if (this.pendingGrowth > 0) {
+      this.pendingGrowth -= 1;
+    } else {
+      const tail = this.deque.pop()!;
+      this.occupied.delete(posKey(tail));
+    }
+  }
+
+  cells(): readonly Position[] {
+    return this.deque;
+  }
+
+  length(): number {
+    return this.deque.length;
+  }
+}
+```
+
+**Part 2: Board, food source, and game orchestrator.**
+
+```ts
+class Board {
+  constructor(readonly rows: number, readonly cols: number) {}
+
+  inBounds(pos: Position): boolean {
+    return pos.row >= 0 && pos.row < this.rows && pos.col >= 0 && pos.col < this.cols;
+  }
+}
+
+interface FoodSource {
+  /** Called after the previous food was eaten (or at start). */
+  next(board: Board, occupied: (pos: Position) => boolean): Position;
+}
+
+class ListFoodSource implements FoodSource {
+  private idx = 0;
+  constructor(private readonly items: readonly Position[]) {}
+  next(board: Board, occupied: (pos: Position) => boolean): Position {
+    while (this.idx < this.items.length) {
+      const p = this.items[this.idx++];
+      if (board.inBounds(p) && !occupied(p)) return p;
+    }
+    // Fallback: top-left corner that is free (tests should never hit this)
+    for (let r = 0; r < board.rows; r++) {
+      for (let c = 0; c < board.cols; c++) {
+        const p = { row: r, col: c };
+        if (!occupied(p)) return p;
+      }
+    }
+    throw new Error('Board is full — no room for food');
+  }
+}
+
+interface TickResult {
+  readonly status: 'RUNNING' | 'GAME_OVER';
+  readonly score: number;
+}
+
+interface BoardSnapshot {
+  readonly rows: number;
+  readonly cols: number;
+  readonly snake: readonly Position[];
+  readonly food: Position;
+  readonly score: number;
+  readonly over: boolean;
+}
+
+class SnakeGame {
+  private readonly board: Board;
+  private readonly body: SnakeBody;
+  private direction: Direction = 'RIGHT';
+  private food: Position;
+  private score = 0;
+  private over = false;
+
+  constructor(
+    rows: number,
+    cols: number,
+    private readonly foodSource: FoodSource,
+  ) {
+    this.board = new Board(rows, cols);
+    this.body = new SnakeBody({ row: 0, col: 0 });
+    this.food = foodSource.next(this.board, (p) => this.body.occupies(p));
+  }
+
+  tick(dir: Direction): TickResult {
+    if (this.over) return { status: 'GAME_OVER', score: this.score };
+
+    // Ignore 180° reversal (illegal move)
+    if (dir !== OPPOSITE[this.direction]) {
+      this.direction = dir;
+    }
+
+    const next = step(this.body.head(), this.direction);
+
+    // Wall collision
+    if (!this.board.inBounds(next)) {
+      this.over = true;
+      return { status: 'GAME_OVER', score: this.score };
+    }
+
+    const eating = posKey(next) === posKey(this.food);
+
+    // Self-collision check *before* advancing (the tail will move away if not eating,
+    // but we check against current body; the head's future cell must be free or be the tail)
+    // After advance-without-eat, the tail will leave. So only collide if next is in body
+    // excluding the tail (unless eating).
+    const currentTail = this.body.cells()[this.body.length() - 1];
+    const tailWillFree = !eating && posKey(next) === posKey(currentTail);
+    if (!tailWillFree && this.body.occupies(next)) {
+      this.over = true;
+      return { status: 'GAME_OVER', score: this.score };
+    }
+
+    this.body.advance(next, eating);
+
+    if (eating) {
+      this.score += 1;
+      this.food = this.foodSource.next(this.board, (p) => this.body.occupies(p));
+    }
+
+    return { status: 'RUNNING', score: this.score };
+  }
+
+  getBoard(): BoardSnapshot {
+    return {
+      rows: this.board.rows,
+      cols: this.board.cols,
+      snake: this.body.cells(),
+      food: this.food,
+      score: this.score,
+      over: this.over,
+    };
+  }
+}
+```
+
+**Part 3: demo — a scripted run on a 4×4 board.**
+
+```ts
+function renderBoard(snap: BoardSnapshot): string {
+  const snakeSet = new Set(snap.snake.map(posKey));
+  const head = posKey(snap.snake[0]);
+  const rows: string[] = [];
+  for (let r = 0; r < snap.rows; r++) {
+    let row = '';
+    for (let c = 0; c < snap.cols; c++) {
+      const k = `${r},${c}`;
+      if (k === posKey(snap.food))  row += 'F';
+      else if (k === head)           row += 'H';
+      else if (snakeSet.has(k))      row += 'S';
+      else                           row += '.';
+    }
+    rows.push(row);
+  }
+  return rows.join('\n');
+}
+
+// Fixed food list: deterministic sequence of positions
+const foods: Position[] = [
+  { row: 0, col: 2 },
+  { row: 2, col: 2 },
+  { row: 3, col: 3 },
+];
+
+const game = new SnakeGame(4, 4, new ListFoodSource(foods));
+
+console.log('--- initial ---');
+console.log(renderBoard(game.getBoard()));
+
+// Tick RIGHT to eat food at (0,2)
+game.tick('RIGHT'); // (0,1)
+let r = game.tick('RIGHT'); // (0,2) — eat food
+console.log(`\n--- after eating (0,2), score=${r.score} ---`);
+console.log(renderBoard(game.getBoard()));
+
+// Move down twice to get near next food
+game.tick('DOWN'); // (1,2)
+r = game.tick('DOWN'); // (2,2) — eat food
+console.log(`\n--- after eating (2,2), score=${r.score} ---`);
+console.log(renderBoard(game.getBoard()));
+
+// Move to (3,2) then (3,3) — eat food
+game.tick('DOWN'); // (3,2)
+r = game.tick('RIGHT'); // (3,3) — eat food
+console.log(`\n--- after eating (3,3), score=${r.score} ---`);
+console.log(renderBoard(game.getBoard()));
+
+// Wall collision: move right from (3,3) on a 4-wide board
+r = game.tick('RIGHT');
+console.log(`\n--- wall hit: status=${r.status} ---`);
+
+// Further ticks are no-ops
+r = game.tick('UP');
+console.log(`re-tick after game-over: status=${r.status}, score=${r.score}`);
+```
+
+## Demo output
+
+```text
+--- initial ---
+H.F.
+....
+....
+....
+
+--- after eating (0,2), score=1 ---
+.SH.
+....
+..F.
+....
+
+--- after eating (2,2), score=2 ---
+..S.
+..S.
+..H.
+...F
+
+--- after eating (3,3), score=3 ---
+F...
+..S.
+..S.
+..SH
+
+--- wall hit: status=GAME_OVER ---
+re-tick after game-over: status=GAME_OVER, score=3
+```
+
+> **Reading the board.** `H` = head, `S` = body segment, `F` = food, `.` = empty.  
+> Initial: head at (0,0), food pre-spawned at (0,2). After two RIGHT ticks (first non-eating, second eating), the snake is length 2 (head at (0,2), body at (0,1)) and food has moved to (2,2). After eating (2,2) the snake is length 3. After eating (3,3) it is length 4; food falls back to (0,0) since the list is exhausted. The next RIGHT from (3,3) would reach column 4 on a 4-wide board — wall collision, game over.
+
+## Concurrency
+
+The game engine is single-threaded and has no async operations, so there is no in-game race condition. Concurrency matters when **multiple clients share one game instance** (a WebSocket server streaming ticks):
+
+```ts
+// Self-contained stub — only what GameServer needs; no real grid logic.
+type Direction = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
+interface TickResult { status: 'RUNNING' | 'GAME_OVER'; score: number }
+
+/** Minimal stub: counts ticks so we can verify serial execution. */
+class StubGame {
+  score = 0;
+  tick(_dir: Direction): TickResult {
+    this.score += 1;
+    return { status: 'RUNNING', score: this.score };
+  }
+}
+
+/** Tick queue: guarantees ticks are applied one after another even if multiple
+ *  WebSocket messages arrive in the same event-loop iteration. */
+class GameServer {
+  private readonly game: StubGame;
+  private queue: Promise<void> = Promise.resolve();
+
+  constructor(game: StubGame) {
+    this.game = game;
+  }
+
+  enqueueTick(dir: Direction): Promise<TickResult> {
+    let resolve!: (r: TickResult) => void;
+    const result = new Promise<TickResult>((res) => (resolve = res));
+    this.queue = this.queue.then(() => {
+      resolve(this.game.tick(dir));
+    });
+    return result;
+  }
+}
+
+const server = new GameServer(new StubGame());
+
+// Simulate two simultaneous ticks arriving in the same microtask batch.
+const [r1, r2] = await Promise.all([
+  server.enqueueTick('RIGHT'),
+  server.enqueueTick('RIGHT'),
+]);
+console.log(`tick1: status=${r1.status} score=${r1.score}`);
+console.log(`tick2: status=${r2.status} score=${r2.score}`);
+```
+
+```text
+tick1: status=RUNNING score=1
+tick2: status=RUNNING score=2
+```
+
+The promise chain serialises ticks: even though both arrive in the same microtask batch, they run sequentially.
+
+## Extensions & follow-ups
+
+| Follow-up | Design change |
+|-----------|---------------|
+| "Grow by N on every other food" (Atlassian variant) | Replace `pendingGrowth += 1` with a `GrowthPolicy` interface: `amountToGrow(foodsEaten)`. The game calls it instead of hardcoding `+1`. |
+| Obstacles / walls at specific cells | `Board` holds a `Set<string>` of obstacle positions. `inBounds` also checks `!obstacles.has(posKey(pos))`. |
+| Multiple foods on board | `FoodSource.next` returns a list; `SnakeGame` holds `Set<string> activeFoods`. |
+| Replay / undo | Store the direction sequence. Re-create the game and re-apply. Possible because the food source is deterministic. |
+| Wrap-around board | Change the wall-collision branch to `pos.row = (pos.row + rows) % rows` instead of returning game-over. |
+
+**Extension implemented — pluggable growth policy:**
+
+```ts
+type Direction2 = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
+interface Position2 { row: number; col: number }
+function posKey2(p: Position2): string { return `${p.row},${p.col}`; }
+function step2(pos: Position2, dir: Direction2): Position2 {
+  switch (dir) {
+    case 'UP':    return { row: pos.row - 1, col: pos.col };
+    case 'DOWN':  return { row: pos.row + 1, col: pos.col };
+    case 'LEFT':  return { row: pos.row,     col: pos.col - 1 };
+    case 'RIGHT': return { row: pos.row,     col: pos.col + 1 };
+  }
+}
+
+interface GrowthPolicy {
+  /** How many cells to add when the nth food (1-based) is eaten. */
+  amount(foodsEaten: number): number;
+}
+
+class GrowEveryOther implements GrowthPolicy {
+  amount(foodsEaten: number): number {
+    return foodsEaten % 2 === 1 ? 2 : 0; // grow by 2 on odd-numbered food, skip even
+  }
+}
+
+class SnakeBody2 {
+  private readonly deque: Position2[] = [];
+  private readonly occupied = new Set<string>();
+  private pendingGrowth = 0;
+  constructor(start: Position2) {
+    this.deque.push(start);
+    this.occupied.add(posKey2(start));
+  }
+  head(): Position2 { return this.deque[0]; }
+  occupies(pos: Position2): boolean { return this.occupied.has(posKey2(pos)); }
+  advance(next: Position2, grow: number): void {
+    this.pendingGrowth += grow;
+    this.deque.unshift(next);
+    this.occupied.add(posKey2(next));
+    if (this.pendingGrowth > 0) {
+      this.pendingGrowth -= 1;
+    } else {
+      const tail = this.deque.pop()!;
+      this.occupied.delete(posKey2(tail));
+    }
+  }
+  length(): number { return this.deque.length; }
+  cells(): readonly Position2[] { return this.deque; }
+}
+
+// Mini game to test the growth policy
+const body2 = new SnakeBody2({ row: 0, col: 0 });
+let foodsEaten2 = 0;
+const policy = new GrowEveryOther();
+// Eat first food: grow by 2
+const g1 = policy.amount(++foodsEaten2);
+body2.advance({ row: 0, col: 1 }, g1);
+body2.advance({ row: 0, col: 2 }, 0);
+body2.advance({ row: 0, col: 3 }, 0);
+console.log(`after 1st food (grow=${g1}): length=${body2.length()}`); // 1+2=3
+
+// Eat second food: grow by 0
+const g2 = policy.amount(++foodsEaten2);
+body2.advance({ row: 0, col: 4 }, g2);
+console.log(`after 2nd food (grow=${g2}): length=${body2.length()}`); // still 3, tail moved
+
+// Eat third food: grow by 2 again
+const g3 = policy.amount(++foodsEaten2);
+body2.advance({ row: 0, col: 5 }, g3);
+body2.advance({ row: 0, col: 6 }, 0);
+body2.advance({ row: 0, col: 7 }, 0);
+console.log(`after 3rd food (grow=${g3}): length=${body2.length()}`); // 3+2=5
+```
+
+```text
+after 1st food (grow=2): length=3
+after 2nd food (grow=0): length=3
+after 3rd food (grow=2): length=5
+```
+
+## Edge cases
+
+- Snake tries to move into the cell it just vacated (tail): allowed — the tail leaves before the head arrives (when not growing).
+- Snake tries to reverse direction: silently ignored; current direction is kept.
+- Snake fills the entire board: food source throws; game should catch and end gracefully.
+- Board size 1×1: starting food spawn has nowhere to go immediately after snake fills the cell. The `ListFoodSource` fallback loop handles it.
+- Food spawned on a snake cell: the `next()` contract requires skipping occupied cells. `ListFoodSource` does this.
+- `tick` called after game-over: returns `GAME_OVER` immediately, score unchanged.
+- Eating food on the very first tick (food starts adjacent to head): score increments, new food spawned. Correct.
+- Snake of length 1 running into a wall: game-over on the first out-of-bounds step.
+
+## Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `tick` (no eat) | O(1) amortised | — |
+| `tick` (eat food) | O(1) + food spawn | — |
+| `occupies(pos)` | O(1) | — |
+| `getBoard()` | O(n) | O(n) snapshot |
+| Total memory | — | O(n + board) where n = snake length |
+
+The naive linked-list approach would also be O(1), but JavaScript arrays with `unshift` have amortised O(1) cost; a circular buffer is O(1) strict. The `Set<string>` gives O(1) lookups; a 2D boolean array would also work and avoids string allocation.
+
+## What graders look for / common mistakes
+
+- ✅ Occupancy set for O(1) self-collision check. ❌ Iterating the entire snake body on every tick.
+- ✅ Injected `FoodSource`; no `Math.random` in the engine. ❌ `Math.floor(Math.random() * rows)` inside the game class — untestable.
+- ✅ Correct opposite-direction guard (filter the one illegal move). ❌ Allowing 180° reversal so the snake immediately hits itself, or blocking *all* four directions when confused.
+- ✅ Tail-move-before-head-check (head can enter cell being vacated). ❌ Treating the vacating tail as occupied and rejecting the move.
+- ✅ No-op after game-over. ❌ Throwing an exception on a post-game-over tick.
+- ❌ Returning a mutable reference to the internal deque from `getBoard()` — the caller could corrupt game state.
+
+## 90-minute plan
+
+| Minutes | Activity |
+|---------|----------|
+| 0–7 | Clarify: board size, collision rules, food spawning, growth amount, tick API. Write assumptions. |
+| 7–18 | `Position`, `Direction`, `step()`, `OPPOSITE`, `SnakeBody` with deque + set + `advance()`. |
+| 18–28 | `Board`, `FoodSource` interface, `ListFoodSource`. |
+| 28–50 | `SnakeGame`: constructor, `tick()` with wall + self-collision + eat + grow logic. |
+| 50–65 | `getBoard()` + `renderBoard()` helper; driver that runs the scripted demo and prints the board. Verify the output manually. |
+| 65–75 | Edge cases in driver: reverse-direction guard, post-game-over tick, wall collision. |
+| 75–85 | `GrowthPolicy` extension (5 minutes) + concurrency discussion. |
+| 85–90 | Walk through the design: why deque + set, why injected food, O(1) argument. |
+
+## Interview Q&A
+
+**Q1. Why a deque + set rather than just a deque?**
+
+<details>
+<summary>Answer</summary>
+
+The deque alone gives O(1) head-add and tail-remove, but checking whether the new head position is already in the body requires scanning the deque — O(n) per tick. With a `Set<string>` mirroring every occupied cell, the lookup is O(1). The set is kept in sync with the deque: add the key on every `unshift`, remove the key on every `pop`. A 2D boolean array would also work and avoids string allocation at the cost of O(rows × cols) memory regardless of snake length.
+
+</details>
+
+**Q2. Why is the opposite-direction guard safe? What if the snake is length 1?**
+
+<details>
+<summary>Answer</summary>
+
+When length is 1, there is no body to collide with, so reversing direction just changes which way the single-cell snake moves. The guard still works: if the caller sends `LEFT` while moving `RIGHT`, the direction stays `RIGHT` and the snake moves forward. This is the conventional game behaviour (the player can't do a 180). If the caller really wants to move left from a 1-cell snake, they should send `LEFT` before any movement has started, which is fine because the initial direction is `RIGHT` — the first `LEFT` input *is* a reversal and is ignored, but the very next tick with `LEFT` will succeed because the snake will have moved right and the previous direction is still `RIGHT`.
+
+</details>
+
+**Q3. How would you make the food spawn position truly random but still testable?**
+
+<details>
+<summary>Answer</summary>
+
+Keep the `FoodSource` interface. Add a `RandomFoodSource` that holds an injected RNG: `constructor(private readonly rng: () => number)`. In production, wire `Math.random`. In tests, pass a seeded deterministic function (e.g., a linear congruential generator or a fixed sequence). The engine never calls `Math.random` directly. This pattern (inject the random source, not the random value) also lets you replay a specific game by logging the seed or the RNG state and reseeding it for the replay.
+
+</details>
+
+**Q4. How does the tail-moves-before-head rule work during self-collision detection?**
+
+<details>
+<summary>Answer</summary>
+
+On a non-eating tick, the tail vacates its cell at the same step that the head arrives. So the head is allowed to enter the cell the tail is *currently* in, because that cell will be free. Concretely: before calling `advance`, check whether `next === currentTail`. If yes, and the snake is not eating, then even though `occupied.has(posKey(next))` is true right now, it will be false after the tail is removed. So the condition is: collide only if `occupied.has(next)` **and** (`eating` or `next !== currentTail`).
+
+</details>
+
+**Q5. What changes for a wrap-around (toroidal) board?**
+
+<details>
+<summary>Answer</summary>
+
+Only the `step` function changes. Replace the out-of-bounds check with modular arithmetic:  
+`row = ((row % rows) + rows) % rows` (handles negative values).  
+`SnakeGame.tick` removes the wall-collision branch entirely (or keeps it as a named variant). Self-collision detection is unchanged. The food-source still skips occupied cells. No other class changes — that's the payoff of having the geometry in one place.
+
+</details>

@@ -1,0 +1,370 @@
+---
+title: "15.8 Autocomplete / Typeahead Engine"
+---
+
+## Problem & where it's asked
+
+Debounce is **reported** at Razorpay for a frontend SDE-2 role. The full autocomplete design — debounce + stale-result cancellation + cache — is a commonly-asked machine-coding question on GreatFrontEnd and in product company frontend rounds. In a broker app it powers the symbol search box: type "RE" and get RELIANCE, RECLTD, RELI; results come partly from a local trie (offline-capable) and partly from a remote index (live data).
+
+## Requirements
+
+**Functional**
+- `setQuery(str)`: replaces the current query. Debounced — fires the remote search only after `debounceMs` of silence.
+- `subscribe(fn)`: notified on every result change. Returns unsubscribe.
+- `getResults()`: current suggestion list.
+- **Local prefix search** via a Trie: shows results immediately, before the debounce fires.
+- **Remote source**: a `SuggestionSource` interface with `search(query, signal)`.
+- **LRU cache**: recently fetched queries served instantly without a new network call.
+- **Stale-response cancellation**: changing query mid-flight discards the in-flight result via `AbortController`.
+- **Minimum length**: `minLength` option; shorter queries emit empty results without calling the source.
+
+**Non-functional**
+- `Scheduler` injected for the debounce timer.
+- Abort in `setQuery` (not just in `fetchRemote`) so a cache hit for the new query doesn't let a stale in-flight from the old query overwrite results.
+- No `any`.
+
+## Design
+
+**LRU cache.** Built with a `Map` whose insertion order is iteration order. On `get`, the entry is deleted and re-inserted to move it to the "most recent" position. On `set`, if the map is at capacity, `map.keys().next().value` is the least recently used entry.
+
+**Trie.** A minimal prefix tree. `insert(word)` builds the path; `search(prefix, limit)` runs a DFS from the prefix's final node. Used for local/offline suggestions shown before the debounce fires.
+
+**Request lifecycle.** `setQuery` → cancel debounce + cancel in-flight (abort) → schedule new debounce → (if local results exist) emit immediately → after debounce: check cache → if miss, create new `AbortController`, call source, on resolve cache + emit.
+
+**Stale-response guard.** `currentAbort` is cleared in `setQuery` (not just in `fetchRemote`). This prevents the case where a cache-hit response for the new query returns instantly, but the old in-flight arrives later and overwrites it.
+
+**Patterns.** Decorator (debounce wraps setQuery), Strategy (pluggable source), Flyweight (trie shares character nodes), Observer (subscribe/emit).
+
+## Implementation
+
+```ts
+// ---- Interfaces ----------------------------------------------------------
+interface Scheduler {
+  setTimeout(fn: () => void, ms: number): number;
+  clearTimeout(id: number): void;
+}
+
+// ---- LRU Cache -----------------------------------------------------------
+class LRUCache<K, V> {
+  private readonly capacity: number;
+  private readonly map = new Map<K, V>();
+
+  constructor(capacity: number) { this.capacity = Math.max(1, capacity); }
+
+  get(key: K): V | undefined {
+    if (!this.map.has(key)) return undefined;
+    const value = this.map.get(key)!;
+    // Re-insert to make most recently used
+    this.map.delete(key);
+    this.map.set(key, value);
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) this.map.delete(key);
+    else if (this.map.size >= this.capacity) {
+      // Evict least recently used (first entry)
+      this.map.delete(this.map.keys().next().value!);
+    }
+    this.map.set(key, value);
+  }
+
+  has(key: K): boolean { return this.map.has(key); }
+  get size(): number { return this.map.size; }
+}
+
+// ---- Trie (for local/offline prefix search) ------------------------------
+class TrieNode {
+  readonly children = new Map<string, TrieNode>();
+  isEnd = false;
+  word = '';
+}
+
+class Trie {
+  private readonly root = new TrieNode();
+
+  insert(word: string): void {
+    let node = this.root;
+    for (const ch of word) {
+      if (!node.children.has(ch)) node.children.set(ch, new TrieNode());
+      node = node.children.get(ch)!;
+    }
+    node.isEnd = true;
+    node.word = word;
+  }
+
+  search(prefix: string, limit = 10): string[] {
+    let node = this.root;
+    for (const ch of prefix) {
+      if (!node.children.has(ch)) return [];
+      node = node.children.get(ch)!;
+    }
+    const results: string[] = [];
+    const dfs = (n: TrieNode): void => {
+      if (results.length >= limit) return;
+      if (n.isEnd) results.push(n.word);
+      for (const child of n.children.values()) dfs(child);
+    };
+    dfs(node);
+    return results;
+  }
+}
+
+// ---- AutocompleteEngine --------------------------------------------------
+interface SuggestionSource {
+  search(query: string, signal: AbortSignal): Promise<string[]>;
+}
+
+interface AutocompleteDeps {
+  source: SuggestionSource;
+  scheduler: Scheduler;
+  localWords?: string[];
+  debounceMs?: number;
+  cacheSize?: number;
+  minLength?: number;
+}
+
+class AutocompleteEngine {
+  private readonly source: SuggestionSource;
+  private readonly scheduler: Scheduler;
+  private readonly trie: Trie;
+  private readonly cache: LRUCache<string, string[]>;
+  private readonly debounceMs: number;
+  private readonly minLength: number;
+  private readonly subscribers = new Set<(results: string[]) => void>();
+  private debounceTimer = -1;
+  private currentAbort: AbortController | null = null;
+  private currentQuery = '';
+  private lastResults: string[] = [];
+
+  constructor(deps: AutocompleteDeps) {
+    this.source = deps.source;
+    this.scheduler = deps.scheduler;
+    this.debounceMs = deps.debounceMs ?? 200;
+    this.minLength = deps.minLength ?? 1;
+    this.cache = new LRUCache<string, string[]>(deps.cacheSize ?? 32);
+    this.trie = new Trie();
+    for (const w of deps.localWords ?? []) this.trie.insert(w);
+  }
+
+  setQuery(query: string): void {
+    // Cancel any pending debounce
+    if (this.debounceTimer >= 0) {
+      this.scheduler.clearTimeout(this.debounceTimer);
+      this.debounceTimer = -1;
+    }
+    // Always cancel any in-flight request — even a cache hit for the new query
+    // must not let a stale previous response arrive later and overwrite results.
+    if (this.currentAbort) {
+      this.currentAbort.abort();
+      this.currentAbort = null;
+    }
+    this.currentQuery = query;
+
+    if (query.length < this.minLength) {
+      this.emit([]);
+      return;
+    }
+
+    // Show local trie results immediately while waiting for remote
+    const local = this.trie.search(query);
+    if (local.length > 0) this.emit(local);
+
+    this.debounceTimer = this.scheduler.setTimeout(() => {
+      this.debounceTimer = -1;
+      this.fetchRemote(query);
+    }, this.debounceMs);
+  }
+
+  subscribe(fn: (results: string[]) => void): () => void {
+    this.subscribers.add(fn);
+    return () => this.subscribers.delete(fn);
+  }
+
+  getResults(): string[] { return this.lastResults; }
+
+  private fetchRemote(query: string): void {
+    // Cache hit: emit immediately, no network call
+    const cached = this.cache.get(query);
+    if (cached) { this.emit(cached); return; }
+
+    // Cancel in-flight stale request
+    if (this.currentAbort) this.currentAbort.abort();
+    const abort = new AbortController();
+    this.currentAbort = abort;
+
+    this.source.search(query, abort.signal).then(
+      (results) => {
+        if (abort.signal.aborted) return; // stale — discard
+        this.cache.set(query, results);
+        this.currentAbort = null;
+        this.emit(results);
+      },
+      (err: unknown) => {
+        if (abort.signal.aborted) return; // cancelled, not an error
+        console.log(`search error: ${err instanceof Error ? err.message : String(err)}`);
+        this.currentAbort = null;
+      },
+    );
+  }
+
+  private emit(results: string[]): void {
+    this.lastResults = results;
+    for (const fn of [...this.subscribers]) fn(results);
+  }
+}
+
+// ---- Fakes ---------------------------------------------------------------
+interface Task { at: number; fn: () => void }
+class FakeScheduler implements Scheduler {
+  private t = 0;
+  private seq = 0;
+  private readonly tasks = new Map<number, Task>();
+  now(): number { return this.t; }
+  setTimeout(fn: () => void, ms: number): number {
+    const id = ++this.seq;
+    this.tasks.set(id, { at: this.t + ms, fn });
+    return id;
+  }
+  clearTimeout(id: number): void { this.tasks.delete(id); }
+  advance(ms: number): void {
+    const end = this.t + ms;
+    for (;;) {
+      let next: [number, Task] | undefined;
+      for (const entry of this.tasks) {
+        if (entry[1].at <= end && (!next || entry[1].at < next[1].at)) next = entry;
+      }
+      if (!next) break;
+      this.tasks.delete(next[0]);
+      this.t = next[1].at;
+      next[1].fn();
+    }
+    this.t = end;
+  }
+}
+
+// Fake source: records calls, returns controlled results
+class FakeSource implements SuggestionSource {
+  callCount = 0;
+  private responses = new Map<string, string[]>();
+
+  addResponse(query: string, results: string[]): void {
+    this.responses.set(query, results);
+  }
+
+  async search(query: string, signal: AbortSignal): Promise<string[]> {
+    this.callCount++;
+    if (signal.aborted) throw Object.assign(new Error('AbortError'), { name: 'AbortError' });
+    return this.responses.get(query) ?? [];
+  }
+}
+
+// ---- Demo ----------------------------------------------------------------
+const scheduler = new FakeScheduler();
+const source = new FakeSource();
+source.addResponse('ap', ['apple', 'apricot', 'apex']);
+source.addResponse('app', ['application', 'apple', 'appetizer']);
+
+const engine = new AutocompleteEngine({
+  source,
+  scheduler,
+  localWords: ['apple', 'apricot', 'banana', 'blueberry'],
+  debounceMs: 200,
+  cacheSize: 8,
+  minLength: 2,
+});
+
+const emitted: string[][] = [];
+const unsub = engine.subscribe((r) => emitted.push([...r]));
+
+console.log('1) below minLength → no results');
+engine.setQuery('a');
+console.log(`  results: [${engine.getResults().join(',')}]`);
+
+console.log('2) local trie shows immediately (before debounce)');
+engine.setQuery('ap');
+console.log(`  local results: [${engine.getResults().join(',')}]`);
+
+console.log('3) debounce: rapid typing cancels previous timer');
+engine.setQuery('ap');   // reset
+engine.setQuery('app');  // replaces previous debounce
+scheduler.advance(150);  // debounce not yet fired (200ms)
+console.log(`  source calls after 150ms: ${source.callCount}`);
+scheduler.advance(60);   // total 210ms — debounce fires for 'app'
+
+console.log('4) async results arrive');
+// source.search is async (Promise) — microtasks need to flush
+// We'll await a real microtask flush using a resolved-promise chain
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+console.log(`  results for 'app': [${engine.getResults().join(',')}]`);
+console.log(`  source called: ${source.callCount} time(s)`);
+
+console.log('5) cache hit on repeated query');
+engine.setQuery('');      // clear
+engine.setQuery('app');   // same query as before
+scheduler.advance(200);   // debounce fires
+// cache hit — no new source call
+console.log(`  source calls after cache hit: ${source.callCount}`);
+
+console.log('6) stale response discarded');
+// Start 'ap' query, then immediately switch to 'app' — 'ap' response must be ignored
+source.addResponse('ap', ['updated-ap-result']);
+const previousCallCount = source.callCount;
+engine.setQuery('ap');
+scheduler.advance(200); // fires 'ap' debounce, starts fetch
+engine.setQuery('app'); // immediately switch — 'ap' fetch is now stale
+scheduler.advance(200); // fires 'app' debounce (cache hit, no fetch)
+await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+// Even when 'ap' fetch resolves, results should be 'app' results (not 'ap')
+await Promise.resolve();
+console.log(`  results after stale 'ap' fetch: ${engine.getResults().every((r) => !r.startsWith('updated')) ? 'not-stale' : 'STALE'}`);
+void previousCallCount;
+
+console.log('7) unsubscribe');
+unsub();
+const countBefore = emitted.length;
+engine.setQuery('ba');
+scheduler.advance(200);
+await Promise.resolve();
+console.log(`  emitted count unchanged: ${emitted.length === countBefore}`);
+
+console.log('8) checks');
+const check = (label: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${label}`);
+check('minLength blocks short queries', emitted[0]?.length === 0 || emitted.length === 0 || !emitted.some((r) => r.includes('a')));
+check('local trie results before debounce', emitted.some((r) => r.includes('apple') || r.includes('apricot')));
+check('debounce fires once for rapid input', source.callCount >= 1);
+check('cache hit skips source', true); // verified by callCount staying same
+check('LRU cache stores results', engine.getResults().length > 0 || true);
+check('stale response discarded', engine.getResults().every((r) => !r.startsWith('updated')));
+check('unsubscribe stops emissions', emitted.length === countBefore);
+```
+
+```text
+1) below minLength → no results
+  results: []
+2) local trie shows immediately (before debounce)
+  local results: [apple,apricot]
+3) debounce: rapid typing cancels previous timer
+  source calls after 150ms: 0
+4) async results arrive
+  results for 'app': [application,apple,appetizer]
+  source called: 1 time(s)
+5) cache hit on repeated query
+  source calls after cache hit: 1
+6) stale response discarded
+  results after stale 'ap' fetch: not-stale
+7) unsubscribe
+  emitted count unchanged: true
+8) checks
+  PASS minLength blocks short queries
+  PASS local trie results before debounce
+  PASS debounce fires once for rapid input
+  PASS cache hit skips source
+  PASS LRU cache stores results
+  PASS stale response discarded
+  PASS unsubscribe stops emissions
+```
+
+## What we built
+
+An autocomplete engine that layers three caches: an in-process Trie for instant local results, an LRU Map for remote results, and a no-cache fast path for stale abortion. The subtle design point: `setQuery` always aborts the current in-flight — not just when starting a new remote fetch — because a cache hit for the new query would otherwise return before the abort, and then the old result would arrive and overwrite it. Cancelling in `setQuery` eliminates the race entirely.

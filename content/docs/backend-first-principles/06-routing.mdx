@@ -1,0 +1,626 @@
+---
+title: "What is Routing in Backend?"
+description: How a server maps method plus path to a handler, with static and dynamic routes, path and query parameters, nested routes, versioning, deprecation and catch-all routes.
+---
+
+<Callout type="info">
+  Notes for [What is Routing in Backend?](https://youtu.be/SubuU1iOC2s) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, matching internals, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The HTTP lesson showed that a **method** expresses the **what** of a request (your intent). **Routing** expresses the **where**: which resource you want to apply that intent to. A router combines the two and picks the code that runs.
+
+<Mermaid chart={`flowchart LR
+  A["What vs where"] --> B["Method + path = key"]
+  B --> C["Static routes"]
+  C --> D["Dynamic routes<br/>path params"]
+  D --> E["Query params"]
+  E --> F["Nested routes"]
+  F --> G["Versioning + deprecation"]
+  G --> H["Catch-all"]`} />
+
+---
+
+## 1. What routing is 🎓
+
+- **Method = what.** `GET` means fetch, `POST` means create, and so on.
+- **Route (URL path) = where.** `/users` says which resource.
+- **The server maps the pair to a handler**: a set of instructions that runs the business logic and database operations, then returns a response.
+
+> **Routing = mapping (method, URL path) to server-side logic.**
+
+<Mermaid chart={`flowchart LR
+  R["GET /api/books"] --> RT{Router}
+  RT -->|"GET + /api/books"| H1["listBooks handler"]
+  RT -->|"POST + /api/books"| H2["createBook handler"]
+  RT -->|"GET + /api/users/:id"| H3["getUser handler"]
+  H1 --> BL["business logic + DB"] --> RES["response"]`} />
+
+### What the demo shows 🎓
+The demo uses **Burp Suite** to inspect traffic from a small React app.
+- `GET /api/books` returns a list (filler data). `books` is the **resource**, a term that comes back in the REST lesson.
+- `POST /api/books` uses **the same path** but a different method. It creates a book and returns the list.
+- **Takeaway:** the server combines **method + path** into one unique key. `GET /api/books` and `POST /api/books` are two different routes that **never clash**; the method tells them apart.
+
+### 🔧 Going deeper: how a router actually matches
+
+The simplest router is a list that it scans in order. Building one shows the mechanism every framework uses:
+
+```ts title="tiny-router.ts"
+type Handler = (params: Record<string, string>, query: URLSearchParams) => unknown;
+type Route = { method: string; parts: string[]; handler: Handler };
+
+const routes: Route[] = [];
+const add = (method: string, path: string, handler: Handler) =>
+  routes.push({ method, parts: path.split('/').filter(Boolean), handler });
+
+export function match(method: string, rawUrl: string) {
+  const url = new URL(rawUrl, 'http://localhost');
+  const segs = url.pathname.split('/').filter(Boolean);
+  let pathMatched = false;
+
+  for (const r of routes) {
+    if (r.parts.length !== segs.length) continue;
+    const params: Record<string, string> = {};
+    const ok = r.parts.every((p, i) =>
+      p.startsWith(':') ? ((params[p.slice(1)] = decodeURIComponent(segs[i])), true) : p === segs[i]);
+    if (!ok) continue;
+    pathMatched = true;
+    if (r.method === method) return { status: 200, body: r.handler(params, url.searchParams) };
+  }
+  return pathMatched ? { status: 405 } : { status: 404 };   // path exists with another method → 405
+}
+
+add('GET', '/api/books', () => ['book a', 'book b']);
+add('POST', '/api/books', () => 'created');
+add('GET', '/api/users/:id', (p) => ({ id: p.id }));
+```
+
+Real routers (e.g. **find-my-way**, used by Fastify) store routes in a **radix tree** keyed by path segments, so matching costs roughly the length of the path instead of the number of routes. Express 4/5 still scans its route list in **registration order**, which is why order matters (section 3).
+
+### Inside a radix-tree router ➕
+
+The sentence above says radix trees are fast. Here is why, and what they change about which route wins, because that decides how your app behaves when two routes overlap.
+
+#### The structure and the lookup ➕
+
+- **Problem:** the list scan above costs one comparison per route **for every request**. With 500 routes, a request that matches the last one (or none, a 404) pays 500 comparisons, and for regex-based routes each comparison runs a regular expression.
+- **Mechanism:** a **radix tree** (compressed prefix tree) stores routes by their **shared prefixes**. Each node holds a chunk of path text; a request walks down from the root, consuming its path as it matches each node. Parameters are special child nodes that consume one segment. The cost depends on the **length of the path**, not on how many routes exist.
+
+<Mermaid chart={`flowchart TD
+  R["/api/"] --> B["books"]
+  R --> U["users/"]
+  U --> ME["me (static)"]
+  U --> ID[":id (param)"]
+  ID --> P["/posts"]
+  B --> BS["/search"]
+  R --> F["files/* (wildcard)"]`} />
+
+- **Implementation:** a minimal version shows the idea (one segment per node for clarity; real routers also compress shared character prefixes):
+
+```ts title="segment-tree.ts"
+type Handler = (params: Record<string, string>) => unknown;
+type Node = { statics: Map<string, Node>; param?: { name: string; node: Node }; wildcard?: Handler; handlers: Map<string, Handler> };
+const node = (): Node => ({ statics: new Map(), handlers: new Map() });
+const root = node();
+
+export function add(method: string, path: string, h: Handler) {
+  let n = root;
+  for (const seg of path.split('/').filter(Boolean)) {
+    if (seg === '*') { n.wildcard = h; return; }
+    if (seg.startsWith(':')) n = (n.param ??= { name: seg.slice(1), node: node() }).node;
+    else n = n.statics.get(seg) ?? (n.statics.set(seg, node()), n.statics.get(seg)!);
+  }
+  n.handlers.set(method, h);
+}
+
+export function find(n: Node, segs: string[], i = 0, params: Record<string, string> = {}): { n: Node; params: Record<string, string> } | null {
+  if (i === segs.length) return n.handlers.size ? { n, params } : null;
+  const s = n.statics.get(segs[i]);                                   // 1. static first
+  const viaStatic = s && find(s, segs, i + 1, params);
+  if (viaStatic) return viaStatic;
+  if (n.param) {                                                      // 2. then the parameter
+    const r = find(n.param.node, segs, i + 1, { ...params, [n.param.name]: segs[i] });
+    if (r) return r;
+  }
+  return null;                                                        // (3. wildcard handling omitted)
+}
+```
+
+- **Edge cases:** the speed difference only matters at scale. For a typical service with 50 routes, the router is a tiny fraction of request time compared with a single database query. Choose a framework for other reasons; just know where the ordering rules come from.
+
+#### Priority and backtracking ➕
+
+- **Problem:** with a tree, "registration order" no longer exists, so the router needs a fixed rule for overlaps such as `/users/me` vs `/users/:id`.
+- **Mechanism:** at each node, radix routers try **static** children first, then the **parametric** child, then the **wildcard**. That's why section 3's `me` vs `:id` conflict disappears in Fastify. If the static branch matches a segment but fails **deeper down**, a correct router **backtracks** and tries the parametric branch: with `/users/me/settings` and `/users/:id/posts` registered, `/users/me/posts` must still reach `:id/posts` with `id = "me"`. The `find` function above does this by falling through to the `param` branch when the static recursion returns `null`.
+- **Edge cases:** routers differ in exactly these corners (backtracking support, multiple parameters in one segment, regex constraints), so a route table that works in one framework can behave differently after a migration. Write a test for every overlapping pair of routes you rely on.
+
+#### Regex routes and ReDoS ➕
+
+- **Problem:** order-based routers such as Express compile each path string into a **regular expression** (via `path-to-regexp`). JavaScript regexes run on the event-loop thread, so a pattern that backtracks catastrophically on a crafted URL **blocks every request** on the process.
+- **Real case:** **CVE-2024-45296**. Paths with two parameters in one segment separated by something other than `.` (for example `/flights/:from-:to`) compiled into a backtracking regex. A long, crafted URL froze the server. Express 4 fixed it in **4.20.0** by upgrading `path-to-regexp`; Express 5's newer `path-to-regexp` no longer allows regex syntax inside path strings at all.
+- **Mechanism:** avoid ambiguous patterns, keep URLs bounded, and validate inside the handler instead of in the route pattern:
+
+```ts
+// ❌ two params in one segment, regex-shaped matching
+app.get('/flights/:from-:to', handler);
+
+// ✅ one param per segment, then validate
+app.get('/flights/:from/:to', (req, res) => {
+  const p = z.object({ from: z.string().regex(/^[A-Z]{3}$/), to: z.string().regex(/^[A-Z]{3}$/) }).safeParse(req.params);
+  if (!p.success) return res.status(400).json({ error: 'airport codes must be 3 letters' });
+  res.json(searchFlights(p.data.from, p.data.to));
+});
+```
+
+- **Edge cases:** the same risk applies to any regex you write for validation (`z.string().regex(...)`) if it has nested quantifiers. Keep dependencies such as `path-to-regexp` updated (`npm audit` flags them), and cap URL length at the proxy (see the HTTP lesson's limits section, [HTTP](/docs/backend-first-principles/05-http)).
+
+### HEAD and OPTIONS: methods the router answers for you ➕
+
+The router doesn't only dispatch the methods you register. Most frameworks answer two methods **on their own**, which surprises people when they show up in logs or collide with CORS.
+
+#### Automatic HEAD ➕
+
+- **Problem:** HTTP says every resource that supports GET should support HEAD (the same headers, no body), but nobody wants to write two handlers.
+- **Mechanism:** Express runs your **GET handler** for a HEAD request (unless a HEAD route was registered first) and drops the body. Fastify creates a sibling HEAD route for each GET (`exposeHeadRoutes`, on by default).
+- **Implementation:** for an expensive GET, register a cheap HEAD route **before** it:
+
+```ts
+app.head('/reports/:id', async (req, res) => {           // checked first: no report generation
+  const meta = await reports.meta(req.params.id);
+  if (!meta) return res.sendStatus(404);
+  res.set({ 'Content-Length': String(meta.bytes), ETag: `"${meta.version}"` }).end();
+});
+app.get('/reports/:id', generateReport);                 // also served for HEAD if the route above didn't exist
+```
+
+- **Edge cases:** monitoring tools and link checkers often use HEAD, so an expensive GET handler can be triggered far more often than your users call it. If a HEAD reaches a GET handler that **changes state** (it shouldn't, but it happens), HEAD now changes state too.
+
+#### Automatic OPTIONS, and why it matters for 405 and CORS ➕
+
+- **Problem:** a client (or a browser preflight) asks `OPTIONS /api/books`: "what can I do here?".
+- **Mechanism:** Express's router answers an unhandled `OPTIONS` itself: `200` with an **`Allow`** header listing the methods registered for that path (e.g. `GET,HEAD,POST`). It's the same information a correct `405` response needs.
+- **Implementation:** reuse it to return proper 405s, which Express doesn't do by default:
+
+```ts
+app.route('/api/books')
+  .get(listBooks)
+  .post(createBook)
+  .all((req, res) => res.status(405).set('Allow', 'GET, HEAD, POST').json({ error: `${req.method} not allowed` }));
+```
+
+- **Edge cases:** the automatic OPTIONS response carries **no CORS headers**, so if the CORS middleware isn't registered **before** the routes, preflights get Express's plain answer and the browser blocks the real request. And if an auth middleware runs before routing, it rejects preflights (which carry no credentials) with 401. Both are ordering problems: CORS first, then auth, then routes (the HTTP lesson's CORS section).
+
+---
+
+## 2. Static routes 🎓
+
+- **Definition:** a route with **no variable parts**. `/api/books` is a constant string; you always send exactly that, and it always returns the same *kind* of data.
+- The two demo requests above (`GET` and `POST /api/books`) are static routes.
+
+### What counts as "the same path"? ➕
+
+A static route is a constant string, but "does this request match it?" is less obvious than it looks. `/api/books`, `/api/books/`, `/API/Books` and `/api//books` are four different strings, and frameworks, proxies and caches disagree about which of them are equal.
+
+#### Trailing slashes ➕
+
+- **Problem:** a client calls `/api/books/` and your route is `/api/books`. Depending on the framework, it either works or returns 404.
+- **Mechanism:** Express's router is **non-strict** by default (`strict: false`): `/api/books` and `/api/books/` match the same route. Fastify is strict by default (`ignoreTrailingSlash: false`): they are **different** routes, so one of them 404s.
+
+```ts
+const router = express.Router({ strict: true });              // Express: make /books and /books/ different
+const app = Fastify({ routerOptions: { ignoreTrailingSlash: true } });   // Fastify: make them the same
+```
+
+- **Edge cases:** "works either way" isn't free. Caches, CDNs and analytics treat the two URLs as separate entries, and relative links resolve differently (`./reviews` from `/books/` is `/books/reviews`, from `/books` it's `/reviews`). Pick one form and redirect the other (below).
+
+#### Case sensitivity ➕
+
+- **Problem:** RFC 3986 makes the **path case-sensitive** (only scheme and host are case-insensitive), yet Express matches **case-insensitively** by default (`caseSensitive: false`), while Fastify is case-sensitive.
+- **Why it matters for security:** if a reverse proxy and the app disagree, rules can be bypassed. Nginx `location` matching is case-sensitive. With `location /admin { deny all; }` in Nginx and an Express app behind it, a request to **`/ADMIN`** doesn't match the Nginx rule, is forwarded, and Express happily routes it to the `/admin` handler.
+- **Implementation:** enforce access rules **in the app** (where routing actually happens), and make matching strict so the two layers agree:
+
+```ts
+const app = express();
+app.set('case sensitive routing', true);       // /Admin no longer matches /admin
+app.use('/admin', requireAdmin, adminRouter);  // the real protection lives next to the routes
+```
+
+- **Edge cases:** path **parameters** keep their original case either way (`/users/Asha` gives `id = "Asha"`), so normalise values such as usernames or slugs yourself before looking them up.
+
+#### One canonical URL: redirect the rest ➕
+
+- **Problem:** if `/books`, `/books/` and `/Books` all return the same content, search engines index duplicates, caches store duplicates, and logs split one endpoint into several.
+- **Mechanism:** choose **one canonical form** and redirect every variant to it, keeping the query string. Use **301** (permanent) for GET, and **308** when the method and body must be preserved (a 301 may turn a POST into a GET).
+
+```ts title="canonical.ts"
+app.use((req, res, next) => {
+  const [path, query = ''] = req.originalUrl.split(/\?(.*)/s, 2);
+  let canonical = path.replace(/\/{2,}/g, '/').toLowerCase();             // collapse // and lowercase
+  if (canonical.length > 1) canonical = canonical.replace(/\/$/, '');     // drop one trailing slash
+  if (canonical === path) return next();
+  const target = canonical + (query ? `?${query}` : '');
+  res.redirect(req.method === 'GET' || req.method === 'HEAD' ? 301 : 308, target);
+});
+```
+
+- **Edge cases:** only lowercase paths you own entirely; IDs or file keys that are legitimately case-sensitive (`/files/AbC123`) must be left alone, so in real code apply the lowercase rule to specific prefixes. For **APIs**, many teams prefer a `404` for the wrong form over a redirect, because API clients often don't follow redirects for non-GET methods. Redirects are mostly for browser-facing URLs.
+
+#### Normalization and decoding mismatches ➕
+
+- **Problem:** before matching, someone has to **decode** `%xx` escapes and deal with `//` and `..`. When the proxy and the app do this differently, the URL the proxy checked is not the URL the app routed.
+- **Mechanism (what each layer does):** browsers remove `.` and `..` segments before sending; curl does too unless you pass `--path-as-is`; Nginx decodes, resolves `..` and merges slashes for its **own** `location` matching; Node's `req.url` is the **raw** string, and Express decodes only parameter values.
+- **Implementation:** handle malformed input with a 400, not a crash. Express already turns an undecodable parameter (`/users/%E0%A4%A`) into a **400** "Failed to decode param". A hand-written router using `decodeURIComponent` (like the tiny router in section 1) throws a `URIError` and returns a **500** unless you catch it:
+
+```ts
+const safeDecode = (s: string) => { try { return decodeURIComponent(s); } catch { return null; } };
+// in match(): const v = safeDecode(segs[i]); if (v === null) return { status: 400 };
+```
+
+- **Edge cases:** test your **real** proxy plus app with odd paths (`curl --path-as-is 'https://api.example.com/api/public/../admin'`, `/%2e%2e/`, `//admin`, `/ADMIN`) and check that protected routes stay protected. Fastify also rejects parameters longer than `maxParamLength` (100 characters by default) with a 404, which can surprise clients that put long tokens in paths.
+
+---
+
+## 3. Dynamic routes and path parameters 🎓
+
+### The idea
+`GET /api/users/123` fetches **one** user. The `123` is the user's ID, and it changes per request.
+
+On the server this is declared with a **placeholder**, conventionally a **colon**:
+
+```ts
+router.get('/api/users/:id', handler);
+```
+
+- It matches `GET` + `/api` + `/users` + **any string** in the third segment.
+- The server **extracts** that segment and puts it in a slot named `id`, which the handler can use (e.g. to load the user from the DB). In the demo, the handler just echoes the ID back to prove it received it.
+- The colon convention is used across the industry, whether the server is in Java, Python, Node.js, Go or Rust.
+- **Readability:** the route reads like a sentence: *get* data, *from users*, *the one with ID 123*. That human-readable structure is what REST aims for.
+- **Terminology:** the dynamic segment is a **path parameter** (or **route parameter**), because it sits inside the path after a `/`.
+
+### Path parameters are always strings 🎓
+Even though `123` looks like a number, everything in a path (numbers, special characters) arrives as a **string**. Converting it is your job.
+
+### 🔧 Going deeper: turning the string into a trusted value
+**Problem:** `req.params.id` is `"123"`, `"abc"` or `"1; DROP TABLE"`. Passing it straight to the DB either errors deep in your code (a 500 for what is really a client mistake) or, with string-built SQL, opens an injection hole.
+
+**Mechanism:** validate and transform at the edge of the handler, then use parameterised queries.
+
+```ts title="users.controller.ts (NestJS)"
+@Controller('api/users')
+export class UsersController {
+  @Get(':id')
+  findOne(@Param('id', ParseIntPipe) id: number) {   // "abc" → 400 Bad Request, "123" → 123
+    return this.users.findById(id);                   // SELECT ... WHERE id = $1
+  }
+}
+```
+
+```ts title="Express + zod"
+const Params = z.object({ id: z.coerce.number().int().positive() });
+
+app.get('/api/users/:id', async (req, res) => {
+  const parsed = Params.safeParse(req.params);
+  if (!parsed.success) return res.status(400).json({ error: 'invalid id' });
+  const user = await getUser(parsed.data.id);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  res.json(user);
+});
+```
+
+### 🔧 Edge case: route order and conflicts
+`GET /api/users/me` and `GET /api/users/:id` **both** match `/api/users/me`.
+- **Express** picks whichever was **registered first**. Register `me` before `:id`, or `me` gets treated as an ID (and `ParseIntPipe` returns a confusing 400).
+- **Radix-tree routers** such as Fastify always prefer the **static** segment over the parametric one, so order doesn't matter there.
+- In NestJS (Express adapter), routes follow declaration order inside the controller, so put `@Get('me')` above `@Get(':id')`.
+
+➕ Dynamic routes also matter for observability: label logs and metrics with the **route template** (`/api/users/:id`, from `req.route.path`), never the raw path, or every user ID becomes its own time series. See [Logging, monitoring and observability](/docs/backend-first-principles/18-logging-monitoring-observability).
+
+---
+
+## 4. Query parameters 🎓
+
+### The idea
+`GET /api/search?query=some+value`
+- The **route** the server matches is still just `/api/search` (plus the method).
+- After the `?` come **key=value pairs**: the **query parameters**.
+
+### Why they exist (first principles)
+- `POST`, `PUT` and `PATCH` have a **request body** to carry user-supplied values.
+- In REST, a **`GET` has no body**. So how do you send values with it?
+- You *could* force them into the path, e.g. `/api/search/some value`. It technically works, but path parameters have a job: **semantic expression** ("the user whose ID is 123"). A search string isn't an identity of a resource. Stuffing it into the path is hard to maintain and defeats the purpose of readable REST routes.
+- **Query parameters** are the container for that **metadata about the request**.
+
+<Mermaid chart={`flowchart TD
+  Q{"Where does this value go?"}
+  Q -->|"Identifies a resource (user 123)"| P["Path parameter<br/>/api/users/123"]
+  Q -->|"Modifies how a GET reads data<br/>(search, page, filter, sort)"| QP["Query parameter<br/>/api/books?page=2"]
+  Q -->|"Data to create or update"| B["Request body<br/>POST / PUT / PATCH"]`} />
+
+### The lesson's example: pagination
+`GET /api/books` returns one page plus **metadata**, for example:
+
+```json
+{
+  "data": [ "...20 books..." ],
+  "total": 100,
+  "currentPage": 1,
+  "totalPages": 5,
+  "limit": 20
+}
+```
+
+- The server applies a **default limit** (20 here) and starts at page 1, so the first request needs no query parameters.
+- The client reads the metadata (100 total ÷ 20 per page = **5 pages**) and fetches the next one with **`/api/books?page=2`**.
+- The same mechanism carries **filters** (by a user-defined field) and **sorting** (field and ascending or descending order).
+
+### 🔧 Going deeper: implementing it safely
+
+```ts title="books.controller.ts (Express + zod + pg)"
+const ListQuery = z.object({
+  page:  z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),   // cap it: limit=1000000 is a DoS
+  sort:  z.enum(['title', 'createdAt']).default('createdAt'),   // allow-list: never interpolate raw input
+  order: z.enum(['asc', 'desc']).default('desc'),
+  author: z.string().trim().min(1).optional(),
+});
+
+app.get('/api/books', async (req, res) => {
+  const q = ListQuery.safeParse(req.query);
+  if (!q.success) return res.status(400).json({ errors: q.error.flatten() });
+  const { page, limit, sort, order, author } = q.data;
+
+  const col = sort === 'title' ? 'title' : 'created_at';                // identifiers can't be $-params
+  const dir = order === 'asc' ? 'ASC' : 'DESC';
+  const where = author ? 'WHERE author = $3' : '';
+  const args = author ? [limit, (page - 1) * limit, author] : [limit, (page - 1) * limit];
+
+  const [rows, count] = await Promise.all([
+    pool.query(`SELECT * FROM books ${where} ORDER BY ${col} ${dir}, id LIMIT $1 OFFSET $2`, args),
+    pool.query(`SELECT count(*)::int AS n FROM books ${where.replace('$3', '$1')}`, author ? [author] : []),
+  ]);
+  const total = count.rows[0].n;
+  res.json({ data: rows.rows, total, currentPage: page, totalPages: Math.ceil(total / limit), limit });
+});
+```
+
+🔧 Edge cases worth knowing:
+- **Encoding:** in a query string a space can be sent as `+` or `%20`; `URLSearchParams` decodes both. A literal `+` must be sent as `%2B`, or it turns into a space.
+- **Repeated keys:** `?tag=a&tag=b`. Express's default parser gives an **array**, so a value you expected to be a string can arrive as `string[]`. Validate the type.
+- **Stable sort:** add a unique tie-breaker (`, id`) to `ORDER BY`, otherwise rows with equal sort values can repeat or vanish between pages.
+- **Deep pages:** `OFFSET 100000` still reads and discards 100,000 rows. For large tables, use **cursor (keyset) pagination**: `WHERE created_at < $cursor ORDER BY created_at DESC LIMIT 20`.
+- **URLs get logged** by proxies, CDNs and browsers. Never put tokens or secrets in query parameters.
+
+---
+
+## 5. Nested routes 🎓
+
+Not a separate *type* of routing, but a practice you see in every medium-complexity REST API: nesting resources to express relationships.
+
+`GET /api/users/123/posts/456`: one static part and **two path parameters**. Every prefix is a meaningful route of its own, matched to a **different handler**:
+
+| Route | Meaning |
+|---|---|
+| `/api/users` | all users |
+| `/api/users/123` | user 123 |
+| `/api/users/123/posts` | all posts of user 123 |
+| `/api/users/123/posts/456` | post 456 of user 123 |
+
+<Mermaid chart={`flowchart LR
+  U["/api/users"] --> U1["/api/users/:userId"]
+  U1 --> P["/api/users/:userId/posts"]
+  P --> P1["/api/users/:userId/posts/:postId"]`} />
+
+### 🔧 Going deeper: the nesting implies an authorization check
+**Problem:** `/users/123/posts/456` *claims* that post 456 belongs to user 123. If the handler only does `SELECT * FROM posts WHERE id = 456`, then `/users/999/posts/456` returns the same post, and the URL lies.
+
+**Mechanism:** use **every** path parameter in the query, so the relationship is enforced by the data layer:
+
+```sql
+SELECT * FROM posts WHERE id = $1 AND user_id = $2;   -- 0 rows → 404
+```
+
+Also check that the **caller** may see user 123's posts at all. Skipping that is the classic **IDOR / broken object-level authorization** bug. A good guideline is to nest only **one level** (`/users/:id/posts`) and expose the child directly (`/posts/:id`) after that.
+
+### Mounting nested routes as sub-routers ➕
+
+The table above lists nested routes one by one. In a real codebase they're **grouped**: each resource gets its own router (or controller), mounted under a prefix. That grouping has one well-known trap with path parameters. (Which middleware runs for which group, and in what order, is covered in [Controllers, services, repositories and middleware](/docs/backend-first-principles/10-controllers-services-repositories-middleware).)
+
+#### Prefix mounting ➕
+
+- **Problem:** defining every route with its full path (`/api/v1/users/:userId/posts/:postId`) repeats prefixes everywhere, and moving a group (a new API version, a new parent resource) means editing every line.
+- **Mechanism:** a router defines paths **relative** to where it's mounted. The prefix is stripped before the sub-router matches, so the same router can be mounted in several places.
+
+```ts title="routes.ts (Express)"
+const posts = express.Router({ mergeParams: true });     // see the next subsection for mergeParams
+posts.get('/', listPostsOfUser);                          // GET /api/v1/users/:userId/posts
+posts.get('/:postId', getPostOfUser);                     // GET /api/v1/users/:userId/posts/:postId
+
+const users = express.Router();
+users.get('/:userId', getUser);
+users.use('/:userId/posts', posts);                       // nested group
+
+app.use('/api/v1/users', users);                          // the whole tree under one prefix
+```
+
+In NestJS the controller path plays the same role (`@Controller('users/:userId/posts')`), and `RouterModule` can attach a module's controllers under a shared prefix.
+
+- **Edge cases:** inside a mounted router, `req.url` and `req.path` are **relative** to the mount point; use `req.originalUrl` (or `req.baseUrl + req.path`) when you need the full path for logs or redirects.
+
+#### Parent parameters and `mergeParams` ➕
+
+- **Problem:** in the code above without `mergeParams`, `listPostsOfUser` sees `req.params.userId` as **`undefined`**. The handler then runs `WHERE user_id = $1` with `undefined`, or worse, a query without the filter returns **every** user's posts: exactly the broken object-level authorization from the previous subsection.
+- **Why:** Express routers are independent by default. The parent consumed `:userId` while matching the prefix, and the child router only receives its **own** parameters.
+- **Mechanism:** `express.Router({ mergeParams: true })` makes the child router see the parent's parameters (on a name clash, the child's value wins).
+- **Implementation:** fail loudly if the parameter is missing, so a mounting mistake can't silently widen a query:
+
+```ts
+async function listPostsOfUser(req: Request, res: Response) {
+  const userId = Number(req.params.userId);
+  if (!Number.isInteger(userId)) throw new Error('userId missing: is the router mounted with mergeParams?');
+  const { rows } = await pool.query('SELECT * FROM posts WHERE user_id = $1 ORDER BY id', [userId]);
+  res.json(rows);
+}
+```
+
+- **Edge cases:** TypeScript won't catch this: `req.params` is typed loosely by default. Add one integration test per nested route that asserts user A's posts URL never returns user B's posts.
+
+---
+
+## 6. Route versioning and deprecation 🎓
+
+### The demo
+- `GET /api/v1/products` returns items shaped `{ id, name, price }`.
+- `GET /api/v2/products` returns items shaped `{ id, title, price }`.
+
+### The problem it solves
+A response format is a **contract**. Say the API served a web app, then a new **React Native / Android / Flutter** client arrives with new requirements and the response must change. Changing it in place **breaks every existing client**.
+
+**Options:**
+1. A new path such as `/api/new-products`: messy, and the name says nothing.
+2. **Versioning:** keep `v1` exactly as it was and serve the new shape at `v2`. It states the intent clearly and doesn't require renaming the route.
+
+### The deprecation workflow
+1. Ship `v2`.
+2. Announce that `v1` is **deprecated** (e.g. tell the frontend teams).
+3. Give clients a **migration window** to move their calls to `v2`.
+4. Remove `v1` completely. (The lesson phrases this as v2 eventually becoming "the" version.)
+
+This gives you a stable process for shipping **breaking changes**.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Active: v1 released
+  Active --> Deprecated: v2 released, v1 announced deprecated
+  Deprecated --> Deprecated: clients migrate during the window
+  Deprecated --> Removed: sunset date passes
+  Removed --> [*]: v1 returns 410 or 404`} />
+
+### 🔧 Going deeper: implementing it
+
+**URI versioning in NestJS:**
+
+```ts title="main.ts"
+app.setGlobalPrefix('api');
+app.enableVersioning({ type: VersioningType.URI });   // → /api/v1/..., /api/v2/...
+```
+
+```ts title="products.controller.ts"
+@Controller({ path: 'products', version: '1' })
+export class ProductsV1Controller {
+  @Get() list() { return this.svc.list().then(ps => ps.map(p => ({ id: p.id, name: p.title, price: p.price }))); }
+}
+
+@Controller({ path: 'products', version: '2' })
+export class ProductsV2Controller {
+  @Get() list() { return this.svc.list(); }   // { id, title, price }
+}
+```
+
+Both versions share **one service**; only the **response mapping** differs. Don't fork the business logic per version.
+
+**Machine-readable deprecation:** besides telling people, tell clients in headers on every `v1` response:
+
+```ts title="deprecation.middleware.ts"
+export function deprecateV1(req: Request, res: Response, next: NextFunction) {
+  res.setHeader('Deprecation', '@1767225600');                       // RFC 9745: deprecated since this Unix time
+  res.setHeader('Sunset', 'Wed, 30 Jun 2027 23:59:59 GMT');          // RFC 8594: when it stops working
+  res.setHeader('Link', '</api/v2/products>; rel="successor-version"');
+  next();
+}
+```
+
+Then **log calls to v1 per client** so you know who still needs to migrate before you remove it. After removal, `410 Gone` is more informative than `404`.
+
+**Other versioning styles** (covered later in the series): a header (`Accept: application/vnd.example.v2+json` or a custom header) or a query string (`?version=2`). URI versioning is the most visible and the easiest to cache and debug.
+
+---
+
+## 7. Catch-all routes 🎓
+
+- **The demo:** `GET /api/v3/products`, a route the server has **no handler** for.
+- **Mechanism:** after all the real routes, register a final wildcard such as `/*`. Any request that fell through every other matcher lands there, and its handler returns a **friendly "route not found" message**.
+- **Why:** without it you get the framework's default (the lesson calls it an empty or null response). A clear message tells the client this endpoint doesn't exist.
+
+<Mermaid chart={`flowchart TD
+  REQ["GET /api/v3/products"] --> R1{"matches /api/v1/products?"}
+  R1 -->|no| R2{"matches /api/v2/products?"}
+  R2 -->|no| R3{"... other routes ..."}
+  R3 -->|no| C["catch-all handler<br/>404 Route not found"]`} />
+
+### 🔧 Going deeper: catch-all in Express 5 and NestJS
+
+```ts title="Express 5"
+// ...all real routes first...
+app.all('/{*splat}', (req, res) => {           // Express 5: wildcards must be named; braces also match "/"
+  res.status(404).json({ error: 'Route not found', method: req.method, path: req.path });
+});
+```
+
+- In Express 4 the same thing was `app.all('*', ...)`. Express 5 changed the path syntax: `*` needs a name, `?` for optional parameters became braces, and regex characters in path strings are no longer supported.
+- **NestJS** already returns a JSON 404 for unknown routes (it throws `NotFoundException`). To customise the body, use a global exception filter for `NotFoundException` instead of a wildcard controller, which could swallow routes from other modules.
+- **404 vs 405:** if the **path exists** but not with that method (e.g. `DELETE /api/books`), the correct response is **`405 Method Not Allowed`** with an `Allow: GET, POST` header. Many frameworks return 404 by default; the tiny router in section 1 shows how to tell them apart.
+- **SPA fallback:** when the same server also serves a single-page app, the catch-all for **non-API paths** returns `index.html` (the client-side router handles it), while unknown `/api/*` paths still return a JSON 404. Mixing those up turns API typos into `200 OK` HTML responses.
+
+---
+
+## 8. Recap 🎓
+
+| Concept | Example | Purpose |
+|---|---|---|
+| Routing | method + path → handler | the **where** of a request |
+| Static route | `/api/books` | constant path |
+| Dynamic route / path param | `/api/users/:id` | identifies a specific resource; value arrives as a string |
+| Query param | `/api/search?query=x`, `?page=2` | metadata for GETs: search, pagination, filter, sort |
+| Nested route | `/api/users/123/posts/456` | expresses relationships between resources |
+| Versioning | `/api/v1/...`, `/api/v2/...` | breaking changes without breaking clients |
+| Deprecation | announce, migration window, remove | retire old versions safely |
+| Catch-all | `/*` last | friendly response for unknown routes |
+| ➕ Radix tree | static, then param, then wildcard | lookup cost follows path length; overlaps resolved by priority, with backtracking |
+| ➕ Regex routes | `/:a-:b` | ReDoS risk (CVE-2024-45296); one param per segment, validate in the handler |
+| ➕ Auto HEAD / OPTIONS | GET serves HEAD; OPTIONS gets `Allow` | cheap HEAD for expensive GETs; CORS before routes |
+| ➕ Same path? | `/books` vs `/books/` vs `/Books` | know your framework's defaults; one canonical form; proxy and app must agree |
+| ➕ Sub-routers | `users.use('/:userId/posts', posts)` | prefixes in one place; `mergeParams: true` or the parent ID is lost |
+
+That's enough to open a backend codebase, understand its routing, change it and add new routes.
+
+---
+
+## Interview questions
+
+1. **What does a router use to pick a handler?** **The HTTP method plus the URL path. `GET /books` and `POST /books` are different routes.**
+2. **Path parameter vs query parameter: when do you use which?** **Path parameters identify a resource (`/users/123`). Query parameters modify how a GET reads data: search, pagination, filters, sorting.**
+3. **Why must you validate path parameters even if they "look like" numbers?** **They always arrive as strings. Convert and validate at the edge (400 on failure) and use parameterised queries.**
+4. **`/users/me` and `/users/:id` both exist. What can go wrong?** **In order-based routers (Express), whichever is registered first wins, so `me` may be treated as an ID. Register static routes first; radix-tree routers prefer static segments automatically.**
+5. **What's the security risk of `/users/:userId/posts/:postId`?** **Loading the post by `postId` alone ignores ownership (IDOR). Filter by both IDs and check that the caller may access that user's data.**
+6. **How do you ship a breaking response change?** **Version the API (`/v2`), keep v1 unchanged, mark v1 deprecated (announce plus `Deprecation`/`Sunset` headers), give a migration window, monitor v1 usage, then remove it.**
+7. **What should a request for a non-existent route return?** **A clear 404 from a catch-all registered last. If the path exists with other methods, 405 with an `Allow` header.**
+8. **Why is `OFFSET` pagination slow on page 5,000?** **The DB still reads and discards every skipped row. Use keyset (cursor) pagination for deep pages.**
+9. ➕ **Why is a radix-tree router's lookup independent of the number of routes, and how does it resolve `/users/me` vs `/users/:id`?** **It walks the request path through nodes keyed by shared prefixes, so cost depends on path length. At each node it tries static children first, then the parameter, then the wildcard, backtracking if a static branch fails deeper.**
+10. ➕ **How can a route pattern take down a Node server?** **Order-based routers compile paths to regexes; an ambiguous pattern like `/:a-:b` produced a catastrophically backtracking regex (CVE-2024-45296) that blocks the event loop on a crafted URL. Keep one parameter per segment and keep path-to-regexp updated.**
+11. ➕ **What does Express do with HEAD and OPTIONS requests you didn't register?** **HEAD runs the GET handler and drops the body; OPTIONS gets an automatic 200 with an `Allow` header. Register a cheap HEAD for expensive GETs, and put CORS before the routes so preflights get CORS headers.**
+12. ➕ **Nginx denies `/admin`, yet `/ADMIN` reaches the admin handler. Why?** **Nginx location matching is case-sensitive, Express routing is case-insensitive by default. Enforce authorization in the app and enable case-sensitive routing so both layers agree.**
+13. ➕ **A nested router's handler sees `req.params.userId` as undefined. Why?** **Express child routers don't inherit parent parameters unless created with `express.Router({ mergeParams: true })`.**
+
+## Sources
+
+- [Lesson video: What is Routing in Backend? (Sriniously)](https://youtu.be/SubuU1iOC2s)
+- [Express 5 migration guide (path matching changes)](https://expressjs.com/en/guide/migrating-5.html)
+- [Express routing guide](https://expressjs.com/en/guide/routing.html)
+- [find-my-way (Fastify's radix-tree router)](https://github.com/delvedor/find-my-way)
+- [NestJS: Versioning](https://docs.nestjs.com/techniques/versioning)
+- [NestJS: Pipes (ParseIntPipe)](https://docs.nestjs.com/pipes)
+- [RFC 9745: The Deprecation HTTP Response Header Field](https://www.rfc-editor.org/rfc/rfc9745.html)
+- [RFC 8594: The Sunset HTTP Header Field](https://www.rfc-editor.org/rfc/rfc8594.html)
+- [RFC 9110: HTTP Semantics, 405 Method Not Allowed and Allow](https://www.rfc-editor.org/rfc/rfc9110.html#name-405-method-not-allowed)
+- [OWASP API Security: Broken Object Level Authorization](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/)
+- [MDN: URLSearchParams](https://developer.mozilla.org/en-US/docs/Web/API/URLSearchParams)
+- ➕ [Express 5: express.Router options (caseSensitive, mergeParams, strict)](https://expressjs.com/en/5x/api/express/)
+- ➕ [Express 5: app settings and app.get handling HEAD](https://expressjs.com/en/5x/api/application/)
+- ➕ [Fastify: server and router options (ignoreTrailingSlash, caseSensitive, exposeHeadRoutes, maxParamLength)](https://fastify.dev/docs/latest/Reference/Server/)
+- ➕ [OSV: CVE-2024-45296, path-to-regexp backtracking regex](https://osv.dev/vulnerability/CVE-2024-45296)
+- ➕ [RFC 3986: URI Generic Syntax (case sensitivity, dot segments)](https://www.rfc-editor.org/rfc/rfc3986.html)
+- ➕ [RFC 9110: 308 Permanent Redirect](https://www.rfc-editor.org/rfc/rfc9110.html#name-308-permanent-redirect)
+- ➕ [Nginx: location matching](https://nginx.org/en/docs/http/ngx_http_core_module.html#location)
+- ➕ [NestJS: Router module](https://docs.nestjs.com/recipes/router-module)

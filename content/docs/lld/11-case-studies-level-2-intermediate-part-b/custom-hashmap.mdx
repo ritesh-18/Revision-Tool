@@ -1,0 +1,384 @@
+---
+title: "11.5 Custom HashMap"
+---
+
+## Problem & where it's asked
+
+"Implement a `HashMap` from scratch" is a pure data-structures problem that top-tier companies use to separate candidates who understand **hashing, collision resolution and amortised resize** from those who just use the built-in `Map`. The follow-up always lands on concurrency.
+
+| Company | What was reported | Confidence |
+|---|---|---|
+| Amazon, Google, Microsoft | Hash-map design / LRU cache hybrid in SDE-2 loops | reported (lists) |
+| Goldman Sachs, JPMorgan | ConcurrentHashMap discussion (lock striping) | reported |
+| Flipkart, Meesho | "Design HashMap with string keys, handle collisions" | reported |
+
+Graders look for **separate chaining**, the **load-factor threshold** as a policy knob, proper **rehashing** that preserves keys, and a clean **iterator** (not just `keys()`).
+
+## Clarifying questions
+
+| Question | Assumption |
+|---|---|
+| Supported key types? | `string \| number`. No object keys (avoids `hashCode` / `equals` protocol). |
+| Collision strategy? | Separate chaining with a singly-linked list per bucket. |
+| Load factor? | 0.75 (same as Java). Double capacity on breach. |
+| Shrink on delete? | Out of scope (in Java `HashMap` also never shrinks). |
+| Thread-safe? | Single-threaded for now. Talking-points section covers lock striping. |
+| Iterable? | Yes. Expose `[Symbol.iterator]` so `for...of` and spread work. |
+
+## Requirements
+
+**Functional**
+1. `set(key, value)` inserts or overwrites.
+2. `get(key)` returns `value | undefined`.
+3. `has(key)` returns a boolean.
+4. `delete(key)` removes and returns whether it existed.
+5. `size` property.
+6. `[Symbol.iterator]` yields `[key, value]` pairs (unordered within a bucket).
+7. Automatic resize when `size / capacity > 0.75`.
+
+**Non-functional**
+- `set` / `get` / `has` / `delete`: amortised O(1).
+- Generic over `K extends string | number` and `V`; no `any`.
+- Injected capacity for tests (forces early resize).
+
+**Out of scope**
+- Object keys, `equals` / `hashCode`, persistent (CoW) variant, ordered map.
+
+## Entities & relationships
+
+| Entity | Responsibility | Notes |
+|---|---|---|
+| `ChainNode<K, V>` | Singly-linked node for a bucket | key, value, next |
+| `HashMap<K, V>` | Bucket array, hash function, resize, iterator | Generic |
+| `KeyedMutex` (concurrency section) | Per-key async serialisation | Reused from §11.1 |
+| `AsyncMap` (concurrency demo) | Simulates an async remote store | Demo only |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class HashMap~K V~ {
+        -_buckets: Array
+        -_size: number
+        -_capacity: number
+        +set(key, value) this
+        +get(key) V|undefined
+        +has(key) boolean
+        +delete(key) boolean
+        +size: number
+        +capacity: number
+        +[Symbol.iterator]() Generator
+    }
+    class ChainNode~K V~ {
+        +key: K
+        +value: V
+        +next: ChainNode|null
+    }
+    HashMap "1" --> "0..*" ChainNode : buckets`} />
+
+## Design decisions & patterns
+
+- **Separate chaining vs open addressing.** Chaining keeps the implementation simple: inserting prepends to the list, and resizing is a clean sweep of all chains. Open addressing (linear probing, Robin-Hood) has better cache locality but a more fragile delete. Interviewers accept either if you can articulate the trade-off.
+- **Prepend on insert.** The new node becomes the bucket head. O(1), and it handles the common "insert then immediately get the same key" pattern (hit rate from cache locality). Java's `HashMap` switched to tail-insert in Java 8 to keep insertion order within a bucket stable.
+- **Double capacity on resize.** Powers of two let the modulo become a bitwise AND on the lower bits. Halving on shrink is symmetrical but skipped here (Java omits it too).
+- **Load factor as a static field.** It's a policy that operators might tune (0.5 for read-heavy, 0.9 for memory-constrained). Making it a constructor parameter is a simple extension.
+- **No `toString` on keys.** Hashing a `number` and hashing `String(number)` would give different bucket placements, which is confusing. The type union keeps them separate.
+
+## Implementation
+
+**Part 1 — core hash map.**
+
+```ts
+type HashKey = string | number;
+
+interface ChainNode<K, V> {
+  key: K;
+  value: V;
+  next: ChainNode<K, V> | null;
+}
+
+class HashMap<K extends HashKey, V> {
+  private _buckets: Array<ChainNode<K, V> | null>;
+  private _size = 0;
+  private _capacity: number;
+  private static readonly LOAD_FACTOR = 0.75;
+
+  constructor(initialCapacity = 16) {
+    this._capacity = Math.max(1, initialCapacity);
+    this._buckets = new Array<ChainNode<K, V> | null>(this._capacity).fill(null);
+  }
+
+  get size(): number { return this._size; }
+  get capacity(): number { return this._capacity; }
+
+  private hashIndex(key: K): number {
+    let h: number;
+    if (typeof key === 'number') {
+      // Wang hash — distributes integers well
+      h = key | 0;
+      h = ((h >>> 16) ^ h) * 0x45d9f3b | 0;
+      h = ((h >>> 16) ^ h);
+    } else {
+      h = 0;
+      for (let i = 0; i < key.length; i++) {
+        h = Math.imul(31, h) + key.charCodeAt(i) | 0;
+      }
+    }
+    return (h >>> 0) % this._capacity;
+  }
+
+  set(key: K, value: V): this {
+    const idx = this.hashIndex(key);
+    let node = this._buckets[idx];
+    while (node !== null) {
+      if (node.key === key) { node.value = value; return this; }
+      node = node.next;
+    }
+    this._buckets[idx] = { key, value, next: this._buckets[idx] };
+    this._size++;
+    if (this._size / this._capacity > HashMap.LOAD_FACTOR) this._resize();
+    return this;
+  }
+
+  get(key: K): V | undefined {
+    let node = this._buckets[this.hashIndex(key)];
+    while (node !== null) {
+      if (node.key === key) return node.value;
+      node = node.next;
+    }
+    return undefined;
+  }
+
+  has(key: K): boolean {
+    let node = this._buckets[this.hashIndex(key)];
+    while (node !== null) {
+      if (node.key === key) return true;
+      node = node.next;
+    }
+    return false;
+  }
+
+  delete(key: K): boolean {
+    const idx = this.hashIndex(key);
+    let node = this._buckets[idx];
+    let prev: ChainNode<K, V> | null = null;
+    while (node !== null) {
+      if (node.key === key) {
+        if (prev !== null) prev.next = node.next;
+        else this._buckets[idx] = node.next;
+        this._size--;
+        return true;
+      }
+      prev = node;
+      node = node.next;
+    }
+    return false;
+  }
+
+  private _resize(): void {
+    const old = this._buckets;
+    this._capacity *= 2;
+    this._buckets = new Array<ChainNode<K, V> | null>(this._capacity).fill(null);
+    this._size = 0;
+    for (const head of old) {
+      let node = head;
+      while (node !== null) {
+        this.set(node.key, node.value);
+        node = node.next;
+      }
+    }
+  }
+
+  *[Symbol.iterator](): Generator<[K, V], void, undefined> {
+    for (const head of this._buckets) {
+      let node = head;
+      while (node !== null) {
+        const pair: [K, V] = [node.key, node.value];
+        yield pair;
+        node = node.next;
+      }
+    }
+  }
+}
+```
+
+**Part 2 — demo.** Sorted iteration makes the output deterministic regardless of bucket placement.
+
+```ts
+// --- string keys ---
+const m = new HashMap<string, number>(4);
+m.set('alice', 30).set('bob', 25).set('charlie', 35);
+console.log(`size=${m.size} capacity=${m.capacity}`);
+console.log(`get: alice=${m.get('alice')} missing=${m.get('dave')}`);
+
+m.set('alice', 31);                       // overwrite — size stays 3
+m.set('dave', 40);                         // size → 4, 4/4 > 0.75 → resize to capacity 8
+console.log(`after resize: size=${m.size} capacity=${m.capacity}`);
+
+m.delete('charlie');
+console.log(`delete: has(charlie)=${m.has('charlie')} size=${m.size}`);
+
+const entries = [...m].sort(([a], [b]) => String(a).localeCompare(String(b)));
+console.log(`entries: ${entries.map(([k, v]) => `${k}=${v}`).join(', ')}`);
+
+// --- number keys ---
+const nm = new HashMap<number, string>();
+nm.set(1, 'one').set(42, 'forty-two').set(100, 'hundred');
+console.log(`numbers: 1="${nm.get(1)}" 42="${nm.get(42)}" 100="${nm.get(100)}"`);
+```
+
+## Demo output
+
+```text
+size=3 capacity=4
+get: alice=30 missing=undefined
+after resize: size=4 capacity=8
+delete: has(charlie)=false size=3
+entries: alice=31, bob=25, dave=40
+numbers: 1="one" 42="forty-two" 100="hundred"
+```
+
+## Concurrency
+
+The race condition in a concurrent hash map is the same shape as in §11.1: a read-check-then-write separated by an `await` lets two callers both see the "safe" state and both proceed.
+
+```ts
+// KeyedMutex: serialises operations per key.
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => { release = r; });
+    const tail = prev.then(() => mine);
+    this.tails.set(key, tail);
+    await prev;
+    try { return await fn(); }
+    finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+
+// Simulates an async remote store where get/set are not atomic.
+class AsyncMap {
+  private readonly data = new Map<string, number>();
+  async get(k: string): Promise<number> { await Promise.resolve(); return this.data.get(k) ?? 0; }
+  async set(k: string, v: number): Promise<void> { await Promise.resolve(); this.data.set(k, v); }
+}
+
+// Naive: read, yield to event loop, write — classic TOCTOU.
+async function naiveIncrement(m: AsyncMap, key: string): Promise<void> {
+  const v = await m.get(key);
+  await m.set(key, v + 1);
+}
+
+// Safe: entire check-and-write is under a per-key lock.
+async function safeIncrement(m: AsyncMap, lock: KeyedMutex, key: string): Promise<void> {
+  await lock.run(key, () => naiveIncrement(m, key));
+}
+
+const N = 8;
+const naiveMap = new AsyncMap();
+await Promise.all(Array.from({ length: N }, () => naiveIncrement(naiveMap, 'k')));
+console.log(`naive:  expected=${N} got=${await naiveMap.get('k')}`);
+
+const safeMap = new AsyncMap();
+const lock = new KeyedMutex();
+await Promise.all(Array.from({ length: N }, () => safeIncrement(safeMap, lock, 'k')));
+console.log(`locked: expected=${N} got=${await safeMap.get('k')}`);
+```
+
+```text
+naive:  expected=8 got=1
+locked: expected=8 got=8
+```
+
+**Lock striping** scales this further. Instead of one mutex for the whole map, create `S` segment locks and assign each bucket to `segment = bucketIdx % S`. Unrelated keys never contend. Java's pre-Java-8 `ConcurrentHashMap` used 16 segments by default. Lock ordering matters when a resize needs to drain all segments: acquire them in ascending order.
+
+## Extensions & follow-ups
+
+| Follow-up | Approach |
+|---|---|
+| `LRU Cache` | Wrap `HashMap` with a doubly-linked list. `get` moves the node to the head; `set` evicts the tail when over capacity. |
+| Ordered iteration (like `LinkedHashMap`) | Add a global doubly-linked list that chains all entries in insertion order. `set` appends; `delete` unlinks. |
+| Consistent hashing | For distributed caches: keys map to a virtual ring; adding/removing a node only remaps its immediate neighbours. |
+| `WeakMap` semantics | The key holds a `WeakRef<K>`; a `FinalizationRegistry` deletes the entry when the object is GC'd. |
+
+## Edge cases
+
+- **Zero-capacity constructor.** Guard `Math.max(1, initialCapacity)`.
+- **Resize during iteration.** Not supported (like Java's `ConcurrentModificationException`). Document it. A CoW resize avoids the problem.
+- **Integer overflow in hash.** Use `| 0` / `Math.imul` and `>>> 0` to stay in 32-bit range before the modulo.
+- **`NaN` as a key.** `NaN !== NaN` in JS. Since the type is `string | number`, `NaN` sneaks in. Either block it at runtime or document the behaviour.
+- **Collision attack.** An adversary sending many keys that hash to the same bucket degrades to O(n). Mitigate with a random seed added to the hash at construction.
+
+## Complexity
+
+| Operation | Average | Worst (all keys collide) |
+|---|---|---|
+| `set` | O(1) amortised | O(n) |
+| `get` / `has` / `delete` | O(1) | O(n) |
+| `_resize` | O(n) — amortised O(1) per `set` | O(n) |
+| Iteration | O(capacity + size) | O(capacity + size) |
+
+## What graders look for / common mistakes
+
+- ✅ `hashIndex` handles both `string` and `number` without `toString`.
+- ✅ Resize rehashes into a new array (does not just copy pointers).
+- ✅ Overwrite updates value in place without incrementing `_size`.
+- ✅ Delete correctly rewires `prev.next`.
+- ❌ Using `% this._capacity` on a negative hash result (JS `%` can be negative).
+- ❌ Forgetting to reset `_size = 0` before rehashing in `_resize`.
+- ❌ Calling `_resize` after every `set` instead of only when the load factor is exceeded.
+- ❌ Using `JSON.stringify` as a hash function — O(key length²) and breaks `NaN`.
+
+## 90-minute plan
+
+| Minutes | Work |
+|---|---|
+| 0–8 | Clarify key types, collision strategy, load factor, iteration. |
+| 8–20 | `ChainNode`, class skeleton, `hashIndex` for both key types. |
+| 20–35 | `set` with overwrite detection, `get`, `has`, `delete`. |
+| 35–50 | `_resize`, load-factor check, `[Symbol.iterator]`. |
+| 50–65 | Demo: basic ops, overwrite, resize trigger, delete, number keys. |
+| 65–80 | Discuss concurrency: naive race, per-key mutex, lock striping. |
+| 80–90 | LRU cache extension (linked list + map pointer). |
+
+## Interview Q&A
+
+**Q1. Why separate chaining rather than open addressing?**
+
+<details>
+<summary>Answer</summary>
+
+Separate chaining keeps each bucket independent: a delete only touches one chain, never leaves a "tombstone" that breaks probe sequences. Lookup cost is proportional to chain length, which stays near 1 at a 0.75 load factor. Open addressing (Robin Hood or quadratic probing) has better cache performance because values are contiguous, and it avoids pointer allocation, but deletion requires tombstones or backward-shift, and performance degrades sharply above 0.7 load. For an interview implementation, chaining is simpler and equally correct.
+
+</details>
+
+**Q2. Why `size / capacity > 0.75` and not `>=`?**
+
+<details>
+<summary>Answer</summary>
+
+At exactly 0.75 we allow one more insert before resizing. The strict inequality means a map of capacity 4 resizes when the 4th element pushes size to 4 (4/4 = 1.0 > 0.75), not at size 3. This matches Java's behaviour. Choosing `>=` 0.75 would resize a capacity-4 map at size 3 (3/4 = 0.75 ≥ 0.75), which is slightly more conservative. Either is defensible; pick one and explain it.
+
+</details>
+
+**Q3. How does `_resize` preserve correctness?**
+
+<details>
+<summary>Answer</summary>
+
+It doubles `_capacity`, allocates a new bucket array, resets `_size` to 0, then calls `set` for every existing entry. `set` rehashes each key into the new array (the modulo changes because `_capacity` changed). Reusing `set` also handles any chain in the old buckets, so there is no need to write a separate "raw insert" path.
+
+</details>
+
+**Q4. A colleague suggests caching the hash code on the node to speed up resize. Is that a good idea?**
+
+<details>
+<summary>Answer</summary>
+
+Yes, Java's `HashMap` does exactly this since Java 8. Storing the full 32-bit hash means `_resize` can skip the `hashIndex` computation and derive the new bucket index by `fullHash % newCapacity` (or a bitwise AND for power-of-two capacities). The trade-off is one extra integer per node, which is negligible. It also lets `get` short-circuit: if `node.fullHash !== queryHash`, skip the key comparison.
+
+</details>

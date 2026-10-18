@@ -1,0 +1,1145 @@
+---
+title: "Task Queues and Background Jobs"
+description: Why work moves out of the request-response cycle, how producers, brokers and workers cooperate, acknowledgements and visibility timeouts, the four kinds of jobs, and the design rules that keep a queue reliable, implemented with BullMQ.
+---
+
+<Callout type="info">
+  Notes for [Task queues and background jobs](https://youtu.be/r-nQsyguU1Y) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+Code examples use **BullMQ** (Redis-backed, Node.js). The lesson names it as the Node option, alongside **Celery** (Python) and **Asynq** (Go). The concepts carry over to all three.
+
+<Mermaid chart={`flowchart LR
+  A["What a background task is"] --> B["Signup email: sync vs async"]
+  B --> C["Retries + backoff"]
+  C --> D["Common use cases"]
+  D --> E["Producer, broker, consumer"]
+  E --> F["Ack + visibility timeout"]
+  F --> G["4 task types"]
+  G --> H["Design considerations"]
+  H --> I["Best practices"]`} />
+
+---
+
+## 1. What a background task is 🎓
+
+A **background task (or job)** is any code that runs **outside the request-response cycle**. The client sends a request, the server sends a response, and the background work happens separately, on its own schedule.
+
+The defining property: **the result isn't needed immediately**. The request doesn't have to wait for it, so it can be handed to another process and finished there.
+
+---
+
+## 2. The motivating example: sending a verification email 🎓
+
+The flow: a user signs up with email, name and password. The backend validates the input (format, password length and strength), stores the user, generates a verification link or a 6–8 digit code, and must **email it** to prove the address belongs to them.
+
+Sending the email means calling a **third-party email provider** (the lesson mentions Resend, Brevo, Mailgun). You build the HTML template, fill in the link, set recipient, sender and subject, and make an HTTP call to **their** servers. They check your API key and so on, send the mail, and reply with success or failure.
+
+### Problem: doing it synchronously
+You **don't control** that provider. It can be slow or down because of a traffic spike or an outage.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant U as User
+  participant API as Your backend
+  participant DB as Postgres
+  participant M as Email provider
+  U->>API: POST /signup
+  API->>DB: insert user + verification code
+  API->>M: send email
+  M--xAPI: timeout / 503 (provider down)
+  alt no error handling
+    API-->>U: 500, signup "failed" (but the user row exists)
+  else error caught and swallowed
+    API-->>U: 201 "We sent you an email" (it was never sent)
+  end`} />
+
+Both outcomes are bad:
+1. **No error handling:** the provider failure bubbles up and the **whole signup fails**. The user sees an error for something that was only a side effect.
+2. **Error handled:** signup succeeds and the UI says "we sent you an email", **but nothing was sent**. The user has to come back and press *resend*, which is another call to the same provider. If it's still down, the same lie repeats.
+
+There's a third cost even when the provider works: **the user waits** for a network round trip to someone else's server before seeing a response.
+
+### Solution: enqueue the work, respond immediately
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant U as User
+  participant API as Backend (producer)
+  participant Q as Queue (broker)
+  participant W as Worker (consumer)
+  participant M as Email provider
+  U->>API: POST /signup
+  API->>API: validate, insert user, create code
+  API->>Q: enqueue send-verification-email (JSON payload)
+  API-->>U: 201 "Check your inbox"
+  Q->>W: deliver job
+  W->>W: deserialize, run handler
+  W->>M: send email
+  alt success
+    M-->>W: 200
+    W->>Q: ack (job done)
+  else failure
+    M--xW: 503
+    W->>Q: job failed, schedule retry with backoff
+  end`} />
+
+1. The API does the essential work, then **serializes** everything the email needs (recipient, name, link, template ID) into a format such as **JSON** and **pushes it onto a queue**.
+2. It **returns 200/201 straight away**. The email hasn't been sent yet; the API only recorded that it must be.
+3. A **consumer (worker)** running in a **separate process** takes the job off the queue and **deserializes** it into a native structure (an object in JavaScript, a dict in Python, a struct in Go).
+4. The worker is configured with **which queue it listens to**, **what data shape it expects**, and a **handler**: the same code that used to run inline. It calls the provider.
+
+Different job types can use different queues: one for email, one for in-app notifications, one for mobile push. Each has its own workers.
+
+**Is the delay a problem?** No. With a quiet queue, the email goes out within milliseconds to a few seconds; under heavy load, maybe 5–10 seconds. Verification links typically expire after 15–20 minutes, so there's plenty of margin.
+
+### When the provider fails: automatic retries
+If the provider call fails, the **handler throws**, and the job is marked failed. In the synchronous version, this would have been a 500. In a queue, the framework **puts the job back to be retried**.
+
+The usual retry algorithm is **exponential backoff**: wait, and **double the wait** after each failure, up to a maximum number of attempts. The lesson's numbers: retry after **1 minute**, then **2**, then **4**, then **8**, with a cap of **5 attempts**.
+
+Why this works so well: major providers rarely stay down for minutes. A typical blip lasts seconds, so the first or second retry usually succeeds, and **the user still gets the email even though the provider was down when they signed up**.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> waiting: queue.add
+  waiting --> active: worker picks it up
+  active --> completed: handler returns
+  active --> delayed: handler throws and attempts remain
+  delayed --> waiting: backoff delay elapsed
+  active --> failed: handler throws and no attempts left
+  completed --> [*]
+  failed --> [*]: inspect, alert, retry by hand`} />
+
+🔧 The BullMQ version:
+
+```ts title="queues.ts"
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
+
+export const connection = new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null }); // required by BullMQ workers
+
+export const emailQueue = new Queue('email', {
+  connection,
+  defaultJobOptions: {
+    attempts: 5,                                         // 1 try + 4 retries
+    backoff: { type: 'exponential', delay: 60_000 },     // 1 min, 2 min, 4 min, 8 min
+    removeOnComplete: { age: 24 * 3600, count: 10_000 }, // keep Redis from growing forever
+    removeOnFail: { age: 7 * 24 * 3600 },                // keep failures a week for debugging
+  },
+});
+```
+
+```ts title="auth.service.ts (producer)"
+async signup(dto: SignupDto) {
+  const user = await this.users.create(dto);                       // validated, hashed, stored
+  const code = await this.verification.issue(user.id);
+  await emailQueue.add(
+    'verify-email',
+    { userId: user.id, code },                                     // small payload: IDs, not whole objects
+    { jobId: `verify-email-${user.id}-${code}` },                  // a duplicate add is ignored
+  );
+  return { id: user.id };                                          // 201, without waiting for the email
+}
+```
+
+```ts title="email.worker.ts (consumer, separate process)"
+import { Worker, UnrecoverableError } from 'bullmq';
+
+new Worker('email', async job => {
+  if (job.name !== 'verify-email') return;
+  const user = await db.user.findUnique({ where: { id: job.data.userId } });
+  if (!user) throw new UnrecoverableError('user deleted');          // retrying can't help → fail now
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.RESEND_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: 'no-reply@app.com', to: user.email, subject: 'Verify your email',
+                           html: renderVerify(user.name, job.data.code) }),
+    signal: AbortSignal.timeout(10_000),                            // a hung provider must not hang the worker
+  });
+  if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+    throw new UnrecoverableError(`rejected: ${res.status}`);        // bad request won't fix itself
+  }
+  if (!res.ok) throw new Error(`provider ${res.status}`);           // 5xx / 429 → retry with backoff
+}, { connection, concurrency: 10 });
+```
+
+🔧 Notes on the code:
+- BullMQ's exponential backoff is `2^(attempt − 1) × delay`, and it supports a `jitter` option so thousands of failed jobs don't all retry at the same instant.
+- **Not every error deserves a retry.** A 400 from the provider (invalid address) will fail forever; `UnrecoverableError` moves the job straight to *failed*. Retry only **transient** errors (timeouts, 5xx, 429).
+
+### Benefits so far 🎓
+1. **Responsiveness:** the API no longer waits on external services or heavy work, and stops timing out because of them.
+2. **Reliability:** built-in **retries** and **failure detection** for work that is likely to fail occasionally.
+3. Together: a much better user experience.
+
+---
+
+## 3. What usually goes into the background 🎓
+
+| Task | Why it's offloaded |
+|---|---|
+| **Sending emails** | Depends on an external provider (the example above) |
+| **Image and video processing** | Resizing an upload into several sizes for phones vs desktops (small, medium, XL, 2XL); transcoding video. CPU-heavy and slow |
+| **Generating reports** | E.g. a project-management tool sending a daily, weekly (Sunday 12:00) or monthly summary of completed, pending and sprint tasks as an HTML email or PDF. Runs on a **schedule** (cron); Celery and BullMQ support scheduled jobs |
+| **Push notifications** | Food-delivery apps telling you the rider reached the restaurant. Your backend can't push to a phone directly |
+
+**How push notifications work (lesson's explanation):** when the app is installed, the device registers with the **OS vendor's push service** (Google's or Apple's) and gets a device token. Your backend stores that token. To notify a user, the backend calls **Google's or Apple's** service with the token, and **they** deliver the notification. That's an external call, so it goes in a background job.
+
+---
+
+## 4. Inside a task queue 🎓
+
+**Definition:** a task queue is a system for **managing and distributing background jobs**. It's the engine that lets you hand work off **reliably** to a separate process.
+
+**Analogy:** a **to-do list for your backend**. Application code adds items; workers take them one at a time and do them.
+
+<Mermaid chart={`flowchart LR
+  subgraph Producers["Producers: your API code"]
+    P1["signup handler"]
+    P2["upload handler"]
+  end
+  subgraph Broker["Broker: the queue"]
+    Q1[["email queue"]]
+    Q2[["media queue"]]
+  end
+  subgraph Consumers["Consumers: worker processes"]
+    W1["email worker x3"]
+    W2["media worker x2"]
+  end
+  P1 -->|"enqueue: serialize to JSON"| Q1
+  P2 -->|"enqueue"| Q2
+  Q1 -->|"dequeue"| W1
+  Q2 -->|"dequeue"| W2
+  W1 -->|"ack"| Q1
+  W2 -->|"ack"| Q2`} />
+
+| Part | Job | Key detail |
+|---|---|---|
+| **Producer** | Your application code. **Creates** the task with all the data the worker will need, **serializes** it (JSON or another format), and pushes it. That's all it does | Pushing is called **enqueuing** |
+| **Broker** (the queue) | A **temporary holding area** that stores tasks until a worker is ready | Implemented by RabbitMQ, Redis, or a managed service like **AWS SQS** (useful when you need workers spread across regions without running the broker yourself) |
+| **Consumer / worker** | Runs in a **separate process or thread** (same codebase or a separate one), **watches the queue**, takes a task (**dequeuing**), and runs the handler registered for it | You scale it independently of the API |
+
+🔧 **A correction worth knowing:** the lesson mentions **Redis Pub/Sub** as a way to build task queues. Pub/Sub is **fire-and-forget**: if no subscriber is connected at that moment, the message is gone, and there's no acknowledgement or retry. Real Redis-based queues (BullMQ, Sidekiq, and others) are built on **lists, sorted sets and hashes** (or Streams), which **persist** jobs until they're processed. Don't build a job queue on Pub/Sub.
+
+### Choosing a broker: Postgres, Redis, SQS or Kafka ➕
+
+The lesson names several brokers; the choice between them decides your durability, your latency, and whether enqueuing can be atomic with your business data, so it deserves its own comparison.
+
+#### Postgres as the queue (`FOR UPDATE SKIP LOCKED`)
+**Problem:** you already run Postgres, you want "insert the order **and** its job" to commit or fail together (no dual write, section 9.1), and you'd rather not operate another system.
+
+**Why the naive version fails:** a `jobs` table where every worker runs `SELECT ... ORDER BY id LIMIT 1` makes all workers pick the **same** row. Without a lock, two workers run it; with a plain `FOR UPDATE`, all but one worker **block** waiting on that row's lock, so ten workers process one job at a time.
+
+**Mechanism:** `FOR UPDATE SKIP LOCKED` makes each worker **skip** rows another transaction has locked and take the next free one. The Postgres docs say it directly: skipping locked rows gives an inconsistent view, so it isn't for general queries, but it "can be used to avoid lock contention with multiple consumers accessing a queue-like table". Add a **lease** column (`locked_until`), and you have the visibility timeout from section 5 too.
+
+```sql title="jobs.sql"
+CREATE TABLE jobs (
+  id           bigserial PRIMARY KEY,
+  queue        text        NOT NULL,
+  payload      jsonb       NOT NULL,
+  run_at       timestamptz NOT NULL DEFAULT now(),   -- delayed jobs and backoff
+  attempts     int         NOT NULL DEFAULT 0,
+  locked_until timestamptz,                          -- lease = visibility timeout
+  done_at      timestamptz
+);
+CREATE INDEX jobs_ready ON jobs (queue, run_at) WHERE done_at IS NULL;
+```
+
+```ts title="pg-worker.ts"
+// claim up to 10 ready jobs; a crashed worker's lease simply expires and the job becomes claimable again
+const claim = sql`
+  UPDATE jobs SET locked_until = now() + interval '60 seconds', attempts = attempts + 1
+  WHERE id IN (
+    SELECT id FROM jobs
+    WHERE queue = 'email' AND done_at IS NULL AND run_at <= now()
+      AND (locked_until IS NULL OR locked_until < now())
+    ORDER BY run_at
+    LIMIT 10
+    FOR UPDATE SKIP LOCKED
+  )
+  RETURNING id, payload, attempts`;
+
+for (const job of await claim) {
+  try {
+    await handle(job.payload);
+    await sql`UPDATE jobs SET done_at = now() WHERE id = ${job.id}`;
+  } catch {
+    const delaySec = Math.min(3600, 30 * 2 ** job.attempts);                 // exponential backoff
+    await sql`UPDATE jobs SET locked_until = NULL, run_at = now() + ${delaySec} * interval '1 second'
+              WHERE id = ${job.id}`;
+  }
+}
+```
+
+**Edge cases:**
+- **Don't hold the claiming transaction open while the job runs.** The lease pattern above commits the claim at once; a long open transaction holds locks and blocks vacuum.
+- **Table bloat:** every claim and completion is an `UPDATE`, which leaves dead row versions. Delete or archive finished jobs regularly and let autovacuum keep up.
+- **Polling latency vs load:** polling every 100 ms from 50 workers is a steady query load. `LISTEN`/`NOTIFY` can wake workers when a job is inserted, with polling as the fallback.
+- **Throughput ceiling:** fine for hundreds to low thousands of jobs per second on a healthy database; beyond that the queue competes with your OLTP traffic. Libraries such as pg-boss implement this pattern for Node.
+
+#### Redis-backed queues (BullMQ)
+**Strength:** very low latency, rich features (delays, priorities, flows, rate limits, schedulers) without extra infrastructure beyond Redis.
+
+**Why durability is your job:** Redis keeps jobs in RAM. BullMQ's production guide says the only safe `maxmemory-policy` is **`noeviction`**: any other policy lets Redis delete queue keys under memory pressure, silently losing jobs. It also recommends **AOF** persistence (fsync every second is enough for most apps).
+
+```bash title="redis.conf for a queue instance"
+maxmemory-policy noeviction
+appendonly yes
+appendfsync everysec
+```
+
+**Edge cases:**
+- **Keep the queue Redis separate from the cache Redis** (the cache wants `allkeys-lru`, the queue needs `noeviction`).
+- **With `noeviction`, a full Redis rejects writes**, so `queue.add` starts throwing. Retention options (`removeOnComplete`, `removeOnFail`) and depth alerts are what keep it from filling.
+- **Failover can lose the last second of jobs** (asynchronous replication; see the caching lesson's high-availability section), and enqueuing can't share a transaction with Postgres, so critical jobs still need the outbox (section 9.1).
+
+#### Amazon SQS
+**Strength:** fully managed, scales without capacity planning, built-in visibility timeout and dead-letter queues.
+
+**What you must design around:**
+- **Standard queues** deliver at least once and may deliver **out of order**. **FIFO queues** keep order per **message group** and deduplicate within a window, at lower throughput.
+- **Message size** is capped at **1 MiB** (raised from 256 KiB in August 2025), so large inputs go to S3 and the message carries the key.
+- **Short delays only:** per-message `DelaySeconds` goes up to 15 minutes, so a "delete account in 7 days" job needs a scheduler (or EventBridge Scheduler) rather than a delayed message.
+- **Long polling** (`WaitTimeSeconds` up to 20) avoids paying for empty receives.
+
+```ts title="sqs-worker.ts"
+import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from '@aws-sdk/client-sqs';
+const sqs = new SQSClient({});
+
+while (running) {
+  const { Messages = [] } = await sqs.send(new ReceiveMessageCommand({
+    QueueUrl, MaxNumberOfMessages: 10, WaitTimeSeconds: 20, VisibilityTimeout: 60,
+  }));
+  await Promise.all(Messages.map(async m => {
+    await handle(JSON.parse(m.Body!));                                          // throw → no delete → redelivered
+    await sqs.send(new DeleteMessageCommand({ QueueUrl, ReceiptHandle: m.ReceiptHandle! }));  // the ack
+  }));
+}
+```
+
+#### Kafka: a log, not a job queue
+**Problem:** teams already running Kafka try to use it for background jobs and hit strange stalls.
+
+**Why it happens:** Kafka doesn't acknowledge **individual messages**. A consumer group tracks one **offset per partition**: "everything before position N is done". If message N fails, the consumer can't skip it and come back later without extra machinery, so one poison or slow message **blocks its whole partition** (head-of-line blocking), and parallelism is capped by the number of partitions.
+
+**Mechanism when you must:** retry topics with increasing delays plus a dead-letter topic, all implemented in your consumer code. That's a lot of work you get for free from a job queue.
+
+**Where Kafka is the right tool:** high-volume **event streams** that several independent consumers read (search indexing, analytics, audit), with replay from any point in time, and per-key ordering via partitioning.
+
+| Need | Good fit |
+|---|---|
+| Enqueue atomically with business data, modest volume, no new infra | Postgres + `SKIP LOCKED` |
+| Low latency, delays, priorities, flows, in Node | Redis + BullMQ (`noeviction`, AOF) |
+| Managed, elastic, AWS-native, no broker to run | SQS (+ DLQ, FIFO when order matters) |
+| Durable event stream, many consumers, replay | Kafka (not for per-job retries) |
+
+---
+
+## 5. Acknowledgements and the visibility timeout 🎓
+
+### Problem
+A worker has taken a job off the queue, and then it **crashes**, or the external service hangs. If the queue had already deleted the job, **the job is lost**.
+
+### Mechanism 1: acknowledgements
+The job isn't removed when it's handed out. When the worker finishes, it sends an **ack** saying "done, delete it". If it fails, the queue applies its retry rules. Frameworks like Celery, BullMQ and Asynq handle these cases for you.
+
+### Mechanism 2: visibility timeout
+While a worker holds a job, the job is **in progress** and **invisible** to other workers. That period is the **visibility timeout**. If no ack arrives before it ends (the worker crashed, hung, or lost its connection), the queue assumes the worker is dead and **makes the job visible again** so another worker can take it.
+
+**Someone must eventually ack every job**, as a success or a failure.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant Q as Queue
+  participant W1 as Worker 1
+  participant W2 as Worker 2
+  W1->>Q: receive job 42
+  Note over Q: job 42 invisible, timer starts (e.g. 30 s)
+  W1->>W1: processing...
+  W1--xW1: process crashes (no ack)
+  Note over Q: timeout expires: job 42 visible again
+  W2->>Q: receive job 42
+  W2->>W2: process
+  W2->>Q: ack: delete job 42`} />
+
+🔧 **The engineering consequence: at-least-once delivery.** A worker can finish the work and crash **just before** acking. The timeout then hands the job to someone else, and **the work runs twice**. Queues guarantee *at least once*, not *exactly once*. So **handlers must be idempotent** (section 7).
+
+🔧 **How the timeout is tuned:**
+- **AWS SQS:** default visibility timeout **30 seconds**, maximum **12 hours**. Long jobs should extend it while they run (`ChangeMessageVisibility`, a "heartbeat"). Too short → duplicates while a slow job is still running; too long → a crashed job sits idle for a long time before a retry.
+- **BullMQ:** the same idea is a **lock**. The worker holds a lock on the job and keeps renewing it. If the lock isn't renewed (the process died, or **a CPU-heavy handler blocked the event loop**), the job becomes **stalled** and is moved back to *waiting* for another worker, or to *failed* once it exceeds the maximum stall count. Lesson for Node: **don't block the event loop** in a worker; run CPU-heavy work in a child process or worker thread (BullMQ supports *sandboxed processors*).
+
+---
+
+## 6. The four kinds of tasks 🎓
+
+### 6.1 One-off tasks
+Triggered once by an event, and the most common type: verification email after signup, welcome email after verification, password-reset email, a notification when someone messages you.
+
+```ts
+await emailQueue.add('password-reset', { userId, token });
+```
+
+### 6.2 Recurring tasks
+Run **periodically**:
+- **Reports:** daily, monthly or annual stats for users.
+- **Cleanup and maintenance:** the lesson's example is stateful auth. Every login creates a row in a `sessions` table; users who log in and out for years leave many **orphaned, inactive sessions**. A job running every month (or every two or three) deletes long-inactive sessions to free space.
+
+🔧 BullMQ (v5.16+) uses **job schedulers**. `upsertJobScheduler` is idempotent, so running it on every deploy doesn't create duplicates:
+
+```ts title="schedules.ts"
+await maintenanceQueue.upsertJobScheduler(
+  'cleanup-orphan-sessions',
+  { pattern: '0 0 3 1 * *', tz: 'UTC' },           // 03:00 UTC on the 1st of every month (seconds field first)
+  { name: 'cleanup-sessions', data: { olderThanDays: 90 } },
+);
+
+await reportQueue.upsertJobScheduler('weekly-report', { pattern: '0 0 0 * * 0', tz: 'Asia/Kolkata' },
+  { name: 'fan-out-weekly-reports' });              // Sunday midnight IST
+```
+
+```ts title="cleanup.worker.ts"
+// delete in small batches so one job never holds big locks or runs for an hour
+let deleted: number;
+do {
+  deleted = await db.$executeRaw`
+    DELETE FROM sessions WHERE id IN (
+      SELECT id FROM sessions WHERE last_seen_at < now() - interval '90 days' LIMIT 5000
+    )`;
+} while (deleted > 0);
+```
+
+🔧 Edge case: if you run **three API replicas** that each start a plain `setInterval` or node-cron, the job runs **three times**. A queue-based scheduler stores the schedule in Redis, so exactly one job is produced per tick no matter how many processes run.
+
+### 6.3 Schedules, time zones and DST ➕
+
+Recurring tasks look like "a cron expression and done", but as soon as a schedule is meant to follow **someone's local time**, or the scheduler is down at the moment a tick was due, the cron string stops being the whole answer.
+
+#### UTC for the system, the user's zone for the user
+**Problem:** "send the weekly report at 9:00 on Monday". A cron pinned to `0 9 * * 1` in UTC means 14:30 in India and 4:00 or 5:00 in New York **depending on the season**, because US offsets change with daylight saving time and India's doesn't.
+
+**Why it happens:** an offset like `-05:00` is not a time zone. A zone such as `America/New_York` is a **set of rules** that maps instants to offsets, and those rules change twice a year (and occasionally by law).
+
+**Mechanism:**
+- **System jobs** (cleanup, reindexing, billing runs) are scheduled in **UTC**: they don't care about anyone's wall clock and never hit DST edges.
+- **User-facing jobs** store the user's **IANA zone name**, never an offset, and are computed in that zone. For one zone, BullMQ's scheduler takes a `tz` (section 6.2). For **many** users in many zones, don't create one scheduler per user; run **one hourly tick in UTC** that selects the users whose local time is now 9:00 on a Monday:
+
+```sql title="due-weekly-reports.sql"
+-- runs every hour at :00 UTC (a missed 9:00 tick is caught at 10:00); users.tz holds e.g. 'America/New_York' or 'Asia/Kolkata'
+SELECT id
+FROM users
+WHERE extract(isodow FROM now() AT TIME ZONE tz) = 1          -- Monday in the user's zone
+  AND extract(hour   FROM now() AT TIME ZONE tz) >= 9         -- 9 o'clock or later in the user's zone
+  AND (last_report_local_date IS NULL
+       OR last_report_local_date < (now() AT TIME ZONE tz)::date);   -- not sent yet for this local day
+```
+
+The worker that sends the report sets `last_report_local_date` in the same transaction as recording the send, and the job ID includes the local date (`weekly-<userId>-2026-03-09`), so a duplicate tick is a no-op.
+
+**Edge cases:** zones with 30- or 45-minute offsets (India is UTC+5:30, Nepal UTC+5:45) never sit on a whole hour when the tick runs at `:00` UTC, so with the query above Indian users get their report at 9:30. If the exact minute matters, run the tick every 15 minutes and compare minutes too.
+
+#### DST gaps and overlaps
+**Problem:** in `America/New_York`, on the spring-forward day the local times **02:00 to 02:59 do not exist**, and on the fall-back day **01:00 to 01:59 happen twice**. A job scheduled for 02:30 local can be skipped; a job at 01:30 can fire twice.
+
+**Why it happens:** the scheduler has to turn "02:30 local" into an instant, and on those two days there are zero or two valid answers. Libraries choose differently: Luxon, for example, moves a non-existent time **forward by an hour** and makes no promise about which of the two instants an ambiguous time maps to.
+
+**Mechanism:**
+1. **Don't schedule user jobs between 01:00 and 03:00 local** unless you must; US and EU transitions both fall in that window.
+2. **Make every run idempotent per period**, keyed on the **local date** (or week), as above. A double fire then does nothing.
+3. **Prefer "has it run for this period yet?" over "is it exactly time T?"**. The SQL above catches up a skipped run on the next tick, because the condition is "not sent today and it's at or after 9", not "it's exactly 9:00:00".
+
+```ts title="local-period-key.ts"
+import { DateTime } from 'luxon';
+
+export const periodKey = (userId: string, tz: string) =>
+  `weekly-${userId}-${DateTime.now().setZone(tz).toFormat("kkkk-'W'WW")}`;   // ISO week in the user's zone
+// two fires in the same local week → same jobId → the second add is ignored
+```
+
+**Edge cases:** an invalid zone name (typo, or a zone removed from the database) makes date libraries return an invalid date; validate zones on input with `Intl.supportedValuesOf('timeZone')` or by checking the library's validity flag.
+
+#### Missed runs and catch-up
+**Problem:** Redis or the scheduler was down from 02:50 to 03:20, and the 03:00 cleanup job was never produced. Nothing errors; the work silently doesn't happen.
+
+**Why it happens:** a schedule produces a job **at** a moment. If nothing was listening at that moment, the trigger is gone. (This is the same fire-and-forget gap as Pub/Sub, at a coarser grain.)
+
+**Mechanism:** make the job work from a **watermark** rather than from its trigger time. Each run processes "everything since the last successful run" and moves the watermark forward only on success. A missed or failed run is then absorbed by the next one.
+
+```ts title="watermark-job.ts"
+export async function exportEvents() {
+  const { last } = await db.$queryRaw<{ last: Date }[]>`SELECT last FROM watermarks WHERE name = 'export'`.then(r => r[0]);
+  const until = new Date(Date.now() - 60_000);                  // leave a minute for late commits
+  for (let from = last; from < until; ) {
+    const to = new Date(Math.min(from.getTime() + 3_600_000, until.getTime()));   // one hour per chunk
+    await exportRange(from, to);                                 // idempotent: re-exporting a range overwrites
+    await db.$executeRaw`UPDATE watermarks SET last = ${to} WHERE name = 'export'`;
+    from = to;
+  }
+}
+```
+
+**Edge cases:** after a long outage the catch-up can be huge; chunking (as above) keeps each step small and retryable. The one-minute margin matters: rows committed slightly late with an earlier timestamp would otherwise fall behind the watermark and never be exported.
+
+### 6.4 Chained tasks (parent-child dependencies)
+The lesson's example is an **LMS** (learning platform, like Udemy). An instructor uploads a course video (the upload itself goes straight to S3 via a presigned URL, and the API acknowledges immediately). Then:
+
+<Mermaid chart={`flowchart LR
+  U["Video uploaded"] --> E["1. Encode into several<br/>resolutions and formats"]
+  E --> T["2a. Generate thumbnails"]
+  E --> S["2b. Generate transcript<br/>(subtitles)"]
+  T --> TP["3. Resize thumbnails for<br/>devices and networks"]
+  TP --> D["Course ready"]
+  S --> D`} />
+
+- **Encoding** must finish first.
+- **Thumbnail generation** depends on encoding; **thumbnail resizing** depends on thumbnail generation.
+- **Transcription** also depends on encoding, but **not** on the thumbnails, so 2a and 2b **run in parallel**.
+
+A task starts only when its parent has **completed successfully**.
+
+🔧 **Two ways to build this in BullMQ:**
+
+**(a) Each step enqueues the next** when it finishes. Simple and flexible:
+
+```ts title="encode.worker.ts"
+new Worker('media', async job => {
+  if (job.name === 'encode') {
+    await encodeVideo(job.data.videoId);
+    await mediaQueue.addBulk([                                         // fan out to the parallel children
+      { name: 'thumbnails', data: job.data, opts: { jobId: `thumbs-${job.data.videoId}` } },
+      { name: 'transcribe', data: job.data, opts: { jobId: `transcribe-${job.data.videoId}` } },
+    ]);
+  }
+  if (job.name === 'thumbnails') {
+    await generateThumbnails(job.data.videoId);
+    await mediaQueue.add('resize-thumbnails', job.data, { jobId: `resize-${job.data.videoId}` });
+  }
+  // ...
+}, { connection });
+```
+
+The deterministic `jobId`s matter: if `encode` crashes after enqueuing the children and is retried, the second `addBulk` is **ignored** instead of creating duplicates.
+
+**(b) A `FlowProducer` tree.** In BullMQ flows, a **parent waits for all its children**. Children run first, and the parent moves to *waiting* only when every child has succeeded. So you model "course ready" as the parent of the steps it waits for, and the parent can read their results with `job.getChildrenValues()`:
+
+```ts title="course-flow.ts"
+import { FlowProducer } from 'bullmq';
+const flows = new FlowProducer({ connection });
+
+await flows.add({
+  name: 'publish-course-video', queueName: 'media', data: { videoId },
+  children: [
+    { name: 'resize-thumbnails', queueName: 'media', data: { videoId },
+      children: [{ name: 'thumbnails', queueName: 'media', data: { videoId },
+        children: [{ name: 'encode', queueName: 'media', data: { videoId } }] }] },
+    { name: 'transcribe', queueName: 'media', data: { videoId },
+      children: [{ name: 'encode-audio-only', queueName: 'media', data: { videoId } }] },
+  ],
+});
+```
+
+A flow tree can't have two parents share one child job, so if two branches truly need the **same** finished encode, approach (a) or a small "encode first, then add the flow" step is simpler.
+
+### 6.5 Batch tasks
+One trigger creates **many** tasks.
+
+**Example 1: account deletion.** A large platform may hold a user's data across many tables, shards or regions. Deleting it all inside the request could take 40–50 seconds or more, which is far too long to block an API call.
+- The API **responds 200 immediately**, logs the user out, and enqueues `delete-account`.
+- Optionally there's a **grace period** (say 3 or 7 days) during which logging back in cancels the deletion.
+- The worker then fans out: remove the user from projects they own, delete their profile, delete their assets (logos, cover images), delete the account itself, and send a "your account has been deleted" email.
+
+**Example 2: scheduled reports at midnight.** One scheduled tick creates **thousands** of jobs, one per user, each generating and sending that user's report.
+
+<Mermaid chart={`flowchart TD
+  T["delete-account requested"] --> G{"grace period?"}
+  G -->|"yes"| DL["delayed job: run in 7 days<br/>cancelled if the user logs back in"]
+  G -->|"no"| F["fan-out job"]
+  DL --> F
+  F --> J1["remove from projects"]
+  F --> J2["delete assets in S3"]
+  F --> J3["delete profile rows"]
+  J1 --> FIN["delete user + send confirmation email"]
+  J2 --> FIN
+  J3 --> FIN`} />
+
+```ts title="account-deletion.ts"
+// grace period = a delayed job you can cancel
+await accountQueue.add('delete-account', { userId }, { jobId: `delete-${userId}`, delay: 7 * 24 * 3600_000 });
+
+// on login during the grace period:
+const job = await accountQueue.getJob(`delete-${userId}`);
+if (job && (await job.isDelayed())) await job.remove();
+
+// midnight report fan-out: page through users and enqueue in chunks
+for await (const ids of pageUserIds(1000)) {
+  await reportQueue.addBulk(ids.map(id => ({ name: 'weekly-report', data: { userId: id },
+                                             opts: { jobId: `weekly-${weekKey}-${id}` } })));
+}
+```
+
+---
+
+## 7. Design considerations 🎓
+
+### 7.1 Idempotency
+**Problem:** jobs are retried after failures, and (section 5) can be delivered twice. A task must be **safe to run more than once** without side effects piling up.
+
+**The lesson's mechanism:** in the delete-account task, run the database changes **inside a transaction**. If something fails halfway (a DB error or a failed external call), the transaction is **rolled back**, so the retry starts from a clean **0%** instead of from a half-deleted state.
+
+🔧 **Transactions only cover the database.** External side effects (an email, a charge, an S3 delete) can't be rolled back. Techniques for those:
+
+| Technique | How it works |
+|---|---|
+| **Deterministic job IDs** | `jobId: 'welcome-' + userId`. Adding the same ID again is ignored (as long as the earlier job is still stored), so a double click or a retried producer doesn't create two jobs |
+| **Check before acting** | Make each step a no-op if already done: `UPDATE users SET welcome_sent_at = now() WHERE id = $1 AND welcome_sent_at IS NULL RETURNING id`. Zero rows → already sent, skip |
+| **Provider idempotency keys** | Payment and some email APIs accept an `Idempotency-Key` header; resending the same key returns the original result instead of acting twice |
+| **Naturally idempotent operations** | "Set status to X", "delete if exists", "upsert" are safe to repeat; "increment" and "append" are not |
+
+```ts title="idempotent-step.ts"
+const claimed = await db.$queryRaw<{ id: string }[]>`
+  UPDATE users SET welcome_sent_at = now()
+  WHERE id = ${userId} AND welcome_sent_at IS NULL
+  RETURNING id`;
+if (claimed.length === 0) return;                   // a previous run already did this
+try {
+  await sendWelcomeEmail(userId);
+} catch (e) {
+  await db.$executeRaw`UPDATE users SET welcome_sent_at = NULL WHERE id = ${userId}`; // release the claim for the retry
+  throw e;
+}
+```
+
+### 7.2 Error handling
+Everything happens in **another process**, with nobody watching a response. Catch, **log with context**, and let the queue **retry**. Missing an edge case here means silent failures.
+
+### 7.3 Monitoring
+You need a live picture of: **how many jobs are queued**, **how many succeeded**, **how many failed**, and **why** (an external service? an internal bug?). The lesson suggests emitting **metrics** on every event and viewing them with **Prometheus + Grafana** (logging and monitoring get their own lesson later).
+
+🔧 With BullMQ you can read counts directly and export them:
+
+```ts title="queue-metrics.ts"
+import { Gauge } from 'prom-client';
+const depth = new Gauge({ name: 'queue_jobs', help: 'jobs per state', labelNames: ['queue', 'state'] });
+
+setInterval(async () => {
+  for (const q of [emailQueue, mediaQueue]) {
+    const c = await q.getJobCounts('waiting', 'active', 'delayed', 'failed');
+    for (const [state, n] of Object.entries(c)) depth.set({ queue: q.name, state }, n);
+  }
+}, 15_000);
+```
+
+### 7.4 Measuring job latency, not just counts ➕
+
+Counts tell you how much is in the queue; what users feel is **how long** a job waited, so the metrics that drive alerts and autoscaling (section 7.6) need to be time-based. (Carrying a trace across the queue with a `traceparent` in the job data is covered in the logging, monitoring and observability lesson.)
+
+#### Wait time vs run time
+**Problem:** 10,000 waiting jobs may be fine (they drain in 20 seconds), while 50 waiting jobs may be a disaster (each has been there 30 minutes because every worker is stuck on a hung provider). Depth alone can't tell these apart.
+
+**Why it happens:** depth is a stock; latency depends on depth **and** drain rate. Only time measured per job captures both.
+
+**Mechanism:** BullMQ records three timestamps on every job: `timestamp` (created), `processedOn` (picked up by a worker), `finishedOn`. From them:
+- **Wait time** = `processedOn - timestamp - delay`: how long a ready job sat in the queue. This is the user-visible delay and the best scaling signal.
+- **Run time** = `finishedOn - processedOn`: how long the handler took. Rising run time with steady volume means a dependency is slowing down.
+- **Age of the oldest waiting job**: the one number that says "we are behind", even before any job finishes.
+
+```ts title="queue-latency.ts"
+import { Histogram, Gauge } from 'prom-client';
+import { QueueEvents } from 'bullmq';
+
+const wait = new Histogram({ name: 'job_wait_seconds', help: 'ready → active', labelNames: ['queue', 'name'],
+  buckets: [0.1, 0.5, 1, 5, 15, 60, 300, 900] });
+const run = new Histogram({ name: 'job_run_seconds', help: 'active → finished', labelNames: ['queue', 'name', 'result'],
+  buckets: [0.05, 0.25, 1, 5, 30, 120, 600] });
+const oldest = new Gauge({ name: 'job_oldest_waiting_seconds', help: 'age of oldest waiting job', labelNames: ['queue'] });
+
+const record = (result: 'ok' | 'error') => (job: Job) => {
+  const delay = job.opts.delay ?? 0;
+  if (job.processedOn) wait.observe({ queue: job.queueName, name: job.name }, (job.processedOn - job.timestamp - delay) / 1000);
+  if (job.processedOn && job.finishedOn)
+    run.observe({ queue: job.queueName, name: job.name, result }, (job.finishedOn - job.processedOn) / 1000);
+};
+worker.on('completed', record('ok'));
+worker.on('failed', job => job && record('error')(job));
+
+setInterval(async () => {
+  const [first] = await emailQueue.getJobs(['wait'], 0, 0, true);          // asc = true → oldest first
+  oldest.set({ queue: 'email' }, first ? (Date.now() - first.timestamp) / 1000 : 0);
+}, 15_000);
+```
+
+**Edge cases:**
+- **Retries inflate wait time** if you measure from creation: a job retried after 8 minutes of backoff "waited" 8 minutes by design. Record the attempt number as a label or measure the first attempt separately.
+- **Label by queue and job name only.** Never by user or job ID: that creates one time series per job.
+
+#### Classifying failures
+**Problem:** "failed jobs per minute rose" doesn't say whether to page someone (your code is broken) or wait (the provider is having a bad hour).
+
+**Mechanism:** count failures by **class** with a small fixed set of labels, decided where the error is thrown: `transient` (timeouts, 5xx, 429: retry will likely work), `permanent` (validation, 4xx, missing data: `UnrecoverableError`), `bug` (anything unexpected). Alert immediately on `bug`, on a rate threshold for `permanent`, and only on sustained levels plus a growing backlog for `transient`.
+
+```ts title="failure-class.ts"
+const failures = new Counter({ name: 'job_failures_total', help: 'failures by class', labelNames: ['queue', 'name', 'class'] });
+
+worker.on('failed', (job, err) => {
+  const cls = err instanceof UnrecoverableError ? 'permanent'
+            : err.name === 'TimeoutError' || /provider (5\d\d|429)/.test(err.message) ? 'transient'
+            : 'bug';
+  failures.inc({ queue: job?.queueName ?? 'unknown', name: job?.name ?? 'unknown', class: cls });
+});
+```
+
+**Edge cases:** a "transient" error that never stops (a provider permanently rejecting your new API key) looks harmless per attempt; that is what the **final failure** count (jobs that exhausted attempts) and the dead-letter alerts in section 9.4 are for.
+
+### 7.5 Scalability
+When the user base doubles, you need more processing. Design so that you **scale consumers horizontally**: add more worker processes or nodes, with no code change. This works because workers are **stateless** and the broker coordinates who gets which job.
+
+### 7.6 Backpressure and queue-based autoscaling ➕
+
+"Add more workers" needs two more answers: **how many**, and **what happens upstream** when even the maximum isn't enough.
+
+#### How many workers: Little's law
+**Problem:** you guess "4 workers, concurrency 10" and either the backlog grows all day or 90% of the slots sit idle.
+
+**Why it happens:** throughput is limited by **concurrency divided by job duration**, not by the number of processes. Little's law states it for any stable system: **in-flight work = arrival rate × time each item spends in the system**.
+
+**Mechanism:** measure arrival rate and run time (section 7.4), then size: `slots needed = jobs per second × average run seconds`, plus headroom for spikes (aim for roughly 60–70% busy). Example: 50 emails per second × 0.4 s per send = 20 busy slots on average; with headroom, about 30 slots, e.g. 3 workers at `concurrency: 10`.
+
+```ts title="capacity.ts"
+export const slotsNeeded = (jobsPerSec: number, avgRunSec: number, targetUtilisation = 0.65) =>
+  Math.ceil((jobsPerSec * avgRunSec) / targetUtilisation);
+
+slotsNeeded(50, 0.4);   // → 31
+```
+
+**Edge cases:**
+- **I/O-bound vs CPU-bound.** Email or HTTP jobs mostly wait on the network, so one Node process can run dozens concurrently. Image or video jobs burn CPU, so concurrency per process should be about one per core (in sandboxed processors), and you scale with processes.
+- **Downstream limits cap you before workers do.** `workers × concurrency` jobs that each use a database connection must fit in the pool and in Postgres `max_connections`; adding workers past that point only adds waiting.
+
+#### Autoscale on backlog, not CPU
+**Problem:** a CPU-based autoscaler sees email workers at 5% CPU and never adds replicas, while the backlog grows by thousands per minute.
+
+**Why it happens:** I/O-bound workers are **waiting**, not computing. CPU says nothing about whether the queue is keeping up.
+
+**Mechanism:** scale on the signals from section 7.4: **waiting jobs per replica** or **age of the oldest job**. On Kubernetes, **KEDA** adds event-driven scalers; its Prometheus scaler can scale a deployment on the metrics exported above (it also has a Redis lists scaler that reads a list's length directly, but BullMQ's internal key layout is an implementation detail, so the exported metric is the safer contract).
+
+```yaml title="keda-email-workers.yaml"
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: { name: email-workers }
+spec:
+  scaleTargetRef: { name: email-worker }      # the Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 20                          # cap: protect the provider and the database
+  cooldownPeriod: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus:9090
+        query: sum(queue_jobs{queue="email",state="waiting"})
+        threshold: "500"                       # target: about 500 waiting jobs per replica
+```
+
+**Edge cases:**
+- **Scaling down kills workers mid-job.** Workers must drain on `SIGTERM` (section 9.2), and the pod's grace period must exceed your longest job, or scale-down creates stalled jobs and duplicates.
+- **More workers can make an outage worse.** If the backlog exists because the provider is failing, scaling up multiplies the failing calls. Cap `maxReplicaCount`, and let the rate limiter (section 7.8) bound the call rate regardless of replica count.
+
+#### Backpressure at the producer
+**Problem:** during a long provider outage the email queue grows to millions of jobs. Redis (with `noeviction`, as it must be) fills up, and now **every** `queue.add` fails, including password resets and payment jobs sharing that Redis.
+
+**Why it happens:** a queue decouples producers from consumers in time, but not in **space**. If consumers stop, the buffer grows until something runs out.
+
+**Mechanism:** decide per job type what happens when its queue is too deep:
+- **Critical jobs** (the only record of work owed): never drop. Keep them in a separate Redis or in the outbox table (section 9.1), which has disk-sized capacity.
+- **Optional jobs** (analytics events, "someone viewed your profile"): **shed** them, or coalesce them (one "you have new views" job per user per hour instead of one per view).
+- **User-triggered heavy work** (exports): reject with `429` or `503` and a `Retry-After`, so the user knows instead of waiting forever.
+
+```ts title="enqueue-with-backpressure.ts"
+const MAX_WAITING = 200_000;
+let cachedDepth = 0;
+setInterval(async () => { cachedDepth = (await exportQueue.getJobCounts('waiting')).waiting; }, 5_000).unref();
+
+export async function requestExport(userId: string) {
+  if (cachedDepth > MAX_WAITING) {
+    throw new AppError(503, 'EXPORTS_BUSY', 'Exports are busy, please try again in a few minutes');   // with Retry-After
+  }
+  return exportQueue.add('export', { userId }, { jobId: `export-${userId}-${todayKey()}` });
+}
+```
+
+**Edge cases:** checking depth on every enqueue costs a Redis call; a cached value refreshed every few seconds (as above) is accurate enough. Shedding must be **visible**: count shed jobs as a metric, or you've built a silent failure.
+
+### 7.7 Ordering
+If tasks must run in a particular order, check that your library supports **ordered delivery**. 🔧 Most queues don't guarantee global order once you have several workers or retries (a retried job runs **after** jobs added later). Options: a single worker with concurrency 1 for that queue; SQS FIFO **message groups** (strict order per group key, such as per user); or design the handler to not care (use versions or timestamps and ignore older updates).
+
+### 7.8 Rate limiting
+When tasks call external services, **limit how fast you call them**: providers bill per call and enforce their own rate limits. 🔧 In BullMQ, the worker `limiter` is **global for the queue**, so ten workers with `max: 10, duration: 1000` still process only 10 jobs per second in total:
+
+```ts
+new Worker('email', handler, { connection, concurrency: 20, limiter: { max: 10, duration: 1000 } });
+```
+
+### 7.9 Adaptive rate limits against external APIs ➕
+
+A fixed limiter is a guess about the provider's limit; the provider's `429` responses are the truth, so a worker that calls third parties should listen to them, and sometimes needs a separate limit per customer account.
+
+#### Pausing the queue when the provider says 429
+**Problem:** your limiter allows 10 per second, but the provider's real limit today is 5 (a shared account, a lower plan, their own incident). Every job hits `429`, burns one of its 5 attempts, backs off, and eventually lands in *failed* for no reason except pacing.
+
+**Why it happens:** a 429 isn't a failure of **this job**; it's a statement about **the whole account** for the next N seconds. Treating it as a per-job error makes every job pay separately for a shared condition.
+
+**Mechanism:** on 429, **pause the whole queue** for the time the provider asks for, and hand the job back without counting an attempt. BullMQ supports exactly this: `worker.rateLimit(ms)` stops the queue from handing out jobs for that long, and throwing `Worker.RateLimitError()` puts the job back. Jobs released this way don't increase `attemptsMade` (they do increase `attemptsStarted`), so they aren't pushed towards *failed*.
+
+```ts title="email.worker.ts (adaptive)"
+const worker = new Worker('email', async job => {
+  if (job.attemptsStarted > 50) throw new UnrecoverableError('rate-limited too many times');  // a safety cap
+  const res = await sendEmail(job.data);
+  if (res.status === 429) {
+    const retryAfterSec = Number(res.headers.get('retry-after')) || 30;
+    await worker.rateLimit(retryAfterSec * 1000);          // the whole queue pauses, every worker
+    throw Worker.RateLimitError();                         // job goes back; attemptsMade unchanged
+  }
+  if (!res.ok) throw new Error(`provider ${res.status}`);
+}, { connection, concurrency: 20, limiter: { max: 10, duration: 1000 } });
+```
+
+**Edge cases:**
+- **Unbounded re-queues:** because rate-limited attempts don't count, a provider that returns 429 forever keeps the job alive forever. The `attemptsStarted` cap above converts that into a visible failure.
+- **One queue per limit.** The pause applies to the queue. If the same queue sends through two providers with separate limits, a 429 from one pauses both; give each provider (or account) its own queue.
+
+#### Limits per customer account
+**Problem:** a multi-tenant app sends through **each customer's own** API credentials (their Shopify store, their Slack workspace). Each has its own limit; one global limiter is either too slow for everyone or too fast for some.
+
+**Why it happens:** the queue's limiter has one bucket. Open-source BullMQ removed per-group rate limiting in version 3.0 (BullMQ Pro has groups with their own limits).
+
+**Mechanism:** keep a **token bucket per account in Redis** and check it in the handler. If the account has no tokens, move the job back to *delayed* until the next token is due. In BullMQ that's `job.moveToDelayed(timestamp, token)` followed by throwing `DelayedError`, which tells the worker the job wasn't completed or failed.
+
+```ts title="per-account-limit.ts"
+import { DelayedError, Worker } from 'bullmq';
+
+// atomic token bucket: returns 0 if allowed, or ms to wait
+const take = `
+local tokens = tonumber(redis.call('HGET', KEYS[1], 't') or ARGV[1])
+local ts = tonumber(redis.call('HGET', KEYS[1], 'ts') or ARGV[3])
+local now = tonumber(ARGV[3])
+tokens = math.min(tonumber(ARGV[1]), tokens + (now - ts) * tonumber(ARGV[2]) / 1000)
+if tokens < 1 then return math.ceil((1 - tokens) * 1000 / tonumber(ARGV[2])) end
+redis.call('HSET', KEYS[1], 't', tokens - 1, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], 60000)
+return 0`;
+
+new Worker('shop-sync', async (job, token) => {
+  const waitMs = (await connection.eval(take, 1, `bucket:${job.data.accountId}`, 40, 2, Date.now())) as number;
+  if (waitMs > 0) {                                                   // capacity 40, refill 2 per second
+    await job.moveToDelayed(Date.now() + waitMs, token);
+    throw new DelayedError();
+  }
+  await syncShop(job.data);
+}, { connection, concurrency: 50 });
+```
+
+**Edge cases:**
+- **Hot accounts churn the queue:** a tenant with 100,000 jobs and 2 tokens per second keeps bouncing jobs between *active* and *delayed*. Combine with the fairness approach in section 7.10 so one account's backlog doesn't occupy all the active slots.
+- **Use Redis time, or tolerate skew:** `Date.now()` comes from each worker's clock. Small skew only slightly changes refill; large skew breaks the bucket.
+
+### 7.10 Priorities and fairness between tenants ➕
+
+FIFO is fair to **jobs** but not to **people**: whoever enqueues the most work goes first, so a queue shared by urgent and bulk work, or by small and large customers, needs explicit rules.
+
+#### Priorities inside one queue
+**Problem:** a password-reset email waits behind 200,000 marketing emails added a minute earlier.
+
+**Mechanism:** BullMQ jobs take a `priority` from 1 to 2,097,151, where a **lower number runs first**. Adding a prioritised job is `O(log n)` in the number of prioritised jobs, slightly slower than a plain add.
+
+```ts
+await emailQueue.add('password-reset', data, { priority: 1 });
+await emailQueue.add('newsletter', data, { priority: 100 });
+```
+
+**Edge cases:**
+- **Jobs with no priority run before all prioritised jobs.** The docs are explicit about this, and it surprises people: if some producers set priorities and others don't, the ones that don't win. Set a priority on everything in a prioritised queue.
+- **Starvation:** under constant high-priority load, low-priority jobs may never run. If that's unacceptable, use separate queues (next).
+
+#### Separate queues per class of work
+**Problem:** priorities still share one pool of workers. If newsletter jobs are slow (big templates, a slow provider), they occupy every active slot, and a password reset with priority 1 still waits for a slot to free up.
+
+**Mechanism:** isolate by **queue**, each with its own workers and concurrency: `email-transactional` and `email-bulk`. The bulk queue can be fully stuck without affecting the transactional one. This is the bulkhead idea from the error-handling lesson applied to jobs.
+
+```ts
+new Worker('email-transactional', sendTransactional, { connection, concurrency: 20 });
+new Worker('email-bulk', sendBulk, { connection, concurrency: 5, limiter: { max: 20, duration: 1000 } });
+```
+
+**Edge cases:** isolation costs utilisation: transactional workers sit idle at night while bulk work queues. That's usually the right trade for user-facing paths; for the rest, autoscale per queue (section 7.6).
+
+#### Fairness between tenants
+**Problem:** tenant A starts an import that enqueues 500,000 jobs. Tenant B's single job is added after them and waits hours.
+
+**Why it happens:** FIFO order is enqueue order, and one tenant enqueued almost everything.
+
+**Mechanism:** three options, from least to most effort:
+1. **BullMQ Pro groups:** jobs carry a group ID (the tenant) and are processed **round-robin across groups**, with optional per-group concurrency and rate limits. Paid, but solves it directly.
+2. **Cap active jobs per tenant** with a Redis counter: a worker that picks up a job for a tenant already at its cap moves it back to *delayed* briefly.
+3. **Don't enqueue the whole backlog.** Keep a tenant's work items in a Postgres table and enqueue only a small window per tenant (say 100) at a time; each completion enqueues the next item. The queue then always contains a mix of tenants.
+
+```ts title="tenant-cap.ts"
+const CAP = 20;
+
+new Worker('imports', async (job, token) => {
+  const key = `active:tenant:${job.data.tenantId}`;
+  const n = await connection.incr(key);
+  await connection.expire(key, 600);                                   // leak guard if a worker dies
+  if (n > CAP) {
+    await connection.decr(key);
+    await job.moveToDelayed(Date.now() + 2_000 + Math.random() * 1_000, token);
+    throw new DelayedError();
+  }
+  try { await importRow(job.data); }
+  finally { await connection.decr(key); }
+}, { connection, concurrency: 100 });
+```
+
+**Edge cases:**
+- **Counters drift** if a worker is killed between `INCR` and `DECR`; the `EXPIRE` bounds the damage, and a sorted set of leases with timestamps is the more exact version.
+- **Option 2 still lets one tenant fill the queue,** so other tenants' jobs sit behind many bounce-backs. For truly large tenants, option 3 (enqueue a window) scales best.
+
+---
+
+## 8. Best practices from the lesson author's experience 🎓
+
+1. **Keep tasks small and focused.** One task, one unit of work. If a big task fails near the end, the **whole thing re-runs**, wasting CPU; a small task retries only itself. If work depends on other work, use **chained tasks**, so a failing child is retried without redoing its parent. Small tasks are easier to scale, debug and monitor, and easier for the queue to retry.
+2. **Avoid long-running tasks.** A task that takes a long time is a sign it should be **split**, either into parallel pieces or into a parent-child chain. 🔧 Long tasks also collide with visibility timeouts and locks (section 5), and make deploys painful (a worker shutting down mid-job).
+3. **Use proper error handling and logging.** It gives the queue a chance to retry, and gives you the information to tell an external outage from an internal bug.
+4. **Monitor queue length and worker health, with alerts.** If the queue grows past a threshold, you need to scale or investigate; if workers keep dying, find out why.
+
+🔧 Concrete alert rules: waiting jobs above N for 10 minutes (consumers can't keep up); oldest waiting job older than your SLA (e.g. emails older than 2 minutes); failed-jobs rate above normal; zero active workers.
+
+---
+
+## 9. 🔧 Going deeper: edge cases the lesson doesn't cover
+
+### 9.1 The dual-write problem (DB commit vs enqueue)
+In `signup`, two things happen: a DB insert and a queue push. They're **not atomic**:
+- Insert commits, then the process crashes before `queue.add` → **the user never gets an email**.
+- You enqueue inside a DB transaction that later **rolls back** → the worker runs for a user that doesn't exist.
+
+**Fix: the transactional outbox.** Write the job into an `outbox` table **in the same transaction** as the business data. A small relay process reads unsent rows, pushes them to the queue, and marks them sent. If the relay crashes, it just resends (and idempotent handlers absorb the duplicate).
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant API as Backend
+  participant DB as Postgres
+  participant R as Outbox relay
+  participant Q as Queue
+  API->>DB: BEGIN
+  API->>DB: INSERT user
+  API->>DB: INSERT outbox (type verify-email, payload)
+  API->>DB: COMMIT (both or neither)
+  loop every second
+    R->>DB: SELECT unsent rows FOR UPDATE SKIP LOCKED
+    R->>Q: add job (jobId = outbox row id)
+    R->>DB: mark row sent
+  end`} />
+
+### 9.2 Graceful shutdown
+On deploy, Kubernetes or your platform sends `SIGTERM`. If the worker exits immediately, active jobs are cut off mid-way and only come back after the lock or visibility timeout expires.
+
+```ts
+process.on('SIGTERM', async () => {
+  await worker.close();   // stop taking new jobs, wait for active ones to finish
+  process.exit(0);
+});
+```
+
+### 9.3 Dead-letter handling
+After the last attempt, a job lands in **failed** (BullMQ) or a **dead-letter queue** (SQS, RabbitMQ). Treat it as an inbox: alert on it, inspect the error, fix the cause, then **retry the jobs by hand**. Never let it grow silently.
+
+### 9.4 Poison messages, quarantine and safe replay ➕
+
+"Retry by hand" hides three engineering questions: how a job that **crashes the worker** ever reaches the failed set, where failed jobs should live so they aren't deleted before anyone looks, and how to replay thousands of them without causing a second incident.
+
+#### Jobs that kill the worker
+**Problem:** a job with a malformed 2 GB video, or input that triggers an infinite loop, crashes or freezes the worker process. It is handed to the next worker, which also dies, then the next. One bad message takes down the whole worker fleet in turns.
+
+**Why it happens:** the handler never **throws**, so the normal attempts counter never moves. From the queue's point of view the worker simply vanished, so the job's lock expires and it's treated as **stalled**, which looks like an infrastructure blip and is retried.
+
+**Mechanism:**
+- **Bound stalls.** BullMQ moves a job to *failed* once it has stalled more than `maxStalledCount` times (default **1**). Keep that low for queues with risky inputs; don't raise it to "fix" stalls caused by blocking the event loop.
+- **Contain the crash.** Run risky handlers as **sandboxed processors** (a separate child process or worker thread per job), so an out-of-memory crash kills the sandbox, not the worker, and the job fails with an error you can see.
+- **Bound the work.** Validate inputs (size, duration, page count) **before** heavy processing, and give the processing step its own timeout.
+
+```ts title="media.worker.ts"
+import { Worker } from 'bullmq';
+import path from 'node:path';
+
+// the processor runs in a child process; a crash there fails the job instead of killing this worker
+new Worker('media', path.join(__dirname, 'transcode.processor.js'), {
+  connection, concurrency: 2, useWorkerThreads: false, maxStalledCount: 1,
+});
+```
+
+#### A real dead-letter queue in BullMQ
+**Problem:** BullMQ's *failed* set **is** the dead-letter area, but it's mixed with retention rules: `removeOnFail: { age: 7 days }` (section 2) deletes the evidence a week later, possibly before anyone looked, and there's no separate place to alert on or browse.
+
+**Mechanism:** when a job has used up its attempts, copy it into a dedicated **DLQ queue** that no worker consumes, with the error and enough context to act on, then alert on that queue's size.
+
+```ts title="dead-letter.ts"
+const dlq = new Queue('email-dlq', { connection });            // no Worker listens to this queue
+
+worker.on('failed', async (job, err) => {
+  if (!job) return;
+  const exhausted = job.attemptsMade >= (job.opts.attempts ?? 1) || err instanceof UnrecoverableError;
+  if (!exhausted) return;                                       // it will be retried; not dead yet
+  await dlq.add(job.name, {
+    original: job.data, queue: job.queueName, jobId: job.id,
+    error: { name: err.name, message: err.message }, failedAt: Date.now(), attempts: job.attemptsMade,
+  }, { jobId: `dlq-${job.queueName}-${job.id}`, removeOnComplete: false, removeOnFail: false });
+});
+```
+
+On **SQS**, this is built in: a **redrive policy** with `maxReceiveCount` moves a message to the DLQ after that many receives. Two details from the AWS docs: set `maxReceiveCount` high enough for normal retries, and set the DLQ's retention **longer** than the source queue's, because for standard queues a message's expiry is still based on its **original** enqueue time.
+
+#### Replaying without a second incident
+**Problem:** you fix the bug and replay 40,000 dead jobs at once. They all hit the provider in the same minute (rate limit, or worse, your own database), and some of them should never run any more: a 3-day-old verification code, a reminder for a meeting that has passed.
+
+**Mechanism:**
+1. **Fix first, then sample.** Replay ten jobs, confirm they succeed, then the rest.
+2. **Replay through the normal path**, so the queue's limiter, priorities and idempotency rules apply. For jobs still in BullMQ's failed set, `queue.retryJobs({ state: 'failed', count: 500 })` moves them back in batches; from a DLQ queue, re-add them with a **new** job ID derived from the original (the old ID may still exist).
+3. **Check expiry before acting.** Put an `expiresAt` in time-sensitive payloads, and have handlers drop expired work deliberately (counted as a metric) instead of performing it late.
+
+```ts title="replay-dlq.ts"
+export async function replay(limit = 1000, perSecond = 50) {
+  const dead = await dlq.getJobs(['waiting'], 0, limit - 1, true);       // oldest first
+  for (const d of dead) {
+    const { original, queue, jobId } = d.data;
+    if (original.expiresAt && Date.now() > original.expiresAt) { await d.remove(); continue; }   // too late to matter
+    await queues[queue].add(d.name, original, { jobId: `${jobId}-replay-${d.data.failedAt}` });
+    await d.remove();
+    await new Promise(r => setTimeout(r, 1000 / perSecond));            // pace the replay
+  }
+}
+```
+
+**Edge cases:**
+- **Idempotency is what makes replay safe.** Some dead jobs may have partly succeeded (email sent, then the status update failed). Handlers that claim work atomically (section 7.1) turn a duplicate into a no-op.
+- **Replay breaks ordering.** A replayed "set status to shipped" can land after a newer "set status to delivered". Handlers that compare versions or timestamps (section 7.7) are safe; blind overwrites aren't.
+
+### 9.5 Payload hygiene
+Put **IDs** in the payload, not whole objects. The worker loads fresh data when it runs (the user may have changed their email since), payloads stay small in Redis, and you don't copy personal data into the queue.
+
+### 9.6 Evolving job payloads across deploys ➕
+
+Small, ID-only payloads still have a **shape**, and that shape outlives the code that wrote it: a job enqueued today with a 7-day delay will be processed by a version of your worker that doesn't exist yet.
+
+#### Old jobs meet new code
+**Problem:** you rename `userId` to `accountId` and deploy. Jobs already waiting, delayed or sitting in the DLQ still say `userId`; the new handler reads `undefined` and fails (or, worse, succeeds with wrong data).
+
+**Why it happens:** a queue is a **persistent interface** between two deployments: the producer that ran then and the consumer that runs now. Unlike an API call, both sides are never guaranteed to be on the same version.
+
+**Mechanism:** version every payload, validate it at the top of the handler, and **upcast** old versions to the current shape in one place:
+
+```ts title="payloads.ts"
+import { z } from 'zod';
+
+const WelcomeV1 = z.object({ v: z.literal(1).optional(), userId: z.string() });   // old jobs have no v field
+const WelcomeV2 = z.object({ v: z.literal(2), accountId: z.string(), locale: z.string().default('en') });
+
+export function parseWelcome(data: unknown): z.infer<typeof WelcomeV2> {
+  const v2 = WelcomeV2.safeParse(data);
+  if (v2.success) return v2.data;
+  const v1 = WelcomeV1.safeParse(data);
+  if (v1.success) return { v: 2, accountId: v1.data.userId, locale: 'en' };       // upcast
+  throw new UnrecoverableError('unknown welcome payload');                          // straight to the DLQ, not retried
+}
+```
+
+**Edge cases:**
+- **Scheduler templates and delayed jobs are payloads too.** `upsertJobScheduler` stores a data template in Redis; update it in the same deploy, or every future tick produces old-shaped jobs.
+- **Unknown versions should fail permanently and visibly** (as above), not crash-loop.
+
+#### Deploy order: expand, then contract
+**Problem:** in a rolling deploy, new producers can enqueue v2 jobs while **old workers** are still consuming. Old code doesn't know v2 and fails them.
+
+**Mechanism:** split the change into steps that are each safe in both directions:
+1. **Expand:** deploy workers that accept **both** v1 and v2 (the parser above). Producers still emit v1.
+2. **Switch:** deploy producers that emit v2. Any worker can handle either.
+3. **Contract:** once no v1 job can still exist (longest delay + all retries + DLQ retention), delete the v1 branch.
+
+**Edge cases:**
+- **Rollbacks:** if step 2 is rolled back to code that only knows v1, v2 jobs fail. Keep step 1 deployed long enough that a rollback never goes behind it.
+- **Renaming a job name or queue** is the same problem: run consumers for the old and new name side by side until the old one is empty.
+
+---
+
+## 10. Recap 🎓
+
+- Background tasks let you move **time-consuming and non-critical** work out of the request-response cycle, so APIs stay **responsive**, don't **time out** because of external dependencies, and gain **retries** for work that can fail.
+- A task queue has **producers** (enqueue serialized tasks), a **broker** (holds them: RabbitMQ, Redis, SQS) and **consumers** (dequeue, run handlers in separate processes).
+- **Acks** and the **visibility timeout** make sure a task is never lost when a worker dies.
+- Four kinds: **one-off**, **recurring**, **chained**, **batch**.
+- Design for **idempotency**, **error handling**, **monitoring**, **horizontal scaling**, **ordering** and **rate limiting**.
+- Keep tasks **small**, avoid **long-running** ones, **log** well, and **alert** on queue length and worker health.
+- ➕ **Broker choice:** Postgres with `SKIP LOCKED` (atomic with your data), Redis/BullMQ (fast, needs `noeviction` and AOF), SQS (managed, 1 MiB messages, 15-minute max delay), Kafka (an event log, poor at per-job retries).
+- ➕ **Schedules:** system jobs in UTC, user jobs in the user's IANA zone via an hourly UTC tick; idempotent per local period to survive DST gaps and overlaps; watermarks so missed runs catch up.
+- ➕ **Latency metrics:** wait time, run time and oldest-job age beat raw depth; classify failures as transient, permanent or bug.
+- ➕ **Capacity:** size slots with Little's law, autoscale on backlog rather than CPU, cap replicas, and apply backpressure at the producer.
+- ➕ **Provider limits:** pause the queue on 429 with `worker.rateLimit` + `RateLimitError`; per-account token buckets with `moveToDelayed`.
+- ➕ **Fairness:** priorities (no-priority jobs run first), separate queues per class, and per-tenant caps or windows.
+- ➕ **Poison jobs and replay:** bound stalls, sandbox risky handlers, keep a real DLQ, replay paced and idempotently, drop expired work.
+- ➕ **Payload evolution:** version payloads, upcast old versions, deploy expand → switch → contract.
+
+---
+
+## Interview questions
+
+1. **What makes something a candidate for a background job?** **Its result isn't needed to answer the request, and it's slow, heavy or depends on an external service that can fail.**
+2. **What goes wrong if you send the signup email synchronously?** **Either signup fails because of an email outage, or the error is swallowed and the user is told an email was sent when it wasn't; and the user waits on a third party either way.**
+3. **Name the three parts of a task queue.** **Producer (creates and enqueues serialized tasks), broker (stores them), consumer or worker (dequeues and runs the handler in a separate process).**
+4. **What is a visibility timeout?** **The window during which a received job is hidden from other workers; if it isn't acked in time, it becomes visible again so another worker can process it.**
+5. **Why must job handlers be idempotent?** **Delivery is at-least-once: a worker can finish the work and die before acking, and retries re-run failed jobs, so the same job can run more than once.**
+6. **How do you make an email job idempotent?** **Deterministic job IDs to dedupe enqueues, plus an atomic "claim" update such as setting sent_at only where it's null before sending.**
+7. **Explain exponential backoff and why it needs jitter.** **The wait doubles after each failure (1, 2, 4, 8 minutes); jitter randomises it so thousands of failed jobs don't retry at the same instant and overload the recovering service.**
+8. **Which errors shouldn't be retried?** **Permanent ones such as a 400 for an invalid address or a deleted user; fail them immediately and retry only timeouts, 5xx and 429.**
+9. **Chained vs batch tasks?** **Chained tasks have dependencies (a child starts only after its parent succeeds, with independent children in parallel); batch tasks fan one trigger out into many independent jobs.**
+10. **Why is Redis Pub/Sub a poor job queue?** **It's fire-and-forget: no persistence, no ack and no retry; messages published while no worker is listening are lost.**
+11. **What is the dual-write problem with enqueuing and how is it solved?** **The DB commit and the queue push aren't atomic, so one can happen without the other; a transactional outbox writes the job in the same DB transaction and a relay publishes it.**
+12. **What would you alert on for a queue?** **Waiting jobs above a threshold, age of the oldest waiting job, failure rate, and the number of live workers.**
+13. ➕ **How does `FOR UPDATE SKIP LOCKED` turn a table into a queue?** **Each worker skips rows other transactions have locked, so many consumers claim different jobs without blocking; a lease column acts as the visibility timeout.**
+14. ➕ **Why must a BullMQ Redis use `noeviction`?** **Any other policy lets Redis delete queue keys under memory pressure, silently losing jobs.**
+15. ➕ **Why is Kafka a poor fit for per-job retries?** **It tracks one offset per partition, so a failing message blocks everything behind it unless you build retry topics and a dead-letter topic yourself.**
+16. ➕ **How do you send a report at 9:00 local time for users in many zones, across DST?** **Store IANA zone names, run a UTC tick that selects users whose local time has reached 9:00 and who haven't been sent this period, and key the job on the local period so double fires are no-ops.**
+17. ➕ **Why autoscale workers on backlog instead of CPU?** **I/O-bound workers wait rather than compute, so CPU stays low while the queue grows; waiting jobs per replica or oldest-job age reflect whether you're keeping up.**
+18. ➕ **How many worker slots do you need?** **Little's law: arrival rate × average run time, divided by a target utilisation; then check the database pool and provider limits.**
+19. ➕ **How should a worker react to a provider's 429?** **Pause the whole queue for Retry-After (BullMQ rateLimit + RateLimitError, which doesn't consume an attempt) instead of failing each job separately.**
+20. ➕ **One tenant enqueues 500,000 jobs. How do you keep other tenants fast?** **Round-robin groups (BullMQ Pro), a per-tenant active-job cap, or enqueue only a small window per tenant at a time.**
+21. ➕ **A job crashes every worker that runs it. What stops it?** **A low maxStalledCount so it reaches failed, sandboxed processors so the crash is contained, and input limits checked before heavy work.**
+22. ➕ **How do you change a job's payload shape safely?** **Version the payload, accept old and new in the worker first, switch producers second, and remove the old branch only after no old job can remain.**
+
+## Sources
+
+- [Lesson video: Task queues and background jobs (Sriniously)](https://youtu.be/r-nQsyguU1Y)
+- [BullMQ: Retrying failing jobs (attempts, backoff, jitter)](https://docs.bullmq.io/guide/retrying-failing-jobs)
+- [BullMQ: Stalled jobs](https://docs.bullmq.io/guide/workers/stalled-jobs)
+- [BullMQ: Job schedulers](https://docs.bullmq.io/guide/job-schedulers)
+- [BullMQ: Flows](https://docs.bullmq.io/guide/flows)
+- [BullMQ: Job IDs (deduplication rules)](https://docs.bullmq.io/guide/jobs/job-ids)
+- [BullMQ: Concurrency](https://docs.bullmq.io/guide/workers/concurrency)
+- [BullMQ: Rate limiting](https://docs.bullmq.io/guide/rate-limiting)
+- [AWS SQS: Visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)
+- [Redis: Pub/Sub delivery semantics](https://redis.io/docs/latest/develop/interact/pubsub/)
+- [microservices.io: Transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html)
+- [PostgreSQL: SELECT, the locking clause (SKIP LOCKED)](https://www.postgresql.org/docs/current/sql-select.html)
+- [pg-boss (Postgres job queue for Node)](https://github.com/timgit/pg-boss)
+- [BullMQ: Going to production (noeviction, AOF)](https://docs.bullmq.io/guide/going-to-production)
+- [BullMQ: Prioritized jobs](https://docs.bullmq.io/guide/jobs/prioritized)
+- [BullMQ: Process step jobs (moveToDelayed, DelayedError)](https://docs.bullmq.io/patterns/process-step-jobs)
+- [BullMQ Pro: Groups](https://docs.bullmq.io/bullmq-pro/groups)
+- [BullMQ: Sandboxed processors](https://docs.bullmq.io/guide/workers/sandboxed-processors)
+- [AWS: SQS increases maximum message payload size to 1 MiB (2025)](https://aws.amazon.com/about-aws/whats-new/2025/08/amazon-sqs-max-payload-size-1mib)
+- [AWS SQS: Delay queues (15-minute maximum)](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-delay-queues.html)
+- [AWS SQS: Short and long polling](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-short-and-long-polling.html)
+- [AWS SQS: Dead-letter queues (maxReceiveCount, retention)](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+- [KEDA: Prometheus scaler](https://keda.sh/docs/latest/scalers/prometheus/)
+- [Luxon: Time zones and DST](https://moment.github.io/luxon/#/zones)

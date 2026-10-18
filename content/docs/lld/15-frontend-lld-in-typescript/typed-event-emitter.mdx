@@ -1,0 +1,476 @@
+---
+title: "15.1 Typed Event Emitter"
+---
+
+## Problem & where it's asked
+
+"Implement an EventEmitter with `on`, `off` and `emit`" is probably the most common frontend machine-coding warm-up. GreatFrontEnd and BFE.dev both carry it, and a Glassdoor report from **Meta** asks for a variant where `subscribe` returns a `release()` handle (**reported**). Most other companies ask it too, without attribution (**commonly asked**). In a stockbroking app the same object is the bus that carries price ticks, order fills and session events between widgets that don't know about each other.
+
+The JavaScript version takes ten minutes. At SDE-1/SDE-2 level the interviewer is checking whether you can also:
+
+- make it **type-safe**, so `emit('price', payload)` rejects a payload of the wrong shape;
+- say what happens when a listener **throws**, or **unsubscribes during an emit**;
+- spot **leaks** from listeners that are never removed.
+
+## Requirements
+
+**Functional**
+
+- `on(event, listener)` returns an unsubscribe function.
+- `once(event, listener)` fires at most once.
+- `off(event, listener)` removes a listener by reference.
+- `emit(event, payload)` calls listeners in the order they subscribed. Events with no payload are called as `emit('logout')`.
+- `onAny(listener)` is a wildcard that receives a `{ type, payload }` envelope. Use it for loggers and devtools.
+- `listenerCount(event?)` and `removeAllListeners(event?)`.
+
+**Non-functional**
+
+- **Error isolation**: a listener that throws must not stop the ones after it.
+- **Stable iteration**: adding or removing listeners during `emit` must not skip or double-call anyone in the current emit.
+- **Leak warning**: warn once when an event has more listeners than a threshold (Node's default is 10).
+- No `any` in the public API. Event names and payloads come from one typed map.
+
+**Public API (written first)**
+
+```ts
+type EventMap = Record<string, unknown>;
+type EventKey<E extends EventMap> = keyof E & string;
+/** Events whose payload is `void` are emitted with no argument. */
+type Args<T> = [T] extends [void] ? [] : [payload: T];
+type Listener<T> = (...args: Args<T>) => void;
+type Unsubscribe = () => void;
+/** Discriminated union of every event, used by wildcard listeners. */
+type AnyEvent<E extends EventMap> = {
+  [K in EventKey<E>]: { type: K; payload: E[K] };
+}[EventKey<E>];
+
+interface EmitterOptions {
+  maxListeners?: number; // per event, 0 disables the warning
+  onError?: (error: unknown, event: string) => void;
+  warn?: (message: string) => void;
+}
+
+interface Emitter<E extends EventMap> {
+  on<K extends EventKey<E>>(event: K, listener: Listener<E[K]>): Unsubscribe;
+  once<K extends EventKey<E>>(event: K, listener: Listener<E[K]>): Unsubscribe;
+  off<K extends EventKey<E>>(event: K, listener: Listener<E[K]>): boolean;
+  emit<K extends EventKey<E>>(event: K, ...args: Args<E[K]>): boolean;
+  onAny(listener: (event: AnyEvent<E>) => void): Unsubscribe;
+  listenerCount(event?: EventKey<E>): number;
+  removeAllListeners(event?: EventKey<E>): void;
+}
+
+// Usage we are designing for:
+type AppEvents = { price: { symbol: string; ltp: number }; logout: void };
+declare const bus: Emitter<AppEvents>;
+const stop = bus.on('price', (p) => console.log(p.symbol, p.ltp));
+bus.emit('logout');
+stop();
+```
+
+Two details in that API are worth pointing out in the interview:
+
+- `Args<T>` is a conditional **tuple** type. It makes `emit('logout')` legal and `emit('price')` a compile error. The square brackets in `[T] extends [void]` stop the conditional from distributing over unions.
+- `AnyEvent<E>` is a mapped type indexed by its own keys. It turns `{ price: P; logout: void }` into `{ type: 'price'; payload: P } | { type: 'logout'; payload: void }`, so a wildcard listener can `switch (e.type)` and TypeScript narrows the payload in each branch.
+
+## Design
+
+**State model.** A `Map<eventName, Entry[]>`. Each `Entry` wraps the listener together with a `once` flag. The unsubscribe handle closes over **its own entry object**, not over the function. If the same function is subscribed twice, each handle removes exactly one subscription.
+
+**Copy-on-write arrays.** Subscribing and unsubscribing replace the array instead of mutating it. `emit` iterates over the array it read at the start, so changes made during an emit take effect from the *next* emit. That is the same rule the DOM and Node's `EventEmitter` follow.
+
+<Mermaid chart={`classDiagram
+    class Emitter~E~ {
+        <<interface>>
+        +on(event, listener) Unsubscribe
+        +once(event, listener) Unsubscribe
+        +off(event, listener) boolean
+        +emit(event, payload) boolean
+        +onAny(listener) Unsubscribe
+    }
+    class TypedEmitter~E~ {
+        -listeners Map
+        -anyListeners Array
+        -warned Set
+        +waitFor(event, signal) Promise
+    }
+    class Entry {
+        +fn Function
+        +once boolean
+    }
+    Emitter <|.. TypedEmitter
+    TypedEmitter o-- Entry`} />
+
+**Patterns.** This is the **Observer** pattern, with generics carrying the "subject/observer contract" that classic OOP would express with an interface per event. Error routing goes through an injected `onError` strategy. The default rethrows in a microtask, the way a browser's `reportError` would, so the error isn't swallowed and the other listeners still run.
+
+## Implementation
+
+Part 1 covers types and subscription management.
+
+```ts
+type EventMap = Record<string, unknown>;
+type EventKey<E extends EventMap> = keyof E & string;
+type Args<T> = [T] extends [void] ? [] : [payload: T];
+type Listener<T> = (...args: Args<T>) => void;
+type Unsubscribe = () => void;
+type AnyEvent<E extends EventMap> = {
+  [K in EventKey<E>]: { type: K; payload: E[K] };
+}[EventKey<E>];
+
+interface EmitterOptions {
+  maxListeners?: number;
+  onError?: (error: unknown, event: string) => void;
+  warn?: (message: string) => void;
+}
+
+type AnyFn = (...args: unknown[]) => void;
+interface Entry {
+  readonly fn: AnyFn;
+  readonly once: boolean;
+}
+
+class TypedEmitter<E extends EventMap> {
+  private readonly listeners = new Map<string, readonly Entry[]>();
+  private anyListeners: ReadonlyArray<(event: AnyEvent<E>) => void> = [];
+  private readonly warned = new Set<string>();
+  private readonly maxListeners: number;
+  private readonly onError: (error: unknown, event: string) => void;
+  private readonly warn: (message: string) => void;
+
+  constructor(options: EmitterOptions = {}) {
+    this.maxListeners = options.maxListeners ?? 10;
+    // Default: surface the error asynchronously so other listeners still run.
+    this.onError = options.onError ?? ((error) => queueMicrotask(() => { throw error; }));
+    this.warn = options.warn ?? ((message) => console.warn(message));
+  }
+
+  on<K extends EventKey<E>>(event: K, listener: Listener<E[K]>): Unsubscribe {
+    return this.add(event, listener as unknown as AnyFn, false);
+  }
+
+  once<K extends EventKey<E>>(event: K, listener: Listener<E[K]>): Unsubscribe {
+    return this.add(event, listener as unknown as AnyFn, true);
+  }
+
+  off<K extends EventKey<E>>(event: K, listener: Listener<E[K]>): boolean {
+    const target: unknown = listener;
+    const entry = this.listeners.get(event)?.find((e) => e.fn === target);
+    return entry ? this.removeEntry(event, entry) : false;
+  }
+
+  onAny(listener: (event: AnyEvent<E>) => void): Unsubscribe {
+    this.anyListeners = [...this.anyListeners, listener];
+    return () => {
+      this.anyListeners = this.anyListeners.filter((l) => l !== listener);
+    };
+  }
+
+  listenerCount(event?: EventKey<E>): number {
+    if (event !== undefined) return this.listeners.get(event)?.length ?? 0;
+    let total = 0;
+    for (const list of this.listeners.values()) total += list.length;
+    return total;
+  }
+
+  removeAllListeners(event?: EventKey<E>): void {
+    if (event !== undefined) this.listeners.delete(event);
+    else this.listeners.clear();
+  }
+
+  private add(event: string, fn: AnyFn, once: boolean): Unsubscribe {
+    const entry: Entry = { fn, once };
+    const next = [...(this.listeners.get(event) ?? []), entry]; // copy-on-write
+    this.listeners.set(event, next);
+    this.checkLeak(event, next.length);
+    let active = true;
+    return () => {
+      if (!active) return; // calling the handle twice is harmless
+      active = false;
+      this.removeEntry(event, entry);
+    };
+  }
+
+  private removeEntry(event: string, entry: Entry): boolean {
+    const list = this.listeners.get(event);
+    if (!list) return false;
+    const next = list.filter((e) => e !== entry);
+    if (next.length === list.length) return false;
+    if (next.length > 0) this.listeners.set(event, next);
+    else this.listeners.delete(event); // don't keep empty arrays for dead events
+    return true;
+  }
+
+  private checkLeak(event: string, count: number): void {
+    if (this.maxListeners <= 0 || count <= this.maxListeners || this.warned.has(event)) return;
+    this.warned.add(event);
+    this.warn(
+      `Possible memory leak: ${count} listeners for "${event}" (max ${this.maxListeners}). Did you forget to unsubscribe?`,
+    );
+  }
+```
+
+Part 2 covers `emit` with error isolation, plus the `waitFor` extension, which turns an event into a Promise that can be cancelled.
+
+```ts
+  emit<K extends EventKey<E>>(event: K, ...args: Args<E[K]>): boolean {
+    const snapshot = this.listeners.get(event) ?? [];
+    for (const entry of snapshot) {
+      if (entry.once) this.removeEntry(event, entry); // remove BEFORE calling, so re-entrant emits don't re-fire it
+      this.safeCall(event, () => entry.fn(...args));
+    }
+    const wildcard = this.anyListeners;
+    if (wildcard.length > 0) {
+      const envelope = { type: event, payload: (args as unknown[])[0] } as unknown as AnyEvent<E>;
+      for (const fn of wildcard) this.safeCall(event, () => fn(envelope));
+    }
+    return snapshot.length > 0;
+  }
+
+  /** Extension: await the next occurrence of an event; cancellable with AbortController. */
+  waitFor<K extends EventKey<E>>(event: K, signal?: AbortSignal): Promise<E[K]> {
+    return new Promise<E[K]>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error(`waitFor("${event}") aborted`));
+        return;
+      }
+      const onAbort = (): void => {
+        unsubscribe();
+        reject(new Error(`waitFor("${event}") aborted`));
+      };
+      const unsubscribe = this.add(event, (...args: unknown[]) => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve(args[0] as E[K]);
+      }, true);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  private safeCall(event: string, call: () => void): void {
+    try {
+      call();
+    } catch (error) {
+      this.onError(error, event);
+    }
+  }
+}
+```
+
+Part 3 is the demo. It simulates widgets on a trading screen subscribing and unsubscribing, and ends with assertion-style checks.
+
+```ts
+// A `type` alias (not an `interface`) is used on purpose: interfaces have no implicit
+// index signature, so they would not satisfy `Record<string, unknown>`.
+type TradingEvents = {
+  price: { symbol: string; ltp: number };
+  'order:filled': { orderId: string; qty: number };
+  logout: void;
+};
+
+const log: string[] = [];
+const bus = new TypedEmitter<TradingEvents>({
+  maxListeners: 3,
+  onError: (error, event) =>
+    console.log(`  [onError] "${event}" listener failed: ${error instanceof Error ? error.message : String(error)}`),
+  warn: (message) => console.log(`  [warn] ${message}`),
+});
+
+console.log('1) watchlist + header subscribe (header uses once)');
+const stopWatchlist = bus.on('price', (p) => console.log(`  watchlist: ${p.symbol} @ ${p.ltp}`));
+bus.once('price', (p) => console.log(`  header (once): first tick ${p.symbol}`));
+bus.emit('price', { symbol: 'RELIANCE', ltp: 2950.5 });
+bus.emit('price', { symbol: 'INFY', ltp: 1612 });
+
+console.log('2) a buggy widget throws; others still run');
+const stopBuggy = bus.on('order:filled', () => {
+  throw new Error('chart not mounted');
+});
+bus.on('order:filled', (o) => console.log(`  positions: +${o.qty} (${o.orderId})`));
+bus.emit('order:filled', { orderId: 'ORD-1', qty: 10 });
+stopBuggy();
+
+console.log('3) unsubscribe during emit takes effect next time');
+let stopLate: Unsubscribe = () => {};
+bus.on('logout', () => {
+  console.log('  session: clearing tokens, removing analytics listener');
+  stopLate();
+});
+stopLate = bus.on('logout', () => console.log('  analytics: logout tracked'));
+bus.emit('logout');
+bus.emit('logout');
+
+console.log('4) wildcard logger');
+const stopAny = bus.onAny((e) => {
+  switch (e.type) {
+    case 'price':
+      log.push(`${e.type}:${e.payload.symbol}`);
+      break;
+    case 'order:filled':
+      log.push(`${e.type}:${e.payload.orderId}`);
+      break;
+    case 'logout':
+      log.push(e.type);
+      break;
+  }
+});
+bus.emit('price', { symbol: 'TCS', ltp: 4100 });
+bus.emit('logout');
+stopAny();
+console.log(`  devtools log = ${log.join(', ')}`);
+
+console.log('5) leak warning when a component forgets cleanup');
+const leaked: Unsubscribe[] = [];
+for (let i = 0; i < 3; i++) leaked.push(bus.on('price', () => {}));
+leaked.forEach((stop) => stop());
+
+console.log('6) waitFor + AbortController');
+const nextFill = bus.waitFor('order:filled');
+bus.emit('order:filled', { orderId: 'ORD-2', qty: 5 });
+const fill = await nextFill;
+console.log(`  awaited fill ${fill.orderId} qty=${fill.qty}`);
+const controller = new AbortController();
+const pending = bus.waitFor('order:filled', controller.signal);
+controller.abort();
+try {
+  await pending;
+} catch (error) {
+  console.log(`  ${error instanceof Error ? error.message : String(error)}`);
+}
+
+// Compile-time checks: this function is never called, but tsc must accept it.
+function typeTests(b: TypedEmitter<TradingEvents>): void {
+  // @ts-expect-error payload is missing `ltp`
+  b.emit('price', { symbol: 'X' });
+  // @ts-expect-error unknown event name
+  b.on('prices', () => {});
+  // @ts-expect-error `price` requires a payload
+  b.emit('price');
+  b.emit('logout');
+}
+void typeTests;
+
+console.log('7) checks');
+const check = (name: string, ok: boolean): void => console.log(`  ${ok ? 'PASS' : 'FAIL'} ${name}`);
+check('once listener removed after first emit', bus.listenerCount('price') === 1);
+stopWatchlist();
+check('unsubscribe removes the listener and cleans the map', bus.listenerCount('price') === 0);
+check('emit returns false when nobody listens', bus.emit('price', { symbol: 'SBIN', ltp: 800 }) === false);
+check('waitFor listener removed after abort', bus.listenerCount('order:filled') === 1);
+const handler = (): void => {};
+bus.on('logout', handler);
+check('off() by reference', bus.off('logout', handler) && !bus.off('logout', handler));
+bus.removeAllListeners();
+check('removeAllListeners()', bus.listenerCount() === 0);
+```
+
+## Demo output
+
+```text
+1) watchlist + header subscribe (header uses once)
+  watchlist: RELIANCE @ 2950.5
+  header (once): first tick RELIANCE
+  watchlist: INFY @ 1612
+2) a buggy widget throws; others still run
+  [onError] "order:filled" listener failed: chart not mounted
+  positions: +10 (ORD-1)
+3) unsubscribe during emit takes effect next time
+  session: clearing tokens, removing analytics listener
+  analytics: logout tracked
+  session: clearing tokens, removing analytics listener
+4) wildcard logger
+  watchlist: TCS @ 4100
+  session: clearing tokens, removing analytics listener
+  devtools log = price:TCS, logout
+5) leak warning when a component forgets cleanup
+  [warn] Possible memory leak: 4 listeners for "price" (max 3). Did you forget to unsubscribe?
+6) waitFor + AbortController
+  positions: +5 (ORD-2)
+  awaited fill ORD-2 qty=5
+  waitFor("order:filled") aborted
+7) checks
+  PASS once listener removed after first emit
+  PASS unsubscribe removes the listener and cleans the map
+  PASS emit returns false when nobody listens
+  PASS waitFor listener removed after abort
+  PASS off() by reference
+  PASS removeAllListeners()
+```
+
+## Testing strategy
+
+- **Behaviour tests** (shown as `PASS` lines): once semantics, unsubscribe cleanup, `emit` return value, `off` by reference, and that an aborted `waitFor` leaves no listener behind.
+- **Type tests**: `// @ts-expect-error` lines turn type mistakes into compile-time tests. If a refactor makes the types looser, `tsc` fails because the expected error has gone.
+- **Edge cases worth a test each**: the same function subscribed twice; unsubscribing inside the listener itself; `emit` called from inside a listener (re-entrancy); a listener that throws a non-`Error` value.
+- The injected `onError` and `warn` make both paths observable without spying on `console`.
+
+## Performance & memory considerations
+
+- Copy-on-write makes `on`/`off` O(n) per event but keeps `emit` allocation-free. That's the right trade-off, because UIs emit far more often than they subscribe. For a price bus with thousands of ticks per second, that matters.
+- Deleting the map key when the last listener leaves stops a long-running SPA from accumulating empty arrays for dynamic event names such as `price:${symbol}`.
+- The leak warning is a heuristic. A dashboard with 50 tiles legitimately has 50 `price` listeners, so make the threshold configurable, or better, fan out per symbol (`price:RELIANCE`).
+- Listeners hold closures, and closures hold components. A missing unsubscribe keeps an unmounted component tree in memory. That is why every subscription returns its own handle.
+
+## How it plugs into React
+
+```tsx
+function useEvent<E extends EventMap, K extends EventKey<E>>(
+  bus: TypedEmitter<E>,
+  event: K,
+  handler: Listener<E[K]>,
+) {
+  const ref = useRef(handler);
+  useLayoutEffect(() => { ref.current = handler; }); // always call the latest closure
+  useEffect(
+    () => bus.on(event, ((...args: Args<E[K]>) => ref.current(...args)) as Listener<E[K]>),
+    [bus, event], // the unsubscribe handle IS the cleanup
+  );
+}
+
+// usage
+useEvent(tradingBus, 'order:filled', (o) => toast.success(`Filled ${o.qty}`));
+```
+
+## Extensions & follow-ups
+
+- **Implemented:** `waitFor(event, signal)`, which turns the next event into a Promise and cleans up on abort.
+- Per-listener priority, e.g. risk checks before UI updates. Keep entries sorted on insert.
+- Namespaced wildcards (`order:*`), done by matching prefixes when you emit.
+- Async listeners with `emitAsync` that awaits them in order (`serial`) or together (`parallel`).
+- A `WeakRef`-based listener option for caches that shouldn't keep their owners alive.
+
+## Interview Q&A
+
+**Q1. What happens if a listener removes another listener while `emit` is running?**
+
+<details>
+<summary>Answer</summary>
+
+Nothing surprising. `emit` iterates over the array it read at the start, and removal creates a new array. The removed listener still receives the current event and misses the next one. The alternative, mutating the array in place, can skip the neighbour of the removed element, which is a classic bug. `once` listeners are removed *before* they are invoked, so a re-entrant `emit` of the same event can't fire them twice.
+
+</details>
+
+**Q2. Why does `on` return a function instead of making callers use `off`?**
+
+<details>
+<summary>Answer</summary>
+
+`off(event, fn)` needs the exact function reference, and that fails with inline arrow functions, which is how most React code is written. A returned handle closes over the specific subscription, is idempotent, and plugs straight into `useEffect` cleanup and `useSyncExternalStore`'s `subscribe` contract. We keep `off` for compatibility with Node-style APIs.
+
+</details>
+
+**Q3. How would you make `emit('logout')` legal but `emit('price')` a type error?**
+
+<details>
+<summary>Answer</summary>
+
+Use a rest parameter typed with a conditional tuple: `...args: [T] extends [void] ? [] : [payload: T]`. The brackets prevent distribution, so `string | void` isn't split into two branches. The same `Args<T>` type is reused for listener parameters, so both sides of the contract stay in sync.
+
+</details>
+
+**Q4. One listener throws. Should `emit` throw?**
+
+<details>
+<summary>Answer</summary>
+
+Not by default, in a UI bus. One broken widget shouldn't stop positions or P&L from updating. We catch each listener's error and send it to an injectable `onError`. The default rethrows in a microtask, so it still reaches `window.onerror` and error-monitoring tools. A domain event bus inside a transaction might want fail-fast behaviour instead, and that's exactly why the policy is injectable.
+
+</details>

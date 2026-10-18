@@ -1,0 +1,813 @@
+---
+title: "11.1 Notification System"
+---
+
+## Problem & where it's asked
+
+"Design a notification service" sounds like HLD, but in a machine-coding round it means an **in-memory library**. Other modules raise events such as "order placed" or "price alert triggered". Your service decides *who* gets told, *on which channels*, *with what text*, and *what happens when a vendor is down*.
+
+| Company | What was reported | Confidence |
+|---|---|---|
+| Flipkart (Oct 2025) | Order notifications to several stakeholder types, with per-stakeholder preferences | reported |
+| Walmart (2026) | Order notification system, preferences, **event replay** | reported |
+| Microsoft (2026), Goldman Sachs (2026) | EMAIL/SMS/PUSH channels, subscribe to event types, **no duplicate sends** | reported |
+| Zepto | Templates | reported (snippet only) |
+| Swiggy, PhonePe, Razorpay | Plausible because they send huge volumes of OTP and order messages | uncertain |
+
+Graders look for **Observer** (producers don't know about channels), a **Strategy/Adapter** per channel, and a clean **preference model**. Follow-ups tend to be "add a new channel", "rate-limit per user" and "retry failed sends".
+
+## Clarifying questions
+
+| Question | Assumption for this design |
+|---|---|
+| Which channels? | EMAIL, SMS and PUSH now. WhatsApp should be addable without editing the service. |
+| Who triggers notifications? | Domain events (`ORDER_PLACED`, `ORDER_SHIPPED`, `PRICE_ALERT`) published on an in-process event bus. |
+| Are preferences per event type or global? | Per user **per event type**. A system default applies when the user hasn't set anything. |
+| How is the message text built? | A template per (event type, channel) with `{{variable}}` placeholders. A missing variable is an error, never a silent blank. |
+| What if a vendor fails? | Retry **transient** failures with exponential backoff (up to 3 attempts). Don't retry **permanent** failures such as an invalid token. |
+| Rate limit? | At most N notifications per user per window (fixed window). Excess ones are recorded as `RATE_LIMITED`, not thrown. |
+| Duplicates? | Producers may publish the same event twice. The key is `(eventId, userId, channel)`, and each key is delivered at most once. |
+| Sync or async? | Sends are `async`. The demo processes them sequentially so the output is deterministic. |
+
+## Requirements
+
+**Functional**
+1. Register users with optional email, phone and device token.
+2. Register a template per (event type, channel) and render it with event data.
+3. Store per-user channel preferences per event type, with defaults.
+4. On an event, deliver it on every preferred channel the user has an address for.
+5. Retry transient failures with backoff and record attempts and final status.
+6. Rate-limit per user, and deduplicate by `(eventId, userId, channel)`.
+7. Query the notification history (for replay and audit).
+
+**Non-functional**
+- New channels plug in without changing `NotificationService` (OCP).
+- Deterministic and testable: inject the clock, id generator and sleeper.
+- One failing channel must not stop the other channels.
+
+**Out of scope**
+- Real vendor SDKs, persistent queues, scheduling ("send at 9 am"), digests and localisation. These are discussed under extensions.
+
+## Entities & relationships
+
+| Entity | Key fields | Relationships |
+|---|---|---|
+| `User` | id, name, email?, phone?, deviceToken? | has many `NotificationRecord`s |
+| `NotificationEvent` | eventId, type, userId, data | produced by domain services, consumed through `EventBus` |
+| `Template` | subject, body | one per (EventType, Channel) in `TemplateRegistry` |
+| `PreferenceStore` | userId → eventType → channels | falls back to defaults |
+| `ChannelSender` (interface) | channel, addressOf(), send() | implemented by adapters around vendor clients |
+| `RetryPolicy` | maxAttempts, baseDelayMs | used by the service |
+| `PerUserRateLimiter` | limit, windowMs | one window per user |
+| `NotificationRecord` | id, eventId, channel, status, attempts, reason | stored in `NotificationRepository` |
+
+## Class diagram
+
+<Mermaid chart={`classDiagram
+    class EventBus {
+        +subscribe(handler)
+        +publish(event)
+    }
+    class NotificationService {
+        +registerSender(sender)
+        +handle(event) NotificationRecord[]
+    }
+    class ChannelSender {
+        <<interface>>
+        +channel
+        +addressOf(user) string
+        +send(message)
+    }
+    class EmailSender
+    class SmsSender
+    class PushSender
+    class FakeSmtpClient
+    class FakeSmsGateway
+    class FakePushProvider
+    class TemplateRegistry
+    class TemplateRenderer
+    class PreferenceStore
+    class PerUserRateLimiter
+    class RetryPolicy
+    class NotificationRepository
+    EventBus --> NotificationService : notifies
+    NotificationService --> ChannelSender
+    ChannelSender <|.. EmailSender
+    ChannelSender <|.. SmsSender
+    ChannelSender <|.. PushSender
+    EmailSender --> FakeSmtpClient : adapts
+    SmsSender --> FakeSmsGateway : adapts
+    PushSender --> FakePushProvider : adapts
+    NotificationService --> TemplateRegistry
+    NotificationService --> TemplateRenderer
+    NotificationService --> PreferenceStore
+    NotificationService --> PerUserRateLimiter
+    NotificationService --> RetryPolicy
+    NotificationService --> NotificationRepository`} />
+
+Each channel delivery has its own small lifecycle:
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> DUPLICATE : key already seen
+    PENDING --> RATE_LIMITED : over per-user limit
+    PENDING --> SENT : vendor accepted
+    PENDING --> PENDING : transient failure, retry
+    PENDING --> FAILED : permanent error or retries exhausted
+    SENT --> [*]
+    FAILED --> [*]
+    RATE_LIMITED --> [*]
+    DUPLICATE --> [*]`} />
+
+## Design decisions & patterns
+
+- **Observer (`EventBus`)**: `OrderService` publishes `ORDER_PLACED` and knows nothing about SMS. Adding "also send to the seller" becomes a new subscriber, not an edit to order code. *Rejected:* calling `notificationService.sendSms()` directly from domain services, which couples every service to every channel.
+- **Strategy + Adapter (`ChannelSender`)**: each vendor SDK has its own shape (`sendMail({html})`, `push(phone, text)` returning a status code…). The adapter converts that into one interface and **translates vendor errors into `TransientSendError` / `PermanentSendError`**. That classification is what makes the retry policy generic. *Rejected:* a `switch (channel)` inside the service, which breaks OCP the moment WhatsApp arrives.
+- **Template registry keyed by (event, channel)**: SMS text has to be short and email can be rich, so a single template per event isn't enough.
+- **Preferences with defaults**: store only overrides. A new user works out of the box, and changing a default doesn't require migrating every user.
+- **Rate limiter and dedup inside the service, before sending**: both are cheap synchronous checks, so they run before any `await`. That ordering matters for concurrency (see below).
+- **Status recorded, not thrown**: one user's broken push token shouldn't turn `handle()` into an exception that hides the email that *was* sent. Validation errors (unknown user, malformed event) do throw, because those are programmer or caller mistakes.
+- **Injected `Sleeper`**: backoff waits become instant and observable in tests.
+
+## Implementation
+
+**Part 1 — types, errors and infrastructure.**
+
+```ts
+type Channel = 'EMAIL' | 'SMS' | 'PUSH';
+type EventType = 'ORDER_PLACED' | 'ORDER_SHIPPED' | 'PRICE_ALERT';
+type DeliveryStatus = 'PENDING' | 'SENT' | 'FAILED' | 'RATE_LIMITED' | 'DUPLICATE';
+
+interface Clock { now(): number; }
+class FakeClock implements Clock {
+  constructor(private t = 0) {}
+  now(): number { return this.t; }
+  advance(ms: number): void { this.t += ms; }
+}
+
+interface IdGenerator { next(prefix: string): string; }
+class SeqIdGenerator implements IdGenerator {
+  private n = 0;
+  next(prefix: string): string { this.n += 1; return `${prefix}-${this.n}`; }
+}
+
+interface Sleeper { sleep(ms: number): Promise<void>; }
+class RecordingSleeper implements Sleeper {
+  readonly waits: number[] = [];
+  async sleep(ms: number): Promise<void> { this.waits.push(ms); }
+}
+
+class NotificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+class ValidationError extends NotificationError {}
+class TemplateError extends NotificationError {}
+class TransientSendError extends NotificationError {}
+class PermanentSendError extends NotificationError {}
+
+interface User {
+  id: string;
+  name: string;
+  email?: string;
+  phone?: string;
+  deviceToken?: string;
+}
+
+interface NotificationEvent {
+  eventId: string; // producer-supplied; part of the dedup key
+  type: EventType;
+  userId: string;
+  data: Record<string, string>;
+}
+
+interface Message { channel: Channel; to: string; subject: string; body: string; }
+
+interface NotificationRecord {
+  id: string;
+  eventId: string;
+  userId: string;
+  channel: Channel;
+  status: DeliveryStatus;
+  attempts: number;
+  createdAt: number;
+  reason?: string;
+}
+```
+
+**Part 2 — templates, preferences and repositories.** The renderer fails loudly on a missing variable. "Your OTP is " followed by nothing is a real production bug.
+
+```ts
+interface Template { subject: string; body: string; }
+
+class TemplateRegistry {
+  private readonly templates = new Map<string, Template>();
+  register(type: EventType, channel: Channel, template: Template): void {
+    this.templates.set(`${type}:${channel}`, template);
+  }
+  get(type: EventType, channel: Channel): Template {
+    const t = this.templates.get(`${type}:${channel}`);
+    if (!t) throw new TemplateError(`no template for ${type}/${channel}`);
+    return t;
+  }
+}
+
+class TemplateRenderer {
+  render(text: string, data: Record<string, string>): string {
+    return text.replace(/\{\{(\w+)\}\}/g, (_match, key: string) => {
+      const value = data[key];
+      if (value === undefined) throw new TemplateError(`missing variable "${key}"`);
+      return value;
+    });
+  }
+}
+
+class PreferenceStore {
+  private readonly overrides = new Map<string, Map<EventType, Channel[]>>();
+  constructor(private readonly defaults: Record<EventType, Channel[]>) {}
+
+  set(userId: string, type: EventType, channels: Channel[]): void {
+    const perUser = this.overrides.get(userId) ?? new Map<EventType, Channel[]>();
+    perUser.set(type, [...new Set(channels)]);
+    this.overrides.set(userId, perUser);
+  }
+  channelsFor(userId: string, type: EventType): Channel[] {
+    return [...(this.overrides.get(userId)?.get(type) ?? this.defaults[type])];
+  }
+}
+
+class UserRepository {
+  private readonly users = new Map<string, User>();
+  save(user: User): void { this.users.set(user.id, user); }
+  get(id: string): User {
+    const u = this.users.get(id);
+    if (!u) throw new ValidationError(`unknown user ${id}`);
+    return u;
+  }
+}
+
+class NotificationRepository {
+  private readonly byId = new Map<string, NotificationRecord>();
+  private readonly dedupKeys = new Set<string>();
+
+  static keyOf(eventId: string, userId: string, channel: Channel): string {
+    return `${eventId}|${userId}|${channel}`;
+  }
+  /** Returns false if this key was already claimed (a duplicate). Synchronous on purpose. */
+  claim(record: NotificationRecord): boolean {
+    const key = NotificationRepository.keyOf(record.eventId, record.userId, record.channel);
+    if (this.dedupKeys.has(key)) return false;
+    this.dedupKeys.add(key);
+    this.byId.set(record.id, record);
+    return true;
+  }
+  all(): NotificationRecord[] { return [...this.byId.values()]; }
+}
+```
+
+**Part 3 — vendor clients and channel adapters (Strategy + Adapter).** The fake vendors have deliberately *different* APIs, the way real SDKs do.
+
+```ts
+// --- "Third-party" SDKs (fakes with their own shapes) ---
+class FakeSmtpClient {
+  async sendMail(opts: { from: string; to: string; subject: string; html: string }): Promise<{ accepted: boolean }> {
+    console.log(`    [smtp] ${opts.to} <- "${opts.subject}"`);
+    return { accepted: !opts.to.endsWith('@bounce.test') };
+  }
+}
+class FakeSmsGateway {
+  constructor(private failuresBeforeSuccess = 0) {}
+  async push(phone: string, text: string): Promise<number> {
+    if (this.failuresBeforeSuccess > 0) {
+      this.failuresBeforeSuccess -= 1;
+      console.log(`    [sms] ${phone} -> 503`);
+      return 503;
+    }
+    console.log(`    [sms] ${phone} <- "${text}"`);
+    return 200;
+  }
+}
+class FakePushProvider {
+  async dispatch(token: string, title: string, _body: string): Promise<void> {
+    if (token.startsWith('expired')) throw new Error('InvalidRegistration');
+    console.log(`    [push] ${token} <- "${title}"`);
+  }
+}
+
+// --- Our port ---
+interface ChannelSender {
+  readonly channel: Channel;
+  addressOf(user: User): string | undefined;
+  send(message: Message): Promise<void>;
+}
+
+// --- Adapters: translate vendor results into our error vocabulary ---
+class EmailSender implements ChannelSender {
+  readonly channel = 'EMAIL' as const;
+  constructor(private readonly client: FakeSmtpClient, private readonly from: string) {}
+  addressOf(user: User): string | undefined { return user.email; }
+  async send(m: Message): Promise<void> {
+    const res = await this.client.sendMail({ from: this.from, to: m.to, subject: m.subject, html: m.body });
+    if (!res.accepted) throw new PermanentSendError('mailbox rejected');
+  }
+}
+class SmsSender implements ChannelSender {
+  readonly channel = 'SMS' as const;
+  constructor(private readonly gateway: FakeSmsGateway) {}
+  addressOf(user: User): string | undefined { return user.phone; }
+  async send(m: Message): Promise<void> {
+    const status = await this.gateway.push(m.to, m.body.slice(0, 160));
+    if (status >= 500) throw new TransientSendError(`sms gateway ${status}`);
+    if (status >= 400) throw new PermanentSendError(`sms rejected ${status}`);
+  }
+}
+class PushSender implements ChannelSender {
+  readonly channel = 'PUSH' as const;
+  constructor(private readonly provider: FakePushProvider) {}
+  addressOf(user: User): string | undefined { return user.deviceToken; }
+  async send(m: Message): Promise<void> {
+    try {
+      await this.provider.dispatch(m.to, m.subject, m.body);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Invalid tokens will never succeed; everything else is worth retrying.
+      if (msg === 'InvalidRegistration') throw new PermanentSendError('device token expired');
+      throw new TransientSendError(msg);
+    }
+  }
+}
+```
+
+**Part 4 — retry policy, rate limiter, event bus and the service.** Note that `claim()` and `tryAcquire()` both run **before the first `await`**, so two concurrent `handle()` calls can't both slip through.
+
+```ts
+class RetryPolicy {
+  constructor(readonly maxAttempts: number, private readonly baseDelayMs: number) {
+    if (maxAttempts < 1) throw new ValidationError('maxAttempts must be >= 1');
+  }
+  delayBefore(nextAttempt: number): number {
+    return this.baseDelayMs * 2 ** (nextAttempt - 2); // attempt 2 -> base, 3 -> 2*base
+  }
+}
+
+class PerUserRateLimiter {
+  private readonly windows = new Map<string, { start: number; count: number }>();
+  constructor(private readonly limit: number, private readonly windowMs: number, private readonly clock: Clock) {}
+
+  tryAcquire(userId: string): boolean {
+    const now = this.clock.now();
+    const w = this.windows.get(userId);
+    if (!w || now - w.start >= this.windowMs) {
+      this.windows.set(userId, { start: now, count: 1 });
+      return true;
+    }
+    if (w.count >= this.limit) return false;
+    w.count += 1;
+    return true;
+  }
+}
+
+type EventHandler = (event: NotificationEvent) => Promise<void>;
+class EventBus {
+  private readonly handlers: EventHandler[] = [];
+  subscribe(handler: EventHandler): void { this.handlers.push(handler); }
+  async publish(event: NotificationEvent): Promise<void> {
+    for (const h of this.handlers) await h(event);
+  }
+}
+
+class NotificationService {
+  private readonly senders = new Map<Channel, ChannelSender>();
+
+  constructor(
+    private readonly users: UserRepository,
+    private readonly templates: TemplateRegistry,
+    private readonly renderer: TemplateRenderer,
+    private readonly prefs: PreferenceStore,
+    private readonly limiter: PerUserRateLimiter,
+    private readonly retry: RetryPolicy,
+    private readonly repo: NotificationRepository,
+    private readonly sleeper: Sleeper,
+    private readonly clock: Clock,
+    private readonly ids: IdGenerator,
+  ) {}
+
+  registerSender(sender: ChannelSender): void { this.senders.set(sender.channel, sender); }
+
+  async handle(event: NotificationEvent): Promise<NotificationRecord[]> {
+    if (!event.eventId.trim()) throw new ValidationError('eventId is required');
+    const user = this.users.get(event.userId);
+    const results: NotificationRecord[] = [];
+    for (const channel of this.prefs.channelsFor(user.id, event.type)) {
+      results.push(await this.deliver(event, user, channel));
+    }
+    return results;
+  }
+
+  private async deliver(event: NotificationEvent, user: User, channel: Channel): Promise<NotificationRecord> {
+    const record: NotificationRecord = {
+      id: this.ids.next('ntf'), eventId: event.eventId, userId: user.id, channel,
+      status: 'PENDING', attempts: 0, createdAt: this.clock.now(),
+    };
+    // --- synchronous gatekeeping: no await before these checks ---
+    if (!this.repo.claim(record)) return { ...record, status: 'DUPLICATE' };
+    const sender = this.senders.get(channel);
+    const to = sender?.addressOf(user);
+    if (!sender || !to) return this.finish(record, 'FAILED', `no ${channel} sender/address`);
+
+    let message: Message;
+    try {
+      const t = this.templates.get(event.type, channel);
+      message = {
+        channel, to,
+        subject: this.renderer.render(t.subject, event.data),
+        body: this.renderer.render(t.body, event.data),
+      };
+    } catch (err) {
+      return this.finish(record, 'FAILED', err instanceof Error ? err.message : String(err));
+    }
+    if (!this.limiter.tryAcquire(user.id)) return this.finish(record, 'RATE_LIMITED', 'per-user limit');
+
+    // --- async part: send with retries ---
+    while (record.attempts < this.retry.maxAttempts) {
+      record.attempts += 1;
+      if (record.attempts > 1) await this.sleeper.sleep(this.retry.delayBefore(record.attempts));
+      try {
+        await sender.send(message);
+        return this.finish(record, 'SENT');
+      } catch (err) {
+        if (err instanceof TransientSendError) continue;
+        return this.finish(record, 'FAILED', err instanceof Error ? err.message : String(err));
+      }
+    }
+    return this.finish(record, 'FAILED', 'retries exhausted');
+  }
+
+  private finish(record: NotificationRecord, status: DeliveryStatus, reason?: string): NotificationRecord {
+    record.status = status;
+    if (reason !== undefined) record.reason = reason;
+    return record;
+  }
+}
+```
+
+**Part 5 — wiring and demo.** `main` is the composition root. Every dependency is created here and injected.
+
+```ts
+const fmt = (r: NotificationRecord): string =>
+  `${r.channel}:${r.status}(attempts=${r.attempts}${r.reason ? `, ${r.reason}` : ''})`;
+
+const clock = new FakeClock(1_000_000);
+const ids = new SeqIdGenerator();
+const sleeper = new RecordingSleeper();
+const users = new UserRepository();
+const templates = new TemplateRegistry();
+const prefs = new PreferenceStore({
+  ORDER_PLACED: ['EMAIL', 'SMS', 'PUSH'],
+  ORDER_SHIPPED: ['EMAIL', 'SMS'],
+  PRICE_ALERT: ['PUSH'],
+});
+const repo = new NotificationRepository();
+const service = new NotificationService(
+  users, templates, new TemplateRenderer(), prefs,
+  new PerUserRateLimiter(4, 60_000, clock), new RetryPolicy(3, 100),
+  repo, sleeper, clock, ids,
+);
+service.registerSender(new EmailSender(new FakeSmtpClient(), 'no-reply@shop.test'));
+service.registerSender(new SmsSender(new FakeSmsGateway(2))); // first 2 calls fail with 503
+service.registerSender(new PushSender(new FakePushProvider()));
+
+templates.register('ORDER_PLACED', 'EMAIL', { subject: 'Order {{orderId}} confirmed', body: 'Hi {{name}}, total Rs {{amount}}' });
+templates.register('ORDER_PLACED', 'SMS', { subject: '', body: 'Order {{orderId}} placed' });
+templates.register('ORDER_PLACED', 'PUSH', { subject: 'Order {{orderId}} placed', body: 'Tap to track' });
+templates.register('ORDER_SHIPPED', 'EMAIL', { subject: 'Order {{orderId}} shipped', body: 'AWB {{awb}}' });
+templates.register('ORDER_SHIPPED', 'SMS', { subject: '', body: 'Shipped! AWB {{awb}}' });
+templates.register('PRICE_ALERT', 'PUSH', { subject: '{{symbol}} hit Rs {{price}}', body: 'Open app' });
+
+users.save({ id: 'u1', name: 'Asha', email: 'asha@mail.test', phone: '+919800000001', deviceToken: 'tok-asha' });
+users.save({ id: 'u2', name: 'Ravi', email: 'ravi@mail.test', phone: '+919800000002', deviceToken: 'expired-ravi' });
+prefs.set('u1', 'ORDER_PLACED', ['EMAIL', 'PUSH']); // Asha doesn't want SMS for orders
+
+const bus = new EventBus();
+bus.subscribe(async (e) => {
+  const results = await service.handle(e);
+  console.log(`  ${e.eventId} -> ${results.map(fmt).join(' ')}`);
+});
+
+const publish = async (label: string, e: NotificationEvent): Promise<void> => {
+  console.log(`# ${label}`);
+  try {
+    await bus.publish(e);
+  } catch (err) {
+    console.log(`  error: ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+  }
+};
+
+await publish('1. Asha places an order (prefers EMAIL+PUSH)',
+  { eventId: 'evt-1', type: 'ORDER_PLACED', userId: 'u1', data: { orderId: 'O1', name: 'Asha', amount: '499' } });
+await publish('2. Producer retries the same event',
+  { eventId: 'evt-1', type: 'ORDER_PLACED', userId: 'u1', data: { orderId: 'O1', name: 'Asha', amount: '499' } });
+await publish('3. Ravi order placed: SMS gateway flaky, push token expired',
+  { eventId: 'evt-2', type: 'ORDER_PLACED', userId: 'u2', data: { orderId: 'O2', name: 'Ravi', amount: '120' } });
+console.log(`  backoff waits: ${sleeper.waits.join(',')}`);
+await publish('4. Shipped event with a missing template variable',
+  { eventId: 'evt-3', type: 'ORDER_SHIPPED', userId: 'u2', data: { orderId: 'O2' } });
+
+console.log('# 5. Price-alert burst for Asha (limit 4/min, 2 already used)');
+for (const [i, price] of ['101', '102', '103'].entries()) {
+  await bus.publish({ eventId: `alert-${i}`, type: 'PRICE_ALERT', userId: 'u1', data: { symbol: 'INFY', price } });
+}
+clock.advance(60_000);
+console.log('  ...one minute later');
+await bus.publish({ eventId: 'alert-9', type: 'PRICE_ALERT', userId: 'u1', data: { symbol: 'INFY', price: '110' } });
+
+await publish('6. Unknown user', { eventId: 'evt-4', type: 'PRICE_ALERT', userId: 'u404', data: {} });
+
+const counts = new Map<DeliveryStatus, number>();
+for (const r of repo.all()) counts.set(r.status, (counts.get(r.status) ?? 0) + 1);
+console.log(`# history: ${[...counts].map(([s, n]) => `${s}=${n}`).join(' ')}`);
+```
+
+## Demo output
+
+```text
+# 1. Asha places an order (prefers EMAIL+PUSH)
+    [smtp] asha@mail.test <- "Order O1 confirmed"
+    [push] tok-asha <- "Order O1 placed"
+  evt-1 -> EMAIL:SENT(attempts=1) PUSH:SENT(attempts=1)
+# 2. Producer retries the same event
+  evt-1 -> EMAIL:DUPLICATE(attempts=0) PUSH:DUPLICATE(attempts=0)
+# 3. Ravi order placed: SMS gateway flaky, push token expired
+    [smtp] ravi@mail.test <- "Order O2 confirmed"
+    [sms] +919800000002 -> 503
+    [sms] +919800000002 -> 503
+    [sms] +919800000002 <- "Order O2 placed"
+  evt-2 -> EMAIL:SENT(attempts=1) SMS:SENT(attempts=3) PUSH:FAILED(attempts=1, device token expired)
+  backoff waits: 100,200
+# 4. Shipped event with a missing template variable
+  evt-3 -> EMAIL:FAILED(attempts=0, missing variable "awb") SMS:FAILED(attempts=0, missing variable "awb")
+# 5. Price-alert burst for Asha (limit 4/min, 2 already used)
+    [push] tok-asha <- "INFY hit Rs 101"
+  alert-0 -> PUSH:SENT(attempts=1)
+    [push] tok-asha <- "INFY hit Rs 102"
+  alert-1 -> PUSH:SENT(attempts=1)
+  alert-2 -> PUSH:RATE_LIMITED(attempts=0, per-user limit)
+  ...one minute later
+    [push] tok-asha <- "INFY hit Rs 110"
+  alert-9 -> PUSH:SENT(attempts=1)
+# 6. Unknown user
+  error: ValidationError: unknown user u404
+# history: SENT=7 FAILED=3 RATE_LIMITED=1
+```
+
+Walk through it. Event 1 skipped SMS because of Asha's preference. Event 2 was fully de-duplicated. Ravi's SMS needed three attempts (backoff 100 ms, then 200 ms), and his expired push token failed immediately with no retries. The rate limiter let two alerts through (4 per minute, 2 already used) and let the next one through after the window rolled over. Duplicates aren't stored in the history, because they never claimed a key.
+
+## Concurrency
+
+**The race.** Node runs your code on one thread, but anything separated by an `await` can interleave. Suppose the rate limiter (or dedup store) lives in Redis, so both "read the count" and "write the count" are async:
+
+```ts
+// ❌ check-then-act across an await
+const used = await store.get(userId);   // both requests read 3
+if (used < limit) {                     // both pass (limit 4)
+  await store.set(userId, used + 1);    // both write 4
+  await send();                         // 5 messages go out
+}
+```
+
+The same shape breaks dedup: two copies of `evt-1` arriving together both see "not sent yet".
+
+**Fixes**, from simplest to most general:
+1. Make the check-and-increment **one atomic operation**. In memory that means a synchronous method with no `await` inside, which is what `tryAcquire()` and `claim()` do. In Redis it means `INCR` + `EXPIRE` or a Lua script, and for dedup `SET key NX`.
+2. When the critical section has to contain an `await`, use a **per-key async mutex** so users don't block each other.
+
+```ts
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<void>>();
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => { release = r; });
+    const tail = prev.then(() => mine);
+    this.tails.set(key, tail);
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.tails.get(key) === tail) this.tails.delete(key);
+    }
+  }
+}
+
+// Simulates a remote counter store (e.g. Redis) where every call is async.
+class AsyncCounterStore {
+  private readonly data = new Map<string, number>();
+  async get(k: string): Promise<number> { await Promise.resolve(); return this.data.get(k) ?? 0; }
+  async set(k: string, v: number): Promise<void> { await Promise.resolve(); this.data.set(k, v); }
+}
+
+const LIMIT = 4;
+
+async function naiveAllow(store: AsyncCounterStore, user: string): Promise<boolean> {
+  const used = await store.get(user);
+  if (used >= LIMIT) return false;
+  await store.set(user, used + 1);
+  return true;
+}
+
+async function lockedAllow(store: AsyncCounterStore, lock: KeyedMutex, user: string): Promise<boolean> {
+  return lock.run(user, () => naiveAllow(store, user));
+}
+
+const burst = 10;
+const naiveStore = new AsyncCounterStore();
+const naive = await Promise.all(Array.from({ length: burst }, () => naiveAllow(naiveStore, 'u1')));
+console.log(`naive : allowed ${naive.filter(Boolean).length} of ${burst} (limit ${LIMIT})`);
+
+const safeStore = new AsyncCounterStore();
+const lock = new KeyedMutex();
+const safe = await Promise.all(Array.from({ length: burst }, () => lockedAllow(safeStore, lock, 'u1')));
+console.log(`locked: allowed ${safe.filter(Boolean).length} of ${burst} (limit ${LIMIT})`);
+```
+
+```text
+naive : allowed 10 of 10 (limit 4)
+locked: allowed 4 of 10 (limit 4)
+```
+
+In a multi-instance deployment the in-process mutex isn't enough. The atomic operation has to live in the shared store (Redis `INCR`, a DB unique constraint on the dedup key).
+
+## Extensions & follow-ups
+
+| Follow-up | How the design changes |
+|---|---|
+| "Add WhatsApp" | Write a `WhatsAppSender` adapter, call `registerSender`, add templates. The service doesn't change. |
+| "If SMS fails, fall back to WhatsApp" | A `FallbackSender` **composite** that wraps an ordered list of senders and tries the next on `PermanentSendError`. Implemented below. |
+| "Replay events" (Walmart) | Keep an append-only event log. `replay(fromTime)` re-publishes, and dedup keys stop double sends. To force a resend, use a new `eventId` suffix. |
+| "Multiple stakeholders" (Flipkart: customer, seller, delivery agent) | The event carries `recipients: {userId, role}[]`. Preferences and templates are keyed by role as well. |
+| Quiet hours / DND | A `DeliveryRule` chain (Chain of Responsibility) that runs before sending: quiet hours, DND registry, marketing opt-out. |
+| Priority (OTP vs marketing) | Separate queues or a priority queue. OTPs bypass the rate limiter and quiet hours. |
+| Async at scale | `handle()` enqueues jobs, and workers consume per channel. The retry policy moves into the queue (delay + DLQ). |
+
+**Extension implemented: a new WhatsApp channel plus a fallback composite.** Notice that nothing in the existing senders changes.
+
+```ts
+type Channel = 'SMS' | 'WHATSAPP' | 'SMS_OR_WHATSAPP';
+interface User { id: string; phone?: string; }
+interface Message { to: string; body: string; }
+class PermanentSendError extends Error { override name = 'PermanentSendError'; }
+
+interface ChannelSender {
+  readonly channel: Channel;
+  addressOf(user: User): string | undefined;
+  send(message: Message): Promise<void>;
+}
+
+class SmsSender implements ChannelSender {
+  readonly channel = 'SMS' as const;
+  constructor(private readonly dndNumbers: Set<string>) {}
+  addressOf(u: User): string | undefined { return u.phone; }
+  async send(m: Message): Promise<void> {
+    if (this.dndNumbers.has(m.to)) throw new PermanentSendError(`${m.to} is on DND`);
+    console.log(`  [sms] ${m.to} <- ${m.body}`);
+  }
+}
+
+class WhatsAppSender implements ChannelSender {
+  readonly channel = 'WHATSAPP' as const;
+  addressOf(u: User): string | undefined { return u.phone; }
+  async send(m: Message): Promise<void> {
+    console.log(`  [whatsapp] ${m.to} <- ${m.body}`);
+  }
+}
+
+/** Composite: looks like one sender, tries each inner sender in order. */
+class FallbackSender implements ChannelSender {
+  readonly channel = 'SMS_OR_WHATSAPP' as const;
+  constructor(private readonly chain: ChannelSender[]) {
+    if (chain.length === 0) throw new Error('fallback chain cannot be empty');
+  }
+  addressOf(u: User): string | undefined {
+    return this.chain.map((s) => s.addressOf(u)).find((a) => a !== undefined);
+  }
+  async send(m: Message): Promise<void> {
+    const errors: string[] = [];
+    for (const sender of this.chain) {
+      try {
+        await sender.send(m);
+        return;
+      } catch (err) {
+        if (!(err instanceof PermanentSendError)) throw err; // transient: let the retry policy decide
+        errors.push(`${sender.channel}: ${err.message}`);
+        console.log(`  fallback after ${sender.channel} failed`);
+      }
+    }
+    throw new PermanentSendError(`all channels failed (${errors.join('; ')})`);
+  }
+}
+
+const sender = new FallbackSender([new SmsSender(new Set(['+919800000002'])), new WhatsAppSender()]);
+for (const user of [{ id: 'u1', phone: '+919800000001' }, { id: 'u2', phone: '+919800000002' }, { id: 'u3' }]) {
+  const to = sender.addressOf(user);
+  if (!to) {
+    console.log(`${user.id}: skipped, no phone`);
+    continue;
+  }
+  console.log(`${user.id}:`);
+  await sender.send({ to, body: 'Your OTP is 4821' });
+}
+```
+
+```text
+u1:
+  [sms] +919800000001 <- Your OTP is 4821
+u2:
+  fallback after SMS failed
+  [whatsapp] +919800000002 <- Your OTP is 4821
+u3: skipped, no phone
+```
+
+## Edge cases
+
+- The user has no address for a preferred channel. Record `FAILED` with a reason and carry on with the other channels.
+- The user's preferences list is empty (opted out of everything). Nothing is sent and nothing is recorded. Say whether compliance needs an audit row for this.
+- A template is missing or a variable is absent. Mark it `FAILED` and don't send half-rendered text.
+- A duplicate event arrives *while* the first is still retrying. It's blocked, because `claim()` happens before the first `await`.
+- The permanent vs transient classification is wrong. Retrying a 400 forever wastes quota, and not retrying a 503 loses messages. The adapter owns this decision.
+- A rate-limit window boundary. A fixed window allows a burst of 2×limit around the boundary. Use a sliding window if that matters.
+- The SMS body is longer than 160 characters. Truncate or split, and always do it in the adapter.
+- Time zones for quiet hours. Store the user's time zone and never use the server's local time.
+
+## Complexity
+
+| Operation | Time | Notes |
+|---|---|---|
+| `handle(event)` | O(C × A) | C = preferred channels (≤ 3), A = attempts (≤ 3), plus template rendering O(template length) |
+| `claim` / dedup | O(1) | `Set` lookup |
+| `tryAcquire` | O(1) | one window per user; memory O(active users) |
+| `channelsFor` | O(1) | map lookup with default fallback |
+
+## What graders look for / common mistakes
+
+- ✅ Producers depend on an event bus, not on concrete channels.
+- ✅ One interface per channel, with vendor quirks hidden in adapters.
+- ✅ Retries only for transient errors, with backoff and a cap.
+- ✅ Dedup and rate-limit checks that are atomic.
+- ❌ `if (channel === 'EMAIL') … else if …` inside the service.
+- ❌ Retrying everything, including invalid addresses, or retrying with no delay.
+- ❌ One channel's exception aborting the other channels.
+- ❌ Hard-coding `Date.now()` and `setTimeout`, which makes the design impossible to test and slow to demo.
+- ❌ Storing preferences as a list of booleans (`emailOn`, `smsOn`…). That doesn't scale to new channels or per-event settings.
+
+## 90-minute plan
+
+| Minutes | Work |
+|---|---|
+| 0–10 | Clarify channels, preferences, retries, dedup and rate limit. Write down assumptions. |
+| 10–20 | Types, errors, `ChannelSender` interface, class diagram sketch. |
+| 20–40 | Template registry and renderer, preference store, repositories, three adapters. |
+| 40–60 | `NotificationService.deliver` with the dedup → address → render → rate limit → retry pipeline. |
+| 60–75 | Driver with scenarios: happy path, duplicate, flaky vendor, missing variable, burst. |
+| 75–85 | Add a new channel live (or the fallback composite) to prove OCP. |
+| 85–90 | Walk through the concurrency argument and scaling notes. |
+
+## Interview Q&A
+
+**Q1. Why classify errors as transient or permanent in the adapter rather than in the service?**
+
+<details>
+<summary>Answer</summary>
+
+Only the adapter understands the vendor's codes. A 503 from the SMS gateway, a `InvalidRegistration` from the push provider and a bounced mailbox all mean different things. Once the adapter translates them into our two error types, the service's retry loop is generic and doesn't need to change when a vendor does.
+
+</details>
+
+**Q2. How do you guarantee "no duplicate sends" if the service runs on 5 pods?**
+
+<details>
+<summary>Answer</summary>
+
+The in-memory `Set` becomes a shared, atomic claim: a unique index on `(event_id, user_id, channel)` in the notifications table, or `SET key NX EX` in Redis. The insert *is* the lock. Because vendors can also time out after actually sending, pass the same key to vendors that support idempotency, and accept that SMS is at-least-once in the worst case.
+
+</details>
+
+**Q3. Where would you put the rate limit: before or after rendering? Before or after retries?**
+
+<details>
+<summary>Answer</summary>
+
+Put it after cheap validation, so invalid requests don't burn quota, and before the first send. Count the **notification**, not the attempts. Otherwise a flaky vendor would eat the user's quota. OTPs usually bypass the per-user limit and are protected by a different, per-phone limit.
+
+</details>
+
+**Q4. Observer vs a message queue: when do you switch?**
+
+<details>
+<summary>Answer</summary>
+
+An in-process Observer is fine when producers and the notifier live in one process and losing an in-flight notification on a crash is acceptable. Once you need durability, retries across restarts, fan-out to other services, or independent scaling, publish to Kafka or SQS. The consumer then calls the same `NotificationService`, so the design barely changes.
+
+</details>
