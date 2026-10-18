@@ -1,0 +1,833 @@
+---
+title: "Graceful Shutdown"
+description: Process lifecycle, Unix signals, connection draining with a timeout and ordered resource cleanup, plus how it plays out in Python (uvicorn, FastAPI, Celery), Docker and Kubernetes, solved at the engineering level.
+---
+
+<Callout type="info">
+  Notes for [Graceful Shutdown](https://youtu.be/6rfBgphiCWM) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+<Mermaid chart={`flowchart LR
+  A["The problem: deploy mid-payment"] --> B["Process lifecycle"]
+  B --> C["Signals: SIGTERM, SIGINT, SIGKILL"]
+  C --> D["Step 1: connection draining"]
+  D --> E["Timeout"]
+  E --> F["LB + service discovery"]
+  F --> G["Step 2: resource cleanup<br/>reverse order"]
+  G --> H["Demo: Go server"]
+  H --> I["Python, Docker, Kubernetes"]`} />
+
+---
+
+## 1. The problem 🎓
+
+You're in the middle of a **critical payment** (say, buying something on Amazon or Flipkart) and the server handling it has to restart because someone pushed to production.
+
+**Zero-downtime deployment** makes sure the new server is up and ready for traffic **before** the old one goes away. But at some point the old server **must** stop: it stops receiving traffic and everything moves to the new one. That moment is the danger zone. What happens to the payment that was half-processed?
+- Does it **vanish**?
+- Does the customer get **charged twice** because of a race (the client retries a request the old server had already half-done)?
+- Do you end up processing refunds by hand?
+
+This problem is as old as servers, and the solution is **graceful shutdown**: stop the server **gracefully**, never abruptly.
+
+### The "good manners" analogy 🎓
+When guests are over and it's 9 pm and time to sleep, you don't push them out and slam the door. A graceful backend:
+1. **politely finishes** what it's doing (ongoing conversations),
+2. **says goodbye** to its guests (clients),
+3. **cleans up** after itself,
+4. **then** closes the door.
+
+The payoff is a good user experience and **no data corruption**: no double charges, no lost transactions.
+
+---
+
+## 2. Process lifecycle 🎓
+
+Everything that runs on an operating system runs as a **process**, including your backend. Like a living thing, a process has a **lifecycle**: it is **born** (starts), **lives** (executes) and **dies** (is terminated). Graceful shutdown is about controlling the last phase.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Starting: exec
+  Starting --> Running: connected to DB, Redis, listening
+  Running --> Draining: SIGTERM or SIGINT received
+  Draining --> CleaningUp: in-flight work done or timeout hit
+  CleaningUp --> Exited: exit code 0
+  Running --> Killed: SIGKILL
+  Draining --> Killed: SIGKILL after grace period
+  Exited --> [*]
+  Killed --> [*]`} />
+
+When the OS (or a tool on top of it) decides your process must stop, it **doesn't just pull the plug**. It follows an established protocol, like a conversation:
+- OS: "It's time for you to stop."
+- App: "Give me a few seconds, then I'll stop myself (or you can stop me)."
+
+Programs don't talk in text, so this conversation happens through **signals**.
+
+---
+
+## 3. Signals 🎓
+
+### What a signal is
+Signals are a **Unix** concept for **inter-process communication (IPC)**: a small, numbered message one process (or the kernel) sends another. "Unix" here means Linux (Ubuntu, Arch, ...) and macOS (which has a Unix core). Servers are almost always **Linux**; Windows Server only appears in specialised cases.
+
+### How your app receives one: handlers
+Your application **registers handlers**: code that sits waiting for a specific signal. By registering, the app is effectively telling the OS: *"when you want me to stop, send me this specific signal and I'll shut myself down with my own predefined steps."*
+
+🔧 Mechanically: the kernel marks the signal as pending for the process and interrupts it. If a handler is registered, the runtime runs it; if not, the **default action** for that signal applies, which for SIGTERM and SIGINT is to **terminate immediately**. So an app with no handler gets no graceful shutdown even from a polite signal. In Python, `signal.signal(signal.SIGTERM, handler)` (or `loop.add_signal_handler(...)` in asyncio code) **replaces** the default, so the process no longer exits on its own; your handler must finish the job and exit. (Python's own default for SIGINT raises `KeyboardInterrupt`; SIGTERM keeps the OS default.) uvicorn, gunicorn and Celery install these handlers for you.
+
+### The three signals that matter
+
+| Signal | Number 🔧 | Meaning | Who sends it | Catchable? | Exit code if it kills you 🔧 |
+|---|---|---|---|---|---|
+| **SIGTERM** | 15 | "Terminate": a **polite request** | Kubernetes, systemd, supervisord, `docker stop`, deployment systems | Yes | 143 (128 + 15) |
+| **SIGINT** | 2 | "Interrupt": user-initiated | a developer pressing **Ctrl+C** | Yes | 130 (128 + 2) |
+| **SIGKILL** | 9 | "Kill": the **nuclear option** | the OS or orchestrator when you ran out of time | **No**, can't be caught or ignored | 137 (128 + 9) |
+
+**SIGTERM** is a gentle tap on the shoulder: *"excuse me, could you finish up and leave?"* Your backend gets a window of a few seconds to:
+1. **finish existing requests** (it might be handling 10–12 at that moment, or 500–600 on a big service),
+2. **clean up resources**,
+3. **exit**.
+
+**SIGINT** is what Ctrl+C sends. The lesson demonstrates it: a Go backend is running locally; pressing Ctrl+C logs **"signal received: interrupt"** and the shutdown steps follow. It needs a key press, so it's used by developers, not process-to-process. **Handle it exactly like SIGTERM.** Whether a human on a laptop or systemd on an EC2 instance asked, the **intention** is the same: shut down cleanly.
+
+**SIGKILL** is pulling the power plug instead of clicking *Shut down*. The process **can't register a handler** for it and **can't ignore it**. It stops at that instant: no cleanup, nothing.
+
+**Why this makes graceful shutdown important:** if you don't respect the polite signals, you eventually get the impolite one. A process that ignores SIGTERM, or takes too long, is **SIGKILLed**, and loses its chance to clean up.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant O as Orchestrator (K8s / supervisord / systemd)
+  participant P as Your process
+  O->>P: SIGTERM
+  Note over P: handler runs - stop accepting, drain, clean up
+  alt finishes within the grace period
+    P-->>O: exit 0
+  else still running when the grace period ends
+    O->>P: SIGKILL
+    Note over P: killed instantly, in-flight work lost (exit 137)
+  end`} />
+
+---
+
+## 4. Step 1: connection draining (finishing in-flight requests) 🎓
+
+**In-flight requests** are the ones your server is processing right now. HTTP servers handle many concurrently: 10, hundreds or thousands depending on scale.
+
+### The restaurant analogy 🎓
+A restaurant has to close (closing time at 10:30–11 pm, or any other reason). The owners don't switch off the lights and throw everyone out. Instead:
+1. someone at the door **stops letting new customers in**;
+2. existing diners are told: *"we're closing; you have 15–20 minutes, take your time, finish, pay (and tip), and leave."*
+
+That's exactly **connection draining**.
+
+### The mechanism
+On a shutdown signal (SIGTERM from a process manager, SIGINT from Ctrl+C):
+1. **Stop accepting new connections or requests.** New work only makes the situation messier.
+2. **Let existing requests finish.**
+3. **Then close** the connections.
+
+What that means depends on the kind of server:
+
+| Server type | Stop accepting | Finish | Close |
+|---|---|---|---|
+| **HTTP backend** | stop accepting new HTTP requests | let in-flight requests complete | close connections |
+| **Database** (also a backend) | stop taking new queries or transactions | finish running queries and transactions | close the connection |
+| **WebSocket server** | stop accepting new sockets | **notify clients** it's closing | then close each socket (never abruptly) |
+
+### The timeout 🎓
+**Problem:** you want to give existing work enough time, but you **can't wait forever**. One blocking operation could hold up the shutdown indefinitely.
+
+**Mechanism:** a **hard deadline**, commonly **30 s** (sometimes 60 s). With no new requests coming in, 30 s is usually more than enough. If work still isn't done, it's **forcefully stopped**; that's the backup plan.
+
+**The trade-off in choosing it:**
+- **Too short:** you cut off legitimate operations.
+- **Too long:** shutdowns become sluggish, which slows deployments and hurts responsiveness.
+
+So base it on your **typical request duration** and operational needs. 30 s suits a normal REST backend; WebSockets or long-running work need you to understand your system and pick deliberately.
+
+### Coordination with load balancers and service discovery 🎓
+Draining only works if traffic **stops being sent** to the instance. That requires coordination with **health checks** and **deregistering from service discovery** (the mechanism that lets deployed services, such as your backend, database and Elasticsearch, find and talk to each other).
+
+🔧 **This is where most "graceful" shutdowns still drop requests.** Closing your listener while the load balancer still thinks you're healthy means new requests hit a closed port and fail. The fix is to **flip readiness first**, keep serving for a few seconds while the LB notices, and only then close the listener. Section 9 shows this in Kubernetes.
+
+### Draining on the load balancer's side ➕
+
+Your process drains its own requests, but a cloud load balancer in front of it has its own drain timer, and the two have to agree.
+
+#### Deregistration delay vs your shutdown timeout ➕
+**Problem.** You tuned a careful 25 s drain, yet clients behind an AWS Application Load Balancer still see occasional 502s during deploys. On another service, scale-downs take five minutes for no visible reason.
+
+**Why it happens.** When a target is deregistered, the load balancer stops sending it **new** requests but keeps existing connections open for the **deregistration delay** (on an ALB the default is **300 s**), so in-flight requests can finish. Two mismatches break this:
+- **Process exits before the LB is done**: if the target closes connections while the LB still considers it draining, AWS documents that the client receives a 5xx.
+- **Delay far longer than any request**: the LB waits up to the full 300 s before the target is fully removed, which slows every rollout and scale-in, even though no request takes that long. (If the target has no in-flight requests and no open connections, deregistration completes immediately, so the long wait shows up mainly when idle keep-alive connections are left open.)
+
+**Mechanism.** Order the timers from the outside in, and size them from real request durations:
+
+```text
+LB deregistration delay   ≥  app drain timeout  ≥  p99.9 request duration
+orchestrator grace period >  preStop sleep + app drain timeout + cleanup
+LB idle timeout           <  app keep-alive timeout   (so the app never closes an idle socket the LB is about to reuse)
+```
+
+```bash
+# a REST API whose slowest requests take ~10 s: drain for 30 s, not 300
+aws elbv2 modify-target-group-attributes \
+  --target-group-arn "$TG_ARN" \
+  --attributes Key=deregistration_delay.timeout_seconds,Value=30
+```
+
+**Edge cases.**
+- The `timeout_keep_alive=65` setting in section 7 exists for the third rule: an ALB's default idle timeout is 60 s, so the app must keep idle sockets open longer than that. uvicorn's default keep-alive timeout is only 5 s, so behind an ALB you must raise it.
+- WebSocket connections live far longer than any deregistration delay; they're cut when it expires unless the app closes them itself first (see "Long-lived connections" in section 7).
+- In Kubernetes with the AWS Load Balancer Controller in IP mode, the pod is deregistered when it starts terminating; the `preStop` sleep from section 9 covers the time the LB needs to stop routing new requests to it.
+
+---
+
+## 5. Step 2: resource cleanup 🎓
+
+### The desk analogy
+Before you leave your desk you take the coffee cup to the sink and tidy the cables. Before a backend exits, it releases what it acquired while running: **file handles, network connections, database connections, temporary files, caches** and other system resources.
+
+### Why each one matters
+- **File handles:** a process accesses files by asking the OS, which hands back a **handle**. Handles must be released; if they keep piling up, you exhaust resources and memory. 🔧 The OS caps how many a process may hold (the file-descriptor limit, `ulimit -n`); hit it and you get `EMFILE: too many open files`.
+- **Network connections:** every request reaches your app **through the OS**, which drives the network card, so the OS tracks every connection, and **limits how many** a process can have open. 🔧 Sockets are file descriptors too, so they count against the same limit.
+- **Database connections:** before exiting, any open **transaction must be committed or explicitly rolled back**. Otherwise it can be left in an inconsistent state, leading to **locks held, deadlocks or data corruption**. 🔧 In practice: if the process exits, the OS closes its sockets and Postgres rolls back the open transaction. The worse case is a connection that doesn't close cleanly (machine crash, network partition): the transaction and its **row locks** can linger until Postgres detects the dead connection, blocking other writers. The bigger real-world risk is work that spans **more than one system**: Stripe charged, but the process died before the DB recorded it. A transaction can't cover that; only finishing the request (draining) or idempotent retries can.
+
+### Clean up in the reverse order of acquisition 🎓
+If you connected Redis, then the DB, then started the HTTP server, shut down the **HTTP server first**, then the DB, then Redis.
+
+**Why:** later resources often **depend on** earlier ones. An in-flight request (HTTP) uses the DB; a DB-backed job may enqueue into Redis. Close Redis first and the still-running request fails mid-way. Reverse order guarantees nothing is torn down while something above it still uses it, the same reason a stack unwinds last-in, first-out.
+
+<Mermaid chart={`flowchart LR
+  subgraph Startup["Startup order"]
+    direction LR
+    S1["1st: Redis"] --> S2["2nd: Postgres pool"] --> S3["3rd: Job worker"] --> S4["4th: HTTP server"]
+  end
+  subgraph Shutdown["Shutdown order: reverse"]
+    direction LR
+    D4["1st: HTTP server<br/>stop accepting, drain"] --> D3["2nd: Job worker<br/>finish current job"] --> D2["3rd: Postgres pool<br/>engine.dispose()"] --> D1["4th: Redis<br/>aclose()"]
+  end
+  Startup --> Shutdown`} />
+
+---
+
+## 6. What the demo shows (Go) 🎓
+
+The lesson walks through a real Go backend (code shown only for context).
+
+1. **Register a handler** for OS interrupts (using a Go `context` that's cancelled on the signal). When it fires, call the **graceful shutdown function**.
+2. Inside it:
+   - **Shut down the HTTP server** with the method the framework provides. Internally it **stops accepting new connections** and **waits for existing ones** to finish.
+   - **Close the database**: stop taking new queries, finish the running ones, then close the pooled **TCP connections** one by one. (Backend and DB talk over TCP; a pool is a set of open TCP connections you borrow from.)
+   - **Shut down the background job server**, which uses Redis (the library is **Asynq**). This also closes its Redis connection.
+3. **Run it and press Ctrl+C.** With no in-flight requests it shuts down in about **1 second**. The logs show:
+   - startup: connected to database → started background job server → started server;
+   - then **^C** → database closed → job server stopping. Asynq logs *starting graceful shutdown*, *waiting for all workers to finish*, *all workers have finished*, *exiting* → finally *server exited properly*.
+
+🔧 The Go equivalent, for reference:
+
+```go title="main.go (Go)"
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+go func() { _ = srv.ListenAndServe() }()   // returns http.ErrServerClosed on Shutdown
+<-ctx.Done()                               // wait for SIGINT or SIGTERM
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+_ = srv.Shutdown(shutdownCtx)              // stop accepting, wait for in-flight (or timeout)
+db.Close()
+asynqServer.Shutdown()                     // waits for workers, closes Redis
+```
+
+The lesson's closing advice: you rarely write this from scratch. Every framework (Node, Go, Rust, Python) has a standard recipe. What matters is understanding **what** happens and **why**.
+
+---
+
+## 7. 🔧 Going deeper: a production graceful shutdown in Python (uvicorn + FastAPI)
+
+uvicorn already does the core of graceful shutdown. On SIGTERM or SIGINT it closes its listening socket, closes idle keep-alive connections, lets in-flight requests finish (marking their connections to close afterwards), and then runs your FastAPI **lifespan** shutdown code. Two things it does not do on its own: wait for the load balancer before it stops accepting, and give up on stuck requests (`--timeout-graceful-shutdown` has no limit by default). The code below adds both.
+
+```python title="shutdown.py"
+import asyncio
+import os
+import signal
+import threading
+from collections.abc import Awaitable, Callable
+from types import FrameType
+
+import structlog
+import uvicorn
+
+log = structlog.get_logger()
+_shutting_down = threading.Event()                    # set from the signal handler, read by /readyz
+
+
+def is_shutting_down() -> bool:
+    return _shutting_down.is_set()
+
+
+class GracefulServer(uvicorn.Server):
+    """uvicorn stops accepting the moment it sees SIGTERM; fail readiness first and wait for the LB."""
+
+    def __init__(
+        self,
+        config: uvicorn.Config,
+        drain_delay_s: float = 5.0,                   # time for the LB to notice we're not ready
+        deadline_s: float = 25.0,                     # hard deadline, under the orchestrator's grace period
+        on_drain_start: list[Callable[[], Awaitable[None]]] | None = None,
+    ) -> None:
+        super().__init__(config)
+        self.drain_delay_s, self.deadline_s = drain_delay_s, deadline_s
+        self.on_drain_start = on_drain_start or []
+        self._hook_tasks: set[asyncio.Task[None]] = set()
+
+    async def serve(self, sockets=None) -> None:
+        self._loop = asyncio.get_running_loop()
+        await super().serve(sockets)
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        if _shutting_down.is_set():                   # duplicate signal
+            if self.should_exit:                      # already draining: uvicorn's rule applies,
+                super().handle_exit(sig, frame)       # a second Ctrl+C forces exit and skips cleanup
+            return                                    # during the delay: ignore
+        _shutting_down.set()
+        log.info("shutdown started", signal=signal.Signals(sig).name)
+
+        # safety net: if anything hangs, exit anyway before SIGKILL arrives
+        force = threading.Timer(self.deadline_s, self._force_exit)
+        force.daemon = True                           # a daemon thread never keeps the process alive
+        force.start()
+
+        # 1. readiness is now 503, but keep serving; start hooks such as closing SSE streams
+        self._loop.call_soon_threadsafe(self._run_hooks)
+        # 2. after the delay, uvicorn stops accepting, drains in-flight requests,
+        #    then runs the lifespan shutdown (3. release resources, reverse order)
+        threading.Timer(self.drain_delay_s, super().handle_exit, (sig, frame)).start()
+
+    def _run_hooks(self) -> None:
+        for hook in self.on_drain_start:
+            task = self._loop.create_task(hook())
+            self._hook_tasks.add(task)
+            task.add_done_callback(self._hook_tasks.discard)
+
+    @staticmethod
+    def _force_exit() -> None:
+        log.error("shutdown timed out, forcing exit")
+        os._exit(1)                                   # sys.exit() in a thread would only end that thread
+```
+
+```python title="main.py"
+from contextlib import AsyncExitStack, asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI, Request, Response
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import create_async_engine
+
+
+def closer(name: str, close: Callable[[], Awaitable[object]]) -> Callable[[], Awaitable[None]]:
+    async def run() -> None:
+        await close()
+        log.info(f"{name} closed")
+    return run
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with AsyncExitStack() as stack:                       # callbacks run in REVERSE order
+        stack.callback(tracer_provider.shutdown)                # flush buffered spans, runs last
+        redis = Redis.from_url(settings.redis_url)              # acquired 1st
+        stack.push_async_callback(closer("redis", redis.aclose))
+        engine = create_async_engine(settings.db_url)           # 2nd
+        stack.push_async_callback(closer("postgres", engine.dispose))  # closes pooled connections
+        worker = await start_job_worker(redis)                  # 3rd
+        stack.push_async_callback(closer("job worker", worker.close))  # stop pulling, finish current job
+        app.state.redis, app.state.engine = redis, engine
+        yield                                                   # 4th: uvicorn serves HTTP
+        # uvicorn has stopped accepting and drained in-flight requests before we get here
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/readyz")
+async def readyz() -> Response:
+    return Response(status_code=503 if is_shutting_down() else 200)
+
+
+@app.get("/livez")
+async def livez() -> Response:
+    return Response(status_code=200)                            # liveness stays green while draining
+
+
+@app.middleware("http")
+async def close_during_drain(request: Request, call_next):
+    response = await call_next(request)
+    if is_shutting_down():
+        response.headers["connection"] = "close"                # keep-alive clients reconnect elsewhere
+    return response
+
+
+if __name__ == "__main__":
+    config = uvicorn.Config(
+        app, host="0.0.0.0", port=8080,
+        timeout_keep_alive=65,                                  # longer than the LB's idle timeout
+        timeout_graceful_shutdown=15,                           # then cancel requests still running
+    )
+    GracefulServer(config, drain_delay_s=5, deadline_s=25).run()
+```
+
+Why each detail is there:
+- **Idempotent handler:** Kubernetes or an impatient developer may send the signal twice. A duplicate during the delay is ignored; once uvicorn is draining, a second Ctrl+C makes it force-exit, which **skips the lifespan cleanup**, so don't make that a habit.
+- **Daemon timer and `os._exit`:** a daemon thread never keeps the interpreter alive, so the safety net only matters if shutdown is still running at the deadline. `sys.exit()` raised in a thread only ends that thread, which is why the timer uses `os._exit(1)`.
+- **uvicorn's connection handling:** on shutdown, uvicorn closes idle keep-alive connections at once and sets busy ones to close after their response, so there's no separate "close idle connections" step. `timeout_graceful_shutdown` is the last-resort "drop everyone": after it, uvicorn cancels the request tasks still running and moves on to the lifespan shutdown.
+- **`AsyncExitStack`:** callbacks run last-in, first-out, so registering each closer right after acquiring the resource gives you reverse-order cleanup for free, and a failing closer still lets the others run.
+- **Liveness vs readiness:** readiness goes red so traffic stops; liveness stays green so the orchestrator doesn't restart the pod mid-drain.
+- **Timeout under the grace period:** your own deadline (25 s) must fire before the orchestrator's SIGKILL (30 s by default in Kubernetes), so your logs say what was still running.
+- **Exit code:** after a clean shutdown, uvicorn re-raises the signal it caught, so outside a container (or under `--init`) a SIGTERM-stopped uvicorn may report 143 rather than 0. That still means "stopped by request"; 137 is the code that means SIGKILL.
+
+🔧 **gunicorn:** with `gunicorn -k uvicorn_worker.UvicornWorker`, the master receives SIGTERM, passes it on to every worker (each runs the same uvicorn drain and lifespan shutdown) and SIGKILLs any worker still alive after `--graceful-timeout` (30 s by default); keep that under the orchestrator's grace period. Note that gunicorn treats SIGINT and SIGQUIT as a **quick** shutdown; only SIGTERM is graceful.
+
+### Long-running work and the double-charge problem
+Draining protects requests that **finish** within the deadline. For anything that might not:
+- **Background workers:** stop **fetching** new jobs on SIGTERM, finish the current one, and rely on the queue's visibility timeout or ack semantics to **redeliver** unfinished jobs to another worker. That means jobs must be **idempotent**.
+- **Payments:** the client sends an **idempotency key**; the server records it with the result. If the old server died mid-request and the client retries against the new one, the key prevents a second charge. Graceful shutdown makes failure rare; idempotency makes it safe.
+- **WebSockets:** send a close frame (code `1001`, "going away") so clients reconnect, ideally with jitter so they don't all stampede the new pods at once.
+
+### Long-lived connections during deploys ➕
+
+The three bullets above name the cases; the first and last deserve real depth, because uvicorn's drain was designed for short request and response cycles, and long-lived connections break its assumptions.
+
+#### Why uvicorn's drain hangs on SSE and cuts WebSockets all at once ➕
+**Problem.** A chat service with 20,000 open WebSockets and SSE streams gets SIGTERM. uvicorn logs "Waiting for connections to close" and sits there: the SSE streams never finish, so it waits until `timeout_graceful_shutdown` cancels them (or SIGKILL arrives), and those clients see an abnormal disconnect instead of a clean one. Meanwhile every WebSocket was closed in the same instant.
+
+**Why it happens.** uvicorn's drain stops accepting and waits until **every** HTTP response has completed. A normal request ends when its response is sent; an SSE stream (a `StreamingResponse`) has **no natural end**, it lasts as long as the user keeps the tab open. Cancelling its task at the deadline is no better: the client gets no final event and can't tell a restart from a network failure. WebSockets uvicorn does close for you (with close code 1012), but only once the drain starts, all at the same moment, and without anything your app wants to say first. And the lifespan shutdown runs **after** the drain, so it's too late to end streams there. Only your code knows which connections are long-lived and how to say goodbye properly.
+
+**Mechanism.** Track long-lived connections yourself and end them deliberately when shutdown **starts** (the `on_drain_start` hook of `GracefulServer` in section 7): tell each client to go away with a proper close frame (or an SSE event), then wait a short time for clean closes; uvicorn's own shutdown drops whatever is left.
+
+```python title="ws_shutdown.py"
+import asyncio
+from collections.abc import AsyncIterator
+
+from fastapi import Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
+
+ws_clients: set[WebSocket] = set()
+draining = asyncio.Event()                                    # set when shutdown starts
+
+
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket) -> None:
+    await ws.accept()
+    ws_clients.add(ws)
+    try:
+        while True:
+            await handle_message(ws, await ws.receive_text())
+    except (WebSocketDisconnect, RuntimeError):               # client left, or we closed the socket
+        pass
+    finally:
+        ws_clients.discard(ws)
+
+
+@app.get("/events")
+async def events(request: Request) -> StreamingResponse:
+    async def stream() -> AsyncIterator[str]:
+        yield "retry: 3000\n\n"                               # browser reconnect delay in ms
+        async for chunk in subscribe_until(draining):         # stops yielding once draining is set
+            yield chunk
+        yield "event: reconnect\ndata: {}\n\n"                # then the response completes normally
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"cache-control": "no-cache"})
+
+
+async def close_long_lived(deadline_s: float = 10) -> None:
+    draining.set()                                            # SSE streams send "reconnect" and end
+    await asyncio.gather(
+        *(ws.close(code=1012, reason="server restarting") for ws in list(ws_clients)),  # 1012 = Service Restart
+        return_exceptions=True,
+    )
+    try:
+        async with asyncio.timeout(deadline_s):
+            while ws_clients:                                 # endpoints remove themselves as clients leave
+                await asyncio.sleep(0.2)
+    except TimeoutError:
+        log.warning("long-lived connections still open", count=len(ws_clients))  # uvicorn drops them next
+
+# GracefulServer(config, on_drain_start=[close_long_lived]) runs this before uvicorn's drain
+```
+
+**Edge cases.** A close frame needs the client to answer; slow or dead clients never do, hence the deadline, after which uvicorn's shutdown closes the transports. The deadline must fit inside the overall shutdown budget from section 9.
+
+#### Resuming without losing messages ➕
+**Problem.** A client reconnects to a new pod after the restart. Messages published while it was disconnected are gone.
+
+**Why it happens.** Delivery state ("what has this client already seen?") lived in the old process's memory, which just exited.
+
+**Mechanism.** Give each message a **sequence number or ID** and keep recent messages in a shared store (Redis stream, database table). On reconnect, the client says where it stopped and the new pod replays the gap. SSE builds this in: every event sent with an `id:` line is remembered by the browser, which sends it back as the `Last-Event-ID` header when it reconnects. For WebSockets, send the last ID in the first message after connecting. See [26-real-time-backends](/docs/backend-first-principles/26-real-time-backends).
+
+```python
+async def replay(request: Request) -> AsyncIterator[str]:
+    # on reconnect: replay everything after the client's last seen id
+    last_id = request.headers.get("last-event-id", "0")
+    for ev in await event_store.after(last_id):
+        yield f"id: {ev.id}\ndata: {ev.model_dump_json()}\n\n"
+```
+
+**Edge cases.** The replay window is finite (keep, say, the last 10 minutes); a client that was gone longer must do a full reload of state.
+
+#### Reconnect storms ➕
+**Problem.** 20,000 clients are disconnected within one second, and all reconnect within the next second. The new pods, still warming up, get a burst of connection setups, auth checks and replay queries, and some fall over, which disconnects more clients.
+
+**Why it happens.** Every client got the same signal at the same moment and runs the same retry code. Their retries are synchronised.
+
+**Mechanism.** Spread the load out in time on both sides:
+- **Client**: reconnect after a **random** delay (full jitter: `random(0, base * 2^attempt)`, capped), not a fixed one.
+- **Server**: during a rolling update only a fraction of pods restart at once (section 9), so only that fraction of clients reconnects; you can also close connections in batches over several seconds instead of all at once.
+- **Admission control**: rate-limit new connections per pod while it warms up.
+
+**Edge cases.** The SSE `retry:` value is a fixed delay per client with no built-in jitter; send a randomised value per client (`retry: 2000` to `retry: 8000`) if you rely on native EventSource reconnects.
+
+### Queue workers on shutdown ➕
+
+The bullet above says workers should stop fetching and rely on redelivery. Here's what that means concretely for the two common queue models, and where it goes wrong.
+
+#### Stop fetching, finish the current job, within a deadline ➕
+**Problem.** A Celery worker is processing a 2-minute video encode when SIGTERM arrives. The pod's grace period is 45 s.
+
+**Why it happens.** Celery treats SIGTERM as a **warm shutdown**: the worker stops consuming new tasks and **waits for active tasks to finish**, with **no built-in timeout**. If the task takes longer than the grace period, SIGKILL arrives mid-task. Worse, with Celery's default (early) acknowledgement the message was acked when the task started, so a task killed halfway is simply gone.
+
+**Mechanism.** Treat the grace period as the deadline, and design the task so being killed is safe: acknowledge **late**, so a task whose worker vanished is redelivered to another worker (RabbitMQ does it as soon as the dead worker's connection drops; Redis and SQS after the visibility timeout).
+
+```python title="worker_shutdown.py (Celery)"
+from celery import Celery
+from celery.signals import worker_shutting_down
+
+app = Celery("encode", broker=settings.broker_url)
+app.conf.update(
+    task_acks_late=True,                         # ack when the task finishes, not when it starts
+    task_reject_on_worker_lost=True,             # a task whose process was killed goes back on the queue
+    worker_prefetch_multiplier=1,                # don't sit on reserved messages while shutting down
+    broker_transport_options={"visibility_timeout": 3600},  # Redis/SQS: redeliver unacked tasks after 1 h
+)
+
+
+@worker_shutting_down.connect
+def on_shutdown(sig: str, how: str, exitcode: int, **_: object) -> None:
+    # warm shutdown: stop consuming, wait for active tasks. No time limit of its own:
+    # terminationGracePeriodSeconds is the deadline, and late acks make a SIGKILL recoverable.
+    log.warning("worker shutting down; unfinished tasks will be redelivered", signal=sig, how=how)
+```
+
+**Edge cases.** For jobs that routinely outlast any grace period, split them into **checkpointed steps** (encode segment by segment, storing progress), so a restart resumes instead of starting over.
+
+#### Releasing jobs instead of waiting for a timeout (SQS-style queues) ➕
+**Problem.** A worker on Amazon SQS received a batch of 10 messages, finished 3, and is shutting down. The other 7 stay invisible until their **visibility timeout** expires (say 15 minutes), so those tasks are delayed for no reason.
+
+**Why it happens.** With SQS, a received message is hidden from other consumers until it's deleted or its visibility timeout expires. A shutting-down worker that just exits leaves the hidden messages waiting out the timer.
+
+**Mechanism.** On shutdown, **hand back** what you won't process: set the visibility timeout of the unstarted messages to 0, which makes them visible to other consumers immediately.
+
+```python title="sqs_release.py"
+from itertools import batched
+from typing import Any
+
+
+def release_unstarted(sqs: Any, queue_url: str, msgs: list[dict[str, str]]) -> None:
+    """sqs is a boto3 SQS client; msgs are the received messages we won't process."""
+    for chunk in batched(msgs, 10):                                    # batch API takes up to 10 entries
+        sqs.change_message_visibility_batch(
+            QueueUrl=queue_url,
+            Entries=[
+                {"Id": m["MessageId"], "ReceiptHandle": m["ReceiptHandle"], "VisibilityTimeout": 0}
+                for m in chunk
+            ],
+        )
+```
+
+**Edge cases.** A message that was half-processed should usually **not** be released immediately if the processing has side effects you can't detect; letting the timeout expire gives any partial write time to settle. Either way the next attempt may repeat work, which is why consumers must be idempotent (see [14-task-queues-background-jobs](/docs/backend-first-principles/14-task-queues-background-jobs)).
+
+#### At-least-once means idempotent handlers ➕
+**Problem.** A job sends a welcome email, then the worker is killed before acknowledging it. The job is redelivered and the user gets two emails.
+
+**Why it happens.** "Do the work" and "acknowledge the message" are two separate steps on two separate systems. A crash between them is always possible, so every queue that never loses messages must sometimes deliver one twice.
+
+**Mechanism.** Record completion under a unique key in the same place the effect happens, and check it first: an `email_sent(job_id)` row inserted in the same transaction as the business write, or an idempotency key passed to the provider when it supports one. The same idea protects HTTP requests cut mid-flight (the payments bullet above; for retries and fault tolerance in general see [16-error-handling-fault-tolerance](/docs/backend-first-principles/16-error-handling-fault-tolerance)).
+
+---
+
+## 8. 🔧 Going deeper: the PID 1 trap in Docker
+
+`docker stop` sends **SIGTERM**, waits **10 s** by default, then sends **SIGKILL**. The signal goes to **PID 1** in the container. Two common ways to break this:
+
+```dockerfile title="Dockerfile"
+# BAD: shell form. PID 1 is /bin/sh, which does not forward SIGTERM to uvicorn
+CMD uvicorn app.main:app --host 0.0.0.0 --port 8080
+
+# ALSO RISKY: a start script that runs uvicorn as a child; sh stays PID 1 and doesn't forward signals
+# (if you need a script, end it with: exec uvicorn ...  so uvicorn replaces the shell)
+CMD ["./start.sh"]
+
+# GOOD: exec form, uvicorn itself is PID 1 and receives SIGTERM
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "65", "--timeout-graceful-shutdown", "15"]
+# or, to use the GracefulServer from section 7:  CMD ["python", "-m", "app.main"]
+```
+
+- With the bad forms, your handler **never runs**; after the timeout the container is SIGKILLed (exit 137) and nothing was drained.
+- A process running as PID 1 also gets **no default signal handling** from the kernel: with no handler registered, SIGTERM is simply ignored. uvicorn, gunicorn and Celery register handlers, so they're fine as PID 1, but a bare `python worker.py` that never calls `signal.signal(signal.SIGTERM, ...)` ignores SIGTERM and waits for the SIGKILL. Registering handlers, or running a tiny init with `docker run --init` (tini), fixes that and also reaps zombie processes.
+
+---
+
+## 9. 🔧 Going deeper: what Kubernetes actually does
+
+When a pod is deleted (rolling update, scale-down, node drain), two things happen **in parallel**:
+- the **kubelet** runs the container's `preStop` hook (if any), then sends **SIGTERM** to PID 1;
+- the **control plane removes the pod from the Service's endpoints**, and each node's kube-proxy, ingress controller or load balancer then has to **catch up**.
+
+Because they're parallel, SIGTERM can arrive **before** every router has stopped sending you traffic. If you close the listener immediately, those last requests get connection refused. The standard fix is a short **`preStop` sleep**, which delays SIGTERM until routing has converged.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant API as K8s API
+  participant EP as Endpoints / LB
+  participant K as kubelet
+  participant App as Pod (your app)
+  API->>EP: remove pod from endpoints (async)
+  API->>K: pod is terminating, grace period 30s starts
+  K->>App: run preStop hook (sleep 5)
+  Note over EP: routers converge, traffic to this pod stops
+  K->>App: SIGTERM
+  App->>App: readiness 503, stop accepting, drain in-flight
+  App->>App: close worker, DB pool, Redis (reverse order)
+  App-->>K: exit 0
+  Note over K,App: if still alive at 30s, SIGKILL`} />
+
+```yaml title="deployment.yaml (excerpt)"
+spec:
+  terminationGracePeriodSeconds: 45        # default is 30; covers preStop + your drain + cleanup
+  containers:
+    - name: api
+      lifecycle:
+        preStop:
+          exec: { command: ["sleep", "5"] } # needs a sleep binary in the image (not in distroless)
+      readinessProbe:
+        httpGet: { path: /readyz, port: 8080 }
+        periodSeconds: 2
+        failureThreshold: 1
+      livenessProbe:
+        httpGet: { path: /livez, port: 8080 }
+```
+
+Budget it: **preStop (5 s) + your drain deadline (25 s) + cleanup ≤ terminationGracePeriodSeconds**. The grace period clock **includes** the `preStop` hook, so a long hook eats your drain time.
+
+### Probe choreography across the pod's life ➕
+
+Shutdown is the last of three moments where health probes decide traffic. The lesson covers the end; a zero-downtime deploy also depends on how the **new** pod starts, because the old one is only removed once the new one is ready.
+
+#### Three probes, three different questions ➕
+**Problem.** Teams often point all probes at one `/health` endpoint that checks the database. During a DB blip every pod fails liveness, Kubernetes restarts all of them at once, and a 30-second database hiccup becomes a full outage.
+
+**Why it happens.** Each probe triggers a different action, so each must ask a different question:
+
+| Probe | Question | Action on failure | Should check |
+|---|---|---|---|
+| **startupProbe** | has the app finished booting? | keep waiting; kill only after the whole startup budget | the server is listening and init is done |
+| **readinessProbe** | should this pod get traffic **now**? | remove from Service endpoints, no restart | warm-up done, not shutting down, critical deps reachable |
+| **livenessProbe** | is the process stuck beyond repair? | **restart** the container | only the process itself (event loop responds), never dependencies |
+
+A dependency outage is not fixed by restarting your process, so dependencies never belong in liveness.
+
+**Mechanism.**
+
+```python title="health.py"
+import asyncio
+
+from fastapi import Response
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
+ready = False                                        # flipped once warm-up is complete
+
+
+async def ping_db() -> None:
+    async with engine.connect() as conn:
+        await conn.execute(text("select 1"))
+
+
+async def warm_up() -> None:                         # called from the lifespan, before the yield
+    global ready
+    await ping_db()                                  # open the first DB connections
+    await cache.preload()                            # fill hot caches before taking traffic
+    ready = True
+
+
+@app.get("/startupz")
+async def startupz() -> Response:
+    return Response(status_code=200 if ready else 503)
+
+
+@app.get("/readyz")
+async def readyz() -> Response:
+    if not ready or is_shutting_down():
+        return Response(status_code=503)
+    try:
+        async with asyncio.timeout(1):               # keep it cheap, with a timeout
+            await ping_db()
+    except (TimeoutError, SQLAlchemyError, OSError):
+        return Response(status_code=503)
+    return Response(status_code=200)
+
+
+@app.get("/livez")
+async def livez() -> Response:
+    return Response(status_code=200)                 # if this can't answer, the event loop is stuck
+```
+
+```yaml title="deployment.yaml (probes)"
+startupProbe:
+  httpGet: { path: /startupz, port: 8080 }
+  periodSeconds: 2
+  failureThreshold: 60          # up to 120 s to boot; liveness and readiness don't run until this passes
+readinessProbe:
+  httpGet: { path: /readyz, port: 8080 }
+  periodSeconds: 2
+  failureThreshold: 1
+livenessProbe:
+  httpGet: { path: /livez, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 3           # 30 s of no answer before a restart
+  timeoutSeconds: 2
+```
+
+#### The arithmetic of each probe ➕
+**Problem.** A slow-starting app (migrations check, large cache) gets restarted in a loop: liveness kills it before it ever finishes booting.
+
+**Why it happens.** Without a startup probe, liveness starts checking almost immediately. The time to act is roughly `periodSeconds × failureThreshold`. With 10 s × 3 the app has about 30 s to boot.
+
+**Mechanism.** Give boot time its own budget with `startupProbe` (2 s × 60 = 120 s above). Kubernetes holds off liveness and readiness until the startup probe succeeds once, so the liveness budget can stay short for the running phase.
+
+**Edge cases.**
+- **Readiness checking a shared dependency** can still remove **every** pod at once when that dependency fails, leaving zero endpoints. That can be the right answer (better a fast 503 from the LB than hung requests), but decide it consciously; some teams only check dependencies that are specific to the pod.
+- A heavy readiness check (a real query every 2 s from 50 pods) is load on the database; cache its result for a second or two.
+- During termination Kubernetes removes the pod from endpoints regardless of readiness; failing readiness in your handler mainly matters for **other** load balancers that use the same endpoint.
+
+### Rolling update maths ➕
+
+The `preStop` and grace period settings protect **one** pod. A deploy replaces **all** of them, and the rollout settings decide how much capacity you have while it happens.
+
+#### `maxSurge` and `maxUnavailable`: capacity during the rollout ➕
+**Problem.** A deployment runs 4 replicas at 70% CPU each. During a rollout, latency spikes and some requests time out, even though each pod shuts down gracefully.
+
+**Why it happens.** With the defaults (`maxSurge: 25%`, `maxUnavailable: 25%`), Kubernetes may take 1 of 4 pods out of service before its replacement is ready. The remaining 3 must carry the same traffic: 4 × 70% / 3 ≈ 93% each. Graceful shutdown doesn't add capacity; it only stops requests from being dropped.
+
+**Mechanism.** Calculate the worst moment of the rollout. For `replicas = N`:
+- minimum available pods = `N - maxUnavailable` (percentages round **down** for `maxUnavailable`);
+- maximum total pods = `N + maxSurge` (percentages round **up** for `maxSurge`).
+
+For services that run hot, use **surge-only** rollouts: never fewer pods than you need, at the cost of temporarily running extra ones.
+
+```yaml title="deployment.yaml (strategy)"
+spec:
+  replicas: 4
+  minReadySeconds: 10           # a new pod must stay ready 10 s before it counts as available
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1               # at most 5 pods during the rollout
+      maxUnavailable: 0         # never fewer than 4 ready pods
+```
+
+**Edge cases.** Surge needs spare room in the cluster; if the new pod can't be scheduled, the rollout stalls (Kubernetes marks it failed after `progressDeadlineSeconds`, 600 s by default). Surge also raises connections to the database, so the `pods × poolMax` budget from [17-configuration-management](/docs/backend-first-principles/17-configuration-management) must use the surge count.
+
+#### How long a rollout takes ➕
+**Mechanism.** With `maxSurge: 1, maxUnavailable: 0`, pods are replaced roughly one at a time, and each step waits for the new pod to start and pass readiness plus `minReadySeconds`. Old pods terminate in parallel with the next step, so their drain time mostly overlaps:
+
+```text
+rollout time ≈ (replicas / maxSurge) × (image pull + boot + readiness + minReadySeconds)
+example: 12 replicas, surge 1, 25 s per pod  →  about 5 minutes
+```
+
+**Edge cases.** A long rollout means two versions serve traffic side by side for that whole time; the API and database schema must be compatible both ways during it (expand-then-contract migrations).
+
+#### Node drains and PodDisruptionBudgets ➕
+**Problem.** A cluster upgrade drains a node that happens to run 3 of your 4 pods. They are evicted together, and the service drops to one pod.
+
+**Why it happens.** Rolling update settings only govern **your** deployments' rollouts. Evictions from `kubectl drain`, cluster autoscaler scale-downs and node upgrades are **voluntary disruptions** controlled by a different object.
+
+**Mechanism.** A **PodDisruptionBudget** tells the eviction API how many pods must stay available; evictions that would break it are refused until replacements are ready elsewhere. Each evicted pod still goes through the normal termination flow, so graceful shutdown applies.
+
+```yaml title="pdb.yaml"
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: api-pdb }
+spec:
+  minAvailable: 3
+  selector: { matchLabels: { app: api } }
+```
+
+**Edge cases.** A PDB that allows zero disruptions (`minAvailable` equal to the replica count) blocks node drains forever. It doesn't protect against involuntary failures (a node crashing); spreading pods across nodes and zones with topology spread constraints does.
+
+---
+
+## 10. Recap 🎓
+
+- Even with zero-downtime deploys, the old process must eventually stop. Doing it abruptly risks lost or **double-processed** transactions.
+- Every app runs as a **process** with a lifecycle; the OS asks it to stop through **signals**, received by **handlers** the app registers.
+- **SIGTERM** (programs: Kubernetes, systemd, supervisord) and **SIGINT** (Ctrl+C) are polite and catchable, so handle both the same way. **SIGKILL** can't be caught or ignored; it's what you get if you don't respect the polite ones.
+- Graceful shutdown = **stop accepting new work → finish in-flight work (connection draining) → clean up resources → exit**.
+- Draining needs a **timeout** (commonly 30 s), sized to your typical request duration, and coordination with **load balancers, health checks and service discovery**.
+- Clean up files, sockets, DB connections (commit or roll back transactions), temp files and caches, in **reverse order of acquisition**.
+- Frameworks give you the building blocks; understand **what** they do and **why**.
+- ➕ **Load balancers drain too**: order the timers so LB deregistration delay ≥ app drain ≥ slowest requests, grace period > preStop + drain + cleanup, and LB idle timeout below the app's keep-alive timeout.
+- ➕ **Long-lived connections** (WebSockets, SSE) never end on their own: track them, send a close frame or reconnect event, terminate stragglers, let clients resume from a last-seen ID, and add jitter to avoid reconnect storms.
+- ➕ **Queue workers**: stop fetching, finish the current job within the grace period (ack late so a killed job is redelivered), release unstarted messages (SQS visibility 0), and make handlers idempotent because delivery is at-least-once.
+- ➕ **Probes**: startup for boot time, readiness for "send me traffic", liveness only for a stuck process, never for dependencies.
+- ➕ **Rolling updates**: `maxSurge` and `maxUnavailable` set the capacity floor during a deploy; PodDisruptionBudgets protect against node drains.
+
+---
+
+## Interview questions
+
+1. **SIGTERM vs SIGINT vs SIGKILL?** **SIGTERM: polite termination request from programs (catchable). SIGINT: Ctrl+C, user-initiated (catchable, handle like SIGTERM). SIGKILL: immediate, can't be caught or ignored.**
+2. **What are the steps of a graceful shutdown?** **Stop accepting new connections, drain in-flight requests within a timeout, release resources in reverse order, exit.**
+3. **Why is there a shutdown timeout, and how do you choose it?** **So a stuck operation can't block shutdown forever. Size it from typical request duration: too short cuts real work, too long slows deploys. It must be under the orchestrator's grace period.**
+4. **Why clean up in reverse order of acquisition?** **Later resources depend on earlier ones (requests use the DB, jobs use Redis); tearing down a dependency first breaks work still using it.**
+5. **What happens to an open DB transaction if the process dies?** **It's rolled back once the DB detects the dead connection, but until then its locks block others. Commit or roll back explicitly and close the pool.**
+6. 🔧 **Your FastAPI app drains on SIGTERM, but Kubernetes pods still exit with 137. Why?** **Likely a shell-form CMD or a start script without `exec`, so uvicorn isn't PID 1 and never gets the signal; or the drain exceeds `terminationGracePeriodSeconds` (uvicorn waits without limit unless `--timeout-graceful-shutdown` is set).**
+7. 🔧 **Why do requests still fail during rolling updates even though uvicorn drains?** **Endpoint removal and SIGTERM happen in parallel; routers still send traffic briefly. Add a preStop sleep and fail readiness before closing the listener.**
+8. 🔧 **How do you avoid charging a customer twice when a server dies mid-payment?** **Idempotency keys stored with the result, so a retry returns the stored outcome instead of charging again.**
+9. 🔧 **Why might uvicorn's shutdown hang at "Waiting for connections to close"?** **Long-lived responses such as SSE streams never complete, and uvicorn waits without limit by default; end them yourself when shutdown starts, send `Connection: close`, and set `--timeout-graceful-shutdown` as a hard deadline.**
+10. ➕ **Clients behind an ALB get 502s during deploys even though the app drains. What do you check?** **Whether the app closes connections before the target's deregistration delay ends, and whether the LB idle timeout is shorter than the app's keep-alive timeout. Align the timers outside-in.**
+11. ➕ **How do you shut down a server holding 20,000 WebSockets?** **Track the sockets, send close code 1001 or 1012, wait briefly, terminate the rest, and have clients reconnect with jitter and resume from their last message ID.**
+12. ➕ **A worker is mid-job when SIGTERM arrives and the job outlasts the grace period. What happens and how do you design for it?** **The job is killed. With late acks it is redelivered (RabbitMQ when the connection drops, SQS or Redis after the visibility timeout); with Celery's default early ack it is lost. Use `task_acks_late` plus `task_reject_on_worker_lost`, treat the grace period as the deadline, checkpoint long jobs, release unstarted messages, and make handlers idempotent.**
+13. ➕ **Why must liveness probes not check the database?** **A DB blip would fail liveness on every pod and restart them all, turning a dependency hiccup into an outage. Restarting doesn't fix a dependency; that belongs in readiness at most.**
+14. ➕ **What is the startup probe for?** **It gives slow-booting apps their own time budget; liveness and readiness don't run until it passes, so liveness can stay strict afterwards.**
+15. ➕ **4 replicas at 70% CPU slow down during every rollout. Why, and what setting fixes it?** **The default `maxUnavailable: 25%` removes one pod before its replacement is ready, so 3 pods carry 4 pods of load. Use `maxSurge: 1, maxUnavailable: 0`.**
+16. ➕ **What protects your service when a node is drained for an upgrade?** **A PodDisruptionBudget, which limits voluntary evictions; rolling update settings only govern your own rollouts.**
+
+## Sources
+
+- [Lesson video: Graceful Shutdown (Sriniously)](https://youtu.be/6rfBgphiCWM)
+- [Linux man page: signal(7)](https://man7.org/linux/man-pages/man7/signal.7.html)
+- [Python: `signal` module](https://docs.python.org/3/library/signal.html)
+- [uvicorn: settings, `--timeout-graceful-shutdown` and `--timeout-keep-alive`](https://www.uvicorn.org/settings/#timeouts)
+- [FastAPI: Lifespan events](https://fastapi.tiangolo.com/advanced/events/)
+- [gunicorn: Signal handling (TERM vs INT/QUIT, `graceful_timeout`)](https://docs.gunicorn.org/en/stable/signals.html)
+- [Docker: `docker container stop`](https://docs.docker.com/reference/cli/docker/container/stop/)
+- [Docker: Dockerfile CMD (shell vs exec form)](https://docs.docker.com/reference/dockerfile/#cmd)
+- [Kubernetes: Pod lifecycle, termination of Pods](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)
+- [Kubernetes: Container lifecycle hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
+- [Google Cloud: Kubernetes best practices, terminating with grace](https://cloud.google.com/blog/products/containers-kubernetes/kubernetes-best-practices-terminating-with-grace)
+- ➕ [AWS: ALB target group attributes, deregistration delay](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html#deregistration-delay)
+- ➕ [AWS: ALB idle timeout](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-load-balancer-attributes.html#connection-idle-timeout)
+- ➕ [IANA: WebSocket close code registry (1001, 1012)](https://www.iana.org/assignments/websocket/websocket.xhtml#close-code-number)
+- ➕ [HTML Standard: Server-sent events (`id`, `retry`, `Last-Event-ID`)](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+- ➕ [AWS Architecture Blog: Exponential backoff and jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
+- ➕ [Celery: Stopping the worker (warm and cold shutdown)](https://docs.celeryq.dev/en/stable/userguide/workers.html#stopping-the-worker)
+- ➕ [Celery: `task_acks_late` and `task_reject_on_worker_lost`](https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-acks-late)
+- ➕ [Amazon SQS: Visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)
+- ➕ [Kubernetes: Configure liveness, readiness and startup probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+- ➕ [Kubernetes: Deployments, rolling update (`maxSurge`, `maxUnavailable`)](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-update-deployment)
+- ➕ [Kubernetes: Specifying a Disruption Budget](https://kubernetes.io/docs/tasks/run-application/configure-pdb/)

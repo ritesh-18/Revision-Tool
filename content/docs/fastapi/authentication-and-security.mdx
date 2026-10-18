@@ -1,0 +1,725 @@
+---
+title: "Authentication and security"
+description: "Authentication in FastAPI from first principles: the OAuth2 password flow with OAuth2PasswordBearer, argon2 password hashing with pwdlib, issuing and verifying JWTs with PyJWT, a get_current_user dependency chain, scopes and roles, API keys, refresh token rotation, CORS vs auth, and the security traps (timing attacks, alg=none, secrets, expiry), with real 401 and 403 responses."
+---
+
+Authentication answers **who is calling**. Authorization answers **what they may do**. FastAPI doesn't ship an auth system. It ships **building blocks** (`OAuth2PasswordBearer`, `APIKeyHeader`, `Security`, `SecurityScopes`) that plug into [dependency injection](/docs/fastapi/dependency-injection) and OpenAPI. You assemble the rest from a password hasher and a JWT library. This chapter builds a complete, working setup and shows what each piece defends against.
+
+All snippets were run on **CPython 3.14.6** with **FastAPI 0.143.0**, **PyJWT 2.15.1** and **pwdlib 0.3.1** (argon2). For the language-agnostic theory (sessions vs tokens, OAuth flows, RBAC), read [Authentication and authorization](/docs/backend-first-principles/08-authentication-authorization) first.
+
+## The flow we're building
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant T as POST /token
+  participant A as Protected endpoint
+  C->>T: form fields username, password, scope
+  T->>T: verify argon2 hash
+  T-->>C: access token 15 min, refresh token 7 days
+  C->>A: Authorization: Bearer access token
+  A->>A: OAuth2PasswordBearer reads header
+  A->>A: get_current_user decodes JWT, checks exp and scopes
+  A-->>C: 200, or 401 / 403
+  C->>T: POST /refresh with refresh token
+  T-->>C: new pair, old refresh token now dead`} />
+
+- **401 Unauthorized** means "I don't know who you are": the token is missing, malformed, forged or expired. The response should carry a `WWW-Authenticate` header that says which scheme to use.
+- **403 Forbidden** means "I know who you are, and you can't do this": a missing scope, wrong role or disabled account. Retrying with the same credentials won't help.
+
+## Password hashing with pwdlib and argon2
+
+Never store passwords. Store a **slow, salted hash** of each password, and verify by hashing the attempt the same way.
+
+```python
+import time
+from pwdlib import PasswordHash
+
+password_hash = PasswordHash.recommended()
+print(password_hash.hashers)
+
+h1 = password_hash.hash("correct horse battery staple")
+h2 = password_hash.hash("correct horse battery staple")
+print(h1)
+print("same password, same hash?", h1 == h2)
+print("verify right:", password_hash.verify("correct horse battery staple", h1))
+print("verify wrong:", password_hash.verify("Correct horse battery staple", h1))
+
+t0 = time.perf_counter()
+for _ in range(10):
+    password_hash.verify("correct horse battery staple", h1)
+print(f"one verify ~ {(time.perf_counter() - t0) / 10 * 1000:.0f} ms")
+
+valid, new_hash = password_hash.verify_and_update("correct horse battery staple", h1)
+print("verify_and_update:", valid, new_hash)
+```
+
+```text title="Output"
+(<pwdlib.hashers.argon2.Argon2Hasher object at 0x0000039590594C90>,)
+$argon2id$v=19$m=65536,t=3,p=4$HlLnjtmtqL8Eah5cBfzY1Q$a7akarcPCCRzV4U9k//e9qOaROqiFqdVvCh+SdbCB3M
+same password, same hash? False
+verify right: True
+verify wrong: False
+one verify ~ 45 ms
+verify_and_update: True None
+```
+
+Read the hash string field by field. It's self-describing:
+
+| Part | Meaning |
+|---|---|
+| `$argon2id` | algorithm: Argon2id, the winner of the Password Hashing Competition |
+| `v=19` | algorithm version |
+| `m=65536,t=3,p=4` | 64 MiB of memory, 3 passes, 4 lanes. These are the **cost** parameters |
+| `HlLnjtmt...` | a random 16-byte **salt**, different for every hash |
+| `a7akarcP...` | the derived hash |
+
+Why each property matters:
+
+- **The salt** makes two identical passwords hash differently (`same hash? False`), so an attacker can't use precomputed tables or spot users who share a password.
+- **Slowness** is the point. At about 45 ms per guess, an attacker with your database dump can try a few dozen passwords per second per core, instead of billions with SHA-256. **Memory hardness** (64 MiB per attempt) also makes GPU and ASIC cracking expensive.
+- **Parameters in the string** let you raise the cost later. `verify_and_update` returns a new hash when the stored one uses outdated parameters (here `None`, because it's current), so you can upgrade hashes transparently at login.
+
+pwdlib replaced passlib in FastAPI's docs because passlib is unmaintained and breaks on recent Python and bcrypt versions.
+
+<Callout type="warn">
+A 45 ms CPU-bound call inside an `async def` endpoint **blocks the event loop** for 45 ms, stalling every other request on that worker. Make the login endpoint a plain `def` (FastAPI runs it in the threadpool), or wrap the call with `await run_in_threadpool(password_hash.verify, ...)`. See [asyncio](/docs/python/asyncio) for why.
+</Callout>
+
+## JWTs with PyJWT
+
+A **JSON Web Token** is three base64url segments joined by dots: `header.payload.signature`. The signature is an HMAC (or RSA/ECDSA signature) over the first two segments. Anyone can **read** a JWT. Only the holder of the key can **create** one that verifies.
+
+```python
+import base64, json
+from datetime import datetime, timedelta, timezone
+import jwt
+
+SECRET = "a-32-byte-or-longer-random-secret-from-env!"
+now = datetime.now(timezone.utc)
+token = jwt.encode(
+    {"sub": "42", "scope": "items:read", "iat": now, "exp": now + timedelta(minutes=15)},
+    SECRET, algorithm="HS256",
+)
+print(token)
+
+def b64(part):
+    return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+
+header, payload, signature = token.split(".")
+print("header :", b64(header))
+print("payload:", b64(payload))
+print("decoded:", jwt.decode(token, SECRET, algorithms=["HS256"]))
+```
+
+```text title="Output"
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsInNjb3BlIjoiaXRlbXM6cmVhZCIsImlhdCI6MTc5MTg5MDk2MiwiZXhwIjoxNzkxODkxODYyfQ.DjE3soziN0h9oJXPAFLGfPqKmGjbryPake8kCDS3aDQ
+header : {'alg': 'HS256', 'typ': 'JWT'}
+payload: {'sub': '42', 'scope': 'items:read', 'iat': 1791890962, 'exp': 1791891862}
+decoded: {'sub': '42', 'scope': 'items:read', 'iat': 1791890962, 'exp': 1791891862}
+```
+
+The payload decoded with plain base64, no key needed. **A JWT is signed, not encrypted.** Never put secrets, passwords or personal data in it. PyJWT converted the `datetime` values to Unix timestamps (`exp` is 900 seconds after `iat`).
+
+Standard claims you'll use:
+
+| Claim | Meaning |
+|---|---|
+| `sub` | subject: the user ID, as a **string** |
+| `exp` | expiry, checked automatically by `jwt.decode` |
+| `iat` | issued-at |
+| `jti` | unique token ID, used for revocation lists and refresh rotation |
+| `aud` / `iss` | audience and issuer, checked when you pass `audience=` / `issuer=` |
+
+### What verification rejects
+
+```python
+def attempt(label, fn):
+    try:
+        print(label, "->", fn())
+    except jwt.PyJWTError as e:
+        print(label, "->", type(e).__name__ + ":", e)
+
+# 1. tampered payload: change sub to "1" and keep the old signature
+evil_payload = base64.urlsafe_b64encode(json.dumps(
+    {**b64(payload), "sub": "1"}).encode()).rstrip(b"=").decode()
+attempt("tampered", lambda: jwt.decode(f"{header}.{evil_payload}.{signature}", SECRET, algorithms=["HS256"]))
+# 2. wrong secret
+attempt("wrong key", lambda: jwt.decode(token, "another-secret-that-is-long-enough!!", algorithms=["HS256"]))
+# 3. expired
+old = jwt.encode({"sub": "42", "exp": now - timedelta(seconds=1)}, SECRET, algorithm="HS256")
+attempt("expired", lambda: jwt.decode(old, SECRET, algorithms=["HS256"]))
+# 4. alg=none
+none_token = jwt.encode({"sub": "1"}, None, algorithm="none")
+print("none token:", none_token)
+attempt("alg none", lambda: jwt.decode(none_token, SECRET, algorithms=["HS256"]))
+attempt("no algorithms arg", lambda: jwt.decode(token, SECRET))
+# 5. missing exp is accepted unless required
+noexp = jwt.encode({"sub": "42"}, SECRET, algorithm="HS256")
+attempt("no exp", lambda: jwt.decode(noexp, SECRET, algorithms=["HS256"]))
+attempt("no exp, required", lambda: jwt.decode(noexp, SECRET, algorithms=["HS256"],
+                                               options={"require": ["exp", "sub"]}))
+# 6. short key
+attempt("short key", lambda: jwt.encode({"sub": "1"}, "secret", algorithm="HS256"))
+# 7. leeway
+attempt("expired w/ leeway", lambda: jwt.decode(old, SECRET, algorithms=["HS256"], leeway=10))
+```
+
+```text title="Output"
+tampered -> InvalidSignatureError: Signature verification failed
+wrong key -> InvalidSignatureError: Signature verification failed
+expired -> ExpiredSignatureError: Signature has expired
+none token: eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxIn0.
+alg none -> InvalidAlgorithmError: The specified alg value is not allowed
+no algorithms arg -> DecodeError: It is required that you pass in a value for the "algorithms" argument when calling decode().
+no exp -> {'sub': '42'}
+no exp, required -> MissingRequiredClaimError: Token is missing the "exp" claim
+short key -> eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.8qZF8vbN3UpcanXFc-mPXJkOPN01-bRch8XX3rToP1U
+expired w/ leeway -> {'sub': '42', 'exp': 1791890961}
+```
+
+```text title="Output (stderr, from the short key line)"
+InsecureKeyLengthWarning: The HMAC key is 6 bytes long, which is below the minimum recommended length of 32 bytes for SHA256. See RFC 7518 Section 3.2.
+```
+
+Each line is a defence:
+
+- **Tampering fails** because the signature covers the exact bytes of header and payload.
+- **`alg=none`** is the most famous JWT attack. The token's header says "no signature", and the signature segment is empty. Libraries that trusted the header's `alg` accepted it. PyJWT refuses unless `"none"` is in **your** `algorithms` list, and it **requires** that list. Always pass a fixed list, never the algorithm read from the token.
+- **A token without `exp` is valid forever** unless you require the claim. Use `options={"require": ["exp", "sub"]}`.
+- **Short HMAC keys** only warn. A 6-byte secret can be brute-forced offline from any token you've issued. Generate one with `secrets.token_urlsafe(32)` or longer.
+- **`leeway`** tolerates small clock differences between servers. Keep it to seconds.
+
+<Callout title="HS256 vs RS256">
+HS256 uses one shared secret for signing **and** verifying, so every service that verifies tokens can also mint them. With RS256 or ES256, the auth service signs with a private key and everyone else verifies with the public key (often fetched from a JWKS URL). Use HS256 inside a single service, and asymmetric keys when other services or third parties verify your tokens.
+</Callout>
+
+## The complete auth app
+
+The pieces fit together in one module: settings, a user store, token helpers, the security dependencies, and the endpoints.
+
+### Settings, users and login
+
+```python
+import hashlib
+import os
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, Security, status
+from fastapi.security import (
+    APIKeyHeader,
+    OAuth2PasswordBearer,
+    OAuth2PasswordRequestForm,
+    SecurityScopes,
+)
+from pwdlib import PasswordHash
+from pydantic import BaseModel
+
+# ---- settings (from the environment in real life) -------------------------
+SECRET_KEY = os.environ.get("JWT_SECRET", "dev-only-" + "x" * 40)
+ALGORITHM = "HS256"
+ACCESS_TTL = timedelta(minutes=15)
+REFRESH_TTL = timedelta(days=7)
+
+password_hash = PasswordHash.recommended()       # argon2id
+
+# ---- fake user store ------------------------------------------------------
+class User(BaseModel):
+    id: int
+    username: str
+    role: str
+    scopes: list[str]
+    disabled: bool = False
+
+class UserInDB(User):
+    hashed_password: str
+
+USERS = {
+    "alice": UserInDB(id=1, username="alice", role="admin",
+                      scopes=["items:read", "items:write"],
+                      hashed_password=password_hash.hash("wonderland")),
+    "bob": UserInDB(id=2, username="bob", role="member", scopes=["items:read"],
+                    hashed_password=password_hash.hash("builder")),
+}
+DUMMY_HASH = password_hash.hash("dummy password for timing")
+
+
+def authenticate(username: str, password: str) -> UserInDB | None:
+    user = USERS.get(username)
+    if user is None:
+        password_hash.verify(password, DUMMY_HASH)   # same cost as a real check
+        return None
+    if not password_hash.verify(password, user.hashed_password):
+        return None
+    return user
+```
+
+The `DUMMY_HASH` line defends against **user enumeration by timing**. Without it, "unknown user" returns in microseconds and "wrong password" takes 45 ms, so an attacker can tell which usernames exist just by timing the login endpoint. With it, both paths cost one argon2 verify. Both also return the **same message**.
+
+### Issuing tokens
+
+```python
+REFRESH_STORE: dict[str, dict] = {}              # jti -> {"user": ..., "used": bool}
+
+
+def create_access_token(user: UserInDB, scopes: list[str]) -> str:
+    now = datetime.now(timezone.utc)
+    claims = {"sub": str(user.id), "username": user.username, "scope": " ".join(scopes),
+              "type": "access", "iat": now, "exp": now + ACCESS_TTL}
+    return jwt.encode(claims, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token(user: UserInDB) -> str:
+    now = datetime.now(timezone.utc)
+    jti = str(uuid.uuid4())
+    REFRESH_STORE[jti] = {"user": user.username, "used": False}
+    claims = {"sub": str(user.id), "type": "refresh", "jti": jti,
+              "iat": now, "exp": now + REFRESH_TTL}
+    return jwt.encode(claims, SECRET_KEY, algorithm=ALGORITHM)
+
+
+class TokenPair(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+```
+
+The `type` claim matters. Both tokens are signed with the same key, so without it a refresh token (valid for 7 days) could be presented as an access token. In production, `REFRESH_STORE` is a database table or Redis.
+
+### `OAuth2PasswordBearer` and `get_current_user`
+
+`OAuth2PasswordBearer` is a class whose instances are dependencies. Calling it with the request does very little: it reads the `Authorization` header, checks that it starts with `Bearer `, and returns the rest of the string. If the header is missing, it raises a 401. It **doesn't validate the token**. That's your job. Its other purpose is OpenAPI: it registers an OAuth2 password-flow security scheme, which gives Swagger UI its "Authorize" button.
+
+```python
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="token",
+    scopes={"items:read": "Read items", "items:write": "Create items"},
+)
+
+
+def credentials_error(detail: str, scopes: SecurityScopes) -> HTTPException:
+    auth = f'Bearer scope="{scopes.scope_str}"' if scopes.scopes else "Bearer"
+    return HTTPException(status.HTTP_401_UNAUTHORIZED, detail=detail,
+                         headers={"WWW-Authenticate": auth})
+
+
+async def get_current_user(
+    security_scopes: SecurityScopes,
+    token: Annotated[str, Depends(oauth2_scheme)],
+) -> User:
+    try:
+        claims = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM],
+                            options={"require": ["exp", "sub"]})
+    except jwt.ExpiredSignatureError:
+        raise credentials_error("Token expired", security_scopes)
+    except jwt.PyJWTError:
+        raise credentials_error("Could not validate credentials", security_scopes)
+    if claims.get("type") != "access":
+        raise credentials_error("Not an access token", security_scopes)
+    user = USERS.get(claims.get("username", ""))
+    if user is None or str(user.id) != claims["sub"]:
+        raise credentials_error("User not found", security_scopes)
+    if user.disabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Inactive user")
+    granted = set(claims["scope"].split())
+    for scope in security_scopes.scopes:
+        if scope not in granted:
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                detail=f"Missing scope: {scope}")
+    return User(**user.model_dump())
+
+
+CurrentUser = Annotated[User, Security(get_current_user)]
+```
+
+The dependency chain is:
+
+<Mermaid chart={`flowchart BT
+  H["Authorization header"] --> B["oauth2_scheme<br/>extract bearer string"]
+  B --> G["get_current_user<br/>decode JWT, load user, check scopes"]
+  SS["SecurityScopes<br/>scopes required by this route"] --> G
+  G --> R["require_role admin<br/>check role"]
+  G --> E1["GET /users/me"]
+  G --> E2["POST /items with scope items:write"]
+  R --> E3["GET /admin/stats"]`} />
+
+Note what `get_current_user` returns: a `User` **without** `hashed_password`. Even if an endpoint forgets a response model, the hash can't leak.
+
+Loading the user from storage on every request (here a dict, in practice a DB query or cache) is what lets you **disable** an account immediately. A purely stateless check (trusting the claims alone) would keep accepting a fired employee's token until it expires.
+
+### Roles and scopes
+
+Scopes come from the token and describe what this **token** may do. Roles come from the user record and describe what this **person** is. A role check is just another dependency, built by a factory:
+
+```python
+def require_role(*roles: str):
+    async def checker(user: CurrentUser) -> User:
+        if user.role not in roles:
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                detail=f"Requires role: {' or '.join(roles)}")
+        return user
+    return checker
+```
+
+### Endpoints
+
+```python
+app = FastAPI()
+
+
+@app.post("/token", response_model=TokenPair)
+def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
+    user = authenticate(form.username, form.password)
+    if user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                            detail="Incorrect username or password",
+                            headers={"WWW-Authenticate": "Bearer"})
+    # grant only scopes that were requested AND that the user actually has
+    scopes = [s for s in form.scopes if s in user.scopes] or user.scopes
+    return TokenPair(access_token=create_access_token(user, scopes),
+                     refresh_token=create_refresh_token(user))
+
+
+@app.get("/users/me", response_model=User)
+async def me(user: CurrentUser):
+    return user
+
+
+@app.get("/items")
+async def read_items(user: Annotated[User, Security(get_current_user, scopes=["items:read"])]):
+    return [{"id": 1, "owner": user.username}]
+
+
+@app.post("/items", status_code=201)
+async def create_item(user: Annotated[User, Security(get_current_user, scopes=["items:write"])]):
+    return {"created_by": user.username}
+
+
+@app.get("/admin/stats")
+async def admin_stats(user: Annotated[User, Depends(require_role("admin"))]):
+    return {"users": len(USERS), "viewer": user.username}
+```
+
+Two details:
+
+- `login` is a plain `def`, so the 45 ms argon2 verify runs in the threadpool, off the event loop.
+- `OAuth2PasswordRequestForm` reads **form fields** (`username`, `password`, `scope`), because the OAuth2 spec requires `application/x-www-form-urlencoded` for this flow. It needs the `python-multipart` package. `form.scopes` is the space-separated `scope` field split into a list. The client may ask for fewer scopes than it's entitled to (least privilege), but never more.
+
+### Real responses
+
+A test script calls the app with `TestClient` and prints status, body and the `WWW-Authenticate` header:
+
+```python
+client = TestClient(app)
+
+def show(label, r):
+    www = r.headers.get("www-authenticate")
+    extra = f"  WWW-Authenticate: {www}" if www else ""
+    print(f"{label}: {r.status_code} {r.json()}{extra}")
+
+def login(username, password, scope=""):
+    return client.post("/token", data={"username": username, "password": password, "scope": scope})
+
+show("wrong password", login("alice", "nope"))
+show("unknown user", login("mallory", "x"))
+r = login("bob", "builder")
+print("bob login:", r.status_code, list(r.json()))
+claims = jwt.decode(r.json()["access_token"], options={"verify_signature": False})
+print("access claims:", {k: claims[k] for k in ("sub", "username", "scope", "type")})
+```
+
+```text title="Output"
+wrong password: 401 {'detail': 'Incorrect username or password'}  WWW-Authenticate: Bearer
+unknown user: 401 {'detail': 'Incorrect username or password'}  WWW-Authenticate: Bearer
+bob login: 200 ['access_token', 'refresh_token', 'token_type']
+access claims: {'sub': '2', 'username': 'bob', 'scope': 'items:read', 'type': 'access'}
+```
+
+(`verify_signature: False` is used here only to **inspect** a token in a test. Never use it to authenticate.)
+
+Now the protected endpoints, with a range of good and bad tokens:
+
+```python
+H = lambda t: {"Authorization": f"Bearer {t}"}
+show("no token        GET /users/me", client.get("/users/me"))
+show("garbage token   GET /users/me", client.get("/users/me", headers=H("abc.def.ghi")))
+show("bob             GET /users/me", client.get("/users/me", headers=H(bob)))
+show("bob             GET /items", client.get("/items", headers=H(bob)))
+show("bob             POST /items", client.post("/items", headers=H(bob)))
+show("alice           POST /items", client.post("/items", headers=H(alice)))
+show("bob             GET /admin/stats", client.get("/admin/stats", headers=H(bob)))
+show("alice           GET /admin/stats", client.get("/admin/stats", headers=H(alice)))
+show("no token        POST /items", client.post("/items"))
+# expired: a correctly signed token whose exp is in the past
+show("expired token   GET /items", client.get("/items", headers=H(expired)))
+# forged: jwt.encode({... "username": "alice", "scope": "items:write" ...}, None, algorithm="none")
+show("alg=none forged POST /items", client.post("/items", headers=H(forged)))
+# alice logs in asking only for items:read
+show("alice read-only POST /items", client.post("/items", headers=H(alice_ro)))
+```
+
+```text title="Output"
+no token        GET /users/me: 401 {'detail': 'Not authenticated'}  WWW-Authenticate: Bearer
+garbage token   GET /users/me: 401 {'detail': 'Could not validate credentials'}  WWW-Authenticate: Bearer
+bob             GET /users/me: 200 {'id': 2, 'username': 'bob', 'role': 'member', 'scopes': ['items:read'], 'disabled': False}
+bob             GET /items: 200 [{'id': 1, 'owner': 'bob'}]
+bob             POST /items: 403 {'detail': 'Missing scope: items:write'}
+alice           POST /items: 201 {'created_by': 'alice'}
+bob             GET /admin/stats: 403 {'detail': 'Requires role: admin'}
+alice           GET /admin/stats: 200 {'users': 2, 'viewer': 'alice'}
+no token        POST /items: 401 {'detail': 'Not authenticated'}  WWW-Authenticate: Bearer
+expired token   GET /items: 401 {'detail': 'Token expired'}  WWW-Authenticate: Bearer scope="items:read"
+alg=none forged POST /items: 401 {'detail': 'Could not validate credentials'}  WWW-Authenticate: Bearer scope="items:write"
+alice read-only POST /items: 403 {'detail': 'Missing scope: items:write'}
+```
+
+The pattern to notice: **every identity failure is a 401** with a `WWW-Authenticate` challenge, and **every permission failure is a 403**. "No token" came from `OAuth2PasswordBearer` itself, before your code ran. The last line shows least privilege: alice is an admin, but this particular token was issued only with `items:read`.
+
+The scheme and the per-route scopes also appear in OpenAPI:
+
+```python
+schema = app.openapi()
+print(json.dumps(schema["components"]["securitySchemes"]["OAuth2PasswordBearer"], indent=2))
+print(schema["paths"]["/items"]["post"]["security"])
+```
+
+```text title="Output"
+{
+  "type": "oauth2",
+  "flows": {
+    "password": {
+      "scopes": {
+        "items:read": "Read items",
+        "items:write": "Create items"
+      },
+      "tokenUrl": "token"
+    }
+  }
+}
+[{'OAuth2PasswordBearer': ['items:write']}]
+```
+
+## API keys via header
+
+Machine clients (cron jobs, partner integrations, internal services) often use a long random **API key** instead of a user login:
+
+```python
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+# store only a hash of each key, like a password (keys are long and random,
+# so a fast hash is fine here)
+API_KEYS = {hashlib.sha256(b"sk_live_reporting_9f8e7d6c5b4a").hexdigest(): "reporting-service"}
+
+
+async def get_api_client(key: Annotated[str | None, Depends(api_key_header)]) -> str:
+    if key is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing API key",
+                            headers={"WWW-Authenticate": "ApiKey"})
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    for stored, client in API_KEYS.items():
+        if secrets.compare_digest(digest, stored):
+            return client
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid API key",
+                        headers={"WWW-Authenticate": "ApiKey"})
+
+
+@app.get("/reports/daily")
+async def daily_report(client: Annotated[str, Depends(get_api_client)]):
+    return {"report": "ok", "client": client}
+```
+
+```text title="Output"
+no key   : 401 {'detail': 'Missing API key'}  WWW-Authenticate: ApiKey
+bad key  : 401 {'detail': 'Invalid API key'}  WWW-Authenticate: ApiKey
+good key : 200 {'report': 'ok', 'client': 'reporting-service'}
+```
+
+Design notes:
+
+- **Store a hash, not the key.** A leaked database then doesn't leak working keys. Unlike passwords, API keys have about 128+ bits of randomness, so a fast SHA-256 is enough. Brute-forcing is impossible either way, and you avoid 45 ms of argon2 on every request.
+- **Prefix keys** (`sk_live_`, `sk_test_`) so secret scanners such as GitHub's can recognise them in leaked code, and so humans can tell environments apart.
+- `auto_error=False` makes the dependency return `None` instead of raising, so you control the error (and can fall back to another scheme). With the default `auto_error=True`, FastAPI 0.143 returns `401 {"detail": "Not authenticated"}` for a missing key.
+- Real systems keep keys in a database with an owner, scopes, created/last-used timestamps and a revoked flag. Index by a non-secret key prefix and compare only the hash, instead of looping.
+
+## Refresh tokens
+
+Short-lived access tokens (5 to 15 minutes) limit the damage of a stolen token, but logging in every 15 minutes is unacceptable. A **refresh token** is a long-lived credential whose only power is to get a new access token. It goes only to the refresh endpoint, never to every API call, so it's exposed far less often.
+
+**Rotation** makes refresh tokens safer still: each refresh token works **once**. Using it returns a new pair and kills the old one. If an old refresh token is ever presented again, either the legitimate client or a thief already used it, and the server can't tell which. So it revokes the whole family and forces a fresh login.
+
+```python
+class RefreshIn(BaseModel):
+    refresh_token: str
+
+
+@app.post("/refresh", response_model=TokenPair)
+def refresh(body: RefreshIn):
+    error = HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid refresh token",
+                          headers={"WWW-Authenticate": "Bearer"})
+    try:
+        claims = jwt.decode(body.refresh_token, SECRET_KEY, algorithms=[ALGORITHM],
+                            options={"require": ["exp", "sub", "jti"]})
+    except jwt.PyJWTError:
+        raise error
+    record = REFRESH_STORE.get(claims["jti"])
+    if claims.get("type") != "refresh" or record is None:
+        raise error
+    if record["used"]:
+        # reuse of a rotated token: assume theft, revoke every token of this user
+        for r in REFRESH_STORE.values():
+            if r["user"] == record["user"]:
+                r["used"] = True
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token reuse detected",
+                            headers={"WWW-Authenticate": "Bearer"})
+    record["used"] = True                          # rotation: one use per refresh token
+    user = USERS[record["user"]]
+    return TokenPair(access_token=create_access_token(user, user.scopes),
+                     refresh_token=create_refresh_token(user))
+```
+
+```python
+pair1 = login("bob", "builder").json()
+r = client.post("/refresh", json={"refresh_token": pair1["refresh_token"]})
+print("refresh #1:", r.status_code, list(r.json()))
+pair2 = r.json()
+show("reuse old refresh token", client.post("/refresh", json={"refresh_token": pair1["refresh_token"]}))
+show("new token after reuse  ", client.post("/refresh", json={"refresh_token": pair2["refresh_token"]}))
+show("access token as refresh", client.post("/refresh", json={"refresh_token": pair2["access_token"]}))
+show("refresh token as access", client.get("/users/me",
+     headers={"Authorization": f"Bearer {pair2['refresh_token']}"}))
+```
+
+```text title="Output"
+refresh #1: 200 ['access_token', 'refresh_token', 'token_type']
+reuse old refresh token: 401 {'detail': 'Refresh token reuse detected'}  WWW-Authenticate: Bearer
+new token after reuse  : 401 {'detail': 'Refresh token reuse detected'}  WWW-Authenticate: Bearer
+access token as refresh: 401 {'detail': 'Invalid refresh token'}  WWW-Authenticate: Bearer
+refresh token as access: 401 {'detail': 'Not an access token'}  WWW-Authenticate: Bearer
+```
+
+The second line is the theft scenario: the old token was replayed, so even the **new** token (line three) stopped working. The last two lines show why the `type` claim exists.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Active : issued at login or refresh
+  Active --> Used : presented once, new pair issued
+  Used --> FamilyRevoked : presented again, reuse detected
+  Active --> FamilyRevoked : sibling token reused
+  Active --> Expired : exp passes
+  FamilyRevoked --> [*]
+  Expired --> [*]`} />
+
+Because refresh tokens are **stateful** (the server keeps a record per `jti`), logout is simple: mark the user's refresh records as revoked. The access tokens already issued remain valid until they expire, which is why their lifetime must be short. If you need instant revocation of access tokens too, keep a deny-list of `jti` values in Redis until their `exp`, or check a per-user "tokens valid after" timestamp on each request.
+
+<Callout title="Where should a browser keep tokens?">
+For browser apps, put the refresh token in an **`HttpOnly`, `Secure`, `SameSite=Strict` cookie** scoped to the refresh path, where JavaScript (and therefore XSS) can't read it, and keep the access token in memory. Cookies bring CSRF back into play, so `SameSite` and a CSRF token matter then. `localStorage` is readable by any script on the page. [Backend security](/docs/backend-first-principles/20-backend-security) covers XSS and CSRF in depth.
+</Callout>
+
+## CORS is not authentication
+
+CORS confuses people because a CORS error looks like an auth error in the browser console. They are unrelated:
+
+- **Authentication** is the **server** deciding whether the caller is allowed.
+- **CORS** is the **browser** deciding whether JavaScript from origin A may **read** a response from origin B. The server only *advises* through `Access-Control-*` headers. curl, Postman, mobile apps and other servers ignore CORS completely.
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.example.com"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=True,
+)
+
+@app.get("/items")
+def items(authorization: str | None = Header(default=None)):
+    if authorization != "Bearer good":
+        raise HTTPException(401, "Not authenticated", headers={"WWW-Authenticate": "Bearer"})
+    return ["secret item"]
+```
+
+```text title="Output"
+1. preflight from allowed origin
+   200 OK {'access-control-allow-methods': 'GET, POST', 'access-control-max-age': '600', 'access-control-allow-headers': 'Accept, Accept-Language, Authorization, Content-Language, Content-Type', 'access-control-allow-credentials': 'true', 'access-control-allow-origin': 'https://app.example.com'}
+2. preflight from evil origin
+   400 Disallowed CORS origin {'access-control-allow-methods': 'GET, POST', 'access-control-max-age': '600', 'access-control-allow-headers': 'Accept, Accept-Language, Authorization, Content-Language, Content-Type', 'access-control-allow-credentials': 'true'}
+3. real GET from evil origin, with a valid token
+   200 ['secret item'] {'access-control-allow-credentials': 'true'}
+4. allowed origin, no token
+   401 {'detail': 'Not authenticated'} {'access-control-allow-credentials': 'true', 'access-control-allow-origin': 'https://app.example.com'}
+```
+
+Look at case 3. A request claiming to come from `https://evil.example` **ran the endpoint and got a 200 with the secret**. The middleware only withheld `Access-Control-Allow-Origin`, which tells a *browser* to hide the response from the page's JavaScript. Any non-browser client reads it fine. CORS protects **users' browsers** from malicious pages that would ride on the user's cookies. It does not protect your API from callers.
+
+Also note:
+
+- **Preflight** (`OPTIONS`) requests carry no `Authorization` header by design. `CORSMiddleware` answers them before routing, so your auth dependency never sees them. Don't require auth on `OPTIONS`.
+- Case 4: a 401 still gets CORS headers. If it didn't, the browser would report a misleading "CORS error" and hide the real 401 from your frontend code.
+- `allow_origins=["*"]` with `allow_credentials=True` is not allowed by the CORS spec. Starlette handles it by echoing the request's origin, which effectively allows **every** site to make credentialed requests. List origins explicitly.
+
+## Security traps
+
+### Timing-safe comparison
+
+`==` on strings stops at the first differing character, so its running time leaks **how much** of a guess was correct. With enough samples, an attacker can recover a secret byte by byte. The effect is exaggerated here with a 1 MB secret so it's visible:
+
+```python
+import secrets, timeit
+secret = "s" * 1_000_000
+early = "x" + "s" * 999_999          # differs at the first byte
+late = "s" * 999_999 + "x"           # differs at the last byte
+n = 2000
+for name, fn in [("==", lambda a: a == secret),
+                 ("compare_digest", lambda a: secrets.compare_digest(a, secret))]:
+    t_early = timeit.timeit(lambda: fn(early), number=n) / n * 1e6
+    t_late = timeit.timeit(lambda: fn(late), number=n) / n * 1e6
+    print(f"{name:15} first byte wrong: {t_early:7.2f} us   last byte wrong: {t_late:7.2f} us")
+```
+
+```text title="Output"
+==              first byte wrong:    0.08 us   last byte wrong:   35.47 us
+compare_digest  first byte wrong:  495.96 us   last byte wrong:  477.56 us
+```
+
+`==` is about 400 times faster when the first byte is wrong. `secrets.compare_digest` (the same function as `hmac.compare_digest`) takes the same time wherever the difference is. Use it for API keys, webhook signatures, CSRF tokens, reset codes and anything else secret. PyJWT and pwdlib already compare in constant time internally.
+
+### The rest of the list
+
+- **`alg=none` and algorithm confusion.** Always pass `algorithms=[...]` explicitly. Never decode with the algorithm from the token header. With RS256, a classic attack signs an HS256 token using the *public* key as the HMAC secret. A fixed algorithm list prevents it.
+- **Secrets in code.** `SECRET_KEY = "changeme"` committed to git is the most common real-world JWT compromise. Load it from the environment or a secrets manager (see [project structure and settings](/docs/fastapi/project-structure-and-settings)), make it at least 32 random bytes, and fail at startup if it's missing in production. Rotating it logs everyone out, so support a key ID (`kid` header) and two active keys if you need smooth rotation.
+- **Token expiry.** Require `exp`. Keep access tokens short (minutes) and refresh tokens bounded (days). Expiry is your only revocation mechanism for stateless access tokens.
+- **Sensitive data in JWTs.** Anyone holding the token can base64-decode it. Put an ID in `sub`, not an email, phone number or role list you consider private.
+- **Logging tokens.** Access logs that print `Authorization` headers or URLs with `?token=` turn logs into a credential store. Redact them.
+- **Tokens in query strings.** They end up in browser history, proxy logs and `Referer` headers. Use the `Authorization` header (WebSockets are the usual exception; use short-lived, single-use tickets there).
+- **Different errors for unknown user vs wrong password**, or different timings. Both enable user enumeration.
+- **No rate limit on `/token`.** Argon2 slows offline cracking, but online guessing still needs throttling per account and per IP.
+- **Disabled users with valid tokens.** Look the user up per request (or cache briefly), and check `disabled`.
+
+## Common mistakes
+
+1. Treating `OAuth2PasswordBearer` as validation. It only extracts the header string.
+2. Calling `jwt.decode` without `algorithms=[...]`, or with `options={"verify_signature": False}` outside tests.
+3. Not requiring `exp`, so tokens without expiry are valid forever.
+4. Using one token type for everything. Add a `type` claim and check it.
+5. Returning 403 for a missing or invalid token. That's a 401 with `WWW-Authenticate`. 403 is for "authenticated but not allowed".
+6. Hashing passwords with SHA-256 or MD5, or using unmaintained passlib. Use pwdlib with argon2.
+7. Running argon2 in an `async def` endpoint and blocking the loop for ~45 ms per login.
+8. Comparing secrets with `==`.
+9. Thinking CORS protects the API. It only restricts what browsers let pages read.
+10. Hard-coding `SECRET_KEY`, or using a short one (PyJWT only warns).
+
+## Key points
+
+- FastAPI gives you security **dependencies** (`OAuth2PasswordBearer`, `APIKeyHeader`, `Security`, `SecurityScopes`). They extract credentials and document them in OpenAPI. Validation is your code.
+- Hash passwords with argon2id via `PasswordHash.recommended()`. The hash string carries algorithm, cost and salt, and `verify_and_update` upgrades old hashes.
+- A JWT is signed, not encrypted. Verify with a fixed `algorithms` list, require `exp` and `sub`, and keep the key long and out of the code.
+- `get_current_user` decodes the token, loads the user, checks status and scopes, and returns a safe `User`. Build roles on top with a dependency factory.
+- 401 means "who are you?" and includes `WWW-Authenticate`. 403 means "not allowed".
+- API keys: hash them at rest, compare with `secrets.compare_digest`, prefix them for scanning.
+- Refresh tokens are long-lived, single-use and stateful. Rotation plus reuse detection catches theft.
+- CORS is a browser read-permission system, not access control.
+- For the wider threat model (injection, SSRF, rate limiting, headers), see [Backend security](/docs/backend-first-principles/20-backend-security).

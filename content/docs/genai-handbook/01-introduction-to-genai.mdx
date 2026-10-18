@@ -1,0 +1,581 @@
+---
+title: "1. Introduction to Generative AI"
+description: "Generative AI refers to a class of machine learning systems that produce new content — text, images, audio, video, code, structured data — rather than..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth on topics the chapter already covers.
+  - ➕ **Beyond the handbook**: topics the chapter does not cover, added because a GenAI engineer should know them.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams.
+</Callout>
+
+## 1.1 Concept Explanation
+
+Generative AI refers to a class of machine learning systems that produce *new content* — text, images, audio, video, code, structured data — rather than merely classifying or predicting from existing data. The defining property is that the output space is open-ended and probabilistic. A traditional classifier answers "is this a cat or a dog?" with a label. A generative model answers "describe this image" with an unbounded sentence drawn from a learned probability distribution over all possible sentences.
+
+This shift from *discriminative* to *generative* reframes what a model is for. Discriminative models map inputs to a small, fixed output space. Generative models learn the underlying distribution of data so deeply that they can sample new examples that look plausible — and, in modern LLMs, that capability extends to reasoning, planning, and conversation.
+
+The reason this matters for engineering: generative output is not a label, it is a *behavior*. You cannot grade it with accuracy alone. You cannot cache it like a database row. You cannot trust a single sample to be reproducible. Every architectural decision downstream — evaluation, observability, caching, retry strategy, cost control — flows from this single fact.
+
+## 1.1a Why the Same Prompt Gives Different Answers 🔧
+
+The section above says you cannot trust a single sample to be reproducible. This deep dive explains exactly where the variation comes from, because "set temperature to 0" does not make it go away, and engineers who assume it does build flaky tests and unreproducible bug reports.
+
+### Source 1: sampling is random by design
+
+**Problem.** Two calls with the same prompt return different text.
+
+**Why it happens.** The model outputs a probability distribution over the next token, and the server draws a random sample from it (Chapter 2 covers the maths). Each sampled token becomes part of the input for the next step, so one different early token sends the rest of the answer down a different path. Small differences compound.
+
+**Mechanism.** With temperature above 0, randomness is the intended behavior. Some APIs accept a `seed` parameter that fixes the random number generator, which makes repeats *more likely* to match but not guaranteed, because of the two sources below.
+
+### Source 2: floating-point arithmetic is not associative
+
+**Problem.** Even greedy decoding (always pick the top token) can differ between runs.
+
+**Why it happens.** On a computer, `(a + b) + c` is not always equal to `a + (b + c)`. Each addition rounds to the nearest representable number, so the order of additions changes the rounding. GPU kernels add up thousands of numbers in parallel, and the order depends on how the work is split.
+
+**Implementation.** You can see the effect in a few lines of NumPy:
+
+```python
+import numpy as np
+
+print((0.1 + 1e20) - 1e20)   # 0.0  (0.1 was rounded away)
+print(0.1 + (1e20 - 1e20))   # 0.1
+
+rng = np.random.default_rng(0)
+v = rng.standard_normal(1_000_000).astype(np.float32)
+whole = v.sum()
+chunked = np.float32(0)
+for part in np.split(v, 1000):          # same numbers, different grouping
+    chunked += part.sum()
+print(whole, chunked, whole == chunked)  # usually differ in the last digits
+
+# A tiny difference only matters when the top two logits are nearly tied
+logits_a = np.array([12.0, 11.9999999, 3.0])
+logits_b = logits_a + np.array([0.0, 2e-7, 0.0])   # a rounding-sized nudge
+print(logits_a.argmax(), logits_b.argmax())  # 0 then 1: a different token
+```
+
+**Edge case.** Most tokens are not near-ties, so most of the output is stable. The divergence starts at the first near-tie and then compounds, which is why two "deterministic" runs often match for a few sentences and then split.
+
+### Source 3: your request shares a batch with strangers
+
+**Problem.** The rounding order changes even when the kernel code is identical.
+
+**Why it happens.** Inference servers batch many users' requests together (Chapter 13 covers continuous batching). Many GPU kernels choose a different internal split of the work depending on batch size. Your prompt's logits therefore depend slightly on how many other requests happened to be in flight. A 2025 analysis by Thinking Machines Lab named this lack of *batch invariance* as the main practical cause of nondeterminism at temperature 0, and showed that batch-invariant kernels for matrix multiplication, attention and normalization make vLLM fully deterministic, at some throughput cost.
+
+**Edge cases.** Mixture-of-experts models can add another source, because the routing of tokens to experts can depend on which other tokens share the batch. Providers also update serving stacks and quantization without changing a model's alias, so "same model name" does not mean "same numbers".
+
+### The engineering response
+
+**Problem.** You still need reproducible bug reports, stable tests and fair evaluations.
+
+**Mechanism.** Treat the model as a distribution, not a function. Pin an exact model snapshot instead of an alias, log everything needed to replay a call, and evaluate several samples per input instead of one.
+
+**Implementation (Python, OpenAI-compatible API).**
+
+```python
+import asyncio
+import os
+
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()  # also works against vLLM via base_url
+MODEL = os.environ["MODEL_SNAPSHOT"]  # a dated snapshot, never a moving alias
+
+
+async def sample_k(prompt: str, k: int = 5) -> dict:
+    runs = await asyncio.gather(
+        *(
+            client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                seed=42,  # best effort only
+            )
+            for _ in range(k)
+        )
+    )
+    outputs = [r.choices[0].message.content or "" for r in runs]
+    distinct = len(set(outputs))
+    # Log the backend fingerprint: a change explains a sudden shift in outputs
+    fingerprints = {r.system_fingerprint for r in runs}
+    return {"outputs": outputs, "distinct": distinct, "fingerprints": sorted(fingerprints, key=str)}
+```
+
+**Failure modes.** Snapshot tests that compare exact strings break randomly, so assert on structure (valid JSON, required fields, a judge score above a threshold) instead. A regression "fixed" by a rerun was not fixed. Caching a single response hides variance from users but not from your evals.
+
+## 1.2 Internal Working — Evolution of AI
+
+The arc of AI history matters because each era's failures motivate the next era's architecture.
+
+**1950s–1980s: Symbolic AI.** Handcrafted rules, expert systems, logic programming. These collapsed because the world has too many edge cases for rules to enumerate. The lesson: human-authored knowledge does not scale.
+
+**1990s–2000s: Statistical ML.** SVMs, decision trees, random forests, gradient boosting. These learned from data but required heavy feature engineering — humans had to tell the model what to look at. The lesson: data scales, but feature engineering bottlenecks the data pipeline.
+
+**2010s: Deep Learning.** Neural networks that learn features automatically from raw inputs. Convolutional networks dominated vision in 2012 (AlexNet on ImageNet), recurrent networks dominated sequence tasks, and reinforcement learning conquered games in 2016 (AlphaGo). The lesson: feature engineering is what the model itself should learn.
+
+**2017: The Transformer.** The "Attention Is All You Need" paper eliminated recurrence in favor of *attention* — a mechanism that lets every position in a sequence look at every other position in parallel. This unlocked scale. Bigger models trained on bigger data on bigger GPUs produced disproportionately better results — a phenomenon now called *scaling laws*.
+
+**2020–today: Foundation Models and LLMs.** GPT-3 demonstrated that a sufficiently large language model trained on sufficiently varied text would acquire general-purpose capabilities without task-specific training. ChatGPT in late 2022 made this visible to consumers. The years since have been a Cambrian explosion: GPT-4, Claude, Gemini, Llama, Mistral, Qwen, DeepSeek, and multimodal extensions to image, audio, and video.
+
+## 1.3 Traditional AI vs Deep Learning vs LLMs
+
+| Dimension           | Traditional ML    | Deep Learning         | LLMs                                    |
+| ------------------- | ----------------- | --------------------- | --------------------------------------- |
+| Feature engineering | Manual            | Automatic             | Automatic + emergent reasoning          |
+| Data requirement    | Thousands of rows | Millions of examples  | Trillions of tokens                     |
+| Compute             | CPU               | GPU cluster           | Multi-thousand GPU cluster              |
+| Output type         | Labels/numbers    | Labels/numbers/images | Open-ended text + multimodal            |
+| Generalization      | Narrow, one task  | Domain-bounded        | Cross-domain, few-shot                  |
+| Interpretability    | High              | Low                   | Very low                                |
+| Deployment unit     | KB–MB models     | MB–GB models         | GB–TB models                           |
+| Failure mode        | Wrong label       | Wrong label           | Wrong label + hallucination + injection |
+
+LLMs are not simply bigger deep learning models. They exhibit *emergent capabilities* — abilities that don't appear in smaller models and appear suddenly past certain parameter counts. In-context learning (learning a task from examples in the prompt), chain-of-thought reasoning, and tool use are all emergent. This is operationally important: you cannot extrapolate the behavior of a 7B model to predict the behavior of a 70B model.
+
+## 1.3a Emergence: Real Jump or Measurement Artifact? 🔧
+
+The paragraph above treats emergence as abilities that "appear suddenly"; research since 2023 shows that part of that suddenness comes from how we score, which changes how you should plan.
+
+### The metric effect
+
+**Problem.** A capability chart shows a model family scoring near zero, then jumping to high accuracy past some size. Teams read this as "the ability switches on at N parameters".
+
+**Why it happens.** Many benchmarks use all-or-nothing scoring such as exact match. If an answer needs 10 tokens to be right and the model gets each token right with probability `p`, the exact-match score is roughly `p ** 10`. When `p` improves smoothly from 0.5 to 0.95, `p ** 10` goes from 0.001 to 0.6. A smooth underlying improvement looks like a cliff. Schaeffer, Miranda and Koyejo (NeurIPS 2023) showed that many reported emergent abilities become smooth, predictable curves when re-scored with a continuous metric such as per-token log-likelihood.
+
+**Implementation.** A short simulation reproduces the illusion:
+
+```python
+import numpy as np
+
+sizes = np.logspace(8, 11, 7)                          # 100M to 100B params
+per_token = 1 / (1 + np.exp(-2.0 * (np.log10(sizes) - 9.5)))  # smooth curve
+exact_match = per_token ** 10                          # 10-token answer, all must be right
+
+for n, p, em in zip(sizes, per_token, exact_match):
+    print(f"{n:9.1e} params  per-token={p:.2f}  exact-match={em:.3f}")
+# per-token rises gently; exact-match sits near 0 and then shoots up
+```
+
+### What it means for planning
+
+**Mechanism.** Measure your task with a continuous signal (log-probability of the correct answer, partial-credit rubric, judge score) as well as the pass/fail metric. The continuous signal shows whether a smaller or cheaper model is "almost there" and likely to cross your bar with better prompting, retrieval or fine-tuning.
+
+**Edge cases.** The mirage argument does not prove that nothing is emergent. Some behaviors, such as following multi-step tool protocols, are genuinely hard to predict from small models. The safe conclusion is the handbook's: do not extrapolate, run your own evals on the candidate model. The difference is that you now know a continuous metric makes those evals more informative.
+
+## 1.4 Transformers and Attention — Why They Won
+
+Before transformers, sequence models processed tokens one at a time. A 1,000-token document required 1,000 sequential steps, making training slow and long-range dependencies — the link between paragraph 1 and paragraph 10 — hard to learn because gradients vanish across so many steps.
+
+The transformer replaces sequential processing with *self-attention*. Every token can attend to every other token in a single parallel operation. The matrix multiplication this requires maps perfectly onto GPU hardware, which is itself optimized for massive parallel matrix math. This co-evolution — an architecture that exploits the hardware that happens to exist at the same moment — is why transformers scaled and earlier architectures did not.
+
+<Mermaid chart={`flowchart LR
+  subgraph RNN["Sequential (RNN)"]
+    direction LR
+    R1["T1"] --> R2["T2"] --> R3["T3"] --> R4["T4"]
+    R2 -.- H["hidden states<br/>(slow, vanishing gradients)"]
+    R3 -.- H
+    R4 -.- H
+  end
+  subgraph TF["Parallel (Transformer)"]
+    direction TB
+    P1["T1"] <--> ATT["every-to-every attention<br/>(fast, full context preserved)"]
+    P2["T2"] <--> ATT
+    P3["T3"] <--> ATT
+    P4["T4"] <--> ATT
+  end`} />
+
+The cost of this design: attention is *quadratic* in sequence length. Doubling the context window quadruples the compute and memory. Every "long context model" innovation since 2017 is, at heart, a workaround for this quadratic wall: sliding windows, sparse attention, linear attention, flash attention, ring attention, paged KV cache.
+
+## 1.5 Real-World Use Cases — Why LLMs Changed the Industry
+
+The economic impact comes from *generality*. Before LLMs, deploying NLP at a company meant training one model per task: a sentiment classifier, a summarizer, a question-answering system, a chatbot — each with its own data pipeline, labeled corpus, and engineering team. An LLM replaces dozens of such systems with a single foundation model that handles all of them through prompting.
+
+This collapses a horizontal cost curve. Tasks that previously required six-month projects now require well-written prompts and retrieval. The bottleneck shifts from *training* to *prompting, retrieval, evaluation, and deployment* — which is precisely the territory of the GenAI Full Stack Engineer.
+
+Concrete categories where LLMs dominate today:
+
+- Conversational interfaces (customer support, internal knowledge assistants).
+- Code generation and review (Copilot-class tools).
+- Document understanding (contract analysis, medical records, legal discovery).
+- Search and retrieval (semantic search replacing keyword search).
+- Workflow automation (agents executing multi-step tasks across systems).
+- Content generation (marketing, drafting, translation, summarization).
+- Data extraction (turning unstructured text into structured records).
+
+## 1.6 Production Architecture — The GenAI Ecosystem
+
+<Mermaid chart={`flowchart TD
+  APP["APPLICATION LAYER<br/>(chatbots, copilots, agents, search)"] --> ORCH["ORCHESTRATION<br/>(LangChain, LangGraph, MCP, custom)"]
+  ORCH --> RAG["RAG<br/>(vector DBs)"]
+  ORCH --> INF["INFERENCE<br/>(vLLM, TGI)"]
+  ORCH --> AG["AGENTS<br/>(tools, memory)"]
+  RAG --> FM["FOUNDATION MODELS<br/>(GPT, Claude, Gemini, Llama, Mistral, Qwen)"]
+  INF --> FM
+  AG --> FM
+  FM --> INFRA["INFRASTRUCTURE<br/>(GPUs, Kubernetes, cloud, networking)"]
+  INFRA --> OBS["OBSERVABILITY<br/>(traces, evals, cost, drift, safety)"]`} />
+
+Every layer has commercial, open-source, and self-hosted options. A GenAI engineer's job is to reason across all layers — choosing which to build, which to buy, and which to self-host based on cost, latency, compliance, and capability constraints. The skill is not knowing one tool deeply; it is knowing which tradeoff each tool represents.
+
+## 1.7 Alternatives — Open-Source vs Closed-Source Models
+
+Closed models (GPT, Claude, Gemini) offer the highest raw capability with no infrastructure burden — you pay per token, the provider handles GPUs, scaling, safety tuning, and global routing. Open models (Llama, Mistral, Qwen, DeepSeek, Phi) offer data sovereignty, fine-tuning freedom, predictable cost at scale, and no vendor lock-in, at the cost of operational complexity.
+
+| Factor                | Closed-Source API | Open-Source Self-Hosted  |
+| --------------------- | ----------------- | ------------------------ |
+| Capability ceiling    | Highest           | Catching up but trailing |
+| Time to first request | Minutes           | Days to weeks            |
+| Cost at low volume    | Cheap             | Expensive (idle GPU)     |
+| Cost at high volume   | Expensive         | Much cheaper             |
+| Data residency        | Provider's choice | Your choice              |
+| Fine-tuning freedom   | Limited or paid   | Full                     |
+| Latency               | Network-bound     | Optimizable              |
+| Compliance burden     | Shared            | Yours                    |
+| Failure modes         | Provider outages  | Your outages             |
+
+The decision is rarely binary in production. Many companies use closed models for the hardest reasoning tasks (where capability gaps matter) and open models for high-volume, lower-complexity tasks (where unit economics matter). A typical hybrid: a frontier model for the planner agent, a quantized 8B model for embedding generation and routing, classical search for first-pass filtering.
+
+## 1.7a One Interface for Closed and Open Models 🔧
+
+A hybrid setup like the one above only stays cheap to run if application code does not care which model answers, so this section builds the thin model abstraction layer that 1.19 recommends, in Python.
+
+### The OpenAI-compatible wire format
+
+**Problem.** Every provider has its own SDK, request shape and streaming format. Code written against one is hard to move.
+
+**Why it happens.** Providers compete on features (tool calling, caching, reasoning controls), and each feature adds provider-specific fields.
+
+**Mechanism.** Most self-hosted servers (vLLM, SGLang, llama.cpp server, Ollama) and many hosted providers expose an OpenAI-compatible `/v1/chat/completions` endpoint. One client library pointed at different `base_url` values covers a large share of models. Providers with their own native API (for example Anthropic's Messages API) get their own adapter behind the same interface.
+
+### The interface and an adapter
+
+**Implementation.** Keep the interface small and in your own types, so no provider type leaks into business code:
+
+```python
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+from openai import AsyncOpenAI
+
+type Role = Literal["system", "user", "assistant"]
+
+
+@dataclass(frozen=True)
+class Message:
+    role: Role
+    content: str
+
+
+@dataclass(frozen=True)
+class ChatRequest:
+    messages: list[Message]
+    max_tokens: int
+    temperature: float | None = None
+    timeout: float | None = None  # seconds; None means the client default
+
+
+@dataclass(frozen=True)
+class ChatResult:
+    text: str
+    input_tokens: int
+    output_tokens: int
+    provider: str
+    model: str
+
+
+class LlmProvider(Protocol):
+    name: str
+
+    async def chat(self, req: ChatRequest) -> ChatResult: ...
+    def stream(self, req: ChatRequest) -> AsyncIterator[str]: ...
+
+
+class OpenAICompatibleProvider:
+    def __init__(self, name: str, model: str, base_url: str | None = None, api_key: str | None = None):
+        self.name = name
+        self._model = model
+        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key or "not-needed-for-local")
+
+    def _messages(self, req: ChatRequest) -> list[dict]:
+        return [{"role": m.role, "content": m.content} for m in req.messages]
+
+    async def chat(self, req: ChatRequest) -> ChatResult:
+        res = await self._client.chat.completions.create(
+            model=self._model,
+            messages=self._messages(req),
+            max_tokens=req.max_tokens,
+            temperature=req.temperature if req.temperature is not None else 0.3,
+            timeout=req.timeout,
+        )
+        usage = res.usage
+        return ChatResult(
+            text=(res.choices[0].message.content or "") if res.choices else "",
+            input_tokens=usage.prompt_tokens if usage else 0,
+            output_tokens=usage.completion_tokens if usage else 0,
+            provider=self.name,
+            model=res.model,
+        )
+
+    async def stream(self, req: ChatRequest) -> AsyncIterator[str]:
+        stream = await self._client.chat.completions.create(
+            model=self._model,
+            messages=self._messages(req),
+            max_tokens=req.max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},  # final chunk carries token usage
+            timeout=req.timeout,
+        )
+        async for chunk in stream:
+            # The usage-only final chunk has an empty choices list
+            if chunk.choices and (delta := chunk.choices[0].delta.content):
+                yield delta
+```
+
+The same class serves a frontier API and a self-hosted model:
+
+```python
+import os
+
+frontier = OpenAICompatibleProvider("openai", os.environ["FRONTIER_MODEL"])
+local = OpenAICompatibleProvider(
+    "vllm",
+    "my-org/llama-8b-instruct-awq",
+    base_url="http://vllm.internal:8000/v1",
+)
+```
+
+### Routing and fallback
+
+**Problem.** A provider outage or rate limit should degrade the product, not break it.
+
+**Mechanism.** Try providers in order with a per-attempt timeout. Fall back only on errors that another provider can fix: timeouts, HTTP 429 and 5xx. A 400 (bad request) will fail everywhere, so retrying it just wastes money.
+
+```python
+import dataclasses
+
+import openai
+
+
+def is_retryable(err: Exception) -> bool:
+    # The per-attempt timeout fired (APITimeoutError is a subclass of APIConnectionError)
+    # or the network failed: another provider may succeed
+    if isinstance(err, openai.APIConnectionError):
+        return True
+    if isinstance(err, openai.APIStatusError):
+        return err.status_code == 429 or err.status_code >= 500
+    return False
+
+
+async def chat_with_fallback(
+    providers: list[LlmProvider],
+    req: ChatRequest,
+    timeout_s: float = 20.0,
+) -> ChatResult:
+    last_err: Exception | None = None
+    for p in providers:
+        try:
+            return await p.chat(dataclasses.replace(req, timeout=timeout_s))
+        except Exception as err:
+            last_err = err
+            if not is_retryable(err):
+                raise
+    assert last_err is not None, "providers must not be empty"
+    raise last_err
+```
+
+### Edge cases and failure modes
+
+- **Prompts are not portable.** A prompt tuned for one model can lose quality on another. Keep a prompt version per model in the routing table and run your eval set against every fallback target, not only the primary.
+- **Token counts differ.** Each model has its own tokenizer (see [LLM Internals](/docs/genai-handbook/04-llm-internals)), so cost and context-limit checks must use the counts the serving provider returns, not one global estimate.
+- **Streaming cannot fall back mid-answer.** Once the first tokens reached the user, switching providers produces a stitched answer. Fall back only before the first token, or restart the answer visibly.
+- **Feature gaps.** Tool calling, JSON schema output and reasoning controls differ in shape and support. Either restrict the interface to the shared subset or add capability flags per provider and route on them.
+- Retries, circuit breakers and provider outages at scale are covered in [Production Failures](/docs/genai-handbook/24-production-failures).
+
+## 1.8 Tradeoffs — The Three Tensions
+
+Every GenAI design decision sits inside three tensions:
+
+1. **Capability vs Cost.** Frontier models cost more per token but reduce the cost of iteration; small models cost less per token but require more engineering scaffolding.
+2. **Latency vs Quality.** Larger models are slower; chain-of-thought reasoning is slower; multi-step agents are slower. Users abandon flows above a few seconds in interactive contexts.
+3. **Determinism vs Generality.** Tightly constrained outputs (JSON mode, function calls) are predictable but rigid. Open generation is flexible but unverifiable.
+
+Naming these tensions explicitly turns architecture conversations from religious debates into engineering tradeoffs.
+
+## 1.9 Scaling Challenges
+
+The same model behaves differently at 10 requests/second, 1,000 requests/second, and 100,000 requests/second. At small scale, latency is dominated by model compute. At medium scale, latency is dominated by queueing. At large scale, latency is dominated by *tail behavior* — the 99th-percentile request that takes 30x the median. Every scaling regime requires different optimization techniques, covered deeply in Part 4.
+
+## 1.10 Security Concerns at the Introduction Level
+
+The novel attack surfaces introduced by GenAI:
+
+- **Prompt injection** — user-controlled input rewrites the system instructions.
+- **Data leakage** — model regurgitates training data or context from other users.
+- **Tool abuse** — agent invokes destructive tools because an attacker crafted the input.
+- **Jailbreaks** — bypass of safety tuning to produce prohibited content.
+
+Traditional security (OWASP top 10, RBAC, encryption) still applies, but does not cover any of the four above. Chapter 20 treats these in depth.
+
+## 1.11 Deployment Guide — Mental Model
+
+A first GenAI deployment, conceptually:
+
+1. Pick the smallest model that meets quality bar.
+2. Wrap it in an API layer with authentication, rate limiting, and request logging.
+3. Add retrieval (RAG) so the model speaks about your data.
+4. Add structured output where the downstream consumer expects fields.
+5. Add evaluation harness before scaling features.
+6. Add tracing and cost dashboards before adding users.
+7. Add autoscaling and graceful degradation before promising SLAs.
+
+Skipping steps creates the production failures discussed in Chapter 24.
+
+## 1.12 Monitoring Strategy
+
+You cannot monitor an LLM application like a CRUD app. You must track at least: per-request latency (p50, p95, p99), input and output token counts, cost per request, retrieval hit rate, eval scores on a rolling sample, hallucination rate via an LLM-as-judge or human review, and safety violations. Chapter 19 builds the full observability stack.
+
+## 1.13 Cost Optimization — Introductory View
+
+The three biggest levers, in order of impact for most teams:
+
+1. **Model choice.** A 100x cheaper model that passes evals beats a frontier model every time.
+2. **Caching.** Semantic and prefix caches eliminate the most expensive class of duplicate work.
+3. **Retrieval over context.** Send relevant chunks, not whole documents.
+
+Chapter 25 quantifies each.
+
+## 1.14 Interview Perspective
+
+Expect to be asked:
+
+- *Why did transformers win?* — parallelism, hardware fit, scaling laws.
+- *Why pick an open model?* — cost at scale, sovereignty, latency control, fine-tuning.
+- *How is GenAI different from ML?* — output space, generality, deployment complexity, emergent behavior, new failure modes.
+- *Walk me through what happens when a user sends a chat message.* — auth, rate limit, retrieval, prompt assembly, inference, streaming, logging, billing.
+
+The interviewer is testing system thinking, not memorized facts. Use precise vocabulary; explain *why* before *what*.
+
+**➕ More questions:**
+
+- *Why can temperature 0 still return different outputs?* — **Server-side batching changes the order of floating-point additions, which shifts logits slightly. Near-ties flip the chosen token and the difference compounds through the rest of the answer.**
+- *What did Chinchilla change about how models are sized?* — **For a fixed training budget, parameters and tokens should grow together, roughly 20 tokens per parameter. Production models go far beyond that ratio because a smaller, longer-trained model is cheaper to serve.**
+- *Are emergent abilities real?* — **Some sharp jumps come from all-or-nothing metrics. Measured with continuous metrics, many abilities improve smoothly. Either way, evaluate the candidate model on your task instead of extrapolating.**
+- *How would you make your app independent of one LLM provider?* — **A small internal interface with one adapter per wire format, a routing table with per-model prompt versions, fallback only on retryable errors, and evals run against every fallback model.**
+
+## 1.15 Hands-on Exercises
+
+1. List five products you use weekly. For each, identify whether the AI is powered by LLM, classical ML, rules, or none — and justify with observable behavior.
+2. Map a familiar product (a code editor's autocomplete, a customer support bot, a search engine) onto the layered ecosystem diagram in 1.6.
+3. Estimate the monthly cost of replacing a 100-person customer support team with a closed-model chatbot at $0.01 per resolved query and 500 queries per agent per day. Compare to a self-hosted open model at $4 per GPU hour assuming the GPU handles 50 queries per second.
+4. Write a one-paragraph description of "what would break first" if you tripled traffic to one of those products overnight.
+
+## 1.16 Mini Project (Conceptual Design)
+
+Design — on paper — an "AI knowledge assistant" for a 500-person company. Specify:
+
+- The model class and why.
+- The retrieval approach and the storage layer.
+- The infrastructure footprint (managed vs self-hosted).
+- The observability metrics tracked.
+- The top three failure modes you expect.
+- The first compliance requirement that will hit you.
+
+You will return to this design in Chapters 10, 15, 19, and 22 and watch it evolve.
+
+## 1.17 Advanced Notes
+
+- *Emergence* remains poorly understood; capabilities appear discontinuously with scale. This makes capability planning probabilistic, not deterministic.
+- *Scaling laws* describe loss as a power-law function of parameters, data, and compute. They have held for over five orders of magnitude but are not guaranteed to hold further.
+- *Instruction tuning* and *RLHF* turn raw language models into assistants. A "base model" is dangerous and unhelpful by default; the assistants you interact with are post-trained.
+- *Inference-time compute* (chain of thought, tool use, search) is now a separate scaling axis from training compute. A small model with more inference compute can beat a large model with less.
+
+For how reasoning models spend that inference-time compute, see section 4.16a in [LLM Internals](/docs/genai-handbook/04-llm-internals). For how post-training (SFT, RLHF, DPO) works, see [Fine-tuning and Training](/docs/genai-handbook/23-finetuning-training).
+
+## 1.17a Scaling Laws in Numbers 🔧
+
+The advanced notes above state that loss follows a power law in parameters, data and compute; this section turns that into numbers you can use to sanity-check model sizes, training budgets and vendor claims.
+
+### The compute identity
+
+**Problem.** You need a quick way to relate model size, data size and training cost.
+
+**Why it happens.** Training a dense transformer costs about 2 FLOPs per parameter per token for the forward pass and about 4 more for the backward pass (Chapter 2 explains the forward count). So total training compute is approximately:
+
+```text
+C ≈ 6 × N × D
+C = training FLOPs, N = parameters, D = training tokens
+```
+
+**Edge case.** The identity ignores attention's sequence-length term, which is small next to the weight matrix multiplies for typical context lengths, and it does not apply directly to mixture-of-experts models, where only the active parameters count per token.
+
+### From Kaplan to Chinchilla
+
+**Problem.** For a fixed compute budget, should you train a bigger model on less data or a smaller model on more data?
+
+**Mechanism.** Kaplan et al. (2020) fitted power laws and concluded that model size should grow faster than data, which led to very large models trained on relatively few tokens. Hoffmann et al. (2022, "Chinchilla") re-ran the analysis with learning-rate schedules matched to each run's length and found that parameters and tokens should grow in roughly equal proportion, about 20 training tokens per parameter. Their 70B Chinchilla model, trained on 1.4T tokens, beat the 280B Gopher model, which used the same compute budget on fewer tokens.
+
+**Implementation.** Substituting `D = 20N` into `C = 6ND` gives `C = 120 N²`, so the compute-optimal size is `N = sqrt(C / 120)`:
+
+```python
+import math
+
+def chinchilla_optimal(compute_flops: float, tokens_per_param: float = 20.0):
+    n = math.sqrt(compute_flops / (6 * tokens_per_param))
+    return n, tokens_per_param * n
+
+def gpu_hours(compute_flops: float, peak_flops: float, mfu: float = 0.4) -> float:
+    """mfu = model FLOPs utilization, the share of peak you really sustain."""
+    return compute_flops / (peak_flops * mfu) / 3600
+
+C = 1e24
+n, d = chinchilla_optimal(C)
+print(f"params ≈ {n/1e9:.0f}B, tokens ≈ {d/1e12:.1f}T")      # ~91B, ~1.8T
+# ~989 TFLOPS is NVIDIA's dense BF16 figure for H100 SXM
+print(f"H100 hours ≈ {gpu_hours(C, 989e12):,.0f}")            # ~700,000
+```
+
+### Why production models ignore the Chinchilla ratio
+
+**Problem.** Many open models are trained far past 20 tokens per parameter. Meta reported pre-training the Llama 3 8B model on over 15T tokens, close to 2,000 tokens per parameter.
+
+**Why it happens.** Chinchilla minimizes *training* compute for a given loss. A deployed model is trained once and then served billions of times, and serving cost scales with parameter count. Spending extra training compute to make a small model better lowers lifetime cost. Sardana and Frankle (2023) extended the scaling laws with inference demand and showed the optimum shifts to smaller, longer-trained models as expected inference volume grows.
+
+### Failure modes when using scaling laws
+
+- **Loss is not your metric.** Scaling laws predict pre-training loss. Downstream task accuracy can move unevenly (see 1.3a), so a lower-loss model is not guaranteed to be better on your task.
+- **Data quality and repetition.** The laws assume fresh, comparable-quality tokens. Repeating data or mixing in low-quality text bends the curves, and high-quality text is a finite resource.
+- **Extrapolation range.** Fits made on small runs can drift at larger scales. Labs validate on intermediate sizes before committing a big budget, and you should treat any single-number prediction as an estimate.
+
+## 1.18 Common Mistakes
+
+- Treating GenAI as a swap-in for traditional ML pipelines.
+- Choosing self-hosted before measuring whether API costs justify the operational overhead.
+- Underestimating evaluation difficulty; LLM outputs are open-ended and not gradable by accuracy alone.
+- Ignoring latency budgets early — a four-second response feels broken in chat UX and fine in batch workflows; the same model with the same prompt is acceptable in one and unacceptable in the other.
+- Skipping retrieval and stuffing whole documents into the context window — works at 10 users, collapses at 10,000.
+- Treating prompts as throwaway strings rather than versioned, tested artifacts.
+
+## 1.19 Enterprise Best Practices
+
+Start with a thin vertical slice deployed to production rather than a horizontal platform. Establish evaluation harnesses before scaling features. Track cost-per-resolved-task, not just cost-per-token. Build a model abstraction layer from day one so you can swap providers without rewriting application code. Treat prompts, retrieval sources, and tool definitions as code — versioned, reviewed, and rolled back like any other artifact. Make the first compliance conversation (data residency, retention, audit) happen before the first launch, not after.
+
+## Sources
+
+Sources for the 🔧 and ➕ additions:
+
+- Horace He and Thinking Machines Lab, "Defeating Nondeterminism in LLM Inference" (2025): https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+- Schaeffer, Miranda, Koyejo, "Are Emergent Abilities of Large Language Models a Mirage?" (NeurIPS 2023): https://arxiv.org/abs/2304.15004
+- Kaplan et al., "Scaling Laws for Neural Language Models" (2020): https://arxiv.org/abs/2001.08361
+- Hoffmann et al., "Training Compute-Optimal Large Language Models" (Chinchilla, 2022): https://arxiv.org/abs/2203.15556
+- Sardana and Frankle, "Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws" (2023): https://arxiv.org/abs/2401.00448
+- Meta, "Introducing Meta Llama 3" (15T+ pre-training tokens, 2024): https://ai.meta.com/blog/meta-llama-3/
+- NVIDIA H100 Tensor Core GPU datasheet (BF16 throughput): https://www.nvidia.com/en-us/data-center/h100/
+- OpenAI API reference, Chat Completions (`seed`, `system_fingerprint`, `stream_options`): https://platform.openai.com/docs/api-reference/chat
+- vLLM docs, OpenAI-compatible server: https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html
+- openai-python SDK (async client, error classes, per-request `timeout`): https://github.com/openai/openai-python

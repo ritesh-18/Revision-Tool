@@ -1,0 +1,831 @@
+---
+title: "Dependency injection"
+description: "How FastAPI's Depends works underneath: function and class dependencies, the dependency graph, per-request caching, yield dependencies and when their teardown runs, dependency scope, router- and app-level dependencies, Annotated aliases, Security scopes, dependency_overrides, and a mini resolver built from scratch."
+---
+
+Every endpoint needs things that are not part of the HTTP request: a database session, the current user, a settings object, an HTTP client, a rate limiter. **Dependency injection** (DI) is the idea that a function should *declare* what it needs and let something else *provide* it, instead of building those things itself.
+
+FastAPI's `Depends` is a small, request-scoped DI system. It is also the single most important feature to understand properly, because auth, database sessions, pagination, feature flags and testing all go through it.
+
+All snippets were run on **CPython 3.14.6** with **FastAPI 0.143.0** and **Starlette 1.8.0**, using `fastapi.testclient.TestClient`.
+
+## Why DI at all
+
+Here is an endpoint without DI:
+
+```python
+@app.get("/me")
+def me(request: Request):
+    settings = Settings()                          # reads env every request
+    engine = create_engine(settings.db_url)        # new pool every request
+    with Session(engine) as db:
+        token = request.headers["authorization"].removeprefix("Bearer ")
+        user = db.get(User, decode(token)["sub"])
+        return user
+```
+
+Three problems:
+
+1. **Duplication.** Every endpoint repeats the token parsing and session handling.
+2. **Hidden inputs.** Nothing in the signature says this endpoint reads the `Authorization` header, so OpenAPI can't document it.
+3. **Untestable.** To test it you must have a real database and a real token. You can't swap `Session` for a fake without patching module globals.
+
+With DI, the endpoint just declares its needs:
+
+```python
+@app.get("/me")
+def me(user: CurrentUser):
+    return user
+```
+
+`CurrentUser` is a declaration ("give me the authenticated user"). How the user is obtained lives in one dependency function, which itself declares that it needs a session and a token. FastAPI builds the graph, runs it once per request, documents every header and query parameter it found, and lets tests replace any node.
+
+<Callout title="DI vs a DI container">
+Java and C# frameworks use a **container**: you register types at startup and the container constructs objects by type. FastAPI has no container and no type-based lookup. A dependency is just a **callable**, and the "registration" is the `Depends(callable)` marker in a signature. The lookup key is the callable itself. That's why `dependency_overrides` is a dict keyed by functions.
+</Callout>
+
+## Function dependencies
+
+A dependency is any callable. Its parameters are parsed exactly like an endpoint's parameters: query, path, header, cookie, body, or further dependencies.
+
+```python
+from typing import Annotated
+from fastapi import Depends, FastAPI, Query
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+def pagination(skip: int = 0, limit: Annotated[int, Query(le=100)] = 10):
+    return {"skip": skip, "limit": limit}
+
+@app.get("/items")
+def list_items(page: Annotated[dict, Depends(pagination)]):
+    return page
+
+@app.get("/users")
+def list_users(page: Annotated[dict, Depends(pagination)]):
+    return page
+
+client = TestClient(app)
+print(client.get("/items").json())
+print(client.get("/users?skip=20&limit=5").json())
+r = client.get("/items?limit=500")
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+{'skip': 0, 'limit': 10}
+{'skip': 20, 'limit': 5}
+422 {'detail': [{'type': 'less_than_equal', 'loc': ['query', 'limit'], 'msg': 'Input should be less than or equal to 100', 'input': '500', 'ctx': {'le': 100}}]}
+```
+
+Notice what happened:
+
+- `skip` and `limit` are not parameters of `list_items`, yet they were read from the query string and validated. FastAPI **flattens** every dependency's parameters into the endpoint's parameter list.
+- The validation error is a normal 422, with `loc` pointing at the query parameter. The endpoint never ran.
+- Both endpoints show `skip` and `limit` in OpenAPI, because the dependency graph is analysed at startup.
+
+You pass the function **without calling it**: `Depends(pagination)`, not `Depends(pagination())`. FastAPI calls it for you, once per request.
+
+## Class dependencies
+
+`Depends` accepts any callable, and a class is a callable that returns an instance. FastAPI inspects `__init__` to find the parameters:
+
+```python
+class Pagination:
+    def __init__(self, skip: int = 0, limit: int = 10):
+        self.skip = skip
+        self.limit = limit
+
+@app.get("/items")
+def list_items(page: Annotated[Pagination, Depends()]):
+    return {"type": type(page).__name__, "skip": page.skip, "limit": page.limit}
+```
+
+`Depends()` with no argument means "use the type annotation as the dependency". It only works when the annotation is the callable itself, as it is here.
+
+A second pattern is an **instance with `__call__`**. This lets you configure a dependency once and use it with different settings:
+
+```python
+class RateLimiter:
+    def __init__(self, max_per_minute: int):
+        self.max_per_minute = max_per_minute
+
+    def __call__(self, user_agent: str | None = None) -> str:
+        return f"limit={self.max_per_minute} ua={user_agent}"
+
+strict = RateLimiter(10)
+
+@app.get("/search")
+def search(rl: Annotated[str, Depends(strict)]):
+    return {"rl": rl}
+
+client = TestClient(app)
+print(client.get("/items?skip=5").json())
+print(client.get("/search?user_agent=curl").json())
+print(list(app.openapi()["paths"]["/search"]["get"]["parameters"][0].items())[:3])
+```
+
+```text title="Output"
+{'type': 'Pagination', 'skip': 5, 'limit': 10}
+{'rl': 'limit=10 ua=curl'}
+[('name', 'user_agent'), ('in', 'query'), ('required', False)]
+```
+
+FastAPI inspected `strict.__call__` (not `RateLimiter.__init__`), so `user_agent` became a query parameter. The constructor arguments (`max_per_minute`) are your own configuration and never reach the request. This pattern is how `OAuth2PasswordBearer`, `APIKeyHeader` and `HTTPBearer` are built: they are classes whose instances are dependencies.
+
+## Sub-dependencies and the dependency graph
+
+Dependencies can depend on other dependencies. The result is a **directed acyclic graph** (DAG) with the endpoint at the root:
+
+```python
+calls = []
+
+def get_settings():
+    calls.append("get_settings")
+    return {"db_url": "sqlite://"}
+
+def get_db(settings: Annotated[dict, Depends(get_settings)]):
+    calls.append("get_db")
+    return f"db({settings['db_url']})"
+
+def get_user(db: Annotated[str, Depends(get_db)]):
+    calls.append("get_user")
+    return {"name": "ada", "via": db}
+
+@app.get("/me")
+def me(
+    user: Annotated[dict, Depends(get_user)],
+    db: Annotated[str, Depends(get_db)],
+    settings: Annotated[dict, Depends(get_settings)],
+):
+    return {"user": user, "db": db}
+
+client = TestClient(app)
+print(client.get("/me").json())
+print(calls); calls.clear()
+client.get("/me"); print("second request:", calls)
+```
+
+```text title="Output"
+{'user': {'name': 'ada', 'via': 'db(sqlite://)'}, 'db': 'db(sqlite://)'}
+['get_settings', 'get_db', 'get_user']
+second request: ['get_settings', 'get_db', 'get_user']
+```
+
+<Mermaid chart={`flowchart BT
+  S["get_settings"] --> D["get_db"]
+  D --> U["get_user"]
+  U --> E["endpoint me"]
+  D --> E
+  S --> E`} />
+
+The endpoint asks for `get_settings` three times (directly, via `get_db`, and via `get_user`), and for `get_db` twice. Each ran **once** per request. Two facts follow:
+
+1. **Resolution is depth-first.** FastAPI resolves a node's children before calling the node, so `get_settings` ran first and the endpoint last.
+2. **Results are cached per request.** The second time the graph needs `get_db`, it reuses the value. On the next request the cache is empty again, so everything ran again.
+
+### How the graph is built: startup vs request time
+
+FastAPI splits the work into two phases.
+
+**At route registration** (`@app.get(...)`), `fastapi.dependencies.utils.get_dependant()` walks the endpoint signature with `inspect.signature` and the type hints. Every parameter becomes either a request parameter (path, query, header, cookie, body) or a sub-`Dependant` built by recursing into the dependency's own signature. The result is a tree of `Dependant` objects stored on the route. This is also when OpenAPI learns about every parameter, and why a wrong dependency signature fails at import time instead of on the first request.
+
+**At request time**, `solve_dependencies()` walks that tree for this request:
+
+```python
+# fastapi/dependencies/utils.py (simplified from 0.143.0)
+for sub_dependant in dependant.dependencies:
+    call = overrides.get(sub_dependant.call, sub_dependant.call)
+    solved_result = await solve_dependencies(..., dependant=sub_dependant)  # children first
+    key = (call, oauth_scopes, scope)
+    if sub_dependant.use_cache and key in dependency_cache:
+        solved = dependency_cache[key]
+    elif is_generator(call) or is_async_generator(call):
+        solved = await enter_on_exit_stack(call, **solved_result.values)
+    elif is_coroutine(call):
+        solved = await call(**solved_result.values)
+    else:
+        solved = await run_in_threadpool(call, **solved_result.values)
+    dependency_cache[key] = solved
+```
+
+Three details matter in practice:
+
+- **The cache key is the callable** (plus its OAuth scopes and its scope). Two different functions returning the same thing are two different cache entries. The same function used from two places is one entry.
+- **Sync dependencies run in the threadpool**, exactly like sync endpoints. `async def` dependencies run directly on the event loop. A blocking call in an `async def` dependency freezes the whole server (see [asyncio](/docs/python/asyncio)).
+- **Overrides are applied at request time**, by swapping the callable before solving. That's why you can set `app.dependency_overrides` after the routes are defined.
+
+```python
+import threading
+
+def sync_dep():
+    return threading.current_thread().name
+
+async def async_dep():
+    return threading.current_thread().name
+
+@app.get("/")
+async def root(s: Annotated[str, Depends(sync_dep)], a: Annotated[str, Depends(async_dep)]):
+    return {"sync_dep_ran_on": s, "async_dep_ran_on": a,
+            "endpoint_on": threading.current_thread().name}
+```
+
+```text title="Output (under TestClient, the loop runs in a portal thread; under Uvicorn it is MainThread)"
+{'sync_dep_ran_on': 'AnyIO worker thread', 'async_dep_ran_on': 'asyncio-portal-5b9867c0910', 'endpoint_on': 'asyncio-portal-5b9867c0910'}
+```
+
+<Callout title="Cheap sync dependencies are not free">
+A trivial `def get_settings(): return settings` still costs a hop to the threadpool and back on every request. For dependencies that do no IO, write them as `async def`. They then run inline on the loop with no thread handoff.
+</Callout>
+
+## Per-request caching and `use_cache`
+
+The cache is a dict that lives for one request. It exists for correctness, not just speed: if `get_user` and the endpoint both depend on `get_db`, they must get **the same session**, or the user would be loaded in one transaction and the update written in another.
+
+Sometimes you want a fresh value every time the graph asks. Pass `use_cache=False`:
+
+```python
+def get_fresh_settings(s: Annotated[dict, Depends(get_settings, use_cache=False)]):
+    calls.append("get_fresh_settings")
+    return s
+
+@app.get("/fresh")
+def fresh(
+    settings: Annotated[dict, Depends(get_settings)],
+    fresh: Annotated[dict, Depends(get_fresh_settings)],
+):
+    return {}
+
+client.get("/fresh"); print("use_cache=False:", calls)
+```
+
+```text title="Output"
+use_cache=False: ['get_settings', 'get_settings', 'get_fresh_settings']
+```
+
+`get_settings` ran twice in one request. Typical uses are a "now" timestamp or a random nonce that must differ for each consumer. You rarely need it.
+
+<Callout type="warn">
+The cache is **per request**, not global. `Depends(get_settings)` does not make settings a singleton, and it does not reuse a database engine between requests. For process-wide objects, use `functools.lru_cache` on the dependency function, or create the object in the [lifespan](/docs/fastapi/middleware-lifespan-and-background-tasks) and read it from `app.state`.
+</Callout>
+
+## Dependencies with `yield`
+
+A dependency that uses `yield` gets **setup and teardown**. The code before `yield` runs before the endpoint. The yielded value is injected. The code after `yield` runs later, when FastAPI closes the request's exit stack. Underneath, FastAPI wraps the function with `contextlib.contextmanager` (or `asynccontextmanager`) and enters it on an `AsyncExitStack`. If [context managers](/docs/python/context-managers) and [generators](/docs/python/generators-and-yield) are new to you, read those first: a `yield` dependency is just a context manager written as a generator.
+
+```python
+class FakeSession:
+    def commit(self): print("  commit")
+    def rollback(self): print("  rollback")
+    def close(self): print("  close")
+
+def get_session():
+    s = FakeSession()
+    try:
+        yield s
+        s.commit()
+    except Exception as exc:
+        print(f"  dependency saw {type(exc).__name__}: {exc}")
+        s.rollback()
+        raise
+    finally:
+        s.close()
+
+Session = Annotated[FakeSession, Depends(get_session)]
+
+@app.get("/ok")
+def ok(s: Session): return {"ok": True}
+
+@app.get("/http-error")
+def http_error(s: Session): raise HTTPException(404, "not found")
+
+@app.get("/crash")
+def crash(s: Session): raise ValueError("boom")
+
+client = TestClient(app, raise_server_exceptions=False)
+for path in ["/ok", "/http-error", "/crash"]:
+    print("GET", path)
+    r = client.get(path)
+    print("  ->", r.status_code, r.text)
+```
+
+```text title="Output"
+GET /ok
+  commit
+  close
+  -> 200 {"ok":true}
+GET /http-error
+  dependency saw HTTPException: 404: not found
+  rollback
+  close
+  -> 404 {"detail":"not found"}
+GET /crash
+  dependency saw ValueError: boom
+  rollback
+  close
+  -> 500 Internal Server Error
+```
+
+The exception raised in the endpoint is **thrown into the generator at the `yield`**, exactly like `gen.throw(exc)`. That's what makes the `try/except/finally` shape work: the dependency sees the error, rolls back, and re-raises so FastAPI's exception handlers can turn it into a response. An `HTTPException` is an exception like any other here, so it also triggers the rollback.
+
+### You must re-raise
+
+If the dependency catches the exception and doesn't re-raise it, the endpoint's error disappears and no response was ever produced. FastAPI detects this and fails loudly:
+
+```python
+def swallow():
+    try:
+        yield "x"
+    except Exception:
+        print("  swallowed!")   # no raise
+
+@app.get("/swallow")
+def sw(x: Annotated[str, Depends(swallow)]): raise ValueError("lost?")
+```
+
+```text title="Output (traceback trimmed)"
+  swallowed!
+fastapi.exceptions.FastAPIError: Response not awaited. There's a high chance that the application code is raising an exception and a dependency with yield has a block with a bare except, or a block with except Exception, and is not raising the exception again. Read more about it in the docs: https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/#dependencies-with-yield-and-except
+```
+
+The client gets a 500. Use `finally` for cleanup that must always run, and `except ...: raise` only when you need to react to the error.
+
+### When does teardown run? Before or after the response?
+
+This has changed several times in FastAPI's history, so check it against the version you run. In **0.143.0**, `Depends` has a `scope` parameter with two values:
+
+- `scope="function"`: teardown runs right after the endpoint function returns, **before** the response is sent.
+- `scope="request"`: teardown runs **after** the response has been sent to the client.
+- If you pass nothing, a `yield` dependency behaves as `"request"`.
+
+Here is a measurement. A tiny pure ASGI middleware logs the moment the last body byte leaves the server:
+
+```python
+from fastapi.responses import StreamingResponse
+
+class SendSpy:
+    """Pure ASGI middleware that logs when the last body chunk goes out."""
+    def __init__(self, app): self.app = app
+    async def __call__(self, scope, receive, send):
+        async def spy(message):
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                print("  [server] last body byte sent")
+        await self.app(scope, receive, spy)
+
+app = FastAPI()
+app.add_middleware(SendSpy)
+
+def dep_default():
+    print("  default: setup"); yield "d"; print("  default: teardown")
+
+def dep_function():
+    print("  function: setup"); yield "f"; print("  function: teardown")
+
+def dep_request():
+    print("  request: setup"); yield "r"; print("  request: teardown")
+
+@app.get("/plain")
+def plain(
+    a: Annotated[str, Depends(dep_default)],
+    b: Annotated[str, Depends(dep_function, scope="function")],
+    c: Annotated[str, Depends(dep_request, scope="request")],
+):
+    print("  endpoint runs")
+    return {"ok": True}
+
+@app.get("/stream")
+def stream(
+    a: Annotated[str, Depends(dep_default)],
+    b: Annotated[str, Depends(dep_function, scope="function")],
+):
+    def gen():
+        for i in range(2):
+            print(f"  stream chunk {i}")
+            yield f"{i}\n"
+    return StreamingResponse(gen())
+
+client = TestClient(app)
+print("GET /plain"); client.get("/plain")
+print("GET /stream"); client.get("/stream")
+```
+
+```text title="Output"
+GET /plain
+  default: setup
+  function: setup
+  request: setup
+  endpoint runs
+  function: teardown
+  [server] last body byte sent
+  request: teardown
+  default: teardown
+GET /stream
+  default: setup
+  function: setup
+  function: teardown
+  stream chunk 0
+  stream chunk 1
+  [server] last body byte sent
+  default: teardown
+```
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant F as FastAPI route
+  participant D as yield dependency
+  participant E as Endpoint
+  F->>D: run code before yield
+  D-->>F: yielded value
+  F->>E: call endpoint
+  E-->>F: return value
+  F->>D: teardown of scope function deps
+  F->>C: send response
+  F->>D: teardown of scope request deps, the default`} />
+
+The streaming case is why `"request"` is the default. A `StreamingResponse` body is produced **after** the endpoint returns. If a database session closed at `"function"` time, a generator that reads from it while streaming would find it closed. With the default, the session stays open until the last chunk is sent.
+
+`"function"` is for resources you want released as early as possible, such as a lock or a connection you only need while the endpoint body runs.
+
+One rule is enforced at startup: a longer-lived dependency can't depend on a shorter-lived one, because its teardown would use something already torn down.
+
+```python
+def short():
+    yield "short"
+
+def long(s: Annotated[str, Depends(short, scope="function")]):
+    yield "long"
+
+@app.get("/")
+def root(x: Annotated[str, Depends(long, scope="request")]): return {}
+```
+
+```text title="Output"
+DependencyScopeError : The dependency "long" has a scope of "request", it cannot depend on dependencies with scope "function".
+```
+
+### The commit-after-response trap
+
+The default timing has a sharp consequence. If you **commit in the teardown** of a request-scoped dependency, the client already has its `200` by the time the commit runs. If the commit fails, the client is never told.
+
+```python
+def failing_commit_request():
+    yield "s"
+    print("  teardown: commit fails")
+    raise RuntimeError("commit failed: deadlock")
+
+def failing_commit_function():
+    yield "s"
+    print("  teardown: commit fails")
+    raise RuntimeError("commit failed: deadlock")
+
+@app.post("/req")
+def req(s: Annotated[str, Depends(failing_commit_request)]): return {"saved": True}
+
+@app.post("/fn")
+def fn(s: Annotated[str, Depends(failing_commit_function, scope="function")]):
+    return {"saved": True}
+
+client = TestClient(app, raise_server_exceptions=False)
+for p in ["/req", "/fn"]:
+    print("POST", p)
+    r = client.post(p); print("  ->", r.status_code, r.text)
+```
+
+```text title="Output"
+POST /req
+  teardown: commit fails
+  -> 200 {"saved":true}
+POST /fn
+  teardown: commit fails
+  -> 500 Internal Server Error
+```
+
+The `/req` client was told `{"saved": true}` for data that was never saved. The error only shows up in the server logs. Two fixes:
+
+- **Commit explicitly** inside the endpoint or service layer (`await session.commit()`), and let the dependency only roll back and close. This is the pattern used in [Databases with SQLAlchemy](/docs/fastapi/databases-with-sqlalchemy).
+- Or make the session dependency `scope="function"`, so a failing teardown commit becomes a 500. You then can't use the session inside a streaming body.
+
+<Callout type="warn">
+Changing the response from teardown code is not possible with `scope="request"`: the response is already gone. In a quick test, `raise HTTPException(409)` after `yield` gave the client **200** with the default scope and **409** with `scope="function"`. Do validation and permission checks **before** `yield`.
+</Callout>
+
+## Router-level and app-level dependencies
+
+Some dependencies exist only for their side effect: check a header, log, enforce a rate limit. You don't need their return value, so attach them with `dependencies=[...]` at the route, router or app level.
+
+```python
+from fastapi import APIRouter, Header, HTTPException, Request
+
+def log_request(request: Request):
+    print(f"  app-level: {request.method} {request.url.path}")
+
+def require_api_version(x_api_version: Annotated[str, Header()] = "1"):
+    if x_api_version != "2":
+        raise HTTPException(400, "admin API needs X-API-Version: 2")
+
+app = FastAPI(dependencies=[Depends(log_request)])
+admin = APIRouter(prefix="/admin", dependencies=[Depends(require_api_version)])
+
+@admin.get("/stats")
+def stats():
+    return {"users": 42}
+
+@app.get("/health", dependencies=[Depends(lambda: print("  route-level dep"))])
+def health():
+    return {"status": "ok"}
+
+app.include_router(admin)
+
+client = TestClient(app)
+print(client.get("/health").json())
+r = client.get("/admin/stats"); print(r.status_code, r.json())
+r = client.get("/admin/stats", headers={"X-API-Version": "2"}); print(r.status_code, r.json())
+```
+
+```text title="Output"
+  app-level: GET /health
+  route-level dep
+{'status': 'ok'}
+  app-level: GET /admin/stats
+400 {'detail': 'admin API needs X-API-Version: 2'}
+  app-level: GET /admin/stats
+200 {'users': 42}
+```
+
+Order is outermost first: app dependencies, then router dependencies, then route `dependencies=[...]`, then the endpoint's own parameters. They are all merged into the same graph and share the same per-request cache. So if the router requires `get_current_user` and the endpoint also asks for it, the user is loaded once.
+
+<Callout title="Dependencies vs middleware">
+An app-level dependency looks a bit like middleware, but it runs **inside routing**: only for matched routes, after path matching, with full access to parsed parameters and the DI cache. It doesn't run for 404s and can't wrap the response. Middleware sees every request, including unmatched ones, and can modify the response. See [middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks).
+</Callout>
+
+## `Annotated` aliases
+
+Writing `Annotated[AsyncSession, Depends(get_session)]` in every signature gets tedious. Because `Annotated[...]` is an ordinary object, you can bind it to a name once:
+
+```python
+from typing import Annotated
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+CurrentUser = Annotated[User, Depends(get_current_user)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+@app.get("/orders")
+async def list_orders(session: SessionDep, user: CurrentUser):
+    ...
+```
+
+This is the recommended style in modern FastAPI, for three reasons:
+
+- **The type is real.** Your editor and type checker see `session: AsyncSession`, not `session = Depends(...)` whose type is `Any`.
+- **One place to change.** Swap `get_session` for another function and every endpoint follows.
+- **The function stays callable.** With the older default-value style, `def f(db = Depends(get_db))`, calling `f()` directly in a test passes the `Depends` marker object as `db`. With `Annotated`, the parameter has no default, so a direct call must pass a real value.
+
+## `Security` and scopes, briefly
+
+`Security(...)` is `Depends(...)` plus a list of **OAuth2 scopes** that the dependency (and anything below it) needs. A dependency can declare a parameter of type `SecurityScopes` to receive the combined list of scopes required by every `Security` on the path down to it:
+
+```python
+from fastapi import Security
+from fastapi.security import APIKeyHeader, SecurityScopes
+
+TOKENS = {"t-read": {"read"}, "t-admin": {"read", "write"}}
+api_key = APIKeyHeader(name="X-Token")
+
+def current_scopes(
+    security_scopes: SecurityScopes,
+    token: Annotated[str, Security(api_key)],
+) -> set[str]:
+    granted = TOKENS.get(token, set())
+    print(f"  needed={sorted(security_scopes.scopes)} granted={sorted(granted)}")
+    missing = set(security_scopes.scopes) - granted
+    if missing:
+        raise HTTPException(403, f"missing scopes: {sorted(missing)}")
+    return granted
+
+app = FastAPI()
+
+@app.get("/items")
+def read_items(s: Annotated[set, Security(current_scopes, scopes=["read"])]):
+    return {"ok": "read"}
+
+@app.post("/items")
+def write_items(s: Annotated[set, Security(current_scopes, scopes=["write"])]):
+    return {"ok": "write"}
+
+c = TestClient(app)
+r = c.get("/items", headers={"X-Token": "t-read"}); print(r.status_code, r.json())
+r = c.post("/items", headers={"X-Token": "t-read"}); print(r.status_code, r.json())
+r = c.post("/items", headers={"X-Token": "t-admin"}); print(r.status_code, r.json())
+r = c.post("/items"); print(r.status_code, r.json())
+```
+
+```text title="Output"
+  needed=['read'] granted=['read']
+200 {'ok': 'read'}
+  needed=['write'] granted=['read']
+403 {'detail': "missing scopes: ['write']"}
+  needed=['write'] granted=['read', 'write']
+200 {'ok': 'write'}
+401 {'detail': 'Not authenticated'}
+```
+
+The same function `current_scopes` received different `security_scopes` depending on which endpoint used it. This is also why the cache key includes the scopes: `current_scopes` with `["read"]` and with `["write"]` are different cache entries. The scopes appear in the OpenAPI schema too. [Authentication and security](/docs/fastapi/authentication-and-security) builds the full JWT version.
+
+## `app.dependency_overrides`
+
+Because every dependency is looked up by its callable at request time, you can replace any node in the graph without touching the endpoint:
+
+```python
+class EmailSender:
+    def send(self, to: str) -> str:
+        raise RuntimeError("would hit a real SMTP server")
+
+class FakeSender:
+    def __init__(self): self.sent = []
+    def send(self, to: str) -> str:
+        self.sent.append(to); return "queued (fake)"
+
+def get_sender() -> EmailSender:
+    return EmailSender()
+
+Sender = Annotated[EmailSender, Depends(get_sender)]
+app = FastAPI()
+
+@app.post("/invite/{email}")
+def invite(email: str, sender: Sender):
+    return {"result": sender.send(email)}
+
+fake = FakeSender()
+app.dependency_overrides[get_sender] = lambda: fake
+client = TestClient(app)
+print(client.post("/invite/ada@example.com").json(), fake.sent)
+app.dependency_overrides.clear()
+try:
+    client.post("/invite/bob@example.com")
+except RuntimeError as e:
+    print("after clear:", e)
+```
+
+```text title="Output"
+{'result': 'queued (fake)'} ['ada@example.com']
+after clear: would hit a real SMTP server
+```
+
+Rules that trip people up:
+
+- **The key must be the exact callable used in `Depends(...)`.** Overriding `EmailSender` does nothing if the endpoint uses `Depends(get_sender)`. For an instance dependency like `strict = RateLimiter(10)`, the key is `strict`, the instance.
+- **The override's own signature is analysed.** If your replacement declares parameters, FastAPI fills them from the request like any dependency. A zero-argument `lambda` is the simplest.
+- **Overrides are global to the app object.** Clear them after each test (a pytest fixture with `yield` is the usual way), or one test's fake leaks into the next. See [testing](/docs/fastapi/testing).
+- **Overriding a parent cuts off its children.** If you override `get_current_user`, the original's sub-dependencies (`get_session`, the token reader) are never resolved for that request.
+
+## Build a mini resolver yourself
+
+The best way to see that there's no magic is to write the core of it. About 60 lines give you signature inspection, recursive resolution, per-request caching, `yield` teardown through an `ExitStack`, and overrides:
+
+```python
+import inspect
+from contextlib import ExitStack, contextmanager
+from typing import Annotated, Any, Callable, get_args, get_origin, get_type_hints
+
+
+class Depends:
+    def __init__(self, dependency: Callable, *, use_cache: bool = True):
+        self.dependency = dependency
+        self.use_cache = use_cache
+
+
+def find_marker(annotation) -> tuple[type, Depends | None]:
+    """Split Annotated[T, Depends(...)] into (T, marker)."""
+    if get_origin(annotation) is Annotated:
+        base, *extras = get_args(annotation)
+        for extra in extras:
+            if isinstance(extra, Depends):
+                return base, extra
+        return base, None
+    return annotation, None
+
+
+class Resolver:
+    def __init__(self):
+        self.overrides: dict[Callable, Callable] = {}
+
+    def solve(self, func, query: dict, cache: dict, stack: ExitStack, depth=0):
+        func = self.overrides.get(func, func)
+        hints = get_type_hints(func, include_extras=True)
+        kwargs = {}
+        for name, param in inspect.signature(func).parameters.items():
+            base, marker = find_marker(hints.get(name, str))
+            if marker is None:                       # a plain parameter
+                raw = query.get(name, param.default)
+                if raw is inspect.Parameter.empty:
+                    raise ValueError(f"missing query parameter {name!r}")
+                kwargs[name] = base(raw) if isinstance(raw, str) else raw
+                continue
+            dep = self.overrides.get(marker.dependency, marker.dependency)
+            if marker.use_cache and dep in cache:
+                print("  " * depth + f"  cache hit: {dep.__name__}")
+                kwargs[name] = cache[dep]
+                continue
+            value = self.solve(dep, query, cache, stack, depth + 1)
+            cache[dep] = value
+            kwargs[name] = value
+        print("  " * depth + f"call {func.__name__}({', '.join(kwargs)})")
+        if inspect.isgeneratorfunction(func):
+            # run up to the yield now; the code after yield runs when the stack closes
+            return stack.enter_context(contextmanager(func)(**kwargs))
+        return func(**kwargs)
+
+    def handle(self, endpoint, query: dict) -> Any:
+        cache: dict = {}
+        with ExitStack() as stack:                   # one stack per "request"
+            return self.solve(endpoint, query, cache, stack)
+
+
+# ---- an app that uses it ---------------------------------------------------
+def get_settings():
+    return {"dsn": "sqlite://"}
+
+def get_db(settings: Annotated[dict, Depends(get_settings)]):
+    print("    db: open")
+    yield f"conn<{settings['dsn']}>"
+    print("    db: close")
+
+def get_user(db: Annotated[str, Depends(get_db)], user_id: int):
+    return {"id": user_id, "loaded_with": db}
+
+def endpoint(
+    user: Annotated[dict, Depends(get_user)],
+    db: Annotated[str, Depends(get_db)],
+    verbose: bool = False,
+):
+    return {"user": user, "same_db": db == user["loaded_with"], "verbose": verbose}
+
+r = Resolver()
+print(r.handle(endpoint, {"user_id": "7"}))
+print("--- with an override")
+r.overrides[get_settings] = lambda: {"dsn": "postgres://test"}
+print(r.handle(endpoint, {"user_id": "8"}))
+```
+
+```text title="Output"
+      call get_settings()
+    call get_db(settings)
+    db: open
+  call get_user(db, user_id)
+  cache hit: get_db
+call endpoint(user, db, verbose)
+    db: close
+{'user': {'id': 7, 'loaded_with': 'conn<sqlite://>'}, 'same_db': True, 'verbose': False}
+--- with an override
+      call <lambda>()
+    call get_db(settings)
+    db: open
+  call get_user(db, user_id)
+  cache hit: get_db
+call endpoint(user, db, verbose)
+    db: close
+{'user': {'id': 8, 'loaded_with': 'conn<postgres://test>'}, 'same_db': True, 'verbose': False}
+```
+
+Every idea from this chapter is visible:
+
+| Mechanism | In the mini resolver | In FastAPI |
+|---|---|---|
+| Find dependencies | `get_type_hints(include_extras=True)` and look for the `Depends` marker inside `Annotated` | `get_dependant()` at route registration |
+| Plain parameters | read from a `query` dict and convert with the annotation | full Pydantic validation from path, query, header, cookie, body |
+| Recursion | `solve` calls itself depth-first | `solve_dependencies` calls itself |
+| Per-request cache | `cache` dict created in `handle`, keyed by callable | `dependency_cache`, keyed by callable, scopes and scope |
+| `yield` teardown | `contextmanager(func)` entered on an `ExitStack` | `asynccontextmanager` on two `AsyncExitStack`s, one per scope |
+| Overrides | swap the callable before solving | `app.dependency_overrides` checked in `solve_dependencies` |
+| Sync vs async | everything sync | sync calls go to `run_in_threadpool`, async ones are awaited |
+
+What the real one adds: building the graph once at startup instead of per request, Pydantic validation with error aggregation (all 422 errors at once, not just the first), OpenAPI generation, async support, and the two exit stacks for `scope`.
+
+## Common mistakes
+
+1. **Calling the dependency.** `Depends(get_db())` passes the *result* (a generator object) as the dependency. Pass the function: `Depends(get_db)`.
+2. **Expecting a singleton.** The cache lasts one request. A dependency that creates an engine or an HTTP client creates a new one per request and leaks connection pools. Create those in the lifespan.
+3. **Committing in request-scoped teardown.** The client gets 200 before the commit runs. Commit explicitly, or use `scope="function"`.
+4. **Swallowing exceptions in a `yield` dependency.** `except Exception:` without `raise` gives a `FastAPIError` and a 500. Use `finally` for cleanup.
+5. **Raising `HTTPException` after `yield`.** With the default scope the response is already sent. Check things before `yield`.
+6. **Blocking in an `async def` dependency.** `requests.get` or a sync DB driver in an async dependency freezes the event loop. Use a sync `def` (threadpool) or an async library.
+7. **Overriding the wrong key.** Overrides match the callable passed to `Depends`, not the return type or the class it returns.
+8. **Leaking overrides between tests.** `app.dependency_overrides` is shared state. Clear it in fixture teardown.
+9. **Heavy work in deps used by every route.** App-level dependencies run on every matched request. Keep them cheap or cache their inputs.
+
+## Key points
+
+- A dependency is any callable. FastAPI reads its signature, so its parameters become request parameters, validated and documented like the endpoint's own.
+- The graph is analysed once at startup (`get_dependant`) and solved per request (`solve_dependencies`), depth-first.
+- Results are cached **per request**, keyed by the callable, so everything in one request shares one session and one user. `use_cache=False` opts out.
+- `yield` dependencies are context managers on an exit stack. Exceptions from the endpoint are thrown in at the `yield`. Always re-raise.
+- In FastAPI 0.143, `scope="request"` (the default) tears down **after** the response is sent, and `scope="function"` tears down **before**. A request-scoped dependency can't depend on a function-scoped one.
+- Use `dependencies=[...]` on the app, a router or a route for side-effect-only checks.
+- Prefer `Annotated` aliases such as `SessionDep` and `CurrentUser`. They keep types real and signatures short.
+- `Security` is `Depends` plus OAuth2 scopes, received through `SecurityScopes`.
+- `app.dependency_overrides` swaps any node by its callable, which is what makes FastAPI apps easy to test.
+- For the general pattern (controllers, services, repositories), see [Controllers, services, repositories and middleware](/docs/backend-first-principles/10-controllers-services-repositories-middleware).

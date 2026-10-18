@@ -1,0 +1,898 @@
+---
+title: "Exceptions"
+description: "How Python exceptions work from the class hierarchy down to tracebacks, chaining, exception groups and mapping errors to HTTP responses."
+---
+
+Python uses exceptions for everything that goes wrong, and for some things that aren't really errors at all. Loops end because an iterator raises `StopIteration`. `sys.exit()` raises `SystemExit`. Ctrl+C raises `KeyboardInterrupt`. Once you see exceptions as an ordinary control-flow tool built on a class hierarchy, the rules about what to catch make sense.
+
+All snippets were run on **CPython 3.14.6**. Traceback paths are shortened to the file name.
+
+## The exception hierarchy
+
+### What it is
+
+Every exception is an instance of a class that inherits from `BaseException`. Directly under it are four classes, and three of them are deliberately *not* errors:
+
+<Mermaid chart={`flowchart TD
+  BE["BaseException"] --> SE["SystemExit<br/>sys.exit()"]
+  BE --> KI["KeyboardInterrupt<br/>Ctrl+C"]
+  BE --> GE["GeneratorExit<br/>generator.close()"]
+  BE --> BEG["BaseExceptionGroup"]
+  BE --> EX["Exception<br/>everything you normally catch"]
+  EX --> AE["ArithmeticError"]
+  AE --> ZDE["ZeroDivisionError"]
+  EX --> LE["LookupError"]
+  LE --> KE["KeyError"]
+  LE --> IE["IndexError"]
+  EX --> OSE["OSError"]
+  OSE --> FNF["FileNotFoundError"]
+  OSE --> CE["ConnectionError"]
+  OSE --> TE["TimeoutError"]
+  EX --> VE["ValueError"]
+  EX --> TYE["TypeError"]
+  EX --> SI["StopIteration"]
+  EX --> EG["ExceptionGroup"]
+  BEG --> EG
+`} />
+
+You can read the hierarchy straight from each class's `__mro__`:
+
+```python
+for cls in (KeyboardInterrupt, SystemExit, GeneratorExit, ValueError, KeyError, StopIteration, OSError):
+    print(f"{cls.__name__:18} mro: {' -> '.join(c.__name__ for c in cls.__mro__)}")
+print(IOError is OSError, EnvironmentError is OSError)
+```
+
+```text title="Output"
+KeyboardInterrupt  mro: KeyboardInterrupt -> BaseException -> object
+SystemExit         mro: SystemExit -> BaseException -> object
+GeneratorExit      mro: GeneratorExit -> BaseException -> object
+ValueError         mro: ValueError -> Exception -> BaseException -> object
+KeyError           mro: KeyError -> LookupError -> Exception -> BaseException -> object
+StopIteration      mro: StopIteration -> Exception -> BaseException -> object
+OSError            mro: OSError -> Exception -> BaseException -> object
+True True
+```
+
+`IOError` and `EnvironmentError` are just old aliases for `OSError`. Since 3.3 all operating-system errors share one class, and the specific subclass (`FileNotFoundError`, `PermissionError`, `ConnectionRefusedError`, ...) is picked from the `errno` code.
+
+### Why the split exists
+
+`except Exception:` is supposed to mean "any *error*". Shutting down the process, an interrupt from the user and generator cleanup are not errors, so they live outside `Exception`. That means a broad `except Exception` in a request handler won't stop Ctrl+C or `sys.exit()` from working.
+
+### Why bare `except:` is a trap
+
+A bare `except:` is the same as `except BaseException:`. It catches the signals you wanted to pass through:
+
+```python
+import sys
+
+def risky():
+    sys.exit(3)
+
+try:
+    risky()
+except:
+    print("bare except swallowed:", repr(sys.exc_info()[1]))
+
+try:
+    risky()
+except Exception:
+    print("never printed")
+```
+
+```text title="Output"
+bare except swallowed: SystemExit(3)
+```
+
+The second `try` didn't print anything because `SystemExit` went straight past `except Exception` and ended the program, which is what should happen. Bare `except:` also catches `KeyboardInterrupt`, so a worker that retries forever inside one can't be stopped with Ctrl+C.
+
+```python
+def gen():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print("generator cleanup (GeneratorExit)")
+
+g = gen()
+print(next(g))
+g.close()
+
+try:
+    raise KeyboardInterrupt
+except Exception:
+    print("not caught here")
+except BaseException as e:
+    print("caught via BaseException:", type(e).__name__)
+```
+
+```text title="Output"
+1
+generator cleanup (GeneratorExit)
+caught via BaseException: KeyboardInterrupt
+```
+
+Rules of thumb:
+
+- Catch the narrowest class you can actually handle.
+- Use `except Exception` only at boundaries (the top of a request handler, a job runner, a CLI's `main`), and always log the error there.
+- Catch `BaseException` only when you re-raise it, for example to run cleanup and then `raise`.
+
+<Callout title="Coming from JS">
+In JavaScript you can `throw` anything (a string, a number, `undefined`), and `catch (e)` catches all of it, with `e` typed `unknown`. Python only lets you raise instances of `BaseException` subclasses, and `except` filters by class, so you never need `if (e instanceof X)` chains inside one catch block. JS also has nothing like the `BaseException`/`Exception` split. In Node, `process.exit()` isn't an exception at all.
+</Callout>
+
+## try / except / else / finally
+
+### Semantics and order
+
+```python
+def demo(x):
+    try:
+        print("try")
+        result = 10 / x
+    except ZeroDivisionError as e:
+        print("except:", e)
+        return "from except"
+    else:
+        print("else: no exception, result =", result)
+        return "from else"
+    finally:
+        print("finally")
+
+print(demo(2))
+print("---")
+print(demo(0))
+```
+
+```text title="Output"
+try
+else: no exception, result = 5.0
+finally
+from else
+---
+try
+except: division by zero
+finally
+from except
+```
+
+<Mermaid chart={`flowchart TD
+  T["try body"] -->|"no exception"| EL["else block"]
+  T -->|"exception raised"| M{"does an except clause match?"}
+  M -->|"yes"| EX["run that except block"]
+  M -->|"no"| FIN2["finally, then the exception propagates"]
+  EL --> FIN["finally"]
+  EX --> FIN
+  FIN --> OUT["continue, or return or re-raise what was pending"]
+`} />
+
+- `except` clauses are checked **top to bottom**, and the first one whose class matches (via `isinstance`) wins.
+- `else` runs only if the `try` body finished without raising. It exists so the `try` block can stay small: code in `else` isn't protected by the `except` clauses, so a bug there won't be swallowed by mistake.
+- `finally` always runs: on normal exit, after an exception, and on `return`, `break` or `continue`. A pending `return` value or exception is kept aside while `finally` runs.
+
+Because order matters, a base class listed first hides its subclasses:
+
+```python
+try:
+    open("nope.txt")
+except OSError:
+    print("OSError branch caught it first")
+except FileNotFoundError:
+    print("never reached")
+
+try:
+    open("nope.txt")
+except FileNotFoundError as e:
+    print("errno:", e.errno, "filename:", e.filename, "strerror:", e.strerror)
+```
+
+```text title="Output"
+OSError branch caught it first
+errno: 2 filename: nope.txt strerror: No such file or directory
+```
+
+To catch several classes in one clause, use a tuple, `except (KeyError, ValueError) as e:`. Since **3.14** (PEP 758) the parentheses are optional when there's no `as`:
+
+```python
+try:
+    raise TimeoutError("slow")
+except TimeoutError, ConnectionError:
+    print("3.14 lets you drop the parentheses")
+```
+
+```text title="Output"
+3.14 lets you drop the parentheses
+```
+
+### `finally` with `return`: the trap
+
+A `return` inside `finally` replaces whatever was pending, including an exception that was on its way out:
+
+```python
+def f():
+    try:
+        return "try"
+    finally:
+        return "finally"
+print(f())
+
+def g():
+    try:
+        1 / 0
+    finally:
+        return "swallowed"
+print(g())
+
+def h():
+    x = [1]
+    try:
+        return x
+    finally:
+        x.append(2)
+print(h())
+```
+
+```text title="Output"
+demo.py:5: SyntaxWarning: 'return' in a 'finally' block
+  return "finally"
+demo.py:12: SyntaxWarning: 'return' in a 'finally' block
+  return "swallowed"
+finally
+swallowed
+[1, 2]
+```
+
+- `g()` lost a `ZeroDivisionError` without a trace. That's why **PEP 765** makes the compiler emit a `SyntaxWarning` from 3.14 onward when `return`, `break` or `continue` would leave a `finally` block.
+- `h()` shows that `return x` evaluates `x` *before* `finally` runs, but only the reference is saved. Mutating the object in `finally` is still visible to the caller.
+
+### The `as e` name is deleted
+
+```python
+try:
+    1/0
+except ZeroDivisionError as e:
+    err = e
+try:
+    print(e)
+except NameError as ne:
+    print("NameError:", ne)
+print("kept:", repr(err))
+```
+
+```text title="Output"
+NameError: name 'e' is not defined
+kept: ZeroDivisionError('division by zero')
+```
+
+At the end of the `except` block CPython effectively runs `del e`. An exception holds its traceback, the traceback holds every frame, and each frame holds its locals, *including `e` itself*. Leaving `e` around would create a reference cycle that keeps all those frames alive until the cyclic GC runs. If you need the exception later, bind it to another name as above.
+
+<Callout title="Coming from JS">
+`try/catch/finally` in JS has no `else`. JS has the same `finally` override behaviour (a `return` in `finally` wins), but no engine warns about it. And a JS `catch (e)` binding is block-scoped, so it disappears too, though for scoping reasons, not to break a cycle.
+</Callout>
+
+## Raising and re-raising
+
+```python
+raise ValueError("bad input")      # an instance
+raise ValueError                   # a class: Python calls ValueError() for you
+```
+
+A bare `raise` inside an `except` block re-raises the exception currently being handled, with its original traceback intact:
+
+```python
+def parse(s):
+    try:
+        return int(s)
+    except ValueError:
+        print("logging and re-raising")
+        raise
+
+try:
+    parse("x")
+except ValueError as e:
+    print("caller got:", e)
+    print("traceback frames:", end=" ")
+    tb = e.__traceback__
+    while tb:
+        print(tb.tb_frame.f_code.co_name, end=" ")
+        tb = tb.tb_next
+    print()
+```
+
+```text title="Output"
+logging and re-raising
+caller got: invalid literal for int() with base 10: 'x'
+traceback frames: <module> parse
+```
+
+**How tracebacks work underneath.** When an exception passes up through a frame, CPython adds a traceback entry (frame plus line number) to the linked list in `__traceback__`. The list starts at the frame where the exception was caught and runs toward where it was raised. That's why the printed traceback reads "most recent call last". `raise e` (rather than a bare `raise`) adds the current line to the traceback too, which makes the output a little noisier. Prefer a bare `raise`.
+
+## Exception chaining
+
+If an exception is raised while another one is being handled, Python links them instead of losing the first one.
+
+### Implicit chaining: `__context__`
+
+```python
+def load(cfg):
+    try:
+        return cfg["port"]
+    except KeyError:
+        raise ValueError("config missing port")
+load({})
+```
+
+```text title="Output"
+Traceback (most recent call last):
+  File "demo.py", line 3, in load
+    return cfg["port"]
+           ~~~^^^^^^^^
+KeyError: 'port'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "demo.py", line 6, in <module>
+    load({})
+    ~~~~^^^^
+  File "demo.py", line 5, in load
+    raise ValueError("config missing port")
+ValueError: config missing port
+```
+
+"During handling of the above exception" reads like a *second bug* happened inside your handler. When the translation is deliberate, say so with `from`.
+
+### Explicit chaining: `raise ... from`
+
+```python
+class ConfigError(Exception):
+    pass
+
+def load(cfg):
+    try:
+        return int(cfg["port"])
+    except (KeyError, ValueError) as e:
+        raise ConfigError("bad port") from e
+
+try:
+    load({"port": "abc"})
+except ConfigError as e:
+    print("cause:  ", repr(e.__cause__))
+    print("context:", repr(e.__context__))
+    print("suppress_context:", e.__suppress_context__)
+
+try:
+    try:
+        {}["x"]
+    except KeyError:
+        raise ConfigError("hidden") from None
+except ConfigError as e:
+    print("from None -> cause:", e.__cause__, "context:", repr(e.__context__), "suppress:", e.__suppress_context__)
+
+load({"port": "abc"})
+```
+
+```text title="Output"
+cause:   ValueError("invalid literal for int() with base 10: 'abc'")
+context: ValueError("invalid literal for int() with base 10: 'abc'")
+suppress_context: True
+from None -> cause: None context: KeyError('x') suppress: True
+Traceback (most recent call last):
+  File "demo.py", line 6, in load
+    return int(cfg["port"])
+ValueError: invalid literal for int() with base 10: 'abc'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "demo.py", line 25, in <module>
+    load({"port": "abc"})
+    ~~~~^^^^^^^^^^^^^^^^^
+  File "demo.py", line 8, in load
+    raise ConfigError("bad port") from e
+ConfigError: bad port
+```
+
+Three attributes do the work:
+
+| Attribute | Set by | Meaning |
+|---|---|---|
+| `__context__` | always, automatically | the exception being handled when this one was raised |
+| `__cause__` | `raise X from Y` | the explicit cause Y |
+| `__suppress_context__` | `from` (any value, including `None`) | tells the traceback printer to skip `__context__` |
+
+<Mermaid chart={`flowchart LR
+  A["ConfigError('bad port')"] -->|"__cause__ via from e"| B["ValueError('invalid literal...')"]
+  A -.->|"__context__ always set"| B
+  C["ConfigError('hidden')"] -.->|"__context__ still set"| D["KeyError('x')"]
+  C -->|"from None sets __suppress_context__"| E["printer hides the KeyError"]
+`} />
+
+`from None` doesn't erase the context. `__context__` is still there for debuggers. It just stops the printer from showing it. Use it when the original error is pure noise for the caller, such as an internal `KeyError` behind a clean `UserNotFound`.
+
+<Callout title="Coming from JS">
+This is the same idea as ES2022's `new Error("bad port", { cause: err })`, but Python's printer shows the whole chain by default, and Python also records the implicit `__context__` even when you forget to pass a cause.
+</Callout>
+
+## Notes: `add_note` (3.11+)
+
+Sometimes you want to add context without changing the exception's type. `add_note` appends strings to `__notes__`, and the traceback prints them under the message:
+
+```python
+try:
+    raise ValueError("boom")
+except ValueError as e:
+    e.add_note("while parsing row 42 of users.csv")
+    e.add_note("hint: check the 'age' column")
+    print(e.__notes__)
+    raise
+```
+
+```text title="Output"
+['while parsing row 42 of users.csv', "hint: check the 'age' column"]
+Traceback (most recent call last):
+  File "demo.py", line 2, in <module>
+    raise ValueError("boom")
+ValueError: boom
+while parsing row 42 of users.csv
+hint: check the 'age' column
+```
+
+Reach for this in loops over records, retries ("attempt 3 of 5") and test helpers. The standard library uses it too: in 3.14, JSON serialization errors carry a note that says where the bad value was.
+
+## Custom exception hierarchies for a service layer
+
+### The design
+
+In a backend you want two properties:
+
+1. Callers can catch **one** base class for "an error our app raised on purpose".
+2. Each error carries enough data to become an HTTP response *without* the domain layer knowing about HTTP.
+
+```python
+class AppError(Exception):
+    """Base for every error our service raises on purpose."""
+    status_code = 500
+    code = "internal_error"
+
+    def __init__(self, message: str, *, details: dict | None = None):
+        super().__init__(message)
+        self.message = message
+        self.details = details or {}
+
+    def to_dict(self):
+        return {"code": self.code, "message": self.message, "details": self.details}
+
+class NotFoundError(AppError):
+    status_code = 404
+    code = "not_found"
+
+class ValidationError(AppError):
+    status_code = 422
+    code = "validation_error"
+
+class ConflictError(AppError):
+    status_code = 409
+    code = "conflict"
+
+class UserNotFound(NotFoundError):
+    def __init__(self, user_id: int):
+        super().__init__(f"user {user_id} not found", details={"user_id": user_id})
+
+try:
+    raise UserNotFound(7)
+except AppError as e:
+    print(type(e).__name__, e.status_code, e.to_dict())
+    print(str(e), "|", repr(e), "|", e.args)
+```
+
+```text title="Output"
+UserNotFound 404 {'code': 'not_found', 'message': 'user 7 not found', 'details': {'user_id': 7}}
+user 7 not found | UserNotFound('user 7 not found') | ('user 7 not found',)
+```
+
+Guidelines:
+
+- Inherit from `Exception`, never `BaseException`.
+- Always call `super().__init__(message)`. `str(e)` and `e.args` come from `BaseException.__init__`, and if you skip it you get an empty message in logs.
+- Name classes by *what went wrong* (`UserNotFound`, `PaymentDeclined`), not by where they came from.
+- Keep the hierarchy shallow: a base class, a few categories that map to status codes, then concrete errors.
+- Don't create an exception class nobody will ever catch separately. A message is enough for those.
+
+### Trap: custom `__init__` and pickling
+
+Exceptions cross process boundaries (multiprocessing, Celery, `concurrent.futures`) by pickling. `BaseException` pickles as "call the class again with `self.args`, then restore `__dict__`". If your `__init__` signature doesn't accept `self.args`, unpickling fails:
+
+```python
+import pickle
+
+class UserMissing(Exception):
+    def __init__(self, user_id):
+        super().__init__(f"user {user_id} missing")   # args = ("user 7 missing",)
+        self.user_id = user_id
+
+class Quota(Exception):
+    def __init__(self, *, limit):
+        super().__init__(f"limit {limit} exceeded")
+        self.limit = limit
+
+restored = pickle.loads(pickle.dumps(UserMissing(7)))
+print("user_id after round trip:", repr(restored.user_id))
+
+try:
+    pickle.loads(pickle.dumps(Quota(limit=10)))
+except TypeError as e:
+    print("unpickle failed:", e)
+```
+
+```text title="Output"
+user_id after round trip: 7
+unpickle failed: Quota.__init__() takes 1 positional argument but 2 were given
+```
+
+`UserMissing` only survives because its `__init__` happens to accept one positional argument and `__dict__` then overwrites `user_id`. `Quota` breaks: a worker process raises it, and the parent gets a confusing `TypeError` instead. Fix it by accepting `*args`, or by defining `__reduce__`.
+
+## ExceptionGroup and `except*` (3.11+)
+
+### Why they exist
+
+A single `raise` can carry one exception. Concurrent code can have *several* failures at once: three of five parallel HTTP calls time out, or a validator finds four problems. `ExceptionGroup` wraps a list of exceptions (possibly nested), and `except*` handles the parts of a group that match.
+
+```python
+def validate(user):
+    errors = []
+    if not user.get("email"):
+        errors.append(ValueError("email is required"))
+    if not isinstance(user.get("age"), int):
+        errors.append(TypeError("age must be int"))
+    if user.get("name") is None:
+        errors.append(KeyError("name"))
+    if errors:
+        raise ExceptionGroup("invalid user", errors)
+
+try:
+    validate({"age": "x"})
+except* ValueError as eg:
+    print("ValueErrors:", eg.exceptions)
+except* TypeError as eg:
+    print("TypeErrors:", eg.exceptions)
+except* KeyError as eg:
+    print("KeyErrors:", [repr(x) for x in eg.exceptions])
+```
+
+```text title="Output"
+ValueErrors: (ValueError('email is required'),)
+TypeErrors: (TypeError('age must be int'),)
+KeyErrors: ["KeyError('name')"]
+```
+
+Unlike plain `except`, **more than one `except*` clause can run** for the same `try`. Each clause gets a *sub-group* containing only its matching leaves, so `eg` is always a group, even if only one exception matched.
+
+### How it works: `split`
+
+Underneath, `except* T` calls `eg.split(T)`. That returns `(match, rest)` and keeps the nesting structure:
+
+```python
+eg = ExceptionGroup("batch", [ValueError(1), TypeError(2),
+                              ExceptionGroup("inner", [ValueError(3), OSError(4)])])
+match, rest = eg.split(ValueError)
+print("match:", repr(match))
+print("rest: ", repr(rest))
+print(type(BaseExceptionGroup("x", [ValueError()])).__name__)
+print(type(BaseExceptionGroup("x", [KeyboardInterrupt()])).__name__)
+try:
+    raise eg
+except* ValueError as g:
+    print("handled:", repr(g))
+```
+
+```text title="Output"
+match: ExceptionGroup('batch', [ValueError(1), ExceptionGroup('inner', [ValueError(3)])])
+rest:  ExceptionGroup('batch', [TypeError(2), ExceptionGroup('inner', [OSError(4)])])
+ExceptionGroup
+BaseExceptionGroup
+handled: ExceptionGroup('batch', [ValueError(1), ExceptionGroup('inner', [ValueError(3)])])
+  + Exception Group Traceback (most recent call last):
+  |   File "demo.py", line 9, in <module>
+  |     raise eg
+  | ExceptionGroup: batch (2 sub-exceptions)
+  +-+---------------- 1 ----------------
+    | TypeError: 2
+    +---------------- 2 ----------------
+    | ExceptionGroup: inner (1 sub-exception)
+    +-+---------------- 1 ----------------
+      | OSError: 4
+      +------------------------------------
+```
+
+The unhandled remainder (`TypeError` and `OSError`) was re-raised automatically as a smaller group. Some other details:
+
+- `BaseExceptionGroup(...)` returns an `ExceptionGroup` when every member is an `Exception`. `ExceptionGroup` itself refuses to wrap `KeyboardInterrupt` and other base exceptions.
+- You can't mix `except` and `except*` in the same `try`. `break`, `continue` and `return` aren't allowed inside an `except*` block.
+- `except* ExceptionGroup` is a `TypeError`. You match leaf types.
+- A plain `except ValueError` does **not** match an `ExceptionGroup` that contains a `ValueError`. Once code can raise groups, callers need `except*`.
+
+### Where you'll actually meet them: `asyncio.TaskGroup`
+
+```python
+import asyncio
+
+async def fetch(n):
+    await asyncio.sleep(0.01)
+    if n % 2:
+        raise ConnectionError(f"service {n} down")
+    return n
+
+async def main():
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for i in range(4):
+                tg.create_task(fetch(i))
+    except* ConnectionError as eg:
+        print(repr(eg))
+
+asyncio.run(main())
+```
+
+```text title="Output"
+ExceptionGroup('unhandled errors in a TaskGroup', [ConnectionError('service 1 down'), ConnectionError('service 3 down')])
+```
+
+Both failures were collected because they happened in the same event-loop tick. If task 1 fails earlier, `TaskGroup` cancels the remaining tasks, so the group may hold only one error. Don't assume the group lists every task that *would* have failed.
+
+<Callout title="Coming from JS">
+The JS counterpart is `AggregateError` from `Promise.any`, or what you get when you collect the `rejected` entries from `Promise.allSettled`. JS has no syntax like `except*` to pull matching errors out by type. You filter `err.errors` by hand. `TaskGroup` also behaves like `Promise.all` with cancellation: the first failure cancels the siblings, which `Promise.all` can't do.
+</Callout>
+
+## EAFP vs LBYL
+
+Python culture prefers **EAFP**, "easier to ask forgiveness than permission": try the operation and handle the failure. **LBYL**, "look before you leap", checks first.
+
+```python
+config = {"timeout": 5}
+
+# LBYL
+if "retries" in config:
+    retries = config["retries"]
+else:
+    retries = 3
+
+# EAFP
+try:
+    retries = config["retries"]
+except KeyError:
+    retries = 3
+
+print(retries, config.get("retries", 3))
+
+try:
+    with open("settings.local.toml") as f:
+        data = f.read()
+except FileNotFoundError:
+    data = ""
+print(repr(data))
+```
+
+```text title="Output"
+3 3
+''
+```
+
+Why EAFP:
+
+- **No race conditions.** `if os.path.exists(p): open(p)` can fail if the file is deleted between the check and the open (a TOCTOU bug). Opening and catching the error has no gap.
+- **Duck typing.** You call `.read()` and handle `AttributeError`, instead of checking types up front.
+
+What it costs. Since 3.11 a `try` block that doesn't raise is almost free ("zero-cost exceptions": the compiler records handler ranges in a side table instead of pushing a block at runtime). *Raising* still costs something:
+
+```python
+import timeit
+d = {"a": 1}
+def eafp_hit():
+    try: return d["a"]
+    except KeyError: return 0
+def eafp_miss():
+    try: return d["b"]
+    except KeyError: return 0
+def lbyl_miss():
+    return d["b"] if "b" in d else 0
+for f in (eafp_hit, eafp_miss, lbyl_miss):
+    print(f.__name__, round(min(timeit.repeat(f, number=1_000_000, repeat=5)), 3), "s per 1M")
+```
+
+```text title="Output"
+eafp_hit 0.083 s per 1M
+eafp_miss 0.233 s per 1M
+lbyl_miss 0.063 s per 1M
+```
+
+On my machine (3.14.6) a miss costs roughly three times as much as a hit. So use EAFP when failure is *rare*, and an explicit check (or `dict.get`) when the "failure" is the common path. Readability usually decides more than speed does.
+
+## Tracebacks and the `traceback` module
+
+The `traceback` module gives you the same formatting the interpreter uses, as strings or structured frames:
+
+```python
+import traceback
+
+def inner():
+    return {}["missing"]
+def outer():
+    return inner()
+
+try:
+    outer()
+except KeyError as e:
+    print("format_exception_only:", traceback.format_exception_only(e))
+    for fr in traceback.extract_tb(e.__traceback__):
+        print(f"  {fr.name} line {fr.lineno}: {fr.line}")
+```
+
+```text title="Output"
+format_exception_only: ["KeyError: 'missing'\n"]
+  <module> line 9: outer()
+  outer line 6: return inner()
+  inner line 4: return {}["missing"]
+```
+
+The `~~~^^^` markers in modern tracebacks (3.11+) come from column information stored in each code object, which points at the exact sub-expression that failed. Each release also adds better messages: 3.14 suggests the right keyword for typos such as `whille`, and 3.15 suggests `.append` when you call `.push` on a list.
+
+## The `warnings` module
+
+Warnings are for "this works now, but you should know something": deprecations, risky but legal usage, missing optional dependencies. They're not exceptions by default. They go through a filter that decides whether to ignore them, print them once, or turn them into exceptions.
+
+```python
+import warnings
+
+def old_api():
+    warnings.warn("old_api() is deprecated, use new_api()",
+                  DeprecationWarning, stacklevel=2)
+    return 1
+
+old_api()          # shown: the call site is in __main__
+
+warnings.simplefilter("error", DeprecationWarning)
+try:
+    old_api()
+except DeprecationWarning as w:
+    print("now an exception:", w)
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    warnings.warn("careful", UserWarning)
+print([str(w.message) for w in caught], caught[0].category.__name__)
+```
+
+```text title="Output"
+demo.py:8: DeprecationWarning: old_api() is deprecated, use new_api()
+  old_api()          # shown: the call site is in __main__
+now an exception: old_api() is deprecated, use new_api()
+['careful'] UserWarning
+```
+
+- `stacklevel=2` blames the *caller's* line, which is the line that needs fixing.
+- By default `DeprecationWarning` is shown only when it's triggered by code in `__main__`. Library-internal deprecations stay hidden. Test runners like pytest show them all.
+- In CI, run with `python -W error::DeprecationWarning` (or pytest's `filterwarnings = error`) so upcoming breakages fail the build.
+- `typing_extensions.deprecated` and `warnings.deprecated` (3.13+) is a decorator that warns at runtime *and* lets type checkers flag the call.
+
+## Logging exceptions
+
+Inside an `except` block, `logger.exception(...)` logs at ERROR level and attaches the current traceback:
+
+```python
+import logging, sys
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s", stream=sys.stdout)
+log = logging.getLogger("orders")
+
+def charge(order_id):
+    raise TimeoutError("payment gateway timed out")
+
+try:
+    charge(42)
+except TimeoutError:
+    log.exception("charge failed for order %s", 42)
+```
+
+```text title="Output"
+ERROR orders: charge failed for order 42
+Traceback (most recent call last):
+  File "demo.py", line 9, in <module>
+    charge(42)
+    ~~~~~~^^^^
+  File "demo.py", line 6, in charge
+    raise TimeoutError("payment gateway timed out")
+TimeoutError: payment gateway timed out
+```
+
+- `log.error("...", exc_info=True)` does the same thing at any level (`log.warning(..., exc_info=True)` for errors you can recover from).
+- Use lazy `%s` arguments, not f-strings, so the message is formatted only if the record is actually emitted, and so log aggregators can group records by template.
+- **Log or re-raise, not both** at every layer. If each layer logs and re-raises, one failure shows up five times in your logs. Log once, at the boundary that handles the error.
+
+## Mapping exceptions to HTTP errors in FastAPI
+
+The domain layer raises `AppError` subclasses. One handler at the edge turns them into JSON. A catch-all handler logs anything unexpected and returns a generic 500 without leaking internal details:
+
+```python
+import logging
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+log = logging.getLogger("api")
+
+class AppError(Exception):
+    status_code = 500
+    code = "internal_error"
+    def __init__(self, message, *, details=None):
+        super().__init__(message)
+        self.message, self.details = message, details or {}
+
+class NotFoundError(AppError):
+    status_code, code = 404, "not_found"
+
+class UserNotFound(NotFoundError):
+    def __init__(self, user_id):
+        super().__init__(f"user {user_id} not found", details={"user_id": user_id})
+
+app = FastAPI()
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    return JSONResponse(status_code=exc.status_code,
+                        content={"code": exc.code, "message": exc.message, "details": exc.details})
+
+@app.exception_handler(Exception)
+async def unhandled(request: Request, exc: Exception):
+    log.exception("unhandled error on %s", request.url.path)
+    return JSONResponse(status_code=500, content={"code": "internal_error", "message": "Internal Server Error"})
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: int):
+    if user_id != 1:
+        raise UserNotFound(user_id)
+    return {"id": 1, "name": "Ada"}
+
+@app.get("/boom")
+async def boom():
+    return 1 / 0
+
+client = TestClient(app, raise_server_exceptions=False)
+for path in ("/users/1", "/users/7", "/users/abc", "/boom"):
+    r = client.get(path)
+    print(path, r.status_code, r.json() if path != "/users/abc" else r.json()["detail"][0]["type"])
+```
+
+```text title="Output"
+/users/1 200 {'id': 1, 'name': 'Ada'}
+/users/7 404 {'code': 'not_found', 'message': 'user 7 not found', 'details': {'user_id': 7}}
+/users/abc 422 int_parsing
+/boom 500 {'code': 'internal_error', 'message': 'Internal Server Error'}
+```
+
+FastAPI picks the handler for the **most specific class in the exception's MRO**, so `UserNotFound` goes to the `AppError` handler, not to the `Exception` handler. Request validation failures (`/users/abc`) are raised by FastAPI as `RequestValidationError` and get a 422 automatically. `HTTPException` is still fine in route code, but keeping your services free of HTTP types makes them reusable from workers and CLIs.
+
+<Callout title="Coming from JS">
+This is NestJS's exception filters in Python form. `AppError` with `status_code` plays the role of `HttpException`, and `@app.exception_handler(AppError)` is `@Catch(AppError)`. The difference is that Nest's `HttpException` lives in the HTTP layer, while here the domain error only carries a status hint. Some teams keep even that out of the domain and map classes to codes in a dict at the edge.
+</Callout>
+
+## Interview questions
+
+1. **Why shouldn't you write a bare `except:`?** **It catches `BaseException`, including `SystemExit`, `KeyboardInterrupt` and `GeneratorExit`, so it breaks Ctrl+C, `sys.exit()` and generator cleanup and hides bugs. Catch specific classes, or `Exception` at a boundary.**
+2. **When does the `else` clause of a `try` run, and why use it?** **Only if the `try` body raised nothing. It keeps the guarded region small, so exceptions from follow-up code aren't swallowed by the `except` clauses by accident.**
+3. **What happens if `finally` contains a `return`?** **It overrides any pending return value and silently discards any in-flight exception. 3.14 emits a `SyntaxWarning` for it (PEP 765).**
+4. **Difference between `__cause__` and `__context__`?** **`__context__` is set automatically to the exception being handled when a new one is raised. `__cause__` is set explicitly with `raise ... from`. `from None` sets `__suppress_context__` so the context isn't printed, but it is still stored.**
+5. **Why is the `as e` variable deleted after the `except` block?** **The exception references its traceback, which references the frame, which references `e`. Deleting the name breaks that cycle so the frames can be freed by reference counting.**
+6. **How do `ExceptionGroup` and `except*` differ from normal handling?** **A group carries several exceptions. Each `except*` clause receives the matching sub-group via `split`, several clauses can run, and anything unmatched is re-raised as a smaller group.**
+7. **How would you design exceptions for a service layer?** **A single `AppError` base subclassing `Exception`, a few category subclasses that carry a status code and an error code, and concrete errors that call `super().__init__(message)`. One handler at the HTTP edge maps them to responses.**
+8. **Is EAFP slow in Python?** **Entering a `try` that doesn't raise is almost free since 3.11 (zero-cost exceptions). Raising and catching costs a few times more than an `in` check, so use EAFP when failure is rare.**
+
+## Recap
+
+- Everything raised derives from `BaseException`. Normal errors derive from `Exception`. `SystemExit`, `KeyboardInterrupt` and `GeneratorExit` deliberately don't.
+- `except` clauses match top to bottom by `isinstance`. `else` runs only when nothing was raised. `finally` always runs, and a `return` inside it swallows exceptions.
+- A bare `raise` re-raises with the original traceback. `raise X from Y` records a cause, and `from None` hides the context.
+- `add_note` adds context without changing the type. `ExceptionGroup` and `except*` handle several concurrent failures, especially from `TaskGroup`.
+- Build a shallow custom hierarchy rooted at one `AppError`, make it picklable, and map it to HTTP responses at the edge.
+- Prefer EAFP when failures are rare. Warnings are for deprecations. Log with `logger.exception` once, at the layer that handles the error.

@@ -1,0 +1,671 @@
+---
+title: "CPython Memory Management"
+description: "How CPython allocates and frees objects: the PyObject header, reference counting, the cyclic garbage collector, weak references, pymalloc, immortal objects, free-threaded refcounting and leak hunting."
+---
+
+CPython's memory management has two layers. **Reference counting** frees most objects the instant they become unreachable. A **cyclic garbage collector** catches the reference cycles that counting alone can't free. Underneath both sits **pymalloc**, an allocator tuned for millions of small, short-lived objects. Knowing these layers explains why `del` doesn't always free memory, why `__del__` is risky, why some objects can't be weakly referenced, and what changes in the free-threaded build.
+
+Snippets ran on **CPython 3.14.6** (GIL build, 64-bit Windows) unless labelled **3.14t** (free-threaded) or **3.13**. Memory addresses differ on every run.
+
+## Everything is a `PyObject`
+
+### The header
+
+Every Python value (an int, a function, a class, a module, `None`) is a C struct that **starts with the same header**, `PyObject`:
+
+<Mermaid chart={`flowchart LR
+  subgraph GIL["GIL build, 64-bit: 16-byte header"]
+    direction TB
+    R["ob_refcnt<br/>8 bytes"] --> T["ob_type<br/>8 bytes, pointer to the type object"]
+    T --> P["type-specific fields<br/>e.g. ob_size, ob_item, ob_digit"]
+  end
+  subgraph GC["GC-tracked containers also have"]
+    direction TB
+    H["PyGC_Head, 16 bytes<br/>placed BEFORE the object"]
+  end
+  H -.-> R
+`} />
+
+- `ob_refcnt`: how many references point at this object.
+- `ob_type`: a pointer to its type object (`list`, `int`, your class). `type(x)` just reads this field.
+- The rest depends on the type. A list adds a length, a pointer to an array of item pointers, and a capacity.
+- Containers that can take part in cycles (lists, dicts, class instances, ...) carry an extra `PyGC_Head` *in front of* the struct, which links them into the GC's generation lists.
+
+In CPython, `id(x)` is the object's memory address, so `ctypes` can read the header directly:
+
+```python
+import ctypes
+data = []
+addr = id(data)                          # in CPython, id() is the memory address
+refcnt = lambda: ctypes.c_ssize_t.from_address(addr).value   # ob_refcnt is the first field
+print("ob_refcnt:", refcnt())
+alias = data
+print("ob_refcnt:", refcnt())
+del alias
+print("ob_refcnt:", refcnt())
+type_ptr = ctypes.c_void_p.from_address(addr + 8).value      # ob_type is the second field
+print("ob_type == id(list):", type_ptr == id(list))
+```
+
+```text title="Output"
+ob_refcnt: 1
+ob_refcnt: 2
+ob_refcnt: 1
+ob_type == id(list): True
+```
+
+(For learning only. Reading raw memory is fragile and gives different results in the free-threaded build, as shown later.)
+
+### What objects cost
+
+```python
+import sys
+print("object():", sys.getsizeof(object()), " []:", sys.getsizeof([]), " 1:", sys.getsizeof(1),
+      " 2**64:", sys.getsizeof(2**64), " '':", sys.getsizeof(""), " ():", sys.getsizeof(()))
+```
+
+```text title="Output"
+object(): 16  []: 56  1: 28  2**64: 36  '': 41  (): 48
+```
+
+| Object | Bytes | Where they go |
+|---|---|---|
+| `object()` | 16 | just the header |
+| `1` | 28 | header + size + one 30-bit "digit" |
+| `2**64` | 36 | one more digit: ints grow as needed |
+| `[]` | 56 | header 16 + size, item pointer, capacity 24 + `PyGC_Head` 16 |
+| `""` | 41 | header, length, hash, state flags, and a trailing NUL |
+
+`sys.getsizeof` is **shallow**. A list of a million strings reports only the list's own array, not the strings. For deep sizes use `tracemalloc` (below) or a tool such as `pympler`.
+
+The same snippet gives different numbers on other builds:
+
+```text title="Output"
+3.13.14 gil:           object(): 16  []: 56  1: 28  2**64: 36  '': 41  (): 40
+3.14.6 free-threaded:  object(): 32  []: 56  1: 44  2**64: 52  '': 57  (): 48
+```
+
+3.14 tuples gained a cached hash field (8 more bytes). The free-threaded header is 32 bytes, for reasons explained in the free-threading section.
+
+<Callout title="Coming from JS">
+V8 objects also start with a header (a pointer to the object's hidden class, or "map"), but V8 avoids allocation for small integers using **Smis**: tagged values stored inside the pointer itself. CPython has no tagged pointers. Every int is a real heap object, which is why the small-int cache below exists. V8 also *moves* objects (compacting GC), while CPython objects **never move**: `id()` stays the same for an object's whole life, and C extensions can hold raw pointers safely.
+</Callout>
+
+## Reference counting
+
+### How it works
+
+Every time a reference is created (assigning a name, putting an object in a container, passing an argument, pushing it on the interpreter's value stack), CPython calls `Py_INCREF`. Every time one goes away, it calls `Py_DECREF`. When the count reaches **zero**, the type's deallocator runs **immediately**. It decrements everything the object refers to (which can cascade) and returns the memory.
+
+```python
+import sys
+data = []                      # one reference: the name "data"
+print(sys.getrefcount(data))   # +1 for the argument while getrefcount runs
+alias = data
+print(sys.getrefcount(data))
+holder = {"k": data}
+print(sys.getrefcount(data))
+del alias
+holder.clear()
+print(sys.getrefcount(data))
+```
+
+```text title="Output"
+2
+3
+4
+2
+```
+
+### The off-by-one in `sys.getrefcount`
+
+`sys.getrefcount(x)` usually reports **one more** than you'd expect, because passing `x` as the argument creates a temporary reference for the duration of the call. In 3.14 that's no longer guaranteed. The interpreter now often uses **borrowed** references on its evaluation stack (it skips the incref/decref pair when it can prove the object stays alive), so the extra reference sometimes disappears:
+
+```python
+import sys
+def f():
+    x = []
+    return sys.getrefcount(x)
+print("local in function:", f())
+y = []
+print("module global:", sys.getrefcount(y))
+print("literal temp:", sys.getrefcount([]))
+```
+
+```text title="Output"
+3.14.6:   local in function: 1  /  module global: 2  /  literal temp: 1
+3.13.14:  local in function: 2  /  module global: 2  /  literal temp: 1
+```
+
+Use `getrefcount` for comparisons (did this grow?), never for exact values.
+
+### Deterministic destruction
+
+Because freeing happens at refcount zero, CPython destroys objects at predictable moments:
+
+```python
+class Resource:
+    def __init__(self, name): self.name = name
+    def __del__(self): print(f"__del__ {self.name}")
+
+def work():
+    r = Resource("temp")
+    print("leaving work()")
+work()
+print("after work()")
+
+a = Resource("a")
+b = a
+del a
+print("deleted a, b still alive")
+b = None
+print("end")
+```
+
+```text title="Output"
+leaving work()
+__del__ temp
+after work()
+deleted a, b still alive
+__del__ a
+end
+```
+
+- `del a` deletes a **name**, not the object. The object dies only when its *last* reference does.
+- Leaving the function dropped the frame's local, the count reached zero, and `__del__` ran right away.
+
+**Don't rely on this for resources.** It's a CPython implementation detail. PyPy and GraalPy use tracing GCs and free objects later, and in CPython an object stuck in a cycle or referenced by a traceback lives longer. Use `with` for files, sockets, locks and DB connections.
+
+### Pros and cons of refcounting
+
+| Pros | Cons |
+|---|---|
+| memory is reused immediately, which keeps the cache warm | every reference change writes to the object, even "read-only" sharing |
+| no long stop-the-world pauses for most objects | a big structure's last decref frees it all at once (a "deallocation storm") |
+| predictable destruction | **can't free cycles** |
+| simple C API for extensions | writes to the count are why the GIL existed (thread-safe counts) |
+
+One practical effect: with `fork()`-based workers (gunicorn, multiprocessing on Linux), the parent's memory pages are shared copy-on-write, but merely *reading* an object in the child increments its refcount, which writes to the page and forces a copy. Shared memory slowly turns into private memory. `gc.freeze()` (see below) and immortal objects reduce this.
+
+## The cyclic garbage collector
+
+### Why cycles leak under refcounting
+
+```python
+import gc, weakref
+
+class Node:
+    def __init__(self, name):
+        self.name = name
+        self.other = None
+
+gc.disable()                       # make the demo deterministic
+a, b = Node("a"), Node("b")
+a.other, b.other = b, a            # a -> b -> a : a reference cycle
+probe = weakref.ref(a)             # observe a without keeping it alive
+del a, b
+print("after del, still alive?", probe() is not None)
+found = gc.collect()
+print("gc.collect() found", found, "unreachable objects")
+print("after collect, alive?", probe() is not None)
+gc.enable()
+```
+
+```text title="Output"
+after del, still alive? True
+gc.collect() found 2 unreachable objects
+after collect, alive? False
+```
+
+After `del`, each node still has a count of 1 (from the other node), so refcounting never frees them. Cycles are everywhere in real code: parent and child pointers, doubly linked lists, an object stored in its own `__dict__`, a closure that refers to itself, and exception → traceback → frame → the exception variable (which is why `except ... as e` deletes `e`).
+
+### How the collector finds garbage
+
+The GC only tracks **container** objects that can refer to others. Ints and strings can't form cycles, so they're never tracked:
+
+```python
+import gc
+print(gc.is_tracked(1), gc.is_tracked("x"), gc.is_tracked([]))
+```
+
+```text title="Output"
+False False True
+```
+
+For the set of objects it's examining, the collector:
+
+1. Copies each object's refcount into a scratch field (`gc_refs`).
+2. For every object in the set, visits each object it references (via the type's `tp_traverse`) and **subtracts 1** from that target's `gc_refs`.
+3. Whatever still has `gc_refs > 0` is referenced from **outside** the set (a global, a local, the stack), so it's reachable. Everything reachable from those objects is reachable too.
+4. The rest is unreachable garbage: only referenced from inside the set. Finalizers run, weakrefs are cleared, then references are broken (`tp_clear`) so refcounting frees the objects.
+
+Note the trick: the GC never needs to know the program's "roots". Subtracting internal references reveals which objects have references from outside.
+
+### Generations
+
+Scanning every object constantly would be slow. Most objects die young (the *generational hypothesis*), so tracked objects are grouped by age:
+
+<Mermaid chart={`flowchart LR
+  N["new container allocated"] --> G0["generation 0<br/>young"]
+  G0 -->|"survives a gen0 collection"| G1["generation 1"]
+  G1 -->|"survives a gen1 collection"| G2["generation 2<br/>old, long-lived"]
+  G0 -.->|"allocations minus deallocations exceed threshold0 = 2000"| C0["collect gen0"]
+  G1 -.->|"10 gen0 collections"| C1["collect gen0 and gen1"]
+  G2 -.->|"10 gen1 collections, and only if enough new long-lived objects"| C2["full collection"]
+`} />
+
+```python
+import gc
+print("thresholds:", gc.get_threshold())
+print("counts:    ", gc.get_count())
+junk = [[] for _ in range(1500)]
+print("counts after 1500 lists:", gc.get_count())
+def cb(phase, info):
+    if phase == "stop":
+        print(f"  gen{info['generation']} collection: collected={info['collected']}")
+gc.callbacks.append(cb)
+gc.collect(0)
+gc.collect()
+gc.callbacks.remove(cb)
+print("stats gen0:", gc.get_stats()[0])
+```
+
+```text title="Output"
+thresholds: (2000, 10, 10)
+counts:     (245, 3, 0)
+counts after 1500 lists: (1735, 3, 0)
+  gen0 collection: collected=0
+  gen2 collection: collected=0
+stats gen0: {'collections': 4, 'collected': 23, 'uncollectable': 0}
+```
+
+- Generation 0 is collected when container allocations minus deallocations since the last collection pass **2000** (the threshold was 700 before 3.13).
+- Full collections are also throttled: one runs only when the number of objects that survived since the last full collection exceeds 25% of the long-lived objects. That keeps big heaps from being rescanned all the time.
+
+**A version note.** 3.14.0 shipped an *incremental* collector with only two generations, aimed at shorter pauses. It caused memory growth in production workloads and was **reverted in 3.14.5** to the 3.13 generational design. 3.15 keeps the generational GC. If you read about "the incremental GC in 3.14", that only applies to 3.14.0 through 3.14.4.
+
+### Useful `gc` tools
+
+| Call | Use |
+|---|---|
+| `gc.collect(gen=2)` | force a collection and return the number of unreachable objects found |
+| `gc.disable()` / `gc.enable()` | refcounting still works. Some batch jobs disable the GC for speed, but cycles then leak |
+| `gc.freeze()` | move everything into a permanent generation the GC ignores. Call it in a pre-fork server's master before forking, so children don't touch (and copy) those pages |
+| `gc.get_referrers(obj)` / `gc.get_referents(obj)` | who points at this object, and what it points at (debugging leaks) |
+| `gc.callbacks` | hooks around each collection, useful for metrics on pause times |
+| `gc.set_debug(gc.DEBUG_SAVEALL)` | keep unreachable objects in `gc.garbage` instead of freeing them, for inspection |
+
+### `__del__` caveats
+
+Since Python 3.4 (PEP 442), cycles that include objects with `__del__` **are** collected. Before that, they leaked into `gc.garbage`:
+
+```python
+import gc
+
+class Conn:
+    def __init__(self, name):
+        self.name, self.peer = name, None
+    def __del__(self):
+        print(f"__del__ {self.name}, peer is {self.peer.name}")
+
+gc.disable()
+a, b = Conn("a"), Conn("b")
+a.peer, b.peer = b, a
+del a, b
+print("collecting...")
+print("collected:", gc.collect())
+print("gc.garbage:", gc.garbage)
+```
+
+```text title="Output"
+collecting...
+__del__ a, peer is b
+__del__ b, peer is a
+collected: 2
+gc.garbage: []
+```
+
+The remaining traps:
+
+- **Order isn't defined** for finalizers within a cycle. `a`'s `__del__` might see a `b` that has already been finalized.
+- **When** `__del__` runs depends on refcounts or GC timing. It can run in any thread, in the middle of other code, or never (at interpreter shutdown, module globals may already be `None`).
+- **Exceptions inside `__del__`** are printed as "Exception ignored in ..." and swallowed.
+- **Resurrection:** `__del__` can store `self` somewhere and bring the object back to life. It then won't run `__del__` a second time:
+
+```python
+saved = []
+class Phoenix:
+    def __del__(self):
+        print("__del__ runs, resurrecting self")
+        saved.append(self)              # a new reference: the object comes back to life
+p = Phoenix()
+del p
+print("resurrected:", len(saved))
+saved.clear()                           # second death: __del__ is NOT called again
+print("cleared, end")
+```
+
+```text title="Output"
+__del__ runs, resurrecting self
+resurrected: 1
+cleared, end
+```
+
+Prefer context managers for cleanup, and `weakref.finalize` when you really need "run this when the object dies". It doesn't make the object part of a cycle, it runs at most once, and it also runs at interpreter exit.
+
+<Callout title="Coming from JS">
+V8 has no reference counts at all. It's a **tracing, generational, moving** collector: a "scavenger" copies survivors out of the young generation, and mark-compact (mostly concurrent and incremental) handles the old generation. Cycles are a non-issue there because tracing starts from roots. JS also has no deterministic destructors: `FinalizationRegistry` callbacks run "sometime later, maybe", much like `weakref.finalize` on PyPy. CPython inverts the trade-off: freeing is immediate and predictable, plus a smaller non-moving tracing pass just for cycles.
+</Callout>
+
+## Weak references
+
+A weak reference points at an object **without** incrementing its refcount. When the object dies, the weakref is cleared, so `ref()` returns `None`.
+
+```python
+import weakref
+
+class User:
+    def __init__(self, uid): self.uid = uid
+    def __repr__(self): return f"User({self.uid})"
+
+u = User(1)
+r = weakref.ref(u)
+print(type(r).__name__, r() is u)
+del u
+print("after del:", r())
+
+cache = weakref.WeakValueDictionary()
+def load_user(uid):
+    user = cache.get(uid)
+    if user is None:
+        print(f"  loading user {uid} from DB")
+        user = User(uid)
+        cache[uid] = user
+    return user
+
+a = load_user(7)
+b = load_user(7)              # served from cache while someone holds it
+print(a is b, list(cache.keys()))
+del a, b                      # last strong refs gone -> entry vanishes
+print("cache after del:", list(cache.keys()))
+
+weakref.finalize(User(9), print, "finalizer ran for user 9")
+
+for obj in (1, "s", [1], (1,), {}):
+    try:
+        weakref.ref(obj)
+    except TypeError as e:
+        print(type(obj).__name__, "->", e)
+
+class Slotted:
+    __slots__ = ("x",)
+try:
+    weakref.ref(Slotted())
+except TypeError as e:
+    print("Slotted ->", e)
+```
+
+```text title="Output"
+ReferenceType True
+after del: None
+  loading user 7 from DB
+True [7]
+cache after del: []
+finalizer ran for user 9
+int -> cannot create weak reference to 'int' object
+str -> cannot create weak reference to 'str' object
+list -> cannot create weak reference to 'list' object
+tuple -> cannot create weak reference to 'tuple' object
+dict -> cannot create weak reference to 'dict' object
+Slotted -> cannot create weak reference to 'Slotted' object
+```
+
+How it works: a weakly referenceable object has a slot (`tp_weaklistoffset`) pointing to a list of its weakrefs. On deallocation CPython walks that list, clears each weakref, and calls its callback. Built-ins like `int`, `str`, `list` and `dict` skip that slot to save memory, so wrap them in a small class (or subclass, e.g. `class Tags(list): pass`) if you need weakrefs. Classes with `__slots__` need `"__weakref__"` in the slots list.
+
+When to use weak references:
+
+- **`WeakValueDictionary` identity maps**: "one in-memory object per DB row, as long as someone uses it". SQLAlchemy's session identity map works this way.
+- **`WeakKeyDictionary`**: attach extra data to objects you don't own, without keeping them alive.
+- **`WeakSet` for observers and listeners**, so subscribing doesn't keep the subscriber alive forever (a classic leak in event-emitter code).
+- **Back-pointers** (child to parent) to avoid cycles in the first place.
+- **`weakref.WeakMethod`** for bound methods, which otherwise die immediately because each `obj.method` access creates a new bound method object.
+
+<Callout title="Coming from JS">
+`weakref.ref` is `WeakRef`, `WeakKeyDictionary` is `WeakMap`, `WeakSet` is `WeakSet`, and `weakref.finalize` is `FinalizationRegistry`. There's no JS equivalent of `WeakValueDictionary` (a map with weak *values*). You build one from `Map` + `WeakRef` + `FinalizationRegistry`. In CPython the clearing is immediate when the last strong reference goes, whereas in JS it happens whenever the GC gets to it.
+</Callout>
+
+## The memory allocator: pymalloc
+
+### Layers
+
+<Mermaid chart={`flowchart TD
+  A["Python code creates an object"] --> B["object allocator<br/>PyObject_Malloc"]
+  B -->|"request 512 bytes or less"| C["pymalloc<br/>arenas, pools, blocks"]
+  B -->|"request over 512 bytes"| D["raw allocator<br/>C malloc"]
+  C -->|"needs a new arena"| E["OS: mmap or VirtualAlloc<br/>1 MiB at a time"]
+  D --> F["OS heap"]
+`} />
+
+Python allocates and frees enormous numbers of tiny objects (ints, small tuples, frames, dicts). The general-purpose C `malloc` is good, but pymalloc is faster for this pattern and wastes less memory to fragmentation.
+
+### Arenas, pools and blocks
+
+```text title="Output"
+$ python -c "import sys; sys._debugmallocstats()"
+Small block threshold = 512, in 32 size classes.
+
+class   size   num pools   blocks in use  avail blocks
+-----   ----   ---------   -------------  ------------
+    0     16           1              33           988
+    1     32           2             745           275
+    2     48           8            2675            45
+    3     64          26            6525           105
+...
+2 arenas * 1048576 bytes/arena     =            2,097,152
+15 unused pools * 16384 bytes      =              245,760
+```
+
+- **Blocks:** requests are rounded up to a multiple of 16 bytes, which gives 32 **size classes** from 16 to 512 bytes. A 28-byte int uses a 32-byte block.
+- **Pools:** a pool (16 KiB on 64-bit builds since 3.10, 4 KiB before) holds blocks of **one** size class. Each class keeps a list of pools with free blocks, so allocation is "pop the head of a free list", which takes a few instructions.
+- **Arenas:** 1 MiB chunks requested from the OS, carved into pools.
+
+Why your process doesn't shrink: an arena can go back to the OS only when **every** pool in it is empty. One surviving 32-byte object pins the whole megabyte. A service that briefly built a huge dict and then dropped it often stays at its peak RSS. That's fragmentation, not a leak. The common mitigations are to process data in streams, to do the spiky work in a subprocess, or to recycle workers (`--max-requests` in gunicorn).
+
+Two more points:
+
+- Many types keep **free lists** of their own on top of this (floats, tuples of small sizes, frames, dicts), so a freed object is reused without even touching pymalloc.
+- The **free-threaded build doesn't use pymalloc**. It uses **mimalloc**, a thread-safe allocator, because the GC there needs to walk heap pages to find objects. `PYTHONMALLOC=malloc` switches any build to plain `malloc`, which is useful under Valgrind or AddressSanitizer.
+
+## Small int cache and string interning
+
+### Small ints
+
+CPython pre-creates the integers **-5 through 256** at startup and always returns those shared objects:
+
+```python
+import sys
+a = 256; b = int("256")
+print("256:", a is b)
+a = 257; b = int("257")
+print("257:", a is b)
+print("-5:", -5 is int("-5"), " -6:", -6 is int("-6"))
+```
+
+```text title="Output"
+256: True
+257: False
+-5: True  -6: False
+```
+
+(Values like `1000 is 1000` written in the *same* code object can still be `True`, because the compiler stores one constant and reuses it. That's another reason never to use `is` for numbers.)
+
+### String interning
+
+**Interning** keeps one canonical copy of a string, so equal interned strings are the same object and comparing them is a pointer check. CPython automatically interns identifiers (variable, attribute and function names, dict keys in class bodies) and string constants that look like identifiers. Strings built at runtime aren't interned unless you call `sys.intern`:
+
+```python
+import sys
+s1 = "user_id"; s2 = "".join(["user", "_id"])
+print("identifier-like literal vs built string:", s1 is s2, s1 == s2)
+print("after intern:", s1 is sys.intern(s2))
+s3 = "hello world!"; s4 = " ".join(["hello", "world!"])
+print("non-identifier:", s3 is s4, sys.intern(s4) is sys.intern(s3))
+a_literal = "a"
+print("one-char strings cached:", chr(97) is a_literal)
+```
+
+```text title="Output"
+identifier-like literal vs built string: False True
+after intern: True
+non-identifier: False True
+one-char strings cached: True
+```
+
+Why it matters: attribute lookup is a dict lookup keyed by the attribute name. Because both the key in `__dict__` and the name in the bytecode are interned, the dict compares pointers first and usually never compares characters. `sys.intern` helps when you hold millions of repeated strings (column values, tags, JSON keys): you save memory and get faster dict lookups.
+
+## Immortal objects (3.12+)
+
+PEP 683 (3.12) made some objects **immortal**: their refcount is set to a special huge value, and `Py_INCREF`/`Py_DECREF` check for it and **skip the write**. `None`, `True`, `False`, the small ints, interned strings created at startup, and static built-in types are all immortal.
+
+```python
+import sys
+print("immortal:", sys._is_immortal(None), sys._is_immortal(5), sys._is_immortal(300), sys._is_immortal("a"))
+print("refcounts:", sys.getrefcount(None), sys.getrefcount(5), sys.getrefcount(True))
+```
+
+```text title="Output"
+immortal: True True False True
+refcounts: 3221225472 3221225472 3221225472
+```
+
+On 3.13 the same `getrefcount(None)` prints `4294967295`. The exact sentinel value is an implementation detail that changed in 3.14. `sys._is_immortal` is new in 3.14 (the underscore means CPython-specific).
+
+Why bother:
+
+- **No refcount writes** means objects shared across `fork()` children stay on shared copy-on-write pages, which is the gunicorn/Instagram motivation.
+- **Thread safety without atomics**: there are no count updates to synchronize, which is essential for free-threading and for sharing objects between subinterpreters.
+- Code doesn't have to special-case the most heavily used objects. The check costs a branch in every incref, and in practice that's paid back elsewhere.
+
+Trap: since 3.12, code that uses refcounts to detect leaks of `None` or small ints sees an unchanging value. Some old C-extension tests broke for exactly that reason.
+
+## Free-threaded builds and biased reference counting
+
+Free-threaded CPython (PEP 703, `python3.14t`) removes the GIL. It was experimental in 3.13 and became **officially supported in 3.14** (PEP 779), though still not the default build. Without a GIL, two threads incrementing the same refcount would race, and making *every* incref atomic would slow single-threaded code down badly. The solution is **biased reference counting**: most objects are only ever touched by the thread that created them, so that thread gets a cheap, non-atomic counter.
+
+The free-threaded object header is therefore bigger (32 bytes):
+
+<Mermaid chart={`flowchart LR
+  A["ob_tid<br/>owning thread"] --> B["ob_flags, ob_mutex, ob_gc_bits"]
+  B --> C["ob_ref_local<br/>32-bit, owner only, non-atomic"]
+  C --> D["ob_ref_shared<br/>atomic, other threads"]
+  D --> E["ob_type"]
+`} />
+
+You can watch the two counters split on 3.14t:
+
+```python
+import sys, ctypes, threading
+print(sys.version.split()[0], "GIL enabled:", sys._is_gil_enabled())
+
+data = []
+addr = id(data)
+def fields():
+    local = ctypes.c_uint32.from_address(addr + 12).value    # ob_ref_local
+    shared = ctypes.c_ssize_t.from_address(addr + 16).value  # ob_ref_shared
+    return local, shared >> 2                                # low 2 bits are flags
+
+print("start                          -> local: %d shared: %d" % fields())
+refs = [data] * 3                      # main thread (the owner) adds 3 refs: plain increments
+print("after 3 refs from owner        -> local: %d shared: %d" % fields())
+
+keep = []
+def worker():
+    keep.extend([data] * 5)            # another thread adds 5 refs: atomic ops on the shared field
+t = threading.Thread(target=worker); t.start(); t.join()
+print("after 5 refs from other thread -> local: %d shared: %d" % fields())
+print("sys.getrefcount sums both:", sys.getrefcount(data) - 1)
+```
+
+```text title="Output"
+3.14.6 GIL enabled: False
+start                          -> local: 1 shared: 0
+after 3 refs from owner        -> local: 4 shared: 0
+after 5 refs from other thread -> local: 4 shared: 5
+sys.getrefcount sums both: 9
+```
+
+How the pieces fit together:
+
+- **Owner thread:** plain increments of `ob_ref_local`, almost as cheap as in the GIL build.
+- **Other threads:** atomic operations on `ob_ref_shared`. The shared count can even go *negative* temporarily (another thread dropped references the owner created). The object is freed only when the two are merged and the total reaches zero.
+- **Deferred reference counting** for objects that every thread hammers, such as functions, modules, code objects and type objects. The interpreter skips refcounting stack references to them and lets the GC account for them, to avoid contention on one cache line. (3.13 simply made many of these immortal, which leaked them. 3.14 uses deferred counting instead.)
+- **Immortal objects** need no counting at all.
+- **The GC** in the free-threaded build stops the world, isn't generational, and finds objects by walking mimalloc's heap pages instead of linked lists. That's why the GC bits live in the header and there's no `PyGC_Head`.
+
+The cost: single-threaded code runs roughly 5–10% slower on 3.14t, and objects use more memory. The gain: CPU-bound threads finally run in parallel. See the concurrency pages for when that matters.
+
+## Finding leaks with `tracemalloc`
+
+A "leak" in Python is almost always **something still referencing objects you think are gone**: a global list, an unbounded cache (`functools.lru_cache(maxsize=None)` on a method holding `self`), a listener that was never removed, or an exception traceback stored somewhere. `tracemalloc` records the Python traceback of every allocation, so you can diff snapshots:
+
+```python
+import tracemalloc
+
+_request_log = []                       # the "leak": grows forever
+
+def handle_request(i):
+    payload = {"id": i, "body": str(i) * 250}
+    _request_log.append(payload)        # oops: kept for debugging, never trimmed
+    return len(payload["body"])
+
+tracemalloc.start(10)                   # keep 10 frames per allocation
+before = tracemalloc.take_snapshot()
+for i in range(5_000):
+    handle_request(i)
+after = tracemalloc.take_snapshot()
+
+for stat in after.compare_to(before, "lineno")[:3]:
+    print(stat)
+current, peak = tracemalloc.get_traced_memory()
+print(f"current={current/1024:.0f} KiB peak={peak/1024:.0f} KiB")
+```
+
+```text title="Output"
+demo.py:6: size=5708 KiB (+5708 KiB), count=14979 (+14979), average=390 B
+demo.py:12: size=148 KiB (+148 KiB), count=4726 (+4726), average=32 B
+demo.py:7: size=40.8 KiB (+40.8 KiB), count=1 (+1), average=40.8 KiB
+current=5899 KiB peak=5901 KiB
+```
+
+Line 6 (the payload) grew by 5.7 MB across 15k allocations: the dict plus the string for each of 5000 requests. Line 7 is the list's own growing array. Line 12 is the ints above 256 created by the loop. Group by `"traceback"` instead of `"lineno"` to see *which caller* triggered the allocation.
+
+A workflow for a real service:
+
+1. Watch RSS over time (Prometheus, `ps`). A steady climb under constant load is suspicious. A plateau is probably just fragmentation or caches warming up.
+2. Enable `tracemalloc` (via `PYTHONTRACEMALLOC=10` or an admin endpoint), take a snapshot, run traffic, take another, and compare.
+3. Once you know the type that's growing, use `gc.get_referrers()` or `objgraph.show_backrefs()` to find *who* holds it.
+4. For memory in C extensions (NumPy, PyTorch, lxml) that `tracemalloc` can't see, use **memray** (Bloomberg), which tracks native allocations and produces flame graphs.
+
+`tracemalloc` slows allocation down noticeably and adds memory per traced block, so enable it only while investigating.
+
+## Interview questions
+
+1. **How does CPython free memory?** **Mainly by reference counting: an object is deallocated the instant its count reaches zero. A generational cyclic GC handles reference cycles that refcounting can't free.**
+2. **Why does `sys.getrefcount(x)` return one more than expected, and is that reliable?** **The call's argument adds a temporary reference. Since 3.14 the interpreter often uses borrowed stack references, so the extra one may not appear. Only compare counts, never trust exact values.**
+3. **How does the cyclic GC find garbage without knowing the roots?** **For the objects in a generation, it subtracts every internal reference from a copy of each refcount. Objects left with a positive count have references from outside and are reachable, along with everything they reach. The rest is garbage.**
+4. **Are objects with `__del__` in a cycle collected?** **Yes, since 3.4 (PEP 442), but finalizer order in the cycle is undefined, and resurrected objects don't get `__del__` called again. Prefer context managers or `weakref.finalize`.**
+5. **What are immortal objects and why were they added?** **Objects like `None`, small ints and interned strings whose refcount is a sentinel that incref and decref never change (PEP 683, 3.12). They avoid copy-on-write page copies after fork and remove contention for free-threading.**
+6. **Why doesn't RSS drop after deleting a large structure?** **pymalloc returns a 1 MiB arena to the OS only when every pool in it is empty. Scattered survivors pin arenas, which is fragmentation, not a leak.**
+7. **What is biased reference counting?** **In the free-threaded build each object has a non-atomic local count for its owning thread and an atomic shared count for other threads. Deferred refcounting and immortality cover hot shared objects.**
+8. **How would you find a memory leak in a Python service?** **Confirm steady growth, diff `tracemalloc` snapshots grouped by line or traceback, find the holders with `gc.get_referrers` or `objgraph`, and use memray for native allocations.**
+
+## Recap
+
+- Every object starts with a refcount and a type pointer. GC-tracked containers carry an extra GC header. Objects never move, and `id()` is their address.
+- Refcounting frees objects immediately and predictably but can't free cycles. Use `with` for resources anyway.
+- The generational cyclic GC (thresholds `(2000, 10, 10)`) finds unreachable cycles by subtracting internal references. 3.14.5+ reverted the short-lived incremental GC.
+- Weak references (`WeakValueDictionary`, `WeakSet`, `finalize`) let caches and observers avoid keeping objects alive.
+- pymalloc serves objects of 512 bytes or less from 16-byte size classes in pools and 1 MiB arenas. Fragmentation keeps RSS high.
+- Small ints (-5 to 256) and interned strings are shared. Immortal objects (3.12+) skip refcount writes.
+- The free-threaded build uses biased refcounting, deferred refcounting, mimalloc and a non-generational stop-the-world GC.
+- Hunt leaks with `tracemalloc` snapshot diffs, `gc.get_referrers`, and memray for native memory.

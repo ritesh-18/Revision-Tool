@@ -1,0 +1,1013 @@
+---
+title: "Context Managers"
+description: "The with statement desugared, writing class-based and generator-based context managers, ExitStack and the contextlib helpers, async context managers, and real backend uses like transactions, locks and temporary settings."
+---
+
+A context manager is an object that wraps a block of code with **setup** and **guaranteed teardown**. Open a file and always close it. Take a lock and always release it. Start a transaction and always commit or roll back. The `with` statement is the syntax; two dunder methods, `__enter__` and `__exit__`, are the protocol.
+
+It is `try/finally` packaged as a reusable object, and it is everywhere in Python backends: files, DB sessions, HTTP clients, locks, test patches, timers.
+
+<Callout type="info">
+All outputs on this page were produced with **CPython 3.14.6**. Version notes are marked where behaviour differs.
+</Callout>
+
+## The protocol: `__enter__` and `__exit__`
+
+```python
+class Tracer:
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self):
+        print(f"  __enter__ {self.name}")
+        return self              # this is what "as" binds
+    def __exit__(self, exc_type, exc, tb):
+        print(f"  __exit__ {self.name}: exc_type={exc_type}, exc={exc!r}")
+        return False             # do not suppress
+
+with Tracer("ok") as t:
+    print("  body, t is", type(t).__name__)
+
+try:
+    with Tracer("boom"):
+        raise ValueError("bad")
+except ValueError as e:
+    print("caught outside:", e)
+```
+
+```text title="Output"
+  __enter__ ok
+  body, t is Tracer
+  __exit__ ok: exc_type=None, exc=None
+  __enter__ boom
+  __exit__ boom: exc_type=<class 'ValueError'>, exc=ValueError('bad')
+caught outside: bad
+```
+
+- `__enter__(self)` runs before the body. Its **return value** is bound to the name after `as`. It does not have to be `self`.
+- `__exit__(self, exc_type, exc, tb)` runs after the body, **however the body ends**: normally, by exception, by `return`, `break` or `continue`. If the body finished normally, all three arguments are `None`. If an exception escaped, they are the exception's class, the instance, and its traceback.
+- If `__exit__` returns a **truthy** value, the exception is **suppressed** and execution continues after the `with` block. Falsy (including the implicit `None`) lets it propagate.
+
+The value `__enter__` returns varies a lot in practice:
+
+```python
+with open(__import__("os").devnull, "w") as f:
+    print(type(f).__name__)
+import threading
+lock = threading.Lock()
+with lock as got:
+    print("lock.__enter__ returned:", got)
+```
+
+```text title="Output"
+TextIOWrapper
+lock.__enter__ returned: True
+```
+
+A file returns itself. A lock returns the result of `acquire()`, which is just `True`. `decimal.localcontext()` returns a new context object, and `unittest.mock.patch` returns the mock. Always check what the `as` target actually is.
+
+## The `with` statement desugared
+
+This:
+
+```python
+with EXPR as VAR:
+    BODY
+```
+
+behaves like this (simplified from PEP 343):
+
+```python
+manager = EXPR
+enter = type(manager).__enter__      # looked up on the TYPE, before anything runs
+exit = type(manager).__exit__
+VAR = enter(manager)
+try:
+    BODY
+except BaseException as e:
+    if not exit(manager, type(e), e, e.__traceback__):
+        raise                        # re-raise unless __exit__ returned truthy
+else:
+    exit(manager, None, None, None)
+```
+
+<Mermaid chart={`flowchart TD
+    A["evaluate EXPR"] --> B["look up __enter__ and __exit__ on the type"]
+    B --> C["call __enter__, bind result to VAR"]
+    C -->|"__enter__ raises"| X["exception propagates<br/>__exit__ is NOT called"]
+    C --> D["run BODY"]
+    D -->|"finishes, return, break, continue"| E["__exit__(None, None, None)"]
+    D -->|"raises exception"| F["__exit__(type, value, traceback)"]
+    F -->|"returns truthy"| G["exception suppressed<br/>continue after with"]
+    F -->|"returns falsy"| H["exception re-raised"]
+    E --> G
+`} />
+
+Here is a runnable version that proves the semantics:
+
+```python
+class CM:
+    def __enter__(self):
+        print("  enter")
+        return "value"
+    def __exit__(self, et, e, tb):
+        print(f"  exit({et.__name__ if et else None})")
+        return et is KeyError
+
+def manual_with(mgr, body):
+    cls = type(mgr)
+    enter = cls.__enter__          # looked up on the type, before running
+    exit_ = cls.__exit__
+    value = enter(mgr)
+    try:
+        body(value)
+    except BaseException as e:
+        if not exit_(mgr, type(e), e, e.__traceback__):
+            raise
+    else:
+        exit_(mgr, None, None, None)
+
+manual_with(CM(), lambda v: print("  body got", v))
+def bad(v):
+    raise KeyError("k")
+manual_with(CM(), bad)
+print("KeyError suppressed")
+```
+
+```text title="Output"
+  enter
+  body got value
+  exit(None)
+  enter
+  exit(KeyError)
+KeyError suppressed
+```
+
+In bytecode, CPython compiles `with` into `LOAD_SPECIAL` lookups for both methods (3.14), a call to `__enter__`, and an exception-table entry that routes any exception to a handler calling `__exit__` (`WITH_EXCEPT_START`). There is no hidden function call or extra frame, so `with` is cheap.
+
+Key consequences of this expansion:
+
+**1. Methods are looked up on the type.** Adding `__enter__` to an instance does not work:
+
+```python
+class NotACM:
+    pass
+obj = NotACM()
+obj.__enter__ = lambda: None
+obj.__exit__ = lambda *a: None
+try:
+    with obj:
+        pass
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+TypeError: 'NotACM' object does not support the context manager protocol (missed __exit__ method)
+```
+
+**2. If `__enter__` raises, `__exit__` is never called.** The resource was never acquired, so there is nothing to release. That means `__enter__` must clean up after itself if it fails halfway (for example, opened a socket but then failed the handshake).
+
+```python
+class FailsOnEnter:
+    def __enter__(self):
+        raise ConnectionError("cannot connect")
+    def __exit__(self, *exc):
+        print("  __exit__ called?")    # never runs
+
+try:
+    with FailsOnEnter():
+        print("body")
+except ConnectionError as e:
+    print("ConnectionError:", e)
+```
+
+```text title="Output"
+ConnectionError: cannot connect
+```
+
+**3. Multiple managers nest, and exit in reverse order.** Since 3.10 you can wrap them in parentheses across several lines:
+
+```python
+class Tracer:
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self):
+        print(f"  enter {self.name}")
+        return self
+    def __exit__(self, *exc):
+        print(f"  exit {self.name}")
+
+with (
+    Tracer("a") as a,
+    Tracer("b") as b,
+):
+    print("  body")
+```
+
+```text title="Output"
+  enter a
+  enter b
+  body
+  exit b
+  exit a
+```
+
+`with A() as a, B() as b:` is exactly `with A() as a:` containing `with B() as b:`. If `B()` fails, `A` still gets its `__exit__`.
+
+**4. The `as` variable outlives the block.** Python has no block scope, so after `with open(...) as f:` the name `f` still refers to the (now closed) file. That is useful for things like timers whose result you read after the block.
+
+<Callout title="Coming from JS">
+The closest JS equivalent is `try { ... } finally { resource.close() }`, written out by hand every time. The newer explicit resource management proposal adds `using res = getResource()` and `await using`, which call `res[Symbol.dispose]()` or `[Symbol.asyncDispose]()` at the end of the block. That is very close to Python's `with` and `async with`, with one big difference: JS disposers cannot see or suppress the exception, while Python's `__exit__` receives the exception and can swallow it by returning `True`. JS's `DisposableStack` is the counterpart of Python's `ExitStack`.
+</Callout>
+
+## Exception arguments and suppression
+
+`__exit__` can inspect the exception and decide whether to swallow it:
+
+```python
+class SwallowValueErrors:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None and issubclass(exc_type, ValueError):
+            print(f"  swallowed: {exc}")
+            return True          # truthy: exception is suppressed
+        return False
+
+with SwallowValueErrors():
+    int("not a number")
+    print("never printed")
+print("execution continues after the with block")
+
+try:
+    with SwallowValueErrors():
+        {}["missing"]
+except KeyError as e:
+    print("KeyError propagated:", e)
+```
+
+```text title="Output"
+  swallowed: invalid literal for int() with base 10: 'not a number'
+execution continues after the with block
+KeyError propagated: 'missing'
+```
+
+Note that suppression does **not** resume the body. The rest of the body after the failing line is skipped; execution picks up after the whole `with` statement.
+
+### Trap: accidentally truthy return values
+
+Any truthy return value suppresses. An `__exit__` that returns, say, a log message or a status string silently eats every exception:
+
+```python
+class Oops:
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return "logged"          # any truthy value suppresses!
+
+with Oops():
+    1 / 0
+print("ZeroDivisionError vanished")
+```
+
+```text title="Output"
+ZeroDivisionError vanished
+```
+
+Make `__exit__` return `None` or `False` explicitly unless you really mean to suppress. Annotate it as `-> None` (or `-> Literal[False]`) when it never suppresses: type checkers read a `bool` return annotation as "may swallow exceptions" and change their reachability analysis for code after the block.
+
+### Trap: an exception inside `__exit__` replaces the original
+
+If `__exit__` itself raises, the new exception propagates, with the original attached as `__context__`. Logs that only print the top exception lose the real cause.
+
+```python
+class Faulty:
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        raise RuntimeError("cleanup failed")
+
+try:
+    with Faulty():
+        raise ValueError("original")
+except RuntimeError as e:
+    print("got:", repr(e))
+    print("context:", repr(e.__context__))
+```
+
+```text title="Output"
+got: RuntimeError('cleanup failed')
+context: ValueError('original')
+```
+
+To re-raise the original from `__exit__`, just return `False`. Do not `raise exc` yourself; that adds a confusing extra frame to the traceback.
+
+## Writing class-based context managers
+
+A class is the right choice when the manager has state you want to read after the block, when it is reused, or when it is also a normal object (a connection, a client).
+
+```python
+import time
+
+class Timer:
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        self.elapsed = time.perf_counter() - self.start
+        return False
+
+with Timer() as t:
+    sum(range(1_000_000))
+print(f"took {t.elapsed:.4f}s")      # t is still usable after the block
+print("t.elapsed exists:", hasattr(t, "elapsed"))
+```
+
+```text title="Output"
+took 0.0073s
+t.elapsed exists: True
+```
+
+(The timing varies by machine.) Design points:
+
+- **Reusable vs single-use.** `Timer` can be used in many `with` blocks because `__enter__` resets state. A file object is single-use: after closing, entering it again fails. Locks are **reentrant** only if they are `RLock`; a plain `Lock` deadlocks if the same thread enters it twice.
+- **Acquire in `__enter__`, not `__init__`.** If the constructor opens a connection, a `Conn()` created but never used in a `with` leaks it. Libraries like `open()` acquire in the constructor for convenience, but for your own managers deferring to `__enter__` is safer.
+- `contextlib.AbstractContextManager` gives you a default `__enter__` returning `self`, and makes `isinstance(x, AbstractContextManager)` work structurally.
+
+## `contextlib.contextmanager`: generator-based managers
+
+Writing a class for every small setup/teardown pair is verbose. The `@contextmanager` decorator turns a generator function into a context manager factory: code before `yield` is `__enter__`, the yielded value is the `as` target, and code after `yield` is `__exit__`.
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def tag(name):
+    print(f"<{name}>")
+    try:
+        yield name.upper()
+    finally:
+        print(f"</{name}>")
+
+with tag("div") as value:
+    print("  inside, value =", value)
+
+try:
+    with tag("p"):
+        raise ValueError("boom")
+except ValueError:
+    print("ValueError still propagated")
+```
+
+```text title="Output"
+<div>
+  inside, value = DIV
+</div>
+<p>
+</p>
+ValueError still propagated
+```
+
+**How it works.** The decorator wraps your generator in a `_GeneratorContextManager` object:
+
+- `__enter__` calls `next(gen)` and returns what was yielded.
+- `__exit__` with no exception calls `next(gen)` again and expects `StopIteration` (the generator must finish).
+- `__exit__` **with an exception** calls `gen.throw(exc)`. The exception is raised **at the `yield` line inside your generator**. If your generator lets it propagate, it propagates. If your generator catches it and finishes without re-raising, the exception is suppressed.
+
+### The `try/finally` requirement
+
+Because the body's exception is re-raised at the `yield`, any code after a bare `yield` is skipped when the body fails. This is the number one bug with `@contextmanager`:
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def leaky():
+    print("acquire")
+    yield
+    print("release")     # skipped when the body raises!
+
+try:
+    with leaky():
+        raise ValueError("boom")
+except ValueError:
+    print("caught, but release never printed")
+```
+
+```text title="Output"
+acquire
+caught, but release never printed
+```
+
+**Always** put the `yield` inside `try/finally` (or `try/except/else` when commit and rollback differ). The cleanup then runs on every exit path.
+
+Suppressing is done by catching and not re-raising:
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def ignore_key_errors():
+    try:
+        yield
+    except KeyError as e:
+        print(f"  ignored KeyError {e}")   # not re-raising == suppressing
+
+with ignore_key_errors():
+    {}["x"]
+print("continued")
+```
+
+```text title="Output"
+  ignored KeyError 'x'
+continued
+```
+
+Rules enforced by the wrapper:
+
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def twice():
+    yield
+    yield
+
+try:
+    with twice():
+        pass
+except RuntimeError as e:
+    print("RuntimeError:", e)
+```
+
+```text title="Output"
+RuntimeError: generator didn't stop
+```
+
+- Yield **exactly once**. Zero yields raises `RuntimeError: generator didn't yield`; two raises the error above.
+- The object returned by calling the decorated function is **single-use**, because a generator can only run once. Reusing one fails; on 3.14 it fails with an unhelpful `AttributeError: '_GeneratorContextManager' object has no attribute 'args'`. Call the factory again for each `with`.
+
+### Bonus: works as a decorator too
+
+Managers made with `@contextmanager` inherit from `ContextDecorator`, so the same object can wrap a whole function. Each call re-creates the generator, so the single-use rule does not bite here:
+
+```python
+from contextlib import contextmanager
+import time
+
+@contextmanager
+def timed(label):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        print(f"{label}: {(time.perf_counter() - start) * 1000:.0f} ms")
+
+@timed("handler")          # the same object works as a decorator
+def handle():
+    time.sleep(0.05)
+
+handle()
+handle()
+```
+
+```text title="Output"
+handler: 50 ms
+handler: 50 ms
+```
+
+**When to use which:** `@contextmanager` for short, stateless setup/teardown (the common case). A class when you need state after the block, reuse, extra methods, or the speed of avoiding a generator per use.
+
+## `ExitStack`: a dynamic number of resources
+
+`with` is static: you must know how many managers you need when you write the code. `ExitStack` is a context manager that collects other managers and callbacks **at runtime**, and unwinds all of them in LIFO order when it exits.
+
+```python
+from contextlib import ExitStack
+
+class Resource:
+    def __init__(self, name):
+        self.name = name
+    def __enter__(self):
+        print(f"  open {self.name}")
+        return self
+    def __exit__(self, *exc):
+        print(f"  close {self.name}")
+
+names = ["db", "cache", "queue"]
+with ExitStack() as stack:
+    resources = [stack.enter_context(Resource(n)) for n in names]
+    stack.callback(print, "  callback: flush metrics")
+    print("  using", [r.name for r in resources])
+```
+
+```text title="Output"
+  open db
+  open cache
+  open queue
+  using ['db', 'cache', 'queue']
+  callback: flush metrics
+  close queue
+  close cache
+  close db
+```
+
+- `enter_context(cm)` enters `cm` and schedules its `__exit__`.
+- `callback(fn, *args)` schedules any function, which makes it easy to manage things that are not context managers.
+- `push(exit_fn)` schedules an `__exit__`-style function that can see and suppress exceptions.
+
+The most important property is **partial failure safety**: if the third resource fails to open, the first two are still closed.
+
+```python
+from contextlib import ExitStack
+
+class Resource:
+    def __init__(self, name, fail=False):
+        self.name, self.fail = name, fail
+    def __enter__(self):
+        if self.fail:
+            raise OSError(f"cannot open {self.name}")
+        print(f"  open {self.name}")
+        return self
+    def __exit__(self, *exc):
+        print(f"  close {self.name}")
+
+try:
+    with ExitStack() as stack:
+        for n, fail in [("a", False), ("b", False), ("c", True)]:
+            stack.enter_context(Resource(n, fail))
+except OSError as e:
+    print("OSError:", e)
+```
+
+```text title="Output"
+  open a
+  open b
+  close b
+  close a
+OSError: cannot open c
+```
+
+`pop_all()` moves all registered callbacks to a new `ExitStack` and empties the current one. That is the "all or nothing" acquisition pattern: open everything inside a `with`, and if it all succeeded, transfer ownership of the cleanup to the caller.
+
+```python
+from contextlib import ExitStack
+
+class Conn:
+    def __init__(self, name):
+        self.name = name
+    def close(self):
+        print(f"  closed {self.name}")
+
+def open_pool(n):
+    with ExitStack() as stack:
+        conns = []
+        for i in range(n):
+            c = Conn(f"conn{i}")
+            stack.callback(c.close)
+            conns.append(c)
+        # all opened fine: keep them open, hand the cleanup to the caller
+        cleanup = stack.pop_all()
+    return conns, cleanup
+
+conns, cleanup = open_pool(2)
+print("pool ready:", [c.name for c in conns])
+cleanup.close()
+```
+
+```text title="Output"
+pool ready: ['conn0', 'conn1']
+  closed conn1
+  closed conn0
+```
+
+Typical backend uses: opening a variable list of files to merge, entering several `mock.patch` objects in a test fixture, conditionally adding a lock or a transaction, and building `__enter__` for a class that owns several resources.
+
+## Small helpers: `suppress`, `closing`, `nullcontext`, `chdir`
+
+### `suppress(*exceptions)`
+
+A readable replacement for `try: ... except X: pass`.
+
+```python
+from contextlib import suppress
+import os
+
+with suppress(FileNotFoundError):
+    os.remove("definitely-not-here.tmp")
+print("no error")
+
+with suppress(KeyError, IndexError):
+    [][0]
+    print("never printed")
+print("suppressed IndexError")
+```
+
+```text title="Output"
+no error
+suppressed IndexError
+```
+
+Keep the block to the single statement you expect to fail. As with any suppression, everything after the failing line in the block is skipped. Since 3.12, `suppress` also handles matching exceptions inside an `ExceptionGroup`.
+
+### `closing(obj)`
+
+Calls `obj.close()` on exit, for objects that have `close()` but are not context managers. Its most useful job is closing generators deterministically, so their `finally` blocks run right away:
+
+```python
+from contextlib import closing
+
+class LegacyClient:
+    def close(self):
+        print("  LegacyClient.close()")
+
+with closing(LegacyClient()) as client:
+    print("  using", type(client).__name__)
+
+def numbers():
+    try:
+        yield 1
+        yield 2
+    finally:
+        print("  generator cleaned up")
+
+with closing(numbers()) as gen:
+    print(next(gen))
+print("after with")
+```
+
+```text title="Output"
+  using LegacyClient
+  LegacyClient.close()
+1
+  generator cleaned up
+after with
+```
+
+For async generators use `contextlib.aclosing` (3.10+).
+
+### `nullcontext(value=None)`
+
+A do-nothing context manager. It is the clean way to make a manager **optional**:
+
+```python
+from contextlib import nullcontext
+import threading
+
+def process(items, lock=None):
+    with lock if lock is not None else nullcontext():
+        return sum(items)
+
+print(process([1, 2, 3]))
+print(process([1, 2, 3], threading.Lock()))
+
+with nullcontext("value") as v:
+    print(v)
+```
+
+```text title="Output"
+6
+6
+value
+```
+
+Since 3.10 it also supports `async with`, so the same trick works with optional async managers.
+
+### `chdir(path)` (3.11+)
+
+Temporarily changes the working directory and restores it. Not thread-safe or async-safe (the cwd is process-wide), so keep it to scripts and tests.
+
+```python
+import contextlib, os, tempfile
+before = os.getcwd()
+with tempfile.TemporaryDirectory() as d:
+    with contextlib.chdir(d):
+        print(os.path.samefile(os.getcwd(), d))
+    print(os.getcwd() == before)
+```
+
+```text title="Output"
+True
+True
+```
+
+## Async context managers
+
+When setup or teardown needs to `await` (opening a network connection, closing an HTTP session, committing over the wire), use the async protocol: `__aenter__` and `__aexit__`, both coroutines, entered with `async with`.
+
+```python
+import asyncio
+
+class AsyncConnection:
+    async def __aenter__(self):
+        await asyncio.sleep(0)            # e.g. open a socket
+        print("  connected")
+        return self
+    async def __aexit__(self, exc_type, exc, tb):
+        await asyncio.sleep(0)            # e.g. flush and close
+        print("  disconnected")
+        return False
+    async def query(self, sql):
+        return f"rows for {sql!r}"
+
+async def main():
+    async with AsyncConnection() as conn:
+        print(" ", await conn.query("SELECT 1"))
+
+asyncio.run(main())
+```
+
+```text title="Output"
+  connected
+  rows for 'SELECT 1'
+  disconnected
+```
+
+The desugaring is the same as `with`, with `await` in front of each call: `VAR = await enter(mgr)` and `await exit(mgr, ...)`. Suppression works the same way.
+
+`@asynccontextmanager` is the async version of `@contextmanager`, built on an async generator. The same `try/finally` rule applies:
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def http_session(name):
+    print(f"  open session {name}")
+    await asyncio.sleep(0)
+    try:
+        yield {"name": name}
+    finally:
+        await asyncio.sleep(0)
+        print(f"  close session {name}")
+
+async def main():
+    async with http_session("api") as s:
+        print("  using", s)
+
+asyncio.run(main())
+```
+
+```text title="Output"
+  open session api
+  using {'name': 'api'}
+  close session api
+```
+
+Mixing them up raises `TypeError`; on 3.14 the message even suggests the fix:
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def session():
+    yield "s"
+
+try:
+    with session():
+        pass
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+TypeError: 'contextlib._AsyncGeneratorContextManager' object does not support the context manager protocol (missed __exit__ method) but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?
+```
+
+`AsyncExitStack` is the async `ExitStack`, with `enter_async_context` and `push_async_callback`:
+
+```python
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+
+@asynccontextmanager
+async def conn(name):
+    print(f"  open {name}")
+    try:
+        yield name
+    finally:
+        print(f"  close {name}")
+
+async def main():
+    async with AsyncExitStack() as stack:
+        conns = [await stack.enter_async_context(conn(n)) for n in ("pg", "redis")]
+        print("  got", conns)
+
+asyncio.run(main())
+```
+
+```text title="Output"
+  open pg
+  open redis
+  got ['pg', 'redis']
+  close redis
+  close pg
+```
+
+Trap: **cancellation**. In asyncio, a cancelled task gets `CancelledError` thrown in at its current `await`. If that happens inside `async with`, `__aexit__` runs with `CancelledError`, and any `await` inside your cleanup may itself be cancelled again or take a long time. Keep async cleanup short, never suppress `CancelledError` (it is a `BaseException` precisely so `except Exception` misses it), and consider `asyncio.timeout` around slow teardown. FastAPI dependencies with `yield`, `httpx.AsyncClient`, SQLAlchemy's `AsyncSession` and `asyncio.TaskGroup` are all async context managers. See the [asyncio page](/docs/python/asyncio).
+
+<Callout title="Coming from JS">
+`async with` corresponds to `await using`, and `__aexit__` to `[Symbol.asyncDispose]`. In NestJS you often get this behaviour from the framework (interceptors that wrap a transaction, `onModuleDestroy` hooks). In Python you write it at the call site: `async with session.begin():` is the idiomatic way to scope a SQLAlchemy transaction to a block.
+</Callout>
+
+## Real backend uses
+
+### DB transactions: commit on success, roll back on error
+
+```python
+import sqlite3
+from contextlib import contextmanager
+
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE accounts (name TEXT PRIMARY KEY, balance INTEGER)")
+db.executemany("INSERT INTO accounts VALUES (?, ?)", [("alice", 100), ("bob", 0)])
+db.commit()
+
+@contextmanager
+def transaction(conn):
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        print("  rolled back")
+        raise
+    else:
+        conn.commit()
+        print("  committed")
+
+def transfer(amount):
+    with transaction(db) as conn:
+        conn.execute("UPDATE accounts SET balance = balance - ? WHERE name = 'alice'", (amount,))
+        if amount > 100:
+            raise ValueError("insufficient funds")
+        conn.execute("UPDATE accounts SET balance = balance + ? WHERE name = 'bob'", (amount,))
+
+transfer(30)
+try:
+    transfer(500)
+except ValueError as e:
+    print("error:", e)
+print(db.execute("SELECT * FROM accounts ORDER BY name").fetchall())
+```
+
+```text title="Output"
+  committed
+  rolled back
+error: insufficient funds
+[('alice', 70), ('bob', 30)]
+```
+
+The failed transfer had already debited alice by 500 inside the transaction; the rollback undid it. The `try/except/else` shape is the standard pattern: rollback and re-raise on error, commit only if the body succeeded.
+
+Trap: a `sqlite3.Connection` is itself a context manager, but `with conn:` manages a **transaction**, not the connection. It does not close it:
+
+```python
+import sqlite3
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE t (x INTEGER)")
+try:
+    with db:                       # transaction scope, NOT connection close
+        db.execute("INSERT INTO t VALUES (1)")
+        raise RuntimeError("abort")
+except RuntimeError:
+    pass
+with db:
+    db.execute("INSERT INTO t VALUES (2)")
+print(db.execute("SELECT x FROM t").fetchall())
+print("still open:", db.execute("SELECT 1").fetchone())
+db.close()
+```
+
+```text title="Output"
+[(2,)]
+still open: (1,)
+```
+
+Use `contextlib.closing(sqlite3.connect(...))` if you want the connection closed. Always check what a library's `__exit__` actually does.
+
+### Locks
+
+```python
+import threading
+
+counter = 0
+lock = threading.Lock()
+
+def work():
+    global counter
+    for _ in range(100_000):
+        with lock:                 # acquire; release even if the body raises
+            counter += 1
+
+threads = [threading.Thread(target=work) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(counter, lock.locked())
+```
+
+```text title="Output"
+400000 False
+```
+
+`with lock:` guarantees release even if the body raises, which manual `acquire()`/`release()` pairs often get wrong. The same pattern applies to `asyncio.Lock` and `asyncio.Semaphore` via `async with`.
+
+### Temporary settings and patching
+
+```python
+from contextlib import contextmanager
+
+class Settings:
+    debug = False
+    timeout = 30
+
+settings = Settings()
+
+@contextmanager
+def override(obj, **changes):
+    old = {k: getattr(obj, k) for k in changes}
+    for k, v in changes.items():
+        setattr(obj, k, v)
+    try:
+        yield obj
+    finally:
+        for k, v in old.items():
+            setattr(obj, k, v)
+
+with override(settings, debug=True, timeout=1):
+    print("inside:", settings.debug, settings.timeout)
+print("after:", settings.debug, settings.timeout)
+```
+
+```text title="Output"
+inside: True 1
+after: False 30
+```
+
+The standard library uses the same idea in `unittest.mock.patch`, `decimal.localcontext`, and `warnings.catch_warnings`:
+
+```python
+import decimal
+print(decimal.Decimal(1) / decimal.Decimal(7))
+with decimal.localcontext(prec=5):
+    print(decimal.Decimal(1) / decimal.Decimal(7))
+print(decimal.Decimal(1) / decimal.Decimal(7))
+```
+
+```text title="Output"
+0.1428571428571428571428571429
+0.14286
+0.1428571428571428571428571429
+```
+
+Trap: mutating a shared global inside a context manager is not safe across threads or concurrent asyncio tasks; another request sees the temporary value. For per-request state use `contextvars.ContextVar` and reset it with the token in a `finally`, which is what `decimal.localcontext` does internally.
+
+### Timing
+
+The `Timer` class and the `timed` decorator above are the two shapes you will see in production code, usually emitting a metric (Prometheus histogram, OpenTelemetry span) instead of printing. OpenTelemetry's `tracer.start_as_current_span(...)` is itself a context manager.
+
+### A 3.14 warning worth knowing
+
+Context managers exist so you do not write cleanup with `return` inside `finally`. Doing so swallows the in-flight exception, and since 3.14 (PEP 765) the compiler warns about it:
+
+```python
+import warnings, sys
+src = """
+def f():
+    try:
+        raise ValueError
+    finally:
+        return 'swallowed'
+"""
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter("always")
+    compile(src, "demo.py", "exec")
+print(w[0].category.__name__, "-", w[0].message)
+```
+
+```text title="Output"
+SyntaxWarning - 'return' in a 'finally' block
+```
+
+`break` and `continue` in `finally` get the same warning.
+
+## Interview questions
+
+1. **Write out what `with A() as x: body` does.** **Evaluate `A()`, look up `__enter__` and `__exit__` on its type, bind `x` to `__enter__()`'s return value, run the body in a `try`; on exception call `__exit__(type, value, tb)` and re-raise unless it returns truthy; otherwise call `__exit__(None, None, None)`.**
+2. **How does a context manager suppress an exception?** **`__exit__` returns a truthy value. In a `@contextmanager` generator, catch the exception at the `yield` and do not re-raise. Execution resumes after the `with` statement, not inside the body.**
+3. **If `__enter__` raises, is `__exit__` called?** **No. The `try` only starts after `__enter__` succeeds, so `__enter__` must clean up any partial work itself.**
+4. **Why must a `@contextmanager` generator wrap `yield` in `try/finally`?** **The body's exception is thrown into the generator at the `yield`. Without `try/finally`, the cleanup code after `yield` is skipped.**
+5. **What problem does `ExitStack` solve?** **Managing a number of context managers only known at runtime, with LIFO cleanup and safety on partial failure. `pop_all()` transfers ownership of the cleanup to the caller.**
+6. **What is `nullcontext` for?** **A no-op manager so optional managers can be written as `with lock if lock else nullcontext():` instead of duplicating code.**
+7. **How do async context managers differ?** **They define coroutine methods `__aenter__` and `__aexit__`, are used with `async with`, and can be written with `@asynccontextmanager`. Cleanup must cope with `CancelledError` and should never suppress it.**
+8. **What does `with sqlite3.connect(...) as conn:` do on exit?** **It commits or rolls back the transaction; it does not close the connection. Wrap it in `contextlib.closing` to close.**
+
+## Recap
+
+- `with` calls `__enter__` before the body and `__exit__` after it, on every exit path; it is a reusable `try/finally`.
+- `__exit__` receives the exception type, value and traceback (or three `None`s) and suppresses the exception by returning truthy. Watch for accidental truthy returns.
+- Dunders are looked up on the type; `__exit__` is skipped if `__enter__` fails; multiple managers exit in reverse order.
+- `@contextmanager` turns a generator into a manager: before `yield` is setup, after it is teardown, and the `yield` must be inside `try/finally`. Its objects are single-use.
+- `ExitStack` and `AsyncExitStack` handle dynamic sets of resources; `suppress`, `closing`, `aclosing`, `nullcontext` and `chdir` cover the small cases.
+- `async with`, `__aenter__`, `__aexit__` and `@asynccontextmanager` are the async versions; keep teardown short and never swallow `CancelledError`.
+- Real uses: transactions (commit or roll back), locks, temporary settings, timing and tracing spans.

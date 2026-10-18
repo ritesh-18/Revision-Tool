@@ -1,0 +1,1144 @@
+---
+title: "25. Cost Optimization"
+description: "A GenAI bill grows in three dimensions: the number of users, the amount each user does, and the cost per unit of work. The job of cost optimization is to..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth on topics the chapter already covers.
+  - ➕ **Beyond the handbook**: topics the chapter does not cover, added because a GenAI engineer should know them.
+
+  Code is Python 3.14 with asyncio and the official `anthropic` and `openai` Python SDKs. All prices in added sections are **example list prices from September 2026** (mostly Anthropic's, because the multipliers are documented in one place). Prices change several times a year, so load them from config and check the provider pricing pages.
+</Callout>
+
+## 25.1 Concept Explanation
+
+A GenAI bill grows in three dimensions: the number of users, the amount each user does, and the cost per unit of work. The job of cost optimization is to compress the third dimension without harming the first two. Done well, a 50% cost reduction is routine; 80% is achievable on many workloads. Done poorly, cost optimizations degrade quality, and users disappear.
+
+The discipline is twofold: measure what costs money, and apply the cheapest mitigation first.
+
+## 25.2 Where the Money Goes
+
+For most GenAI products, costs sort roughly as:
+
+1. **LLM inference** (50-80% of the bill).
+2. **Vector DB and embeddings** (10-20%).
+3. **GPU infrastructure** (overlaps with #1 for self-hosted).
+4. **Cloud overhead** (storage, networking, observability) (5-15%).
+5. **Third-party AI services** (reranking, STT/TTS, image, etc.) (variable).
+
+The hot path is LLM inference. Most levers below target it.
+
+## 25.2a Per-Request Cost Maths 🔧
+
+Since inference dominates the bill, every lever below starts from the same calculation: what one request costs, split by token type.
+
+### The four token types
+
+**Problem.** Teams quote one "price per million tokens" and get estimates wrong by 2× or more.
+
+**Why it happens.** A request is billed on up to four token counts, each at its own price:
+
+| Token type | What it is | Example price, Claude Sonnet 5.5 (Sept 2026, per million) |
+|---|---|---|
+| Uncached input | Prompt tokens not served from cache | $2.00 |
+| Cache write | Prompt tokens written to cache (5-minute TTL) | $2.50 (1.25× input) |
+| Cache read | Prompt tokens served from cache | $0.20 (0.1× input) |
+| Output | Generated tokens, **including thinking tokens** | $10.00 |
+
+### Worked example
+
+A support-chat request on Claude Sonnet 5.5: system prompt and tool definitions 6,000 tokens (stable, cacheable), retrieved chunks 3,000, history 1,000, user message 200, answer 500 tokens.
+
+```text
+No caching:
+  input   10,200 x $2.00 / 1M = $0.02040
+  output     500 x $10.00 / 1M = $0.00500
+  total                         $0.02540   -> $25,400 per million requests
+
+Cache hit on the 6,000-token prefix:
+  cache read 6,000 x $0.20 / 1M = $0.00120
+  input      4,200 x $2.00 / 1M = $0.00840
+  output       500 x $10.00 / 1M = $0.00500
+  total                          $0.01460   -> $14,600 per million requests (-43%)
+
+Same request, model also thinks for 1,500 tokens (billed as output):
+  extra   1,500 x $10.00 / 1M = $0.01500
+  total                         $0.02960   -> thinking costs more than all the input
+```
+
+Two lessons fall out. Caching the stable prefix is the cheapest large saving. And on reasoning models, output (including thinking) is often the biggest line, which is why 25.10 matters more than it used to.
+
+### Implementation: one cost function for two providers
+
+```python
+from dataclasses import dataclass
+
+from anthropic.types import Usage as AnthropicUsage
+from openai.types.responses import ResponseUsage as OpenAIUsage
+
+
+@dataclass(frozen=True, slots=True)
+class Price:  # USD per 1M tokens
+    input: float
+    cache_write: float
+    cache_read: float
+    output: float
+
+
+# Example list prices, September 2026. Keep these in a versioned config table.
+PRICES: dict[str, Price] = {
+    "claude-opus-5-5":   Price(input=4, cache_write=5,    cache_read=0.2, output=20),
+    "claude-sonnet-5-5": Price(input=2, cache_write=2.5,  cache_read=0.2, output=10),
+    "claude-haiku-4-5":  Price(input=1, cache_write=1.25, cache_read=0.1, output=5),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedUsage:
+    uncached_input: int
+    cache_write: int
+    cache_read: int
+    output: int
+
+
+def from_anthropic(u: AnthropicUsage) -> NormalizedUsage:
+    # Anthropic: input_tokens EXCLUDES cached tokens; cache tokens are reported separately.
+    return NormalizedUsage(
+        uncached_input=u.input_tokens,
+        cache_write=u.cache_creation_input_tokens or 0,
+        cache_read=u.cache_read_input_tokens or 0,
+        output=u.output_tokens,
+    )
+
+
+def from_openai(u: OpenAIUsage) -> NormalizedUsage:
+    # OpenAI Responses API: input_tokens INCLUDES cached tokens; reasoning is inside output_tokens.
+    cached = u.input_tokens_details.cached_tokens
+    return NormalizedUsage(
+        uncached_input=u.input_tokens - cached, cache_write=0, cache_read=cached, output=u.output_tokens,
+    )
+
+
+def cost_usd(model: str, u: NormalizedUsage, batch: bool = False) -> float:
+    p = PRICES.get(model)
+    if p is None:
+        raise KeyError(f"no price for {model}")  # never silently cost an unknown model at 0
+    usd = (
+        u.uncached_input * p.input + u.cache_write * p.cache_write + u.cache_read * p.cache_read + u.output * p.output
+    ) / 1_000_000
+    return usd * 0.5 if batch else usd  # batch discount, see 25.6a
+```
+
+### Edge cases and failure modes
+
+- **Double counting cached tokens.** Adding OpenAI's `cached_tokens` on top of its `input_tokens` counts them twice. The normalisation step exists to stop this.
+- **Price modifiers.** Some request options are billed at a premium (for example fast output modes or pinned-region inference on some providers). Record the options used per request, or the ledger will disagree with the invoice.
+- **Long-context tiers.** Some providers charge more per token above a prompt-length threshold. Check whether your models have one.
+- **Model returned versus requested.** Price on the model string the API returns, not the one you asked for, in case of fallbacks.
+
+## 25.3 Model Choice
+
+The single biggest cost lever. A frontier model can be 50–500× the price of a small model. Many tasks do not need frontier capability.
+
+The discipline:
+- Benchmark your task on multiple models.
+- Define a quality threshold; pick the cheapest model that clears it.
+- Re-benchmark quarterly as new models release.
+
+A typical production architecture uses two or three model tiers: small/cheap for the bulk of requests, medium for harder ones, frontier for the hardest few percent.
+
+## 25.4 Model Routing
+
+A router classifies incoming requests by difficulty and sends each to the appropriate model tier.
+
+Router signals:
+- Input length and complexity.
+- Detected intent.
+- Required output structure.
+- Historical performance per query type.
+
+A good router cuts costs 50-70% with negligible quality loss. A bad router shifts hard queries to weak models and tanks quality. Measure carefully.
+
+## 25.4a Cascades: Small Model First, Escalate on Low Confidence 🔧
+
+A router decides before the call; a cascade is the other common design, where the cheap model always answers first and only weak answers go to the expensive model.
+
+### When a cascade pays off
+
+**Problem.** Routers need a good difficulty classifier, and difficulty is hard to judge from the question alone. Cascades judge the answer instead, but they pay for the small model on every request.
+
+**Why (the numbers).** Let `s` be the small model's cost per request, `L` the large model's, and `e` the fraction escalated. The cascade costs `s + e × L` per request; always using the large model costs `L`. The cascade wins when `e` is below `1 − s/L`.
+
+With Claude Haiku 4.5 ($1 / $5 per million) as the small model and Claude Opus 5.5 ($4 / $20) as the large one, `s/L` is about 0.25 for the same token counts (September 2026 prices). The cascade wins while fewer than 75% of requests escalate. At 30% escalation it costs 0.25 + 0.30 = 0.55 of the large-model bill, a 45% saving. Escalated requests also pay the small model's latency first, so p95 latency gets worse.
+
+**Before you build one.** Measure the simpler option first: the large model at a lower effort setting. On recent models, low or medium effort is often close to the old high-effort quality at a fraction of the output tokens, and a single model keeps one prompt cache (caches are per model, so a cascade gives up cache reuse between its tiers).
+
+### The mechanism: escalate on checkable signals
+
+A model's own "confidence: 0.9" is poorly calibrated. Prefer signals you can verify:
+
+1. **Schema validity.** The small model's output fails to parse or validate.
+2. **Explicit abstention.** The small model sets `needs_escalation` because the context does not contain the answer.
+3. **Grounding check.** Cited chunk IDs are missing or not among the retrieved chunks.
+4. **Cheap judge.** For high-value routes, a small judge model scores the answer against the context.
+
+### Implementation
+
+```python
+import logging
+from dataclasses import dataclass
+from typing import Literal
+
+import anthropic
+from pydantic import BaseModel, Field
+
+client = anthropic.AsyncAnthropic()
+log = logging.getLogger("cascade")
+
+
+class Answer(BaseModel):
+    answer: str
+    cited_chunk_ids: list[str]
+    needs_escalation: bool = Field(description="the context is not enough or the question is ambiguous")
+
+
+@dataclass(frozen=True, slots=True)
+class Chunk:
+    id: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class CascadeResult:
+    tier: Literal["small", "large"]
+    answer: Answer
+
+
+def build_prompt(question: str, chunks: list[Chunk]) -> str:
+    context = "\n\n".join(f"[{c.id}] {c.text}" for c in chunks)
+    return f"Context:\n{context}\n\nQuestion: {question}"
+
+
+SYSTEM = (
+    "Answer only from the context. Cite chunk ids. "
+    "If the context does not contain the answer, set needs_escalation to true."
+)
+
+
+async def answer_with_cascade(question: str, chunks: list[Chunk]) -> CascadeResult:
+    prompt = build_prompt(question, chunks)
+    valid_ids = {c.id for c in chunks}
+
+    try:
+        small = await client.messages.parse(
+            model="claude-haiku-4-5",
+            max_tokens=1_024,
+            system=SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+            output_format=Answer,
+        )
+        out = small.parsed_output
+        grounded = out is not None and bool(out.cited_chunk_ids) and set(out.cited_chunk_ids) <= valid_ids
+        if out and not out.needs_escalation and grounded and small.stop_reason == "end_turn":
+            return CascadeResult("small", out)
+    except (anthropic.APIError, ValueError):
+        # Parse or API failure on the small tier: fall through to the large tier
+        log.warning("small tier failed, escalating", exc_info=True)
+
+    large = await client.messages.parse(
+        model="claude-opus-5-5",
+        max_tokens=4_096,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+        output_format=Answer,
+    )
+    if large.parsed_output is None:
+        raise RuntimeError(f"large tier returned no parsable answer (stop_reason={large.stop_reason})")
+    return CascadeResult("large", large.parsed_output)
+```
+
+Log `tier` on every request. The escalation rate is the number that decides whether the cascade is still worth it.
+
+### Edge cases and failure modes
+
+- **Confidently wrong small-model answers.** The dangerous case is the one that passes every check. Sample small-tier answers into the eval pipeline and track quality per tier, not only overall.
+- **Escalation rate drifts.** New question types push the rate up. Alert when it crosses the break-even rate computed above.
+- **Catching every error hides outages.** The `except` above escalates on any API or parse error. Count small-tier errors separately so a broken small tier does not silently double the bill.
+- **Streaming UX.** A cascade cannot stream the small model's answer and then take it back. Either stream only from the final tier, or accept a short "checking" delay.
+
+## 25.5 Caching
+
+The cheapest token is the one you do not generate. Three cache tiers:
+
+**Exact prompt cache.** Hash the full prompt; if seen, return cached output. Works for FAQ-style or batch workloads.
+
+**Semantic cache.** Embed the prompt; if a semantically similar prompt was recently answered, return that. Works for paraphrased queries. Risk: false positives — make sure the cached answer is general enough.
+
+**Prefix cache.** Most LLM providers now offer "prompt caching" that bills repeated prefixes at a discount. System prompts and few-shot examples become cheap when stable.
+
+Combined, caches typically eliminate 30–60% of LLM calls on chat workloads.
+
+## 25.5a Prompt Caching Economics 🔧
+
+The prefix cache above is the one tier that never returns a wrong answer, so it is worth getting its maths and its silent failure modes exactly right.
+
+### Break-even and effective price
+
+**Problem.** Caching has a write premium. Cache a prefix that is never reused and you pay more than without caching.
+
+**Why (the numbers).** On Anthropic (September 2026), a cache write costs 1.25× the input price with the 5-minute TTL or 2× with the 1-hour TTL. A cache read costs 0.1× on most models (0.05× on Claude Opus 5.5). For a prefix of P tokens used by n requests inside the TTL:
+
+```text
+5-minute TTL:  with cache = 1.25P + (n - 1) x 0.1P     without = nP
+  n = 1:  1.25P vs 1P    -> caching loses 25%
+  n = 2:  1.35P vs 2P    -> caching wins (break-even is just over one reuse)
+  n = 10: 2.15P vs 10P   -> 78% cheaper
+
+1-hour TTL:    with cache = 2P + (n - 1) x 0.1P
+  n = 2:  2.1P  vs 2P    -> still slightly worse
+  n = 3:  2.2P  vs 3P    -> wins
+```
+
+A cache read refreshes the TTL, so steady traffic (one request sharing the prefix at least every 5 minutes) keeps the 5-minute cache warm indefinitely. The 1-hour TTL only earns its double write price when gaps between requests are between 5 and 60 minutes.
+
+Other providers differ: OpenAI caches long prompts automatically with no write premium, and the read discount depends on the model. Check your provider's caching page before you reuse these numbers.
+
+### The mechanism: stable things first
+
+Caching is a prefix match. Any byte change invalidates everything after it. The order that caches best:
+
+1. Tool definitions (fixed, sorted).
+2. System prompt (no timestamps, no user names).
+3. Long, shared documents or few-shot examples.
+4. Conversation history (grows at the end).
+5. The new user message and per-request data.
+
+### Implementation
+
+```python
+from typing import Protocol
+
+import anthropic
+from anthropic.types import Message, MessageParam
+
+client = anthropic.AsyncAnthropic()
+
+
+class Metrics(Protocol):  # your metrics client
+    def histogram(self, name: str, value: float) -> None: ...
+
+
+metrics: Metrics
+STABLE_SYSTEM = "...6,000 tokens of instructions and policies, identical for every user..."
+
+
+async def answer(history: list[MessageParam], user_message: str, user_name: str) -> Message:
+    res = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=2_000,
+        # Explicit breakpoint at the end of the shared system prefix...
+        system=[{"type": "text", "text": STABLE_SYSTEM, "cache_control": {"type": "ephemeral"}}],
+        # ...plus automatic caching for the growing conversation tail
+        cache_control={"type": "ephemeral"},
+        messages=[
+            *history,
+            # Per-user details go here, after the cached prefix, never in the system prompt
+            {"role": "user", "content": f"(User: {user_name})\n{user_message}"},
+        ],
+    )
+
+    u = res.usage
+    read = u.cache_read_input_tokens or 0
+    prefix_tokens = read + (u.cache_creation_input_tokens or 0)
+    metrics.histogram("llm.cache_read_ratio", read / prefix_tokens if prefix_tokens else 0.0)
+    return res
+```
+
+### Edge cases and failure modes
+
+- **Silent invalidators.** A timestamp, a request ID, a user name or randomly ordered JSON in the system prompt makes every request a cache write. The symptom is `cache_read_input_tokens` near zero on repeated traffic. Alert on the read ratio, not just on cost.
+- **Minimum prefix length.** Prefixes shorter than a model-specific minimum (from 512 up to 4,096 tokens on current Claude models, 4,096 on Haiku 4.5) are not cached and no error is returned.
+- **Caches are per model.** A router that splits traffic across three models keeps three caches, each with a lower hit rate.
+- **Concurrency.** Many requests that start at the same moment can all miss, because none has finished writing the cache yet. Warm the cache with one request before fanning out.
+
+## 25.5b Semantic Cache: Hit Rate Against Wrong Answers 🔧
+
+The semantic cache above is the only tier that can return a wrong answer, and its similarity threshold sets that trade-off directly.
+
+### The trade-off in numbers
+
+**Problem.** Lower the similarity threshold and the hit rate rises, but so does the share of hits where the cached answer does not fit the new question.
+
+**Why it happens.** Embeddings measure topical similarity, not equivalence. "How do I enable two-factor login" and "How do I disable two-factor login" sit very close in embedding space and need opposite answers. The cache cannot tell them apart from the score alone.
+
+**Worked example (illustrative assumptions, measure your own).** 1M queries a month, $0.015 average LLM cost per query, embedding cost negligible.
+
+| Threshold | Hit rate | Wrong hits among hits | Monthly saving | Wrong answers served |
+|---|---|---|---|---|
+| 0.97 | 8% | 0.5% | $1,200 | 400 |
+| 0.93 | 18% | 2% | $2,700 | 3,600 |
+| 0.88 | 30% | 6% | $4,500 | 18,000 |
+
+Going from 0.97 to 0.88 saves $3,300 more a month and serves 17,600 more wrong answers. Whether that is acceptable depends on what a wrong answer costs (a support ticket, a refund, a compliance problem), so put that number next to the saving before you choose a threshold.
+
+### The mechanism
+
+- Cache only intents where answers are general (FAQ, product how-to), never personalised or account-specific answers.
+- Scope by tenant, model version, prompt version and source-document version, so a cached answer never crosses those boundaries.
+- Expire entries on a time limit and when their source documents change.
+
+### Implementation (Postgres with pgvector)
+
+```sql
+CREATE TABLE semantic_cache (
+  id             bigserial PRIMARY KEY,
+  tenant_id      uuid NOT NULL,
+  prompt_version text NOT NULL,
+  corpus_version text NOT NULL,          -- bump when source docs change
+  question       text NOT NULL,
+  embedding      vector(1536) NOT NULL,
+  answer         text NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON semantic_cache USING hnsw (embedding vector_cosine_ops);
+```
+
+```python
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+from openai import AsyncOpenAI
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+openai = AsyncOpenAI()
+THRESHOLD = 0.95
+
+
+async def embed(content: str) -> list[float]:
+    res = await openai.embeddings.create(model="text-embedding-3-small", input=content)
+    return res.data[0].embedding
+
+
+@dataclass(frozen=True, slots=True)
+class CacheScope:
+    tenant_id: str
+    prompt_version: str
+    corpus_version: str
+
+
+LOOKUP = text("""
+    SELECT answer, 1 - (embedding <=> CAST(:vec AS vector)) AS similarity
+      FROM semantic_cache
+     WHERE tenant_id = :tenant_id AND prompt_version = :prompt_version AND corpus_version = :corpus_version
+       AND created_at > now() - interval '1 day'
+     ORDER BY embedding <=> CAST(:vec AS vector)
+     LIMIT 1
+""")
+STORE = text("""
+    INSERT INTO semantic_cache (tenant_id, prompt_version, corpus_version, question, embedding, answer)
+    VALUES (:tenant_id, :prompt_version, :corpus_version, :question, CAST(:vec AS vector), :answer)
+""")
+
+
+async def cached_answer(
+    engine: AsyncEngine,
+    scope: CacheScope,
+    question: str,
+    generate: Callable[[], Awaitable[str]],
+) -> tuple[str, bool]:
+    """Returns (answer, cache_hit)."""
+    vec = str(await embed(question))  # pgvector accepts '[1.0, 2.0, 3.0]' text
+    params = {
+        "vec": vec,
+        "tenant_id": scope.tenant_id,
+        "prompt_version": scope.prompt_version,
+        "corpus_version": scope.corpus_version,
+    }
+    async with engine.connect() as conn:
+        row = (await conn.execute(LOOKUP, params)).first()
+    if row is not None and row.similarity >= THRESHOLD:
+        return row.answer, True
+
+    answer = await generate()
+    async with engine.begin() as conn:
+        await conn.execute(STORE, {**params, "question": question, "answer": answer})
+    return answer, False
+```
+
+### Edge cases and failure modes
+
+- **Filtered HNSW search can return fewer rows.** With strict `WHERE` filters, an approximate index may skip close matches. For a small number of tenants, partition the table per tenant or use iterative index scans if your pgvector version supports them.
+- **Negation and small edits.** Add a cheap guard for high-risk differences: if the two questions differ in a negation word or a number, treat it as a miss.
+- **Measuring wrong hits.** Sample cache hits daily and have a judge model (or a person) check whether the cached answer fits the new question. Without this, the wrong-hit column in the table above is a guess.
+- **The cache is a data store.** It holds user questions and answers, so it falls under retention and deletion rules (see [Chapter 26](/docs/genai-handbook/26-enterprise-ai)).
+
+## 25.6 Inference Batching
+
+Self-hosted inference benefits enormously from batching. A single request might use 5% of a GPU's throughput; 32 batched requests use 80% with similar per-request latency. This is the central insight behind vLLM.
+
+For API-based providers, batching is invisible to you, but they pass much of the cost savings on via their own pricing.
+
+## 25.6a Provider Batch APIs for Offline Work ➕
+
+Providers also expose batching directly: a separate asynchronous API that trades latency for a flat discount, which the chapter does not mention.
+
+### What you get and what you give up
+
+**Problem.** Evals, backfills, nightly classification and bulk summarisation run at full real-time prices even though nobody is waiting for them.
+
+**Why it works.** Providers can schedule batch work into idle capacity, so they price it lower. Anthropic's Message Batches API and OpenAI's Batch API both charge 50% of the standard price, with results within 24 hours (often much sooner). On Anthropic the discount also applies to cache reads and writes, so it stacks with prompt caching.
+
+**Worked example (Claude Sonnet 5.5, September 2026 prices).** Nightly classification of 200,000 documents, 3,000 input and 200 output tokens each:
+
+```text
+Real time: 200,000 x (3,000 x $2 + 200 x $10) / 1M = 200,000 x $0.008 = $1,600 per night
+Batch:     50% of that                                                 =   $800 per night
+Saving over a year: about $292,000
+```
+
+### The mechanism
+
+1. Build one request per item, each with a stable `custom_id` (your own primary key).
+2. Submit the batch, store the batch ID in your database, and poll (or use a scheduled job) until processing ends.
+3. Stream the results and match them to your records by `custom_id`, never by position: results come back in any order.
+4. Resubmit the items that errored with a retryable error or expired.
+
+### Implementation (Anthropic)
+
+```python
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
+
+client = anthropic.AsyncAnthropic()
+log = logging.getLogger("batches")
+CLASSIFIER_PROMPT = "Classify the document into one of: invoice, contract, resume, other. Reply with the label only."
+
+
+@dataclass(frozen=True, slots=True)
+class Doc:
+    id: str
+    text: str
+
+
+async def submit_classification(docs: list[Doc]) -> str:
+    batch = await client.messages.batches.create(
+        requests=[
+            Request(
+                custom_id=d.id,  # must be unique within the batch
+                params=MessageCreateParamsNonStreaming(
+                    model="claude-sonnet-5-5",
+                    max_tokens=256,
+                    system=[{"type": "text", "text": CLASSIFIER_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                    messages=[{"role": "user", "content": d.text}],
+                ),
+            )
+            for d in docs
+        ]
+    )
+    return batch.id  # persist this, the job may run for hours
+
+
+async def collect_results(batch_id: str, save: Callable[[str, str], Awaitable[None]]) -> list[str] | None:
+    """Returns None while the batch is still running, else the custom_ids to resubmit."""
+    batch = await client.messages.batches.retrieve(batch_id)
+    if batch.processing_status != "ended":
+        return None
+
+    retry: list[str] = []
+    async for r in await client.messages.batches.results(batch_id):
+        match r.result.type:
+            case "succeeded":
+                text = "".join(b.text for b in r.result.message.content if b.type == "text")
+                await save(r.custom_id, text.strip())
+            case "expired":
+                retry.append(r.custom_id)
+            case "errored" if r.result.error.error.type != "invalid_request_error":
+                retry.append(r.custom_id)
+            case _:
+                log.error("batch %s: %s failed permanently: %r", batch_id, r.custom_id, r.result)
+    return retry
+```
+
+### Edge cases and failure modes
+
+- **No multi-turn tool loops.** Each batch item is a single request. Agent workflows have to be flattened (fetch the tool inputs first) or stay on the real-time API.
+- **Size limits.** Batches have limits on request count and total size. Split large jobs into several batches and track each ID.
+- **Idempotent saves.** A crash during result collection means you will process some results twice. Make `save` an upsert keyed on `custom_id`.
+- **Results are retained for a limited time.** Download them promptly and do not treat the provider as your storage.
+- **Data retention.** Batch inputs and results are stored by the provider until processed and retrieved, which can matter under zero-data-retention agreements. Check what your agreement covers (see [26.9a](/docs/genai-handbook/26-enterprise-ai#269a-provider-data-retention-zdr-and-regional-processing-)).
+
+## 25.7 Quantization
+
+INT8 saves 2× memory; INT4 saves 4×. Smaller memory = more concurrent users per GPU = lower cost per request.
+
+Always benchmark quality. Some tasks tolerate INT4 with no measurable loss; some show clear degradation. The right answer is task-specific.
+
+## 25.8 Speculative Decoding
+
+A small draft model proposes tokens; the large target model verifies. When agreement is high (which it usually is), generation speeds up 2–5× with no quality loss.
+
+Implementation effort is non-trivial but the savings are real for high-volume workloads.
+
+## 25.9 Context Compression
+
+Long prompts cost more. Compression techniques:
+
+- **Truncate retrieval** to the most relevant chunks.
+- **Summarize conversation history** when it grows long.
+- **Compress repeated instructions** into shorter forms.
+- **Drop low-value context** (turn-by-turn metadata that the model can infer).
+
+A 30% prompt reduction is a 30% input cost reduction.
+
+## 25.9a Rolling Summarisation in Code 🔧
+
+"Summarize conversation history when it grows long" interacts with prompt caching in a way that changes when it is worth doing, so the maths comes before the code.
+
+### When summarising saves money, and when it does not
+
+**Problem.** Long chats re-send their whole history every turn. Summarising cuts the tokens but costs an extra model call and can lose details.
+
+**Why (the numbers).** Say 10,000 tokens of old history can be replaced by a 1,000-token summary, saving 9,000 tokens on every later turn. Summarising with Claude Haiku 4.5 costs about 10,000 × $1/M + 1,000 × $5/M = $0.015 (September 2026 prices). The saving per later turn on Claude Opus 5.5 depends on caching:
+
+```text
+History NOT cached:  9,000 x $4.00 / 1M = $0.036 per turn  -> pays back in the first turn
+History cached:      9,000 x $0.20 / 1M = $0.0018 per turn -> needs about 8 more turns to pay back,
+                     and the summary itself invalidates the cache once (one fresh write)
+```
+
+With caching on, summarisation is mostly about staying inside the context window and keeping the model focused, not about cost. Without caching, it is a large cost lever.
+
+### The mechanism
+
+- Trigger only when history crosses a threshold (for example 30,000 tokens), not every turn, so the cached prefix changes rarely.
+- Summarise the oldest part in one step, and keep the most recent turns verbatim.
+- Keep the summary in a fixed position (right after the system prompt) so later turns cache again.
+
+### Implementation
+
+```python
+import math
+from dataclasses import dataclass
+from typing import Literal
+
+import anthropic
+from anthropic.types import MessageParam
+
+client = anthropic.AsyncAnthropic()
+TRIGGER_TOKENS = 30_000
+KEEP_RECENT_TURNS = 6
+
+
+@dataclass(frozen=True, slots=True)
+class Turn:
+    role: Literal["user", "assistant"]
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class Conversation:
+    summary: str | None
+    turns: list[Turn]
+
+
+def estimate_tokens(s: str) -> int:
+    return math.ceil(len(s) / 4)  # rough; fine for a trigger
+
+
+async def maybe_compact(conv: Conversation) -> Conversation:
+    total = estimate_tokens(conv.summary or "") + sum(estimate_tokens(t.text) for t in conv.turns)
+    if total < TRIGGER_TOKENS or len(conv.turns) <= KEEP_RECENT_TURNS:
+        return conv
+
+    old = conv.turns[:-KEEP_RECENT_TURNS]
+    recent = conv.turns[-KEEP_RECENT_TURNS:]
+    transcript = "\n\n".join(f"{t.role.upper()}: {t.text}" for t in old)
+
+    res = await client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1_500,
+        system=(
+            "Summarise this conversation for an assistant who will continue it. Keep every fact, number, "
+            "decision, open question and user preference. Drop small talk."
+        ),
+        messages=[
+            {"role": "user", "content": f"Earlier summary:\n{conv.summary or '(none)'}\n\nNew turns:\n{transcript}"},
+        ],
+    )
+    if res.stop_reason == "max_tokens":
+        return conv  # a truncated summary is worse than none
+
+    summary = "".join(b.text for b in res.content if b.type == "text")
+    return Conversation(summary=summary, turns=recent)
+
+
+def to_messages(conv: Conversation) -> list[MessageParam]:
+    msgs: list[MessageParam] = [{"role": t.role, "content": t.text} for t in conv.turns]
+    if conv.summary:
+        msgs[:0] = [
+            {"role": "user", "content": f"Summary of the earlier conversation:\n{conv.summary}"},
+            {"role": "assistant", "content": "Understood. I have the context."},
+        ]
+    return msgs
+```
+
+### Edge cases and failure modes
+
+- **Details lost in the summary.** Order numbers, exact quotes and code are the usual casualties. Keep structured facts (IDs, amounts) in a separate state object that is never summarised.
+- **The first message must be a user turn.** The summary pair keeps the conversation starting with a user turn, but any other trimming path that leaves an assistant turn first gets the request rejected. Trim on turn-pair boundaries.
+- **Summary drift.** A summary of a summary of a summary loses fidelity each time. Store the full transcript, and regenerate from it rather than from the previous summary when quality matters.
+- **Server-side alternatives.** Some providers offer automatic compaction of long conversations (Anthropic has one in beta). It saves the code above but you still need to evaluate what it drops.
+
+## 25.10 Output Length Control
+
+Output tokens cost more than input tokens (typically 2–4×). Control output length:
+
+- **Explicit max_tokens** limits.
+- **Prompts that ask for concise answers** when concise is appropriate.
+- **Structured outputs** that bound the output shape.
+- **Skip "explain your reasoning"** when it is not needed.
+
+## 25.10a Output Length Control in Code 🔧
+
+The four levers above apply to visible output; on reasoning models a second, hidden stream of output tokens (thinking) needs its own control.
+
+### Where output tokens hide
+
+**Problem.** A team caps answers at 300 words and output cost still rises after a model upgrade.
+
+**Why it happens.** On reasoning models, thinking tokens are billed as output tokens, even when the thinking text is not returned to you. Output is also the expensive side: on Claude models output costs 5× input (for example $20 against $4 per million on Opus 5.5, September 2026). A route with 400 visible output tokens and 2,000 thinking tokens pays for 2,400 output tokens.
+
+### The mechanism: three controls, three different jobs
+
+1. **`max_tokens`** is a hard ceiling. The model does not know it exists, so hitting it truncates mid-sentence or mid-JSON. Use it as a safety net, not as a length control.
+2. **Effort settings** (on Claude, `output_config.effort` from `low` to `max`; OpenAI has a similar reasoning-effort option) change how much the model thinks and how verbose it is. This is the main lever for thinking tokens.
+3. **Instructions and structure** (a target length, a JSON schema with bounded fields) shape visible output.
+
+### Implementation
+
+```python
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+import anthropic
+from anthropic.types import Message
+
+client = anthropic.AsyncAnthropic()
+
+
+class Metrics(Protocol):  # your metrics client
+    def increment(self, name: str, tags: dict[str, str]) -> None: ...
+    def histogram(self, name: str, value: float, tags: dict[str, str]) -> None: ...
+
+
+metrics: Metrics
+
+
+@dataclass(frozen=True, slots=True)
+class RouteConfig:
+    effort: Literal["low", "medium", "high", "xhigh", "max"]
+    max_tokens: int
+    hint: str = ""
+
+
+# Per-route settings, tuned against the eval set, not guessed
+ROUTES: dict[str, RouteConfig] = {
+    "chat": RouteConfig("low", 2_000, "Answer in at most 4 sentences unless asked for detail."),
+    "analysis": RouteConfig("high", 16_000),
+}
+
+
+async def run(route: str, system: str, user: str) -> Message:
+    cfg = ROUTES[route]
+    res = await client.messages.create(
+        model="claude-opus-5-5",
+        max_tokens=cfg.max_tokens,
+        output_config={"effort": cfg.effort},
+        system=f"{system}\n\n{cfg.hint}" if cfg.hint else system,
+        messages=[{"role": "user", "content": user}],
+    )
+
+    if res.stop_reason == "max_tokens":
+        # Truncated: log it, and either retry with a higher cap or return a clear error
+        metrics.increment("llm.truncated", {"route": route})
+    metrics.histogram("llm.output_tokens", res.usage.output_tokens, {"route": route})  # includes thinking
+    return res
+```
+
+Watch p50 and p95 of `output_tokens` per route. A jump after a model or prompt change is the earliest cost signal you will get.
+
+### Edge cases and failure modes
+
+- **Too-low `max_tokens` costs more.** A truncated answer often gets retried, so you pay for the truncated output and the retry.
+- **Lower effort can lower quality.** Coding and multi-step agent work usually need more effort; chat and classification often do fine at low. Decide per route with evals.
+- **"Be concise" can hurt.** For some tasks, a short answer means a wrong one (the model skips steps it needed). Measure quality and length together.
+- **Defaults differ by model.** The default effort level is not the same on every model (Claude Opus 5.5 defaults to `medium`, many others to `high`). Set it explicitly so an upgrade does not change your costs silently.
+
+## 25.11 Smaller Embedding Models
+
+Embedding cost scales with token count and model size. A smaller embedding model (384-dim instead of 1536-dim) cuts embedding cost and vector storage simultaneously.
+
+Matryoshka embeddings (truncatable) let you use a 3072-dim model trained for high quality, store 256 dims for low cost, and switch dynamically per query.
+
+## 25.12 Self-Hosting Thresholds
+
+API calls are cheaper at low volume; self-hosting is cheaper at high volume. The crossover depends on:
+- Model size (smaller models cross over earlier).
+- Utilization (idle GPUs are pure cost).
+- Engineering cost of running inference infra.
+- Negotiated provider discounts.
+
+Rough heuristic: at 1M tokens/day on a small model, API is fine. At 10M tokens/day on a small model, consider self-hosted. At 100M tokens/day, self-hosted almost certainly wins on unit cost — if you can keep GPUs utilized.
+
+## 25.12a A Break-Even Calculation You Can Rerun 🔧
+
+The heuristic above depends on four inputs; this section puts them into one formula so you can rerun it with your own numbers instead of trusting a rule of thumb.
+
+### The formula
+
+**Problem.** Self-hosting decisions are often made on "GPU cost per hour" alone, which leaves out redundancy, utilisation and the people who run it.
+
+**Why it happens.** API cost grows in a straight line with volume: `V × p`, where `V` is tokens per month (in millions) and `p` the blended API price per million. Self-hosting is a step function: a fixed monthly cost for engineering and monitoring, plus one GPU's monthly cost for every block of capacity, with a minimum of two GPUs so a single failure does not take the service down.
+
+### Worked example (every number is an assumption, replace with yours)
+
+- GPU: $3.00 per hour on demand, about $2,190 per month each, minimum 2 for redundancy.
+- Throughput: 1,500 tokens per second per GPU for a small open model on a paged-attention server, at 50% average utilisation, so about 1,971M tokens per GPU per month.
+- Operations: a quarter of an engineer at $20,000 per month fully loaded, plus $500 monitoring: $5,500 per month.
+- API alternative: Claude Haiku 4.5 at $1 input and $5 output (September 2026), with 3 input tokens per output token, blended $2.00 per million.
+
+```text
+2 GPUs:  fixed = 2 x 2,190 + 5,500 = $9,880 / month, capacity about 3,942M tokens
+         API cost equals $9,880 at 9,880 / 2.00 = 4,940M tokens  -> above 2-GPU capacity
+3 GPUs:  fixed = 3 x 2,190 + 5,500 = $12,070, capacity about 5,913M tokens
+         API cost equals $12,070 at 6,035M tokens                 -> above 3-GPU capacity
+4 GPUs:  fixed = 4 x 2,190 + 5,500 = $14,260, capacity about 7,884M tokens
+         API cost equals $14,260 at 7,130M tokens                 -> self-host wins from about here
+
+Break-even: about 7,100M tokens / month, roughly 240M tokens / day
+```
+
+That is well above the 10M to 100M per day in the heuristic, because the heuristic leaves out redundancy and engineering time. Against a frontier-priced API the break-even is much lower, but only if the open model you would host matches its quality on your task, which needs an eval, not an assumption.
+
+### Implementation
+
+```python
+import math
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class Inputs:
+    api_price_per_m: float        # blended API price per 1M tokens
+    gpu_hourly: float
+    min_gpus: int                 # redundancy floor
+    tokens_per_sec_per_gpu: float # measured on your model and traffic shape
+    utilization: float            # 0..1, average over the month
+    fixed_monthly: float          # engineering, monitoring, storage
+
+
+HOURS_PER_MONTH = 730
+
+
+def self_host_monthly(volume_m: float, i: Inputs) -> float:
+    capacity_per_gpu_m = i.tokens_per_sec_per_gpu * HOURS_PER_MONTH * 3600 * i.utilization / 1e6
+    gpus = max(i.min_gpus, math.ceil(volume_m / capacity_per_gpu_m))
+    return gpus * i.gpu_hourly * HOURS_PER_MONTH + i.fixed_monthly
+
+
+def break_even_m(i: Inputs, max_volume_m: int = 1_000_000, step_m: int = 50) -> int | None:
+    """Smallest monthly volume (millions of tokens) where self-hosting is cheaper, or None."""
+    for v in range(step_m, max_volume_m + 1, step_m):
+        if self_host_monthly(v, i) < v * i.api_price_per_m:
+            return v
+    return None
+
+
+print(break_even_m(Inputs(api_price_per_m=2, gpu_hourly=3, min_gpus=2,
+                          tokens_per_sec_per_gpu=1500, utilization=0.5, fixed_monthly=5500)))
+# -> 7150 (about 7,150M tokens per month with the assumptions above)
+```
+
+### Edge cases and failure modes
+
+- **Utilisation is the swing factor.** Chat traffic peaks in business hours. A fleet sized for peak runs at 20 to 40% average, which halves effective capacity. Measure it before you put 50% in the formula.
+- **Throughput depends on the traffic shape.** Long prompts with short answers and short prompts with long answers give very different tokens per second. Benchmark with replayed production traffic.
+- **The API price moves.** API prices have fallen repeatedly. A self-hosting plan that breaks even today can lose in a year, while reserved GPUs are a fixed commitment (see 25.14).
+- **Quality is part of the cost.** If the self-hosted model needs a longer prompt or more retries to match quality, use its measured tokens per task, not per request.
+
+## 25.13 Spot and Preemptible GPUs
+
+Cloud spot/preemptible GPUs cost 50–90% less than on-demand. Suitable for:
+- Batch inference (eval runs, embeddings).
+- Stateless workloads with fast restart.
+- Resilient services with replica diversity.
+
+Not suitable for latency-critical chat that cannot tolerate cold restarts.
+
+## 25.14 Reserved Capacity
+
+For steady-state workloads, commit to 1- or 3-year reserved capacity. Savings of 30–60% versus on-demand. The risk: you pay even if usage drops.
+
+Match reservation to your forecast lower bound; use on-demand for the variable component above.
+
+## 25.15 Right-Sizing
+
+The most common waste: GPUs too big for the model, replicas too many for the load.
+
+- Profile actual GPU utilization. Many production fleets run at 20–40%.
+- Bin-pack small models on shared GPUs via MIG.
+- Reduce replica counts where latency allows.
+- Match GPU class to workload (L40S over H100 when L40S is sufficient).
+
+## 25.16 Network Cost
+
+Cloud egress is expensive. For AI:
+- Keep inference and storage in the same region.
+- Use private connections (PrivateLink) for cross-cloud or hybrid.
+- Compress payloads (gzip, brotli) on the wire.
+- CDN for static assets.
+
+Many AI products discover hidden egress costs when looking at monthly bills.
+
+## 25.17 Vector DB Cost
+
+Levers:
+- Quantization (PQ, scalar, binary) for storage.
+- Lower-dim embeddings.
+- Tier old data to cold storage.
+- Right-size managed tier.
+- Self-host above a threshold.
+
+For large corpora, vector DB cost can exceed inference cost. Audit it.
+
+## 25.18 Eval Cost
+
+Continuous evals can run up costs. Mitigations:
+- Sample production traffic for continuous eval.
+- Run heavy evals nightly, lightweight per-PR.
+- Use cheaper judge models with periodic agreement checks vs frontier judges.
+
+## 25.19 Cost Accounting
+
+You cannot optimize what you cannot measure. For each request, track:
+- Tokens in, tokens out, by model.
+- Cost in USD.
+- Feature / endpoint.
+- User / tenant.
+
+Aggregate to dashboards:
+- Top features by cost.
+- Top users by cost.
+- Cost trend by day, by week.
+- Cost per resolved task — the business metric.
+
+Set anomaly alerts on cost; sudden spike = leak.
+
+## 25.19a Per-Tenant Cost Ledger and Budgets 🔧
+
+The tracking list above becomes useful once it is a ledger you can query and a budget you can enforce before the call, which is what this section builds.
+
+### Why dashboards alone do not control cost
+
+**Problem.** A dashboard shows that tenant X spent $40,000 last month. It does not stop tenant X from spending $40,000 tomorrow.
+
+**Why it happens.** Cost is only known after a call returns, and requests run in parallel. Without a pre-call check, a tenant with a runaway integration can run thousands of concurrent requests before any batch job notices. With per-tenant budgets, the worst case is bounded by the budget plus the in-flight requests.
+
+### The mechanism
+
+- **Ledger in Postgres.** One row per model call, with the token counts, the computed cost and the price version used, so history stays correct when prices change.
+- **Fast counter in Redis.** Month-to-date spend per tenant, checked before each call. Postgres is the source of truth; Redis is the fast path.
+- **Soft and hard limits.** At 80% alert the account owner; at 100% either block, or downgrade to a cheaper model, depending on the contract.
+- **Reconciliation.** Each day, compare the ledger to the provider's usage report (Anthropic and OpenAI both offer usage and cost APIs for admins) and investigate gaps above a small percentage.
+
+### Implementation
+
+```sql
+CREATE TABLE llm_usage (
+  request_id     uuid PRIMARY KEY,         -- one row per model call, idempotent insert
+  tenant_id      uuid NOT NULL,
+  feature        text NOT NULL,
+  model          text NOT NULL,            -- model string returned by the API
+  uncached_input integer NOT NULL,
+  cache_write    integer NOT NULL,
+  cache_read     integer NOT NULL,
+  output_tokens  integer NOT NULL,
+  batch          boolean NOT NULL DEFAULT false,
+  price_version  text NOT NULL,
+  cost_usd       numeric(12, 6) NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON llm_usage (tenant_id, created_at);
+CREATE INDEX ON llm_usage (feature, created_at);
+```
+
+```python
+import datetime as dt
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+import redis.asyncio as redis
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+# cost_usd and NormalizedUsage come from 25.2a
+
+PRICE_VERSION = "2026-09"
+notify_once: Callable[[str, str], Awaitable[None]]  # (tenant_id, event) -> None, your alerting hook
+
+
+def month_key(tenant_id: str) -> str:
+    return f"spend:{tenant_id}:{dt.datetime.now(dt.UTC):%Y-%m}"
+
+
+class BudgetExceededError(Exception):
+    pass
+
+
+async def check_budget(r: redis.Redis, tenant_id: str, monthly_budget_usd: float) -> None:
+    spent = float(await r.get(month_key(tenant_id)) or 0)
+    if spent >= monthly_budget_usd:
+        raise BudgetExceededError(f"tenant {tenant_id} over budget")
+    if spent >= 0.8 * monthly_budget_usd:
+        await notify_once(tenant_id, "budget-80")  # alert, do not block
+
+
+@dataclass(frozen=True, slots=True)
+class UsageRow:
+    request_id: str
+    tenant_id: str
+    feature: str
+    model: str
+    usage: NormalizedUsage
+    batch: bool
+
+
+INSERT_USAGE = text("""
+    INSERT INTO llm_usage (request_id, tenant_id, feature, model, uncached_input, cache_write,
+                           cache_read, output_tokens, batch, price_version, cost_usd)
+    VALUES (:request_id, :tenant_id, :feature, :model, :uncached_input, :cache_write,
+            :cache_read, :output_tokens, :batch, :price_version, :cost_usd)
+    ON CONFLICT (request_id) DO NOTHING
+""")
+
+
+async def record_usage(engine: AsyncEngine, r: redis.Redis, row: UsageRow) -> None:
+    cost = cost_usd(row.model, row.usage, row.batch)
+    async with engine.begin() as conn:
+        res = await conn.execute(INSERT_USAGE, {
+            "request_id": row.request_id, "tenant_id": row.tenant_id, "feature": row.feature, "model": row.model,
+            "uncached_input": row.usage.uncached_input, "cache_write": row.usage.cache_write,
+            "cache_read": row.usage.cache_read, "output_tokens": row.usage.output,
+            "batch": row.batch, "price_version": PRICE_VERSION, "cost_usd": cost,
+        })
+    if res.rowcount == 1:
+        # Only count spend once, even if record_usage is retried
+        key = month_key(row.tenant_id)
+        await r.incrbyfloat(key, cost)
+        await r.expire(key, 40 * 24 * 3600)
+```
+
+Useful queries come straight from the table: cost per feature per day, top tenants this month, and cost per resolved task when you join on your own task or ticket table.
+
+### Edge cases and failure modes
+
+- **Cancelled streams still cost money.** If the user closes the tab, the provider may still bill the tokens generated so far. Record usage from the final stream event when you get it, and an estimate when you do not.
+- **Retries are separate calls.** Each retry is billed. Give each attempt its own `request_id` and link attempts to the user request, so the ledger matches the invoice.
+- **Redis is lost or drifts.** Rebuild the month-to-date counters from Postgres on startup or nightly. Never treat Redis as the record.
+- **In-flight overshoot.** A tenant can exceed the budget by the cost of requests already running when the limit was hit. For tight budgets, also reserve an estimate before the call, as in 24.7a.
+- **Shared resources.** Embedding, vector storage and eval runs also cost money. Attribute them per tenant with an allocation rule (for example by stored vectors), or tenant margins look better than they are.
+
+## 25.20 Cost-Quality-Latency Triangle
+
+You can usually get two of the three. Make the tradeoff explicit per feature.
+
+| Feature class | Optimize for |
+|---|---|
+| Real-time chat | Latency + quality, accept higher cost |
+| Background batch | Cost + quality, accept higher latency |
+| Internal tool | Cost + latency, accept lower quality |
+
+## 25.21 Worked Example
+
+A chat product:
+- 100k MAU, 5 turns/day, 30 days/month = 15M turns/month.
+- Average tokens per turn: 2,000 in, 500 out.
+- Frontier model: $5/M input, $20/M output. Per turn: $0.01 + $0.01 = $0.02. Monthly: $300,000.
+- Add prefix cache (system prompt stable): 30% saving on input → $240,000.
+- Route 70% of easy queries to a cheaper model (10× cheaper): $96,000.
+- Add semantic cache for 20% deduplication: $77,000.
+- Trim retrieval context by 30%: $65,000.
+
+From $300k to $65k. None of those changes degrade quality if done carefully.
+
+## 25.22 Real-World Use Cases
+
+- A startup cut inference bill 80% by routing easy queries to a fine-tuned 7B model.
+- An enterprise cut vector DB bill 70% by switching to binary embeddings and reranking with full-precision.
+- A consumer app cut latency and cost simultaneously by adopting speculative decoding.
+- A SaaS company cut egress cost 60% by colocating inference and storage in one region.
+
+## 25.23 Tradeoffs
+
+| Optimization | Save | Risk |
+|---|---|---|
+| Cheaper model | 5-100× | Quality loss |
+| Caching | 30-60% | Stale answers |
+| Quantization | 2-4× memory | Quality loss |
+| Self-hosting | 30-70% | Ops burden |
+| Spot capacity | 50-90% | Interruption |
+| Reserved | 30-60% | Commitment risk |
+
+## 25.24 Interview Questions
+
+- Walk through cost optimization for a $1M/month chat product.
+- When does self-hosting beat API pricing?
+- Design a model router and explain its failure modes.
+- How do you measure cost per resolved task?
+- Compare semantic caching and prefix caching.
+
+➕ Additional questions:
+
+- ➕ When does a small-model-first cascade cost more than always using the large model? **When the escalation rate is above 1 minus the small-to-large cost ratio, for example above about 75% when the small model costs a quarter as much.**
+- ➕ Why might summarising chat history save almost nothing? **If the history is already prompt-cached, the tokens you remove were billed at a cache-read rate of about a tenth of the input price, and the summary itself invalidates the cache once.**
+- ➕ Your output-token cost doubled after a model upgrade with the same prompts. Where do you look? **Thinking tokens, which are billed as output, and the new model's default effort level; set effort explicitly per route and watch output-token percentiles.**
+- ➕ Which workloads belong on a batch API? **Anything nobody waits for: evals, backfills, nightly classification and enrichment; 50% off on the major providers, single requests only, results within 24 hours.**
+- ➕ How do you keep a per-tenant cost ledger correct when prices change? **Store token counts by type and the price version on every row, not only the computed dollar amount.**
+
+## 25.25 Hands-on Exercises
+
+1. Build a cost calculator for your design from Chapter 1.
+2. Identify the top three levers for your workload and estimate savings.
+3. Plan a quarterly cost review process.
+
+## 25.26 Common Mistakes
+
+- Optimizing the wrong layer (saving pennies on storage while inference burns dollars).
+- No per-feature cost visibility.
+- Skipping caching as "too complex."
+- Routing without measuring; degrades quality silently.
+- No cost alerts; finding a 10× spike at month-end.
+
+## 25.27 Enterprise Best Practices
+
+Cost dashboards per feature, per tenant. Monthly reviews. Budgets per team. Anomaly alerts. Quarterly model and embedding reviews as new options release. Treat cost as a quality dimension equal to latency and accuracy.
+
+## Sources
+
+Prices checked in late September 2026. They change often; treat every price on this page as an example.
+
+- Anthropic, [Pricing](https://platform.claude.com/docs/en/about-claude/pricing): Claude Opus 5.5 $4 / $20, Claude Sonnet 5.5 $2 / $10, Claude Haiku 4.5 $1 / $5 per million input / output tokens; cache write 1.25× (5-minute) or 2× (1-hour); cache reads about 0.1× (0.05× on Opus 5.5); batch 50% off.
+- Anthropic, [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching): prefix matching, TTLs, minimum cacheable lengths, usage fields.
+- Anthropic, [Batch processing](https://platform.claude.com/docs/en/build-with-claude/batch-processing): Message Batches API, result types, discount stacking with caching.
+- Anthropic, [Effort](https://platform.claude.com/docs/en/build-with-claude/effort) and [Extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking): thinking tokens billed as output, effort levels.
+- OpenAI, [Batch API guide](https://platform.openai.com/docs/guides/batch): 50% discount, 24-hour completion window.
+- OpenAI, [Prompt caching guide](https://platform.openai.com/docs/guides/prompt-caching): automatic caching of long prompts, `cached_tokens` in usage.
+- OpenAI, [Pricing](https://openai.com/api/pricing/).
+- [pgvector](https://github.com/pgvector/pgvector): HNSW indexes, cosine distance operator, filtering behaviour.

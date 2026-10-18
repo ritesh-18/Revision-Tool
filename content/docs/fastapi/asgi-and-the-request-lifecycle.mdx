@@ -1,0 +1,739 @@
+---
+title: "ASGI and the request lifecycle"
+description: "WSGI vs ASGI from first principles with a raw scope/receive/send app, what uvicorn does, how Starlette builds a Request and routes it, how FastAPI analyses your endpoint signature once at startup, the full request lifecycle, and the crucial async def vs def difference measured with real timings."
+---
+
+The [first chapter](/docs/fastapi/introduction-and-first-app) treated FastAPI as a black box: a decorator goes in, JSON comes out. This chapter opens the box. By the end you should be able to trace a request from the TCP socket to your function and back, and say exactly which thread runs your code and why.
+
+The most practical result is at the end: **an `async def` endpoint and a `def` endpoint run in completely different places**. Mixing them up is the most common FastAPI performance bug, and it is easy to measure.
+
+All code ran on CPython 3.14.6 on Windows with FastAPI 0.143.0, Starlette 1.8.0, uvicorn 0.54.0 and AnyIO 4.15.1. Timings are approximate.
+
+## The problem a server interface solves
+
+A web framework should not deal with sockets, and a web server should not know about your routes. Python solved this split with a **standard calling convention** between the two:
+
+- the **server** (gunicorn, uvicorn) accepts connections, parses HTTP and calls the application;
+- the **application** (Flask, Django, FastAPI) receives a description of the request and produces a response.
+
+Any server can run any application that follows the convention. WSGI was the first one. ASGI is its async successor.
+
+## WSGI: one call, one response
+
+WSGI ([PEP 3333](https://peps.python.org/pep-3333/)) defines an application as a plain function that takes a dict of request data and a callback, and returns an iterable of bytes:
+
+```python
+import threading
+from wsgiref.simple_server import make_server, WSGIRequestHandler
+import httpx
+
+def app(environ, start_response):
+    body = f"{environ['REQUEST_METHOD']} {environ['PATH_INFO']} q={environ['QUERY_STRING']}".encode()
+    start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))])
+    return [body]
+
+class Quiet(WSGIRequestHandler):
+    def log_message(self, *a): pass
+
+server = make_server("127.0.0.1", 8014, app, handler_class=Quiet)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+print(httpx.get("http://127.0.0.1:8014/hello?x=1").text)
+server.shutdown()
+```
+
+```text title="Output"
+GET /hello q=x=1
+```
+
+That design is simple, and it has one hard limit: **the call is synchronous**. The server calls `app(...)`, and the thread is stuck inside that call until the response is ready. If the handler waits 2 seconds on a database, the thread waits 2 seconds. To serve 100 slow requests at once, you need 100 threads or processes.
+
+WSGI also has no way to express anything other than one request followed by one response. A WebSocket, a long-lived server-sent event stream or an HTTP/2 push don't fit "call a function, get an iterable".
+
+## ASGI: a conversation of events
+
+ASGI (Asynchronous Server Gateway Interface) replaces the single call with an **async function that exchanges messages** with the server:
+
+```python
+async def app(scope, receive, send):
+    ...
+```
+
+| Argument | What it is |
+|---|---|
+| `scope` | a dict describing the connection: type (`http`, `websocket`, `lifespan`), method, path, query string, headers, client address |
+| `receive` | an `async` function. `await receive()` returns the next **incoming** event, such as a chunk of the request body |
+| `send` | an `async` function. `await send(message)` pushes an **outgoing** event, such as the response headers or a chunk of the body |
+
+Because `receive` and `send` are awaitable, the app can pause while waiting for the network, and the event loop runs other requests in the meantime. Because the app sends **events** instead of returning one value, the same interface covers streaming responses and WebSockets.
+
+The main message types:
+
+| Direction | `type` | Meaning |
+|---|---|---|
+| server to app | `http.request` | a chunk of the request body, with `more_body: True` if more follows |
+| server to app | `http.disconnect` | the client went away |
+| app to server | `http.response.start` | status code and headers |
+| app to server | `http.response.body` | a chunk of the response body, with `more_body: True` to stream |
+| both | `lifespan.startup`, `lifespan.shutdown` and their `.complete` replies | process start and stop hooks |
+| both | `websocket.connect`, `websocket.receive`, `websocket.send`, ... | the WebSocket protocol |
+
+### A raw ASGI app
+
+No framework, just the protocol. This app handles the lifespan messages, reads the request body chunk by chunk, and sends a JSON response in two events:
+
+```python title="raw_asgi.py"
+import json
+
+
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+            print("lifespan message:", message)
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    assert scope["type"] == "http"
+    print("scope:", {k: scope[k] for k in ("type", "http_version", "method", "path", "query_string", "headers")})
+
+    # read the whole request body, which may arrive in several chunks
+    body = b""
+    while True:
+        message = await receive()
+        body += message.get("body", b"")
+        if not message.get("more_body", False):
+            break
+
+    payload = json.dumps({"path": scope["path"], "you_sent": body.decode()}).encode()
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode())],
+    })
+    await send({"type": "http.response.body", "body": payload})
+```
+
+To run it under a real server and capture both sides in one output, start uvicorn programmatically in a background thread. `uvicorn.Server` is the same object the `uvicorn` command uses:
+
+```python title="run_raw.py"
+import threading, time
+import httpx
+import uvicorn
+from raw_asgi import app
+
+server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8012))
+thread = threading.Thread(target=server.run, daemon=True)
+thread.start()
+while not server.started:
+    time.sleep(0.05)
+
+r = httpx.post("http://127.0.0.1:8012/hello?x=1", content=b"ping",
+               headers={"content-type": "text/plain"})
+print("client got:", r.status_code, r.headers["content-type"], r.json())
+
+server.should_exit = True     # what Ctrl+C does: a graceful shutdown
+thread.join()
+```
+
+```text title="Output"
+INFO:     Started server process [19376]
+INFO:     Waiting for application startup.
+lifespan message: {'type': 'lifespan.startup'}
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8012 (Press CTRL+C to quit)
+scope: {'type': 'http', 'http_version': '1.1', 'method': 'POST', 'path': '/hello', 'query_string': b'x=1', 'headers': [(b'host', b'127.0.0.1:8012'), (b'accept', b'*/*'), (b'accept-encoding', b'gzip, deflate'), (b'connection', b'keep-alive'), (b'user-agent', b'python-httpx/0.28.1'), (b'content-type', b'text/plain'), (b'content-length', b'4')]}
+INFO:     127.0.0.1:64191 - "POST /hello?x=1 HTTP/1.1" 200 OK
+client got: 200 application/json {'path': '/hello', 'you_sent': 'ping'}
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+lifespan message: {'type': 'lifespan.shutdown'}
+INFO:     Application shutdown complete.
+INFO:     Finished server process [19376]
+```
+
+Look at the raw data the server hands over:
+
+- Headers are a **list of byte-string pairs**, lowercased, not a dict. HTTP allows repeated headers, and a list keeps them.
+- `query_string` is raw **bytes**. Nobody has parsed `x=1` yet.
+- The body is not in the scope at all. It arrives later, through `receive()`, possibly in many chunks.
+- Lifespan is a separate "connection" of type `lifespan` that lives for the whole process. This is what FastAPI's `lifespan=` hook is built on (see [Middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks)).
+
+To see the complete HTTP scope, print every key except the headers:
+
+```python
+import threading, time
+import httpx
+import uvicorn
+
+
+async def app(scope, receive, send):
+    for key in sorted(scope):
+        if key != "headers":
+            print(f"  {key:<14} {scope[key]!r}")
+    await send({"type": "http.response.start", "status": 204, "headers": []})
+    await send({"type": "http.response.body", "body": b""})
+
+
+config = uvicorn.Config(app, port=8013, lifespan="off", log_level="warning")
+server = uvicorn.Server(config)
+threading.Thread(target=server.run, daemon=True).start()
+while not server.started:
+    time.sleep(0.05)
+httpx.get("http://127.0.0.1:8013/a%20b/c?x=1&x=2")
+server.should_exit = True
+```
+
+```text title="Output"
+  asgi           {'version': '3.0', 'spec_version': '2.3'}
+  client         ('127.0.0.1', 58190)
+  http_version   '1.1'
+  method         'GET'
+  path           '/a b/c'
+  query_string   b'x=1&x=2'
+  raw_path       b'/a%20b/c'
+  root_path      ''
+  scheme         'http'
+  server         ('127.0.0.1', 8013)
+  state          {}
+  type           'http'
+```
+
+`path` is already percent-decoded, and `raw_path` keeps the original bytes. `state` is empty here because lifespan is off. With lifespan on, it is a copy of the dict the app filled during startup, which is how values stored at startup reach every request.
+
+Everything FastAPI does is built on top of this one function signature. A FastAPI app is itself an object with `async def __call__(self, scope, receive, send)`.
+
+## What uvicorn does
+
+uvicorn is the piece between the network and that function.
+
+<Mermaid chart={`flowchart LR
+  subgraph OS["Operating system"]
+    S["listening socket :8000"]
+  end
+  subgraph UV["uvicorn process"]
+    L["event loop<br/>asyncio, or uvloop on Linux"]
+    P["HTTP parser<br/>httptools or h11"]
+    T["one task per request<br/>calls app with scope, receive, send"]
+  end
+  S --> L --> P --> T
+  T --> A["your ASGI app"]
+  A -- send events --> P
+  P -- bytes --> S`} />
+
+For each connection, uvicorn:
+
+1. **Accepts** the TCP connection on the event loop. One process can hold thousands of open connections because none of them owns a thread.
+2. **Parses** the bytes of the request line and headers with `httptools` (a C parser, installed by `fastapi[standard]`) or the pure-Python `h11`.
+3. **Builds the `scope`** dict and two closures, `receive` and `send`, bound to this connection.
+4. **Starts a task** that runs `await app(scope, receive, send)`.
+5. As body bytes arrive, it queues them as `http.request` messages for `receive()`. It applies **flow control**: if the app isn't reading, it stops reading the socket.
+6. When the app calls `send(...)`, it serializes the status line, headers and body chunks back to bytes and writes them to the socket.
+7. It handles **keep-alive** (several requests on one connection), timeouts, the **lifespan** protocol, and signals for graceful shutdown.
+
+uvicorn runs **one event loop in one thread per process**. To use several CPU cores, you run several processes (`fastapi run --workers 4`). That is covered in [Deployment and performance](/docs/fastapi/deployment-and-performance).
+
+## Starlette: from scope to `Request`
+
+Working with raw dicts and byte strings gets old quickly. Starlette's `Request` is a thin, lazy wrapper around `scope` and `receive`. Nothing is parsed until you ask for it:
+
+```python
+import asyncio
+from starlette.requests import Request
+
+scope = {
+    "type": "http", "method": "POST", "path": "/users/7", "raw_path": b"/users/7",
+    "query_string": b"verbose=true&tag=a&tag=b", "root_path": "", "scheme": "http",
+    "server": ("127.0.0.1", 8000), "client": ("127.0.0.1", 50000), "http_version": "1.1",
+    "headers": [(b"content-type", b"application/json"), (b"cookie", b"session=abc123"),
+                (b"x-request-id", b"r-1")],
+}
+chunks = [
+    {"type": "http.request", "body": b'{"name": ', "more_body": True},
+    {"type": "http.request", "body": b'"ada"}', "more_body": False},
+]
+
+async def receive():
+    msg = chunks.pop(0)
+    print("  receive() ->", msg)
+    return msg
+
+async def main():
+    request = Request(scope, receive)
+    print(request.method, request.url)
+    print(request.query_params, request.query_params.getlist("tag"))
+    print(request.headers["x-request-id"], request.cookies)
+    print("reading body...")
+    print(await request.json())
+    print("second read is cached:", await request.body())
+
+asyncio.run(main())
+```
+
+```text title="Output"
+POST http://127.0.0.1:8000/users/7?verbose=true&tag=a&tag=b
+verbose=true&tag=a&tag=b ['a', 'b']
+r-1 {'session': 'abc123'}
+reading body...
+  receive() -> {'type': 'http.request', 'body': b'{"name": ', 'more_body': True}
+  receive() -> {'type': 'http.request', 'body': b'"ada"}', 'more_body': False}
+{'name': 'ada'}
+second read is cached: b'{"name": "ada"}'
+```
+
+- `request.url`, `query_params`, `headers` and `cookies` are computed from the scope on first access.
+- The body is pulled from `receive()` only when you `await request.body()` or `.json()`, and then it is cached on the request object. That is why `json()` must be awaited: it may need to wait for the network.
+- `request.stream()` gives you the chunks one by one without buffering, which is how large uploads should be handled.
+
+## Routing: regex match, first wins
+
+When a route is created, Starlette compiles its path template into a regular expression:
+
+```python
+from starlette.routing import compile_path
+
+regex, fmt, convertors = compile_path("/users/{user_id:int}/posts/{slug}")
+print(regex.pattern)
+print(fmt, convertors)
+print(regex.match("/users/42/posts/hello-world").groupdict())
+```
+
+```text title="Output (object addresses trimmed)"
+^/users/(?P<user_id>[0-9]+)/posts/(?P<slug>[^/]+)$
+/users/{user_id}/posts/{slug} {'user_id': <starlette.convertors.IntegerConvertor object at 0x...>, 'slug': <starlette.convertors.StringConvertor object at 0x...>}
+{'user_id': '42', 'slug': 'hello-world'}
+```
+
+On each request, the router walks its list of routes **in order** and asks each one `matches(scope)`. A route answers with one of three values:
+
+- `Match.FULL`: path and method both match. The router stops and calls this route.
+- `Match.PARTIAL`: the path matches but the method doesn't. The router remembers it and keeps looking.
+- `Match.NONE`: no match.
+
+If nothing matched fully but something matched partially, the answer is **405 Method Not Allowed**. If nothing matched at all, it's **404 Not Found**. The matched path parameters are stored in `scope["path_params"]`, still as **strings**. Converting them to `int` is FastAPI's job, not the router's. FastAPI routes use the plain `{user_id}` form (regex `[^/]+`) and leave conversion and validation to Pydantic, which gives you proper 422 errors instead of silent 404s.
+
+For the language-agnostic version (tries vs regex lists, precedence), see [Routing](/docs/backend-first-principles/06-routing).
+
+## FastAPI's contribution: a plan built once, at startup
+
+When you decorate a function, `APIRoute.__init__` inspects its signature and stores the result in a `Dependant` object. That object is the **validation plan**: for each parameter, where to read it from, which Pydantic field validates it, and which special objects (`Request`, `Response`, `BackgroundTasks`) to inject.
+
+```python
+from fastapi import FastAPI, Header, Request
+from pydantic import BaseModel
+from starlette.routing import Match
+
+app = FastAPI()
+
+class Post(BaseModel):
+    title: str
+    body: str
+
+@app.post("/users/{user_id}/posts")
+async def create_post(request: Request, user_id: int, post: Post, draft: bool = False,
+                      user_agent: str | None = Header(default=None)):
+    return {}
+
+route = app.routes[-1]
+print(type(route).__name__, route.path_regex.pattern, route.methods)
+d = route.dependant
+print("call:        ", d.call.__name__)
+print("path_params: ", [(f.name, f.field_info.annotation) for f in d.path_params])
+print("query_params:", [(f.name, f.field_info.annotation, f.field_info.default) for f in d.query_params])
+print("header_params:", [(f.name, f.alias) for f in d.header_params])
+print("body_params: ", [(f.name, f.field_info.annotation) for f in d.body_params])
+print("request_param_name:", d.request_param_name)
+
+scope = {"type": "http", "path": "/users/42/posts", "method": "POST", "root_path": ""}
+match, child = route.matches(scope)
+print(match, child.get("path_params"))
+```
+
+```text title="Output"
+APIRoute ^/users/(?P<user_id>[^/]+)/posts$ {'POST'}
+call:         create_post
+path_params:  [('user_id', <class 'int'>)]
+query_params: [('draft', <class 'bool'>, False)]
+header_params: [('user_agent', 'user-agent')]
+body_params:  [('post', <class '__main__.Post'>)]
+request_param_name: request
+Match.FULL {'user_id': '42'}
+```
+
+Every decision was made before the first request arrived:
+
+- `user_id` is a path parameter because its name appears in the path.
+- `draft` is a query parameter because it is a simple type not in the path.
+- `user_agent` is a header, and its HTTP name was computed as `user-agent` (underscores become hyphens).
+- `post` is the body because it is a Pydantic model.
+- `request` is not a parameter at all. It is a special type, so FastAPI records "inject the `Request` object here".
+
+The full rules are in [Path, query and body parameters](/docs/fastapi/path-query-and-body-parameters). The dependency system builds on the very same structure: a `Depends(...)` parameter becomes a child `Dependant` in `d.dependencies`, analysed the same way. See [Dependency injection](/docs/fastapi/dependency-injection).
+
+Because the analysis runs at import time, a signature FastAPI can't understand fails **before the server starts**, not on the first request:
+
+```python
+from fastapi import FastAPI
+
+class Engine:  # not a Pydantic type, not a Request, not a Depends
+    pass
+
+app = FastAPI()
+try:
+    @app.get("/run")
+    def run(engine: Engine):
+        return {}
+except Exception as e:
+    print(type(e).__name__, ":", str(e).splitlines()[0])
+```
+
+```text title="Output"
+FastAPIError : Invalid args for response field! Hint: check that <class '__main__.Engine'> is a valid Pydantic field type. If you are using a return type annotation that is not a valid Pydantic field (e.g. Union[Response, dict, None]) you can disable generating the response model from the type annotation with the path operation decorator parameter response_model=None. Read more: https://fastapi.tiangolo.com/tutorial/response-model/
+```
+
+The message talks about a "response field" because FastAPI uses the same helper to build every Pydantic field, but the cause is the parameter: Pydantic can't build a validator for an arbitrary class. The fix is usually `Depends(get_engine)`.
+
+Doing the work once is also why FastAPI is fast at request time. Per request, it doesn't call `inspect.signature` or build validators. It runs prebuilt Pydantic validators (compiled in Rust by `pydantic-core`) against the values it pulls from the request.
+
+## The middleware stack
+
+Before a request reaches the router it passes through a stack of ASGI apps, each wrapping the next. You can print the layers:
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"])
+
+@app.get("/")
+async def root():
+    return {}
+
+layer = app.build_middleware_stack()
+while layer is not None:
+    print(type(layer).__module__ + "." + type(layer).__name__)
+    layer = getattr(layer, "app", None)
+```
+
+```text title="Output"
+starlette.middleware.errors.ServerErrorMiddleware
+fastapi.telemetry._asgi.ExceptionTelemetryMiddleware
+starlette.middleware.cors.CORSMiddleware
+starlette.middleware.exceptions.ExceptionMiddleware
+fastapi.middleware.asyncexitstack.AsyncExitStackMiddleware
+fastapi.routing.APIRouter
+builtins.method
+```
+
+(The last line is just the router's own bound `app` method, where the loop runs out of `.app` attributes.)
+
+| Layer | Job |
+|---|---|
+| `ServerErrorMiddleware` | outermost. Catches any exception nobody handled and returns a plain **500** (or a debug traceback page with `debug=True`). Your `Exception` handler, if you register one, runs here |
+| `ExceptionTelemetryMiddleware` | a hook that recent FastAPI versions use to record exceptions for OpenTelemetry. It does nothing unless telemetry is configured |
+| your middleware | everything you add with `add_middleware` or `@app.middleware("http")`, the last one added being the outermost |
+| `ExceptionMiddleware` | turns `HTTPException` and your registered exception types into responses using the exception handlers |
+| `AsyncExitStackMiddleware` | closes uploaded files and other per-request resources when the request ends |
+| `APIRouter` | finds the route and calls it |
+
+Middleware is covered in depth in [Middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks), and exception handlers in [Responses, errors and status codes](/docs/fastapi/responses-errors-and-status-codes).
+
+## The request lifecycle, end to end
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant U as uvicorn
+  participant M as Middleware stack
+  participant R as Router
+  participant H as Route handler
+  participant E as Your endpoint
+  C->>U: TCP bytes
+  U->>U: parse HTTP, build scope
+  U->>M: app with scope, receive, send
+  M->>R: through each middleware
+  R->>R: match routes in order
+  R->>H: route.handle
+  H->>H: read body, parse JSON if content type is JSON
+  H->>H: solve dependencies and validate all params
+  alt any validation errors
+    H-->>M: raise RequestValidationError
+    M-->>U: 422 JSON
+  else valid
+    H->>E: await call or run in threadpool
+    E-->>H: return value
+    H->>H: validate and serialize with response model
+    H-->>U: send response.start and response.body
+  end
+  H->>H: run dependency teardown after yield
+  U-->>C: TCP bytes`} />
+
+Step by step, for a `POST /users/42/posts` with a JSON body:
+
+1. **uvicorn** parses the bytes, builds the `scope`, and calls the app.
+2. **Middleware** runs, outermost first. Each layer can look at the request, short-circuit with its own response, or pass it on.
+3. **The router** walks `app.router.routes` and finds the first `Match.FULL`, putting `{'user_id': '42'}` into the scope.
+4. **The route's ASGI wrapper** builds a Starlette `Request` and opens two `AsyncExitStack`s that will hold cleanup callbacks for dependencies with `yield`.
+5. **Body reading.** If the route has body parameters, FastAPI awaits the body. It parses it as JSON only if the `Content-Type` is `application/json` (or `+json`). Form routes parse multipart or urlencoded data instead. Invalid JSON becomes a 422 `json_invalid` error.
+6. **Solving dependencies.** FastAPI walks the `Dependant`: it pulls each path, query, header and cookie value out of the request, runs any `Depends` functions, and validates everything with Pydantic. Errors are **collected, not raised one by one**, so the client sees every problem at once.
+7. **Errors?** If the list is not empty, FastAPI raises `RequestValidationError`, the `ExceptionMiddleware` turns it into the **422** response, and your function is never called.
+8. **Calling your endpoint.** If it is `async def`, FastAPI awaits it directly on the event loop. If it is a plain `def`, FastAPI runs it in a worker thread. The next section is about this one line.
+9. **Serializing the result.** If the route has a response model (from `response_model=` or the return annotation), the return value is validated and serialized by Pydantic, straight to JSON bytes. Without one, it goes through `jsonable_encoder` and `json.dumps`. If you returned a `Response` object, it is used as is.
+10. **Sending.** The `Response` object calls `send` twice: `http.response.start` with status and headers, then `http.response.body`.
+11. **Teardown.** The exit stacks close, which runs the code after `yield` in your dependencies (closing DB sessions, for example).
+
+## `async def` vs `def`: where your code runs
+
+This is the function that matters, from `fastapi/routing.py` (simplified, with a profiling hook removed):
+
+```python
+async def run_endpoint_function(*, dependant, values, is_coroutine):
+    if is_coroutine:
+        return await dependant.call(**values)
+    else:
+        return await run_in_threadpool(_run_sync_endpoint, function=dependant.call, arguments=values)
+```
+
+`is_coroutine` was computed once, at startup, from whether your function is `async def`. So:
+
+- **`async def` endpoint**: runs **on the event loop thread**. Every other request in the process shares that thread. While your code runs between two `await`s, nothing else in the process runs.
+- **`def` endpoint**: runs in a **worker thread** from AnyIO's thread pool, via `anyio.to_thread.run_sync`. The event loop awaits the result and keeps serving other requests meanwhile.
+
+The same rule applies to dependencies: `def` dependencies also run in the thread pool.
+
+The thread pool is limited by a **capacity limiter with 40 tokens** by default. At most 40 sync endpoints and dependencies run at the same time per process. The 41st waits for a free token.
+
+### Measuring it
+
+Four endpoints, each "doing one second of work" in a different way:
+
+```python title="app.py"
+import asyncio, threading, time
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/async-sleep")
+async def async_sleep():
+    await asyncio.sleep(1)          # yields to the event loop
+    return {"thread": threading.get_ident()}
+
+
+@app.get("/sync-sleep")
+def sync_sleep():
+    time.sleep(1)                   # blocks, but only a worker thread
+    return {"thread": threading.get_ident()}
+
+
+@app.get("/async-blocking")
+async def async_blocking():
+    time.sleep(1)                   # blocks the event loop thread itself
+    return {"thread": threading.get_ident()}
+
+
+@app.get("/ping")
+async def ping():
+    return {"ok": True}
+```
+
+The load generator opens one raw TCP connection per request with asyncio, so the client itself adds almost no overhead. (A first attempt with `httpx.AsyncClient` added close to a second of client-side overhead at 80 concurrent requests on this machine, which would have muddied the numbers.)
+
+```python title="load.py"
+import asyncio, json, time
+
+HOST, PORT = "127.0.0.1", 8000
+
+
+async def get(path):
+    reader, writer = await asyncio.open_connection(HOST, PORT)
+    writer.write(f"GET {path} HTTP/1.1\r\nHost: {HOST}\r\nConnection: close\r\n\r\n".encode())
+    raw = await reader.read()                 # server closes the connection when done
+    writer.close()
+    return json.loads(raw.split(b"\r\n\r\n", 1)[1])
+
+
+async def burst(path, n):
+    start = time.perf_counter()
+    bodies = await asyncio.gather(*(get(path) for _ in range(n)))
+    elapsed = time.perf_counter() - start
+    threads = len({b["thread"] for b in bodies})
+    print(f"{n:>3} x {path:<15} {elapsed:5.2f}s   threads used: {threads}")
+
+
+async def ping_while(path):
+    async def timed_ping():
+        await asyncio.sleep(0.1)              # let the slow requests start first
+        start = time.perf_counter()
+        await get("/ping")
+        return time.perf_counter() - start
+    *_, ping = await asyncio.gather(*(get(path) for _ in range(3)), timed_ping())
+    print(f"/ping while 3 x {path:<15} run: {ping * 1000:6.0f} ms")
+
+
+async def main():
+    for path in ("/async-sleep", "/sync-sleep", "/async-blocking"):
+        await burst(path, 10)
+    print()
+    for path in ("/async-sleep", "/sync-sleep", "/async-blocking"):
+        await ping_while(path)
+    print()
+    for n in (40, 41, 80, 120):
+        await burst("/sync-sleep", n)
+    await burst("/async-sleep", 120)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run the server in one terminal with `uvicorn app:app --log-level warning` and the load generator in another:
+
+```text title="Output"
+ 10 x /async-sleep     1.01s   threads used: 1
+ 10 x /sync-sleep      1.02s   threads used: 10
+ 10 x /async-blocking 10.01s   threads used: 1
+
+/ping while 3 x /async-sleep    run:      2 ms
+/ping while 3 x /sync-sleep     run:      2 ms
+/ping while 3 x /async-blocking run:   2900 ms
+
+ 40 x /sync-sleep      1.02s   threads used: 40
+ 41 x /sync-sleep      2.01s   threads used: 40
+ 80 x /sync-sleep      2.06s   threads used: 40
+120 x /sync-sleep      3.08s   threads used: 40
+120 x /async-sleep     1.04s   threads used: 1
+```
+
+Each block tells a different story.
+
+**Block 1, ten concurrent requests:**
+
+- `async def` + `await asyncio.sleep(1)`: **1 second total**, all on one thread. Each request suspends at the `await`, and the loop starts the next one. This is the ideal case.
+- `def` + `time.sleep(1)`: also **1 second**, but using 10 different threads. FastAPI moved each call to the thread pool, so the blocking sleep only blocked a worker.
+- `async def` + `time.sleep(1)`: **10 seconds**. `time.sleep` never yields, so the event loop thread is stuck for one second per request, and the ten requests run strictly one after another. This is the bug.
+
+**Block 2, is the server still responsive?** A trivial `/ping` takes 2 ms while slow `async` or `def` requests are running. While blocking `async def` requests are running, the same `/ping` takes **2.9 seconds**, because it can't even be parsed until the loop is free. In production this shows up as every endpoint getting slow at once, health checks timing out and the orchestrator restarting a perfectly healthy-looking process.
+
+**Block 3, the 40-token limit:**
+
+- 40 sync requests: 1 second, 40 threads.
+- 41 sync requests: **2 seconds**. The 41st had to wait for a token.
+- 80 sync requests: 2 seconds (two waves of 40). 120: 3 seconds (three waves).
+- 120 async requests: 1 second on one thread. Coroutines waiting on IO don't need threads, so they don't hit that limit.
+
+<Mermaid chart={`flowchart TB
+  subgraph Loop["Event loop thread"]
+    A1["async def endpoint<br/>runs here between awaits"]
+    D["FastAPI request handling,<br/>parsing, validation, serialization"]
+  end
+  subgraph Pool["AnyIO thread pool, 40 tokens"]
+    W1["def endpoint"]
+    W2["def dependency"]
+    W3["run_in_threadpool calls"]
+  end
+  D -- "await to_thread.run_sync" --> Pool
+  Pool -- result --> D
+  A1 -. "time.sleep or sync IO here<br/>freezes every request" .-> Loop`} />
+
+### Raising the limit and offloading by hand
+
+The limiter is a process-wide object. You can resize it at startup, in the lifespan hook. And if an `async def` endpoint must call a blocking function, hand that one call to the thread pool with `await run_in_threadpool(...)` (or `asyncio.to_thread(...)`):
+
+```python title="fixed_app.py"
+import threading, time
+from contextlib import asynccontextmanager
+
+import anyio
+from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    print("default thread tokens:", limiter.total_tokens)
+    limiter.total_tokens = 100
+    print("raised to:", limiter.total_tokens)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def legacy_blocking_call():
+    time.sleep(1)
+    return threading.get_ident()
+
+
+@app.get("/sync-sleep")
+def sync_sleep():
+    return {"thread": legacy_blocking_call()}
+
+
+@app.get("/async-offloaded")
+async def async_offloaded():
+    thread = await run_in_threadpool(legacy_blocking_call)   # await, so the loop stays free
+    return {"thread": thread}
+```
+
+```python title="load2.py"
+import asyncio
+from load import burst
+
+async def main():
+    await burst("/sync-sleep", 120)
+    await burst("/async-offloaded", 10)
+
+asyncio.run(main())
+```
+
+```text title="Output (server log, then load2.py)"
+default thread tokens: 40
+raised to: 100
+120 x /sync-sleep      2.05s   threads used: 100
+ 10 x /async-offloaded  1.01s   threads used: 10
+```
+
+With 100 tokens, 120 sync requests now take two waves (2 seconds) instead of three. The offloaded `async def` endpoint behaves like a `def` one: 10 requests in 1 second on 10 threads.
+
+Raising the limit is not free. Each thread has its own stack (often 1 to 8 MB of reserved address space), and more threads means more contention on whatever they share, such as a database connection pool. If your 40 threads are all waiting on a pool of 10 database connections, raising the token count to 100 only lengthens the queue.
+
+### Which one should I write?
+
+| What the endpoint does | Write | Why |
+|---|---|---|
+| calls async libraries (`httpx.AsyncClient`, `asyncpg`, async SQLAlchemy, the async OpenAI or Anthropic SDK) | `async def` | awaits yield to the loop, so thousands of requests can be in flight with no threads |
+| calls blocking libraries (`requests`, sync SQLAlchemy, `boto3`, most SDKs without `Async` in the name) | `def` | FastAPI moves it to a thread for you |
+| mostly async, with one blocking call | `async def` + `await run_in_threadpool(fn, ...)` | keeps the loop free for that call |
+| pure computation that is very quick (building a dict, formatting) | `async def` | skips the thread hop. A thread round trip costs tens of microseconds |
+| heavy CPU work (image processing, big pandas jobs, model inference) | neither, as is | move it to a process pool or a worker queue. See [Agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs) and [Serving your own models](/docs/fastapi/serving-your-own-models) |
+
+If you aren't sure whether a library blocks, `def` is the **safer default**: the worst case is a little thread overhead. The worst case for a wrong `async def` is a frozen server.
+
+<Callout title="The GIL and free-threaded Python">
+On a standard CPython build, threads in the pool share one GIL, so `def` endpoints give you concurrency for **IO** (the GIL is released while a thread waits on a socket or sleeps) but not parallel CPU work. These measurements ran on the free-threaded 3.14 build, where the pool can also run Python code in parallel. That changes the CPU story but not the event-loop story: a blocking call inside `async def` still freezes the one loop thread. See [Concurrency models and the GIL](/docs/python/concurrency-models-and-the-gil).
+</Callout>
+
+For a tool that finds blocking calls on the loop (asyncio debug mode, slow-callback warnings), see [asyncio: blocking the event loop](/docs/python/asyncio).
+
+## Traps
+
+- **Blocking calls inside `async def`.** `time.sleep`, `requests.get`, a sync DB driver, `open().read()` on a slow disk, a CPU-heavy loop. They stall every request in the process, not just their own. This is the number one FastAPI performance bug.
+- **Assuming `def` endpoints are unlimited.** They share a 40-token pool per process (sync dependencies included). A burst of slow sync requests queues behind it, while the event loop looks idle.
+- **Raising the thread limit to fix a slow downstream.** If the bottleneck is a database pool or an external API's rate limit, more threads only means a longer queue in a different place.
+- **Making everything `async def` because "async is faster".** It's only faster if the code inside actually awaits non-blocking IO. Otherwise it is the blocking bug.
+- **Reading the body in raw ASGI middleware and passing the original `receive` on.** The body is a stream of `http.request` messages, and each one can be received only once. Whoever reads it must hand the app downstream a `receive` that replays it. See [Middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks).
+- **Expecting a signature error at request time.** FastAPI analyses signatures at import time, so a bad parameter type crashes the app on startup. That is a feature: a broken route can't be deployed silently.
+- **Expecting one uvicorn process to use all CPU cores.** It runs one event loop in one thread. Use multiple workers or processes.
+
+## Summary
+
+- **WSGI** is one synchronous call per request, so a waiting request holds a thread. **ASGI** is `async def app(scope, receive, send)`: a conversation of events that lets one thread juggle many requests and supports streaming and WebSockets.
+- **uvicorn** owns the sockets and the event loop, parses HTTP, builds the `scope` and calls your app once per request.
+- **Starlette** wraps `scope`/`receive` in a lazy `Request`, and routes by walking a list of compiled regexes in order (FULL wins, PARTIAL means 405, NONE means 404).
+- **FastAPI** analyses every endpoint signature **once, at startup**, into a `Dependant` plan. Per request it pulls values from the request, validates them all with Pydantic, returns 422 with every error if any fail, calls your function, then validates and serializes the result.
+- **`async def` runs on the event loop thread. `def` runs in AnyIO's thread pool (40 tokens by default).** Blocking inside `async def` freezes the whole process: in the measurements above, 10 requests took 10 s instead of 1 s, and a trivial ping waited 2.9 s.
+- Use `async def` with async libraries, `def` with blocking ones, and `run_in_threadpool` for the occasional blocking call inside async code.

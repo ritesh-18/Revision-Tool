@@ -1,0 +1,885 @@
+---
+title: "Pydantic and Runtime Validation"
+description: "Why type hints don't validate data, and how Pydantic v2 turns annotations into fast runtime validation and serialization, including FastAPI integration, settings, TypeAdapter and how it compares with dataclasses, attrs and msgspec."
+---
+
+The previous two pages were about **static** checking: tools that read your code without running it. But a backend's real enemies arrive at runtime: HTTP bodies, query strings, environment variables, LLM outputs, rows from a queue. No checker can see those. This page covers **runtime validation**, and the library the Python ecosystem has standardised on for it: **Pydantic v2**.
+
+<Callout type="info">
+Snippets ran on **CPython 3.14.6** with **pydantic 2.14.1** (pydantic-core 2.50.1), **pydantic-settings 2.15.0**, **FastAPI 0.143.0**, **attrs 26.1.0** and **msgspec 0.22.0**, all installed into a scratch virtual environment.
+</Callout>
+
+## Why type hints don't validate
+
+Annotations are stored but never enforced. A standard-library dataclass shows it clearly: it uses the annotations to *generate* `__init__`, and still accepts anything.
+
+```python title="dataclass_no_validation.py"
+from dataclasses import dataclass
+
+@dataclass
+class User:
+    id: int
+    email: str
+
+u = User(id="42", email=None)
+print(u)
+print(type(u.id))
+```
+
+```text title="Output"
+User(id='42', email=None)
+<class 'str'>
+```
+
+mypy would flag this *literal* call. But real data comes from `json.loads(body)`, which returns `Any`, and `User(**json.loads(body))` passes the checker no matter what the client sent. Static types describe what your code *assumes*. Something at the boundary has to *make it true*.
+
+<Callout title="Coming from JS">
+This is the same gap as TypeScript: `const body = req.body as CreateUserDto` compiles and proves nothing. In NestJS you close it with `class-validator` + `class-transformer` (decorators plus a `ValidationPipe`) or with zod (`schema.parse(body)`). Pydantic plays both roles, with one twist: the schema *is* the type annotation. You don't write a zod schema and then `z.infer` a type from it. The class is the type and the validator at the same time.
+</Callout>
+
+## Pydantic v2 in one picture
+
+You declare a class that inherits from `BaseModel`, annotate fields with ordinary types, and Pydantic builds a validator from those annotations when the class is created. Validation runs in **pydantic-core**, a library written in Rust. The Python layer only builds a schema description. The Rust layer compiles it into a validator and serializer and does all the per-request work.
+
+<Mermaid chart={`flowchart LR
+  A["class User(BaseModel)<br/>annotations + Field + validators"] --> B["pydantic builds a core schema<br/>once, at class creation"]
+  B --> C["pydantic-core (Rust)<br/>SchemaValidator + SchemaSerializer"]
+  D["dict or JSON bytes"] --> C
+  C -->|"valid"| E["User instance"]
+  C -->|"invalid"| F["ValidationError<br/>all errors collected"]
+  E --> G["model_dump / model_dump_json"]
+`} />
+
+## `BaseModel` basics
+
+```python title="basemodel_basics.py"
+from datetime import datetime
+from pydantic import BaseModel, ValidationError
+
+class User(BaseModel):
+    id: int
+    email: str
+    signup: datetime
+    tags: list[str] = []
+    nickname: str | None = None
+
+u = User(id="42", email="ada@example.com", signup="2026-10-13T09:30:00Z")
+print(repr(u))
+print(type(u.id), u.signup.tzinfo)
+
+try:
+    User(id="forty-two", email=None, signup="yesterday")
+except ValidationError as e:
+    print(e.error_count(), "errors")
+    print(e)
+```
+
+```text title="Output"
+User(id=42, email='ada@example.com', signup=datetime.datetime(2026, 10, 13, 9, 30, tzinfo=TzInfo(0)), tags=[], nickname=None)
+<class 'int'> UTC
+3 errors
+3 validation errors for User
+id
+  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='forty-two', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.14/v/int_parsing
+email
+  Input should be a valid string [type=string_type, input_value=None, input_type=NoneType]
+    For further information visit https://errors.pydantic.dev/2.14/v/string_type
+signup
+  Input should be a valid datetime or date, input is too short [type=datetime_from_date_parsing, input_value='yesterday', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.14/v/datetime_from_date_parsing
+```
+
+What happened:
+
+- `"42"` became the int `42`, and the ISO string became a timezone-aware `datetime`. Pydantic **parses**, not just checks. The output type is guaranteed to match the annotation.
+- Validation **collects every error** instead of stopping at the first one. Each error has a location (`loc`), a machine-readable `type` and a message. `e.errors()` returns them as a list of dicts, which is what FastAPI sends back in a 422 response.
+- `tags: list[str] = []` is safe. Unlike a function default or a dataclass field, Pydantic copies mutable defaults per instance.
+- A field is **required** if it has no default. `str | None` without a default is still required: it may be `None`, but it must be present. This trips up nearly everyone once.
+
+## Strict vs lax mode and coercion
+
+By default Pydantic runs in **lax** mode: it converts inputs when the conversion is unambiguous and lossless. **Strict** mode accepts only the exact type.
+
+```python title="coercion.py"
+from pydantic import BaseModel, ValidationError
+
+class Item(BaseModel):
+    qty: int
+    price: float
+    active: bool
+
+for data in [
+    {"qty": "3", "price": "9.99", "active": "yes"},
+    {"qty": 3.0, "price": 1, "active": 1},
+    {"qty": 3.5, "price": 1, "active": True},
+    {"qty": "3", "price": 1, "active": "maybe"},
+]:
+    try:
+        print(Item.model_validate(data))
+    except ValidationError as e:
+        for err in e.errors():
+            print("ERR", err["loc"], err["type"], "-", err["msg"])
+
+try:
+    Item.model_validate({"qty": "3", "price": 1.0, "active": True}, strict=True)
+except ValidationError as e:
+    print(e.errors()[0]["type"], e.errors()[0]["msg"])
+
+from pydantic import ConfigDict, StrictInt
+class StrictItem(BaseModel):
+    model_config = ConfigDict(strict=True)
+    qty: int
+class Mixed(BaseModel):
+    qty: StrictInt
+    price: float
+try:
+    Mixed(qty="3", price="1.5")
+except ValidationError as e:
+    print(e.errors()[0]["loc"], e.errors()[0]["msg"])
+print(Mixed(qty=3, price="1.5"))
+print(Item.model_validate_json('{"qty": "3", "price": 1, "active": true}'))
+```
+
+```text title="Output"
+qty=3 price=9.99 active=True
+qty=3 price=1.0 active=True
+ERR ('qty',) int_from_float - Input should be a valid integer, got a number with a fractional part
+ERR ('active',) bool_parsing - Input should be a valid boolean, unable to interpret input
+int_type Input should be a valid integer
+('qty',) Input should be a valid integer
+qty=3 price=1.5
+qty=3 price=1.0 active=True
+```
+
+The rules are principled, not JavaScript-loose:
+
+- `"3"` to `int` is fine, `3.0` to `int` is fine, but `3.5` to `int` is an error because it would lose data.
+- `bool` accepts `True/False`, `0/1`, and strings like `"yes"`, `"no"`, `"true"`, `"off"`. `"maybe"` is rejected.
+- Strictness can be set per call (`strict=True`), per model (`ConfigDict(strict=True)`), or per field (`StrictInt`, `StrictStr`, or `Field(strict=True)`).
+- In strict mode, JSON input is still allowed to use JSON's natural encodings. A `datetime` field accepts an ISO string from `model_validate_json`, because JSON has no datetime type.
+
+**When to use which:** lax mode is right at HTTP and env-var boundaries, where everything arrives as strings. Strict mode is right for internal service-to-service contracts and for fields where silent coercion would hide bugs, such as IDs and money.
+
+<Callout title="Coming from JS">
+zod is strict by default (`z.number()` rejects `"3"`) and you opt into `z.coerce.number()`. Pydantic is the reverse: coercing by default, strict on request. class-transformer's `enableImplicitConversion` is the closest NestJS equivalent of lax mode, but Pydantic's rules are much tighter (no `3.5` silently becoming `3`).
+</Callout>
+
+## Field types and constraints with `Field`
+
+`Field(...)` adds defaults, constraints and metadata. You can put it after `=` or inside `Annotated`, and the two are equivalent. The `Annotated` form is preferred for reusable types and keeps the default value visible.
+
+```python title="field_constraints.py"
+from typing import Annotated
+from uuid import UUID, uuid4
+from pydantic import BaseModel, Field, ValidationError
+
+class Product(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    name: str = Field(min_length=1, max_length=50)
+    price: Annotated[float, Field(gt=0, le=10_000)]
+    sku: str = Field(pattern=r"^[A-Z]{3}-\d{4}$")
+    tags: list[str] = Field(default_factory=list, max_length=3)
+    stock: int = 0
+
+a = Product(name="Pen", price=1.5, sku="PEN-0001")
+b = Product(name="Pad", price=2, sku="PAD-0002")
+a.tags.append("office")
+print(a.tags, b.tags, a.id != b.id)
+
+try:
+    Product(name="", price=-1, sku="pen-1", tags=["a", "b", "c", "d"])
+except ValidationError as e:
+    for err in e.errors():
+        print(err["loc"], "->", err["msg"])
+
+a.price = -5
+print("assignment not validated:", a.price)
+```
+
+```text title="Output"
+['office'] [] True
+('name',) -> String should have at least 1 character
+('price',) -> Input should be greater than 0
+('sku',) -> String should match pattern '^[A-Z]{3}-\d{4}$'
+('tags',) -> List should have at most 3 items after validation, not 4
+assignment not validated: -5
+```
+
+Common `Field` arguments: `default`, `default_factory`, `gt`/`ge`/`lt`/`le`, `multiple_of`, `min_length`/`max_length`, `pattern`, `strict`, `alias`, `validation_alias`, `serialization_alias`, `exclude`, `description`, `examples`, `frozen`. Descriptions and examples flow into the generated JSON Schema and therefore into FastAPI's OpenAPI docs.
+
+Beyond the basics, Pydantic understands many types out of the box: `UUID`, `Decimal`, `datetime`/`date`/`timedelta`, `Enum`, `Literal`, `Path`, `IPv4Address`, nested models, `TypedDict`, dataclasses, and its own types such as `HttpUrl`, `PostgresDsn`, `SecretStr`, `EmailStr` (needs the `email-validator` extra) and `PositiveInt`.
+
+**Trap:** look at the last line. By default **assignment is not validated**. `a.price = -5` succeeds. Turn on `validate_assignment=True` or make the model `frozen=True` (both shown below).
+
+## Validators
+
+When types and constraints aren't enough, write validators. In Pydantic v2 they are `field_validator` (one or more fields) and `model_validator` (the whole model).
+
+```python title="validators.py"
+from typing import Self
+from pydantic import BaseModel, field_validator, model_validator, ValidationError
+
+class SignUp(BaseModel):
+    email: str
+    password: str
+    confirm: str
+
+    @field_validator("email")
+    @classmethod
+    def normalise_email(cls, v: str) -> str:
+        if "@" not in v:
+            raise ValueError("must contain @")
+        return v.strip().lower()
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def coerce_password(cls, v: object) -> object:
+        print("  before-validator saw:", repr(v))
+        return str(v) if isinstance(v, int) else v
+
+    @model_validator(mode="after")
+    def passwords_match(self) -> Self:
+        if self.password != self.confirm:
+            raise ValueError("passwords do not match")
+        return self
+
+print(SignUp(email="  Ada@Example.COM ", password=123456, confirm="123456"))
+try:
+    SignUp(email="nope", password="a", confirm="b")
+except ValidationError as e:
+    print(e)
+try:
+    SignUp(email="a@b.c", password="a", confirm="b")
+except ValidationError as e:
+    print(e)
+```
+
+```text title="Output"
+  before-validator saw: 123456
+email='ada@example.com' password='123456' confirm='123456'
+  before-validator saw: 'a'
+1 validation error for SignUp
+email
+  Value error, must contain @ [type=value_error, input_value='nope', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.14/v/value_error
+  before-validator saw: 'a'
+1 validation error for SignUp
+  Value error, passwords do not match [type=value_error, input_value={'email': 'a@b.c', 'passw...d': 'a', 'confirm': 'b'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.14/v/value_error
+```
+
+How validators run:
+
+- **Modes.** `mode="after"` (the default) runs after Pydantic's own type validation, so `v` is already the declared type. `mode="before"` runs on the raw input, which is useful for reshaping data. There are also `"wrap"` (call the inner handler yourself) and `"plain"` (replace Pydantic's validation entirely).
+- **Return the value.** A validator *returns* the (possibly transformed) value. Forgetting `return v` sets the field to `None`, a classic bug.
+- **Raise `ValueError` or `AssertionError`** to produce a validation error. Pydantic catches them and adds them to the error list. Other exceptions propagate as-is.
+- **Ordering.** In the second call, the `email` error stops the model validator from running at all. An after-model-validator only runs when every field is valid, because `self` must be a complete model.
+
+Validators can also live on the type instead of the model, using `Annotated`. That makes them reusable:
+
+```python title="annotated_validators.py"
+from typing import Annotated, Any
+from pydantic import BaseModel, AfterValidator, BeforeValidator, model_validator
+
+def no_spaces(v: str) -> str:
+    if " " in v:
+        raise ValueError("no spaces allowed")
+    return v
+
+Slug = Annotated[str, BeforeValidator(str.strip), AfterValidator(no_spaces)]
+
+class Page(BaseModel):
+    slug: Slug
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "url" in data:
+            data = {"slug": data["url"]}
+        return data
+
+print(Page(slug="  hello-world "))
+print(Page.model_validate({"url": "legacy"}))
+```
+
+```text title="Output"
+slug='hello-world'
+slug='legacy'
+```
+
+<Callout title="Coming from JS">
+`field_validator` is zod's `.refine()` and `.transform()` on a single field. A `mode="after"` `model_validator` is `.superRefine()` on the object, the place for cross-field rules like "passwords match" or "end date after start date". `mode="before"` is `z.preprocess()`. In class-validator terms, these replace custom `@ValidatorConstraint` classes with plain methods.
+</Callout>
+
+**Pydantic v1 names to unlearn:** `@validator` became `@field_validator`, `@root_validator` became `@model_validator`, `.dict()` became `.model_dump()`, `.json()` became `.model_dump_json()`, `.parse_obj()` became `.model_validate()`, `class Config:` became `model_config = ConfigDict(...)`, and `orm_mode` became `from_attributes`. Old blog posts and LLM-generated code still use v1 names a lot.
+
+## Parsing in: `model_validate` and friends
+
+| Method | Input |
+|---|---|
+| `Model(**kwargs)` | keyword arguments (field names or aliases) |
+| `Model.model_validate(obj)` | a dict, or with `from_attributes=True` any object with attributes (ORM rows) |
+| `Model.model_validate_json(data)` | a JSON `str` or `bytes`, parsed directly in Rust |
+| `Model.model_validate_strings(obj)` | a dict whose leaf values are all strings |
+| `Model.model_construct(**values)` | **no validation**: for data you already trust |
+
+Prefer `model_validate_json(raw_bytes)` over `model_validate(json.loads(raw_bytes))`. It skips building intermediate Python dicts and is noticeably faster.
+
+## Serialization out: `model_dump`, aliases and config
+
+```python title="serialization.py"
+from datetime import datetime, timezone
+from decimal import Decimal
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic.alias_generators import to_camel
+
+class Order(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    order_id: int
+    total_amount: Decimal
+    created_at: datetime
+    internal_note: str | None = Field(default=None, exclude=True)
+    customer_email: str = Field(serialization_alias="email")
+
+payload = {"orderId": 7, "totalAmount": "19.90", "createdAt": "2026-10-13T10:00:00Z",
+           "customerEmail": "a@b.c"}
+o = Order.model_validate(payload)
+print(o)
+print(o.model_dump())
+print(o.model_dump(mode="json"))
+print(o.model_dump(by_alias=True, mode="json"))
+print(o.model_dump_json(by_alias=True))
+print(o.model_dump(include={"order_id", "total_amount"}))
+print(Order(order_id=8, total_amount=1, created_at=datetime.now(timezone.utc), customer_email="x@y.z").order_id)
+try:
+    Order.model_validate({**payload, "isAdmin": True})
+except ValidationError as e:
+    print(e.errors()[0]["type"], e.errors()[0]["loc"])
+
+class Defaults(BaseModel):
+    a: int = 1
+    b: int | None = None
+d = Defaults(b=None)
+print(d.model_dump(exclude_unset=True), d.model_dump(exclude_none=True), d.model_fields_set)
+c = o.model_copy(update={"order_id": 99})
+print(c.order_id, o.order_id)
+```
+
+```text title="Output"
+order_id=7 total_amount=Decimal('19.90') created_at=datetime.datetime(2026, 10, 13, 10, 0, tzinfo=TzInfo(0)) internal_note=None customer_email='a@b.c'
+{'order_id': 7, 'total_amount': Decimal('19.90'), 'created_at': datetime.datetime(2026, 10, 13, 10, 0, tzinfo=TzInfo(0)), 'customer_email': 'a@b.c'}
+{'order_id': 7, 'total_amount': '19.90', 'created_at': '2026-10-13T10:00:00Z', 'customer_email': 'a@b.c'}
+{'orderId': 7, 'totalAmount': '19.90', 'createdAt': '2026-10-13T10:00:00Z', 'email': 'a@b.c'}
+{"orderId":7,"totalAmount":"19.90","createdAt":"2026-10-13T10:00:00Z","email":"a@b.c"}
+{'order_id': 7, 'total_amount': Decimal('19.90')}
+8
+extra_forbidden ('isAdmin',)
+{'b': None} {'a': 1} {'b'}
+99 7
+```
+
+Key points:
+
+- **`model_dump()`** returns Python objects (`Decimal`, `datetime`). **`model_dump(mode="json")`** returns only JSON-safe types. **`model_dump_json()`** goes straight to a JSON string in Rust.
+- **Aliases.** `alias_generator=to_camel` lets Python code use `snake_case` while the wire format is `camelCase`. `validation_alias` controls the input name only, `serialization_alias` the output name only, and `alias` sets both. Output uses field names unless you pass `by_alias=True` (FastAPI passes it for you).
+- **Populating by name.** `populate_by_name=True` lets you construct with `order_id=` as well as `orderId`. Since Pydantic 2.11 the clearer settings `validate_by_name=True` and `validate_by_alias=True` exist, and `populate_by_name` is expected to be deprecated in their favour.
+- **Extra keys** are **ignored** by default. `extra="forbid"` rejects them (good for request bodies, where it stops mass-assignment tricks such as `"isAdmin": true`), and `extra="allow"` keeps them.
+- **`exclude_unset=True`** dumps only fields the caller actually sent. That is exactly what PATCH endpoints need, since it tells "not sent" apart from "sent as null". `model_fields_set` shows which ones were set.
+- `exclude=True` on a field hides it from every dump, which is useful for internal fields.
+
+Two more config options matter in practice:
+
+```python title="model_config.py"
+from pydantic import BaseModel, ConfigDict, ValidationError
+class Ignored(BaseModel):
+    a: int
+print(Ignored.model_validate({"a": 1, "b": 2}))
+class Frozen(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    a: int
+f = Frozen(a=1)
+try:
+    f.a = 2
+except ValidationError as e:
+    print(e.errors()[0]["type"])
+print(hash(f) == hash(Frozen(a=1)))
+class Checked(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+    a: int
+c = Checked(a=1)
+c.a = "5"
+print(c.a, type(c.a))
+try:
+    c.a = "x"
+except ValidationError as e:
+    print(e.errors()[0]["type"])
+```
+
+```text title="Output"
+a=1
+frozen_instance
+True
+5 <class 'int'>
+int_parsing
+```
+
+A frozen model is immutable and hashable, so it works as a dict key or a cache key.
+
+<Callout title="Coming from JS">
+`extra="forbid"` is NestJS's `ValidationPipe({ forbidNonWhitelisted: true })`, and the default "ignore" behaves like `whitelist: true`, except Pydantic drops the extra keys without stripping anything you declared. `model_dump(by_alias=True)` replaces the `class-transformer` `@Expose({ name })` plus `instanceToPlain` dance.
+</Callout>
+
+## Discriminated unions
+
+A union of models such as `Card | Bank | Crypto` can be validated two ways. Without a hint, Pydantic tries each member and reports every failure. With a **discriminator**, a `Literal` field that identifies the variant, it jumps straight to the right model.
+
+```python title="discriminated_unions.py"
+from typing import Annotated, Literal
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+
+class Card(BaseModel):
+    kind: Literal["card"]
+    last4: str
+
+class Bank(BaseModel):
+    kind: Literal["bank"]
+    iban: str
+
+class Crypto(BaseModel):
+    kind: Literal["crypto"]
+    wallet: str
+
+Payment = Annotated[Card | Bank | Crypto, Field(discriminator="kind")]
+
+class Checkout(BaseModel):
+    payment: Payment
+
+print(Checkout.model_validate({"payment": {"kind": "bank", "iban": "DE89"}}))
+for bad in [{"kind": "bank", "last4": "4242"}, {"kind": "cash"}]:
+    try:
+        Checkout.model_validate({"payment": bad})
+    except ValidationError as e:
+        print(e)
+
+class Plain(BaseModel):
+    payment: Card | Bank | Crypto
+try:
+    Plain.model_validate({"payment": {"kind": "bank", "last4": "4242"}})
+except ValidationError as e:
+    print(e.error_count(), "errors without a discriminator")
+    for err in e.errors():
+        print(" ", err["loc"], err["msg"])
+```
+
+```text title="Output"
+payment=Bank(kind='bank', iban='DE89')
+1 validation error for Checkout
+payment.bank.iban
+  Field required [type=missing, input_value={'kind': 'bank', 'last4': '4242'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.14/v/missing
+1 validation error for Checkout
+payment
+  Input tag 'cash' found using 'kind' does not match any of the expected tags: 'card', 'bank', 'crypto' [type=union_tag_invalid, input_value={'kind': 'cash'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.14/v/union_tag_invalid
+4 errors without a discriminator
+  ('payment', 'Card', 'kind') Input should be 'card'
+  ('payment', 'Bank', 'iban') Field required
+  ('payment', 'Crypto', 'kind') Input should be 'crypto'
+  ('payment', 'Crypto', 'wallet') Field required
+```
+
+The discriminated version gives one precise error instead of four confusing ones, runs faster (no trial and error), and produces a proper `oneOf` plus `discriminator` in the OpenAPI schema. Use it for event payloads, webhook types, LLM tool-call outputs, and anything with a `type` field.
+
+For plain unions (like `int | str`), Pydantic v2 uses a "smart" mode: it first looks for an exact type match before trying coercion, so `"1"` stays a string for `int | str` instead of becoming `1`.
+
+<Callout title="Coming from JS">
+This is `z.discriminatedUnion("kind", [Card, Bank, Crypto])`, and on the static side it is TypeScript's tagged-union narrowing. Static checkers narrow the Python version too: `match payment: case Card(): ...` or `if payment.kind == "card":` narrows to `Card`.
+</Callout>
+
+## Settings with pydantic-settings
+
+`pydantic-settings` (a separate package since v2) builds a model from environment variables, `.env` files and secrets directories, with all the usual validation.
+
+```python title="settings.py"
+import os
+from pydantic import Field, PostgresDsn, SecretStr, ValidationError
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="APP_", env_file=".env", env_nested_delimiter="__")
+
+    debug: bool = False
+    port: int = 8000
+    database_url: PostgresDsn
+    openai_api_key: SecretStr
+    allowed_origins: list[str] = ["http://localhost:3000"]
+
+os.environ.update({
+    "APP_DEBUG": "true",
+    "APP_DATABASE_URL": "postgresql://app:pw@localhost:5432/app",
+    "APP_ALLOWED_ORIGINS": '["https://a.com", "https://b.com"]',
+})
+with open(".env", "w") as f:
+    f.write("APP_PORT=9000\nAPP_OPENAI_API_KEY=sk-secret-123\n")
+
+s = Settings()
+print(s.debug, s.port, s.allowed_origins)
+print(s.database_url.scheme, s.database_url.hosts()[0]["host"], s.database_url.path)
+print(s.openai_api_key, repr(s.openai_api_key))
+print(s.openai_api_key.get_secret_value())
+
+del os.environ["APP_DATABASE_URL"]
+try:
+    Settings()
+except ValidationError as e:
+    print(e.errors()[0]["loc"], e.errors()[0]["msg"])
+```
+
+```text title="Output"
+True 9000 ['https://a.com', 'https://b.com']
+postgresql localhost /app
+********** SecretStr('**********')
+sk-secret-123
+('database_url',) Field required
+```
+
+How it works:
+
+- **Priority order** (highest first): arguments passed to `Settings(...)`, environment variables, the `.env` file, the secrets directory, then field defaults. You can reorder or add sources (for example AWS Secrets Manager) by overriding `settings_customise_sources`.
+- Env var names are matched case-insensitively by default, with `env_prefix` prepended.
+- Complex types (lists, dicts, nested models) are read as **JSON** from a single variable. With `env_nested_delimiter="__"`, a nested model field can also be set as `APP_DB__HOST`.
+- `SecretStr` hides the value in `repr`, logs and tracebacks. You have to call `.get_secret_value()` explicitly.
+- A missing required setting fails at startup with a clear error, not at the first request that touches it.
+
+Typical pattern: create one `Settings()` at startup (or behind `functools.lru_cache`) and inject it. In FastAPI, use `Depends(get_settings)` so tests can override it.
+
+<Callout title="Coming from JS">
+This replaces `@nestjs/config` plus a Joi or zod validation schema for `process.env`, and the `dotenv` package. The difference is that you get a typed object (`s.port` is an `int`) instead of `configService.get<number>('PORT')`, which still returns a string unless you transform it.
+</Callout>
+
+## `TypeAdapter`: validate any type, not just models
+
+Not everything is a `BaseModel`. `TypeAdapter` builds a validator and serializer for **any** type: a list of models, a `TypedDict`, a dataclass, a union, an `Annotated` constrained type.
+
+```python title="type_adapter.py"
+from typing import Annotated
+from pydantic import TypeAdapter, Field, ValidationError
+from typing import TypedDict
+
+class Row(TypedDict):
+    id: int
+    score: float
+
+rows = TypeAdapter(list[Row])
+print(rows.validate_python([{"id": "1", "score": "0.5"}]))
+print(rows.validate_json(b'[{"id": 2, "score": 1}]'))
+print(rows.dump_json([{"id": 3, "score": 2.0}]))
+
+PositiveInts = TypeAdapter(list[Annotated[int, Field(gt=0)]])
+try:
+    PositiveInts.validate_python([1, 0, "x"])
+except ValidationError as e:
+    for err in e.errors():
+        print(err["loc"], err["msg"])
+print(rows.json_schema())
+```
+
+```text title="Output"
+[{'id': 1, 'score': 0.5}]
+[{'id': 2, 'score': 1.0}]
+b'[{"id":3,"score":2.0}]'
+(1,) Input should be greater than 0
+(2,) Input should be a valid integer, unable to parse string as an integer
+{'$defs': {'Row': {'properties': {'id': {'title': 'Id', 'type': 'integer'}, 'score': {'title': 'Score', 'type': 'number'}}, 'required': ['id', 'score'], 'title': 'Row', 'type': 'object'}}, 'items': {'$ref': '#/$defs/Row'}, 'type': 'array'}
+```
+
+The result is still a plain list of plain dicts, now guaranteed to match `Row`. This is how you get runtime safety for a `TypedDict` (which the advanced typing page showed has none by itself).
+
+**Trap:** building a `TypeAdapter` compiles a schema, which is relatively expensive. Create it once at module level and reuse it. Don't build one inside a request handler.
+
+Related helpers: `@validate_call` validates a function's arguments against its annotations, and `pydantic.dataclasses.dataclass` is a drop-in `@dataclass` that validates.
+
+```python title="validate_call_demo.py"
+from pydantic import validate_call, ValidationError
+from pydantic.dataclasses import dataclass
+
+@validate_call
+def repeat(text: str, times: int) -> str:
+    return text * times
+
+print(repeat("ab", "3"))
+try:
+    repeat("ab", "three")
+except ValidationError as e:
+    print(e.errors()[0]["loc"], e.errors()[0]["msg"])
+
+@dataclass
+class Point:
+    x: int
+    y: int
+print(Point(x="1", y=2))
+```
+
+```text title="Output"
+ababab
+(1,) Input should be a valid integer, unable to parse string as an integer
+Point(x=1, y=2)
+```
+
+## Performance: pydantic-core in Rust
+
+Pydantic v2 rewrote the validation engine in Rust (pydantic-core, built on PyO3 and the `jiter` JSON parser). Pydantic's v2 announcement put it at roughly 4 to 50 times faster than v1, depending on the workload. The design matters as much as the language:
+
+- The schema is compiled **once**, when the class is defined, into a tree of Rust validators. Per-call work is only walking the data.
+- `model_validate_json` parses JSON and validates in one pass, without building an intermediate Python dict.
+- Serialization (`model_dump_json`) is also Rust, which is why it beats `json.dumps(model.model_dump())`.
+
+A rough local measurement (1,000 records, best of 5, Windows laptop; treat the numbers as relative, not absolute):
+
+```python title="perf_compare.py"
+import json, timeit
+from dataclasses import dataclass
+import attrs, msgspec
+from pydantic import BaseModel, TypeAdapter
+
+raw = json.dumps([{"id": i, "name": f"user{i}", "score": i * 0.5, "tags": ["a", "b"]}
+                  for i in range(1_000)]).encode()
+
+class PUser(BaseModel):
+    id: int
+    name: str
+    score: float
+    tags: list[str]
+
+@dataclass
+class DUser:
+    id: int
+    name: str
+    score: float
+    tags: list[str]
+
+@attrs.define
+class AUser:
+    id: int = attrs.field(validator=attrs.validators.instance_of(int))
+    name: str = attrs.field(validator=attrs.validators.instance_of(str))
+    score: float = attrs.field(converter=float)
+    tags: list[str] = attrs.field(factory=list)
+
+class MUser(msgspec.Struct):
+    id: int
+    name: str
+    score: float
+    tags: list[str]
+
+p_list = TypeAdapter(list[PUser])
+m_dec = msgspec.json.Decoder(list[MUser])
+
+cases = {
+    "json.loads + dataclass (no validation)": lambda: [DUser(**d) for d in json.loads(raw)],
+    "json.loads + attrs validators": lambda: [AUser(**d) for d in json.loads(raw)],
+    "pydantic TypeAdapter.validate_json": lambda: p_list.validate_json(raw),
+    "msgspec Decoder.decode": lambda: m_dec.decode(raw),
+}
+for name, fn in cases.items():
+    t = min(timeit.repeat(fn, number=50, repeat=5)) / 50
+    print(f"{name:42s} {t*1000:7.3f} ms per 1,000 records")
+```
+
+```text title="Output"
+json.loads + dataclass (no validation)       1.144 ms per 1,000 records
+json.loads + attrs validators                1.897 ms per 1,000 records
+pydantic TypeAdapter.validate_json           1.136 ms per 1,000 records
+msgspec Decoder.decode                       0.266 ms per 1,000 records
+```
+
+Pydantic does full validation, including nested lists, in about the time it takes to `json.loads` and build unvalidated dataclasses. msgspec is several times faster still, because it does less (strict by default, fewer features) and decodes straight into compact C structs.
+
+Performance tips: validate from JSON bytes, not dicts. Reuse `TypeAdapter`s. Prefer discriminated unions. Avoid `mode="wrap"` validators and Python validators in hot paths, since each one crosses from Rust back into Python. Use `model_construct` only for data you produced yourself.
+
+## How FastAPI uses Pydantic
+
+FastAPI reads your endpoint signature (through the annotations) and decides, for each parameter, where it comes from and how to validate it. Pydantic models become the JSON body. Simple types become path or query parameters. `Annotated[..., Query()]`, `Header()`, `Depends()` override the default.
+
+```python title="fastapi_validation.py"
+from typing import Annotated
+from fastapi import FastAPI, Query
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class UserIn(BaseModel):
+    email: str = Field(pattern=r".+@.+")
+    password: str = Field(min_length=8)
+    age: int = Field(ge=13)
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+
+@app.post("/users", response_model=UserOut, status_code=201)
+def create_user(body: UserIn, notify: Annotated[bool, Query()] = False) -> dict:
+    # returns MORE than UserOut declares; response_model filters it
+    return {"id": 1, "email": body.email, "password": body.password}
+
+client = TestClient(app)
+r = client.post("/users?notify=yes", json={"email": "a@b.c", "password": "hunter2!!", "age": "30"})
+print(r.status_code, r.json())
+r = client.post("/users?notify=maybe", json={"email": "nope", "password": "x", "age": 9})
+print(r.status_code)
+import json
+for err in r.json()["detail"]:
+    print(err["loc"], err["type"], "-", err["msg"])
+schema = app.openapi()["components"]["schemas"]["UserIn"]
+print(json.dumps(schema, indent=1))
+```
+
+```text title="Output"
+201 {'id': 1, 'email': 'a@b.c'}
+422
+['query', 'notify'] bool_parsing - Input should be a valid boolean, unable to interpret input
+['body', 'email'] string_pattern_mismatch - String should match pattern '.+@.+'
+['body', 'password'] string_too_short - String should have at least 8 characters
+['body', 'age'] greater_than_equal - Input should be greater than or equal to 13
+{
+ "properties": {
+  "email": {
+   "type": "string",
+   "pattern": ".+@.+",
+   "title": "Email"
+  },
+  "password": {
+   "type": "string",
+   "minLength": 8,
+   "title": "Password"
+  },
+  "age": {
+   "type": "integer",
+   "minimum": 13.0,
+   "title": "Age"
+  }
+ },
+ "type": "object",
+ "required": [
+  "email",
+  "password",
+  "age"
+ ],
+ "title": "UserIn"
+}
+```
+
+(A deprecation warning that this Starlette version prints about its test client's HTTP library is omitted from the output.)
+
+What FastAPI did:
+
+1. **Request validation.** It validated the query string and the JSON body together and returned **one 422 response with every error**, each with a `loc` saying where (`query` or `body`, plus the field). Your handler never ran for the bad request.
+2. **Coercion.** `"30"` became `30`, and `notify=yes` became `True`.
+3. **Response filtering.** The handler returned a dict containing `password`. Because of `response_model=UserOut`, FastAPI validated the return value against `UserOut` and serialized only `id` and `email`. This is a security feature: separate input and output models stop internal fields from leaking. (If you annotate the return type as `-> UserOut` instead, FastAPI uses that as the response model.)
+4. **OpenAPI.** The same models generated the JSON Schema above, including `pattern`, `minLength` and `minimum`. They are served at `/openapi.json` and rendered in `/docs`. One definition drives validation, serialization and documentation.
+
+<Mermaid chart={`flowchart LR
+  A["HTTP request"] --> B["FastAPI router<br/>matches path"]
+  B --> C["read signature annotations<br/>path, query, header, body"]
+  C --> D["Pydantic validates<br/>all params together"]
+  D -->|"errors"| E["422 response<br/>detail list with loc"]
+  D -->|"ok"| F["Depends resolved<br/>handler called with typed objects"]
+  F --> G["return value validated<br/>against response_model"]
+  G --> H["serialized to JSON<br/>by pydantic-core"]
+  C -.-> I["OpenAPI schema<br/>generated at startup"]
+`} />
+
+<Callout title="Coming from JS">
+In NestJS the same pipeline takes a DTO class with class-validator decorators, a global `ValidationPipe`, `@nestjs/swagger` decorators (`@ApiProperty`) to document it, and a `ClassSerializerInterceptor` with `@Exclude()` for responses. FastAPI gets all four from the type annotations. The `response_model` filter is the equivalent of returning a response DTO through `plainToInstance` with `excludeExtraneousValues`.
+</Callout>
+
+## Comparison with dataclasses, attrs and msgspec
+
+```python title="library_compare.py"
+import msgspec, attrs
+class M(msgspec.Struct):
+    id: int
+print(M(id="1"))
+try:
+    msgspec.json.decode(b'{"id": "1"}', type=M)
+except msgspec.ValidationError as e:
+    print("msgspec:", e)
+print(msgspec.json.decode(b'{"id": "1"}', type=M, strict=False))
+@attrs.define
+class A:
+    id: int
+print(A(id="1"))
+```
+
+```text title="Output"
+M(id='1')
+msgspec: Expected `int`, got `str` - at `$.id`
+M(id=1)
+A(id='1')
+```
+
+msgspec validates only when **decoding**. Constructing a `Struct` directly doesn't check anything, and it is strict by default. attrs, like dataclasses, does not validate unless you attach validators per field.
+
+| | dataclasses | attrs | Pydantic v2 | msgspec |
+|---|---|---|---|---|
+| Ships with Python | yes | no | no | no |
+| Validates on construction | no | opt-in, per field | yes | no (only when decoding) |
+| Coercion | none | via converters | lax by default, strict optional | strict by default, lax optional |
+| JSON parse and dump | no | via cattrs | built in, Rust | built in, C, fastest |
+| JSON Schema and OpenAPI | no | no | yes, first class | yes |
+| Ecosystem | stdlib | mature, used inside many libraries | FastAPI, SQLModel, LangChain, OpenAI and Anthropic SDKs, LLM structured output | Litestar, high-throughput services |
+| Best for | internal data holders | rich classes with less magic | API boundaries, config, LLM I/O | maximum throughput on known schemas |
+
+Rules of thumb:
+
+- **Inside** your domain, where data is already trusted, plain dataclasses (with `slots=True`, `frozen=True`) are light and fast to construct.
+- **At boundaries** (HTTP, queues, env, files, LLM responses), use Pydantic. The ecosystem integration usually decides it.
+- Reach for **msgspec** when profiling shows serialization is the bottleneck and you don't need Pydantic's validators or plugins.
+- Pick **attrs** if you want dataclass-style classes with validators and converters but without Pydantic's parsing behaviour.
+
+Type checkers understand all of them. dataclasses are special-cased by checkers, and attrs, Pydantic and msgspec declare the `@dataclass_transform` marker (PEP 681), so pyright and mypy check their constructor calls too. mypy users can also enable the `pydantic.mypy` plugin for stricter checks of `Field` and config options.
+
+<Callout title="Coming from JS">
+A rough map: dataclasses are plain TS classes or interfaces, Pydantic is zod plus class-transformer plus the swagger plugin rolled into one, and msgspec is like a schema-compiled validator such as `ajv` with precompiled schemas: very fast, fewer conveniences.
+</Callout>
+
+## Traps checklist
+
+- `str | None` without a default is still **required**. Add `= None` to make it optional.
+- Assignment is **not validated** unless `validate_assignment=True`.
+- Extra input keys are **silently ignored** by default. Use `extra="forbid"` on request models.
+- Validators must **return** the value.
+- `model_construct` skips validation entirely.
+- Lax mode coerces `"1"` to `1` and `"yes"` to `True`. If that is wrong for a field, make it strict.
+- Building `TypeAdapter`s or models dynamically per request is slow. Build once.
+- v1 code (`.dict()`, `@validator`, `class Config`) is everywhere online. Translate it to v2 names.
+
+## Interview questions
+
+1. **Why can't type hints alone validate request data?**
+   **Annotations are ignored at runtime, and parsed JSON is `Any` to a checker. Something has to inspect the actual values at the boundary, which is what Pydantic does.**
+2. **What does lax mode do, and when would you use strict mode?**
+   **Lax mode coerces unambiguous, lossless inputs (`"3"` to `3`, `"yes"` to `True`) but rejects lossy ones (`3.5` to int). Use strict mode for internal contracts and sensitive fields like IDs and money, where silent coercion hides bugs.**
+3. **Difference between `field_validator` modes `before` and `after`?**
+   **`before` runs on the raw input before type validation (for reshaping). `after` runs on the already-typed value (for business rules). Both must return the value.**
+4. **Why use a discriminated union?**
+   **It picks the variant by a `Literal` tag instead of trying each member. That gives one precise error, faster validation and a proper OpenAPI `discriminator`.**
+5. **How does FastAPI use Pydantic?**
+   **It builds validators from the endpoint signature, validates path, query, header and body together (422 with every error), validates and filters the return value through `response_model`, and generates the OpenAPI schema from the same models.**
+6. **What does `TypeAdapter` add?**
+   **Validation, serialization and JSON Schema for any type (lists, TypedDicts, unions, Annotated types), not just `BaseModel` subclasses. Build it once and reuse it.**
+7. **Why is Pydantic v2 fast?**
+   **Schemas are compiled once into a Rust validator and serializer (pydantic-core). `model_validate_json` parses and validates in one pass without intermediate Python objects.**
+8. **When would you choose msgspec or a dataclass over Pydantic?**
+   **Dataclasses for trusted internal data with no validation cost. msgspec when encode and decode throughput is the bottleneck and its stricter, smaller feature set is enough.**
+
+## Recap
+
+- Type hints describe assumptions. Runtime validation makes them true at the boundary.
+- Pydantic v2 turns annotations, `Field` constraints and validators into a compiled Rust validator. It parses (coerces) in lax mode by default and supports strict mode per call, model or field.
+- `model_validate` and `model_validate_json` bring data in. `model_dump(mode="json")`, `model_dump_json` and aliases send it out. `ConfigDict` controls extras, freezing and assignment validation.
+- Discriminated unions, `pydantic-settings` and `TypeAdapter` cover tagged payloads, configuration and non-model types.
+- FastAPI uses one set of models for request validation, response filtering and OpenAPI.
+- Use dataclasses inside, Pydantic at boundaries, msgspec when raw speed matters.

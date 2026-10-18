@@ -1,0 +1,767 @@
+---
+title: "5. Python for AI Engineers"
+description: "Python is the lingua franca of GenAI not because it is fast — it isn't — but because it sits at the intersection of three communities: scientific computing..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth added to a topic the chapter already covers.
+  - ➕ **Beyond the handbook**: a topic the chapter does not cover, added because a GenAI engineer should know it.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams. Code targets Python 3.11+ (3.14 where noted), Pydantic v2 and FastAPI 0.135+.
+</Callout>
+
+## 5.1 Concept Explanation
+
+Python is the lingua franca of GenAI not because it is fast — it isn't — but because it sits at the intersection of three communities: scientific computing (NumPy, SciPy), machine learning (PyTorch, TensorFlow, JAX), and production web services (FastAPI, asyncio). The result is a single language that lets you load a model, run inference, and expose a streaming HTTP endpoint without leaving your editor.
+
+Hot paths in GenAI are not written in Python — they are in CUDA, C++, and Rust under the hood. Python is the orchestration layer. The skill is knowing where Python's overhead matters and where it does not.
+
+## 5.2 Async Python — Why It Matters Here
+
+GenAI applications spend most of their time *waiting* — waiting for the LLM to produce the next token, waiting for the vector database to return results, waiting for an external API to respond. Synchronous code blocks during these waits, idling a thread per request. At 1,000 concurrent users, that is 1,000 idle threads.
+
+Async Python lets a single thread juggle many in-flight requests. While one request is waiting on the LLM, the runtime schedules another that has work to do. Throughput per server goes up by orders of magnitude with no extra hardware.
+
+The mental model: think of your code as a kitchen. Synchronous Python is a chef who stands and stares at the oven for ten minutes. Asynchronous Python is a chef who puts a pot on the stove, starts chopping vegetables for the next dish, returns to stir when the timer dings, and never stops moving. The kitchen size — your thread count — is the same; the throughput is multiples higher.
+
+## 5.3 The asyncio Foundation
+
+The standard library's `asyncio` module is the event loop that all async Python sits on top of. Coroutines (async functions) yield control whenever they hit an "await" point, returning control to the event loop, which then picks the next ready task.
+
+Two ideas matter operationally:
+- **Cooperative scheduling.** Async tasks do not preempt each other. A CPU-bound function inside an async handler blocks every other request on that worker. The fix is offloading CPU work to a thread pool or process pool.
+- **Cancellation propagation.** When a client disconnects, you want the in-flight LLM call to be cancelled to free GPU time. Async makes this clean; async-unaware libraries do not.
+
+## 5.3a asyncio Pitfalls in LLM Services 🔧
+
+Those two ideas are easy to state, and the bugs below are the ways they get broken in real GenAI code.
+
+### Blocking the event loop by accident
+
+**Problem.** One request uploads a 300-page PDF, and the time-to-first-token of every other chat on the same worker jumps from 600 ms to 8 seconds.
+
+**Why it happens.** A worker runs one event loop on one thread. The loop only gets control back when the running coroutine reaches an `await`. A synchronous call (the sync `requests` library, a sync SDK client, a sync database driver, a long `tokenizer.encode`, a PDF parser) never yields, so every other coroutine waits until it returns.
+
+**Mechanism.** Move blocking I/O to a thread with `asyncio.to_thread`. Move CPU-heavy work to a process pool (see 5.6a). Use the async client of every SDK (`AsyncAnthropic`, `AsyncOpenAI`, `redis.asyncio`, `asyncpg`). To find the culprits, turn on asyncio debug mode: it logs every callback that holds the loop longer than `slow_callback_duration` (0.1 s by default).
+
+```python
+import asyncio
+from anthropic import AsyncAnthropic  # the async client, not Anthropic()
+
+client = AsyncAnthropic()
+
+def parse_pdf_sync(path: str) -> str:
+    ...  # a library that has no async API
+
+async def summarize(path: str) -> str:
+    text = await asyncio.to_thread(parse_pdf_sync, path)  # runs in a worker thread
+    msg = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=512,
+        messages=[{"role": "user", "content": f"Summarize:\n\n{text[:50_000]}"}],
+    )
+    return msg.content[0].text
+
+# In development or a canary: log anything that holds the loop for more than 50 ms.
+async def enable_loop_debug() -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_debug(True)
+    loop.slow_callback_duration = 0.05
+```
+
+**Edge cases.**
+- FastAPI runs a plain `def` route in a thread pool, but runs an `async def` route on the loop. So an `async def` route that calls a sync ORM is worse than a plain `def` route. Pick one style per route on purpose.
+- `asyncio.to_thread` uses the default executor, which has a limited number of threads. If you push hundreds of slow calls through it, they queue, and latency comes back in a different place.
+- Python 3.14 adds `python -m asyncio ps PID` and `python -m asyncio pstree PID`, which list the running tasks of a live process and what each one is awaiting. They help when a worker looks stuck.
+
+### Unbounded fan-out
+
+**Problem.** Ingestion code calls `asyncio.gather(*[embed(c) for c in chunks])` on 5,000 chunks. The provider returns 429s, the connection pool runs out, and half the batch fails.
+
+**Why it happens.** `gather` starts every coroutine at once and has no notion of a limit. Also, when one of them fails, `gather` raises but leaves the others running by default.
+
+**Mechanism.** Limit the number of calls in flight with an `asyncio.Semaphore`. Use `asyncio.TaskGroup` (Python 3.11+), which cancels the sibling tasks when one fails and raises an `ExceptionGroup`. And before reaching for concurrency, check whether the API accepts a batch: most embedding endpoints take a list of inputs, which is cheaper than many single calls.
+
+```python
+import asyncio
+
+async def embed_all(chunks: list[str], limit: int = 16, batch: int = 64) -> list[list[float]]:
+    sem = asyncio.Semaphore(limit)
+    batches = [chunks[i : i + batch] for i in range(0, len(chunks), batch)]
+    results: list[list[list[float]]] = [[] for _ in batches]
+
+    async def run(i: int, items: list[str]) -> None:
+        async with sem:                      # at most `limit` requests in flight
+            results[i] = await embed_batch(items)
+
+    async with asyncio.TaskGroup() as tg:    # one failure cancels the rest
+        for i, items in enumerate(batches):
+            tg.create_task(run(i, items))
+    return [vec for group in results for vec in group]
+```
+
+**Edge cases.**
+- With a TaskGroup, handle failures with `except* SomeError` because the error arrives wrapped in an `ExceptionGroup`. If you want partial success instead of all-or-nothing, catch errors inside `run` and record them.
+- A semaphore limits concurrency, not rate. A provider limit like "N tokens per minute" needs a rate limiter (see [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai)).
+
+### Timeouts that actually cancel
+
+**Problem.** A provider connection stalls. Without a deadline the request hangs until the load balancer kills it, and the user sees a spinner forever.
+
+**Why it happens.** SDK default timeouts are long (the Anthropic Python SDK defaults to 10 minutes per attempt and retries twice), and retries multiply them.
+
+**Mechanism.** Set the SDK timeout and retry count explicitly, then put one overall deadline around the whole operation with `asyncio.timeout` (Python 3.11+). At the deadline, the inner task is cancelled and `TimeoutError` is raised. For streaming, the deadline that matters most is time to first token.
+
+```python
+import asyncio
+import httpx2  # the Anthropic SDK's HTTP layer (an API-compatible httpx fork)
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic(
+    timeout=httpx2.Timeout(60.0, connect=5.0),  # per attempt
+    max_retries=2,                              # SDK retries 429, 5xx and connection errors
+)
+
+async def first_token_within(seconds: float, prompt: str):
+    async with client.messages.stream(
+        model="claude-sonnet-5-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        it = stream.text_stream.__aiter__()
+        async with asyncio.timeout(seconds):   # deadline for the first token only
+            first = await anext(it)
+        yield first
+        async for text in it:                  # no deadline per token after that
+            yield text
+```
+
+**Edge cases.** A 60 s timeout with 2 retries can take three minutes in the worst case. Size the outer deadline for what the user will tolerate, not for the sum of the inner ones. A timeout on a non-idempotent call (one that triggers a tool with side effects) does not mean the work did not happen.
+
+### Swallowed cancellation and lost background tasks
+
+**Problem.** The user closed the tab, but the logs show the generation ran to the end. Or usage records go missing at random.
+
+**Why it happens.** Cancellation is delivered as `asyncio.CancelledError` at the next `await`. It is a `BaseException`, so `except Exception` does not catch it, but a bare `except:` or `except BaseException:` does, and the generation keeps going. Separately, the event loop holds only weak references to tasks, so a task created with `asyncio.create_task` and never stored can be garbage-collected before it finishes.
+
+**Mechanism.** Re-raise `CancelledError` after cleanup. Keep a strong reference to fire-and-forget tasks. Do the cleanup that must survive cancellation (writing usage, releasing a rate-limit reservation) in a separate task, because any `await` inside a `finally` of a cancelled task can be interrupted again.
+
+```python
+import asyncio
+
+_background: set[asyncio.Task] = set()
+
+def fire_and_forget(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background.add(task)                      # strong reference
+    task.add_done_callback(_background.discard)
+
+async def generate(request_id: str, prompt: str):
+    usage = None
+    try:
+        async with client.messages.stream(
+            model="claude-sonnet-5-5", max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
+            usage = (await stream.get_final_message()).usage
+    except asyncio.CancelledError:
+        usage = "cancelled"                    # note it, then let it propagate
+        raise
+    finally:
+        fire_and_forget(record_usage(request_id, usage))
+```
+
+**Edge cases.** When a stream is cancelled, you do not get the final usage numbers, but the provider still bills the tokens generated before the abort. Estimate them from the text you streamed, or reconcile later against the provider's usage reports. On shutdown, await the tasks in `_background` so you do not drop the last records.
+
+## 5.4 FastAPI — The Default Web Framework
+
+FastAPI is the de facto Python framework for GenAI APIs because it is async-first, ships with Pydantic for type-validated request bodies, and produces OpenAPI documentation automatically. Every team you join will use it, will be migrating to it, or will explain why they did not.
+
+Why it dominates over Flask: Flask is synchronous by default. Why over Django: Django is great for CRUD apps but heavy for thin LLM proxies. FastAPI is roughly as lightweight as Flask, async like Node, and type-safe like a real backend framework. For this niche, it is hard to beat.
+
+## 5.5 Pydantic — Schema as Contract
+
+Pydantic is the data validation library that powers FastAPI's request and response handling. You declare your schemas as Python classes with type annotations, and Pydantic enforces them at runtime — rejecting malformed inputs, coercing types where reasonable, and serializing outputs.
+
+For GenAI, Pydantic plays a second role: defining the shape of structured outputs you want from the LLM. Most LLM SDKs now accept a Pydantic schema and instruct the model to produce JSON that conforms. This collapses a class of bugs (the model returning slightly malformed JSON) into a class of retries (Pydantic rejects, you re-prompt).
+
+## 5.5a Pydantic as the LLM Output Contract 🔧
+
+The paragraph above names the pattern. Here is what it looks like in code, and where it still breaks.
+
+### Designing a schema the model can fill
+
+**Problem.** The model returns valid JSON with the wrong values: an invented order number, a category outside your list, a "summary" of 300 words.
+
+**Why it happens.** The model reads the schema as part of its prompt. Field names, descriptions and enums are instructions. A field that is required but often unknown pushes the model to invent a value, because "required" tells it a value must exist.
+
+**Mechanism.** Use `Literal` for closed sets, so the schema lists the allowed values. Write a `description` for every field that is not self-explanatory. Make a field optional (`str | None`) when the honest answer can be "not given". Put business rules in validators.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field, field_validator
+
+class Ticket(BaseModel):
+    category: Literal["billing", "bug", "feature_request", "other"]
+    priority: Literal["low", "medium", "high"]
+    summary: str = Field(description="One sentence, at most 30 words")
+    order_id: str | None = Field(
+        default=None,
+        description="The order ID only if the user wrote one. Never guess.",
+    )
+
+    @field_validator("summary")
+    @classmethod
+    def at_most_30_words(cls, v: str) -> str:
+        if len(v.split()) > 30:
+            raise ValueError("summary must be at most 30 words")
+        return v
+```
+
+**Edge cases.** Provider-side structured output supports only part of JSON Schema. Anthropic's structured outputs, for example, do not enforce numeric bounds or string length limits, and do not allow recursive schemas (as of October 2026). Rules like "at most 30 words" therefore live in your Pydantic validators, which run after the response arrives. The SDK converts your model into a schema the API accepts, so do not assume every `Field` constraint reaches the model.
+
+### Constrained decoding, then validate-and-repair as a fallback
+
+**Problem.** You need a guaranteed shape, but not every model or provider you call supports native structured output.
+
+**Why it happens.** There are two different mechanisms. With native structured output, the provider restricts which tokens can be sampled so that the text always parses against the schema (constrained decoding). With prompting alone, the model only tries to follow the format, and sometimes fails.
+
+**Mechanism.** Use native support when you have it. In the Anthropic Python SDK, `messages.parse` takes the Pydantic class and returns a parsed object. Keep a validate-and-repair loop for other models: validate with `model_validate_json`, and on failure send the validation error back and ask for a corrected answer.
+
+```python
+import json
+from anthropic import AsyncAnthropic
+from pydantic import ValidationError
+
+client = AsyncAnthropic()
+
+async def classify(text: str) -> Ticket:
+    resp = await client.messages.parse(
+        model="claude-sonnet-5-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": f"Classify this support message:\n\n{text}"}],
+        output_format=Ticket,
+    )
+    if resp.stop_reason != "end_turn":          # "max_tokens", "refusal", ...
+        raise RuntimeError(f"incomplete output: {resp.stop_reason}")
+    return resp.parsed_output
+
+async def classify_with_repair(text: str, call_llm, attempts: int = 3) -> Ticket:
+    """For models without native structured output."""
+    schema = json.dumps(Ticket.model_json_schema())
+    messages = [{"role": "user", "content": f"{text}\n\nReturn only JSON matching this schema:\n{schema}"}]
+    for _ in range(attempts):
+        raw = await call_llm(messages)
+        try:
+            return Ticket.model_validate_json(raw)
+        except ValidationError as err:
+            messages += [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": f"That JSON failed validation:\n{err}\nReturn corrected JSON only."},
+            ]
+    raise RuntimeError("no valid output after retries")
+```
+
+**Edge cases.**
+- A schema guarantees shape, not truth. A schema-valid `order_id` can still be invented. Check important values against your database.
+- Constrained decoding cannot help when the output is cut off. If `stop_reason` is `max_tokens`, the JSON is incomplete. Raise `max_tokens` or shrink the schema.
+- A refusal comes back as a refusal, not as JSON. Check `stop_reason` before you trust the parsed object.
+- Each repair round resends the whole conversation. Cap the attempts and track how often repair happens: a rising rate usually means a prompt or model change broke something.
+
+For tool calling and agent loops built on the same schemas, see [AI Agents](/docs/genai-handbook/11-ai-agents).
+
+## 5.6 Multiprocessing, Threading, and asyncio — Picking the Right Tool
+
+Python has three concurrency primitives and they solve different problems:
+
+| Tool | Best for | Avoid for |
+|---|---|---|
+| asyncio | I/O-bound workloads (network, disk, LLM API) | Pure CPU work |
+| Threading | Mixed I/O with blocking libraries | CPU-bound (GIL) |
+| Multiprocessing | CPU-bound work, isolation, parallel inference | Lightweight tasks (process startup cost) |
+
+Common pattern in GenAI servers: asyncio in the request handler, a thread pool for synchronous library calls, a process pool for any heavy CPU preprocessing, and the GPU model itself living in its own server process accessed via inter-process communication.
+
+The Global Interpreter Lock (GIL) is the reason threading does not parallelize CPU work in CPython. PEP 703 is the proposal to make the GIL optional, currently rolling out in 3.13. It will not fully replace multiprocessing soon, but it matters for the medium-term roadmap.
+
+## 5.6a Offloading CPU Work, and Where Free-Threading Fits 🔧
+
+The table says "process pool for CPU work". This section shows how to wire one into an async server and what changed with the GIL since the handbook was written.
+
+### Process pools from async handlers
+
+**Problem.** Chunking and cleaning a large document, or scoring candidates with pure-Python code, runs for seconds. In an `async def` handler it freezes the worker. In a thread it still runs one core at a time.
+
+**Why it happens.** In the default CPython build, the GIL lets only one thread run Python bytecode at a time. Threads help when the work waits (I/O) or runs in C code that releases the GIL. They do not help pure-Python CPU work.
+
+**Mechanism.** Create a `ProcessPoolExecutor` once at startup (FastAPI lifespan), and call it with `loop.run_in_executor`. The arguments and the result are pickled and sent between processes, so the coroutine awaits a future while another core does the work.
+
+```python
+import asyncio
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+
+def chunk_document(text: str, size: int = 1200, overlap: int = 200) -> list[str]:
+    step = size - overlap
+    return [text[i : i + size] for i in range(0, len(text), step)]  # stand-in for real CPU work
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # "spawn" starts clean processes: safe even if the parent has threads or CUDA state
+    app.state.cpu_pool = ProcessPoolExecutor(max_workers=2, mp_context=mp.get_context("spawn"))
+    yield
+    app.state.cpu_pool.shutdown(wait=True, cancel_futures=True)
+
+app = FastAPI(lifespan=lifespan)
+
+class Doc(BaseModel):
+    text: str
+
+@app.post("/ingest")
+async def ingest(doc: Doc, request: Request) -> dict:
+    loop = asyncio.get_running_loop()
+    chunks = await loop.run_in_executor(request.app.state.cpu_pool, chunk_document, doc.text)
+    return {"chunks": len(chunks)}
+```
+
+**Edge cases.**
+- Pickling is not free. Sending a 50 MB string to a child process and back can cost more than the work. Pass a file path or object-store key and let the child read it.
+- Pools multiply. Four uvicorn workers each with a two-process pool means eight extra processes, each with its own memory. Count them when you size the container.
+- Cancelling the awaiting coroutine does not stop a task that is already running in the child process. For work that runs for minutes or must survive a restart, use a job queue instead (see 6.12a in [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai)).
+- Avoid `fork` after threads, CUDA or an SDK client exist in the parent: the child inherits locks in an unknown state. `spawn` re-imports your module, so keep the worker function importable and free of side effects at import time.
+
+### Free-threaded Python in 2026
+
+**What changed.** PEP 703's free-threaded build (no GIL) arrived as experimental in Python 3.13. In Python 3.14, PEP 779 made it officially supported, and the single-threaded slowdown dropped to roughly 5 to 10 percent, depending on platform. It is still a separate build, not the default interpreter.
+
+**Mechanism.** Without the GIL, threads can run Python bytecode on several cores at once, so a thread pool can do CPU work in parallel without pickling. Python 3.14 also added `concurrent.interpreters` and `InterpreterPoolExecutor`, which run isolated interpreters inside one process, another way to use several cores.
+
+```python
+import sys
+
+# True on the default build, False on a free-threaded build with the GIL actually off
+print(getattr(sys, "_is_gil_enabled", lambda: True)())
+```
+
+**Edge cases.**
+- C extensions must declare that they support free-threading. Importing one that does not can turn the GIL back on for the whole process, and you lose the benefit without an error. Check that it is off at startup, as above.
+- Much GenAI CPU work already runs outside the GIL: PyTorch kernels, Rust tokenizers and NumPy release it during heavy calls. Free-threading mainly helps pure-Python CPU code, such as custom parsing and scoring.
+- Code that was "thread-safe because of the GIL" (for example, shared lists and dicts updated without locks) can show new races. Test before switching.
+
+## 5.7 API Design for LLM Endpoints
+
+Three patterns dominate:
+
+**Request-response.** Client sends a prompt, server returns the full completion. Simple, but high-latency feels broken for chat (multi-second blank screens).
+
+**Server-sent events (SSE) streaming.** Server pushes tokens as they generate. This is the default for chat UX. The user sees text appearing in real time, perceived latency drops to time-to-first-token, and you can cancel mid-stream when the user closes the tab.
+
+**WebSocket.** Bidirectional, persistent connection. Used for voice, multi-turn agent loops with intermediate updates, and any flow where the client also needs to send messages mid-generation.
+
+For most LLM apps, SSE is the right answer. WebSocket adds complexity that is often unnecessary.
+
+## 5.8 Streaming Responses — The Implementation Mental Model
+
+In a streaming endpoint, the handler is a generator (or async generator). The framework iterates over the generator and pushes each chunk to the client as it appears. FastAPI handles the HTTP-level details; your code yields tokens.
+
+Two practical concerns:
+- **Backpressure.** If the client is slow to read, the queue fills. Bound your buffers so a slow client cannot exhaust server memory.
+- **Cleanup on disconnect.** When the client disconnects mid-stream, the generator should be cancelled and the LLM call aborted. Make sure your inference client supports cancellation; not all do.
+
+## 5.8a A Streaming Endpoint End to End 🔧
+
+The mental model above becomes concrete with one working endpoint: provider stream in, SSE out, with backpressure and cancellation doing the right thing.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant F as FastAPI worker
+  participant P as LLM provider
+  B->>F: POST /chat/stream (JSON body)
+  F->>P: messages.stream (HTTPS, SSE)
+  P-->>F: text delta
+  F-->>B: event token
+  P-->>F: text delta
+  F-->>B: event token
+  Note over F: idle for 15 s, so FastAPI sends a ping comment
+  P-->>F: message_stop + usage
+  F-->>B: event done (stop_reason, tokens)
+  B--xF: tab closed (disconnect)
+  Note over F,P: generator cancelled, SDK closes the provider connection, billing stops
+`} />
+
+FastAPI 0.135 added native SSE support (`fastapi.sse`). Before that version, use `StreamingResponse` with `media_type="text/event-stream"` and format the events yourself.
+
+```python
+from collections.abc import AsyncIterable
+from anthropic import AsyncAnthropic, APIError
+from fastapi import FastAPI
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from pydantic import BaseModel
+
+app = FastAPI()
+client = AsyncAnthropic()
+
+class ChatIn(BaseModel):
+    message: str
+
+@app.post("/chat/stream", response_class=EventSourceResponse)
+async def chat_stream(body: ChatIn) -> AsyncIterable[ServerSentEvent]:
+    try:
+        async with client.messages.stream(
+            model="claude-sonnet-5-5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": body.message}],
+        ) as stream:
+            async for text in stream.text_stream:
+                yield ServerSentEvent(data={"t": text}, event="token")
+            final = await stream.get_final_message()
+            yield ServerSentEvent(
+                data={"stop_reason": final.stop_reason, "output_tokens": final.usage.output_tokens},
+                event="done",
+            )
+    except APIError:
+        # Headers (200) are already sent: report the failure as an event, not a status code
+        yield ServerSentEvent(data={"message": "generation failed"}, event="error")
+```
+
+### Why the async generator gives backpressure for free
+
+**Problem.** A slow client (a phone on a weak network) reads slowly while the provider produces tokens fast. Where do the tokens pile up?
+
+**Why it happens.** In the code above, nowhere. The server asks the generator for the next event only after it has written the previous one to the socket. If the socket's send buffer is full, that write waits. While it waits, the generator does not read from the provider stream, so the provider connection's TCP window fills and flow control slows the sender. Each layer only pulls when the layer after it is ready.
+
+**Mechanism and the way it breaks.** The chain breaks when you put an unbounded queue in the middle, for example a producer task that reads the provider and pushes to an `asyncio.Queue()` so several consumers can read. That queue grows without limit for a slow reader. Give it a `maxsize` so the producer waits:
+
+```python
+import asyncio
+
+queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=256)  # bounded: put() waits when full
+
+async def producer(stream) -> None:
+    async for text in stream.text_stream:
+        await queue.put(text)
+    await queue.put(None)  # end marker
+```
+
+**Edge cases.** If a client stops reading for minutes, the provider connection may hit its own idle timeout. Put a deadline on how long one stream can stay open.
+
+### Cancellation on disconnect
+
+**Problem.** The user closes the tab at token 50 of 2,000. You want generation to stop and billing to stop with it.
+
+**Why it happens.** When the client disconnects, the server cancels the task running the generator. As the FastAPI docs point out, a task can only be cancelled at an `await`. In the endpoint above, the `async for` over the provider stream is an `await` point, so `CancelledError` is raised there. The `async with` block exits, and the SDK closes the HTTP connection to the provider, which ends generation on their side.
+
+**Edge cases.**
+- If you hand generation to a separate task (`asyncio.create_task`) or a thread, the disconnect cancels the generator but not that task. Cancel it yourself in a `finally`.
+- A loop that never awaits (for example, one that post-processes a large buffered response) cannot be cancelled until it finishes.
+- Some proxies and load balancers keep the upstream connection open after the browser leaves. Test disconnects through the real network path, not only against localhost.
+
+### Errors after the 200
+
+**Problem.** The provider fails at token 400. Your error handler wants to return a 502, but the client already received `200 OK` and part of the answer.
+
+**Why it happens.** HTTP sends the status line and headers before the body. Once streaming starts, the status cannot change. Providers have the same limit: the Anthropic API documents that an error can arrive as an event after a 200 response.
+
+**Mechanism.** Define an `error` event in your stream contract and handle it in the client (show the partial text, mark it failed, offer retry). Do not retry silently on the server after tokens were sent: the user would see the answer start over, or two answers stitched together.
+
+### Heartbeats and proxy buffering
+
+**Problem.** Streams die after 60 seconds of no tokens (a long tool call, a slow retrieval step), or tokens arrive in one burst at the end.
+
+**Why it happens.** Proxies close connections that look idle, and some proxies (nginx by default) buffer the response body before forwarding it.
+
+**Mechanism.** FastAPI's `EventSourceResponse` sends a `ping` comment every 15 seconds when no event has been sent, and sets `Cache-Control: no-cache` and `X-Accel-Buffering: no`. With `StreamingResponse` you must do both yourself. Also check that gzip middleware is not wrapping the stream, because compression buffers output until it has enough bytes.
+
+The same pipeline in NestJS, with the browser side in React, is in 6.5a of [Backend for GenAI](/docs/genai-handbook/06-backend-for-genai) and 7.4a of [Frontend for GenAI](/docs/genai-handbook/07-frontend-for-genai).
+
+## 5.9 WebSocket Basics for AI Apps
+
+WebSocket adds bidirectional messaging. The server can push tokens; the client can send mid-stream interruptions ("stop", "switch topic"). For voice AI, where audio chunks flow both ways, WebSocket is mandatory.
+
+The cost: connections are stateful. Load balancers must support sticky sessions or use a stateless message broker (Redis pub/sub) to forward events between worker instances. Auto-scaling is harder because you cannot rebalance an established connection without breaking it.
+
+## 5.10 Caching with Redis
+
+Redis is the cache of choice because it is fast, supports rich data structures, and ships with pub/sub for cross-instance messaging.
+
+In GenAI apps, Redis is used for:
+- **Prompt-response caching.** Hash the prompt, return the cached completion if recent. Saves money on repeated questions.
+- **Semantic caching.** Embed the prompt, look up similar embeddings in a vector store, return the cached response if similarity is high. Saves money on paraphrased questions.
+- **Rate limiting.** Token bucket per user, stored in Redis, decremented on each request.
+- **Session storage.** Conversation history for chat applications.
+- **Distributed locks.** Coordinating background jobs across workers.
+
+The semantic cache is the high-leverage one. Most chatbot queries cluster around a small number of common questions; serving 60% of them from cache halves the LLM bill.
+
+## 5.10a Making the Response Caches Correct 🔧
+
+The two response caches above save money only if their keys are right; a wrong key either never hits or returns someone else's answer.
+
+### Exact-match cache keys
+
+**Problem.** The cache hit rate is close to zero, or, worse, a user gets an answer that was generated for a different model, prompt version or customer.
+
+**Why it happens.** The key is built from the user's text alone, or from a JSON dump whose key order changes between calls. Anything that changes the output must be in the key: model, prompt template version, sampling parameters, the full message list and the tenant. Anything that does not change the output (request IDs, timestamps) must stay out.
+
+**Mechanism.** Serialize a canonical payload (sorted keys, fixed separators), hash it, and prefix the hash with the tenant. Cache only calls that are close to deterministic (temperature 0, no tools with side effects). Guard against a stampede, where 50 identical requests miss at the same moment and all call the model, with a short lock.
+
+```python
+import asyncio
+import hashlib
+import json
+import redis.asyncio as redis
+
+r = redis.Redis()
+
+def cache_key(tenant: str, model: str, prompt_version: str,
+              messages: list[dict], temperature: float) -> str:
+    payload = json.dumps(
+        {"model": model, "pv": prompt_version, "temp": temperature, "messages": messages},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return f"llm:{tenant}:{hashlib.sha256(payload.encode()).hexdigest()}"
+
+async def cached_completion(tenant, model, prompt_version, messages, call_llm, ttl=3600):
+    key = cache_key(tenant, model, prompt_version, messages, 0.0)
+    if (hit := await r.get(key)) is not None:
+        return json.loads(hit)
+    # Only one caller computes; the others wait briefly and re-read
+    if await r.set(f"{key}:lock", "1", nx=True, ex=30):
+        try:
+            result = await call_llm(model, messages, temperature=0.0)
+            await r.set(key, json.dumps(result), ex=ttl)
+            return result
+        finally:
+            await r.delete(f"{key}:lock")
+    for _ in range(50):
+        await asyncio.sleep(0.2)
+        if (hit := await r.get(key)) is not None:
+            return json.loads(hit)
+    return await call_llm(model, messages, temperature=0.0)  # lock holder failed: compute anyway
+```
+
+**Edge cases.** Answers grounded in retrieved documents go stale when the documents change. Put the index or corpus version in the key, or delete the tenant's keys when you re-ingest. Never cache answers that contain one user's personal data under a key another user can produce.
+
+### Semantic cache failure modes
+
+**Problem.** "How do I cancel my order?" and "How do I stop my order from being cancelled?" have very similar embeddings, and the semantic cache returns the first answer for the second question.
+
+**Why it happens.** Embedding similarity measures topic closeness, not equal meaning. Negation, numbers, names and dates change the answer but barely move the vector.
+
+**Mechanism.** Use a high similarity threshold, tuned on real paraphrase pairs from your logs, not on a guess. Scope lookups by tenant and by the version of the knowledge they were answered from. Skip the semantic cache for queries that contain entities (order numbers, names, amounts). For high-stakes answers, run a cheap check (a small model or a rule) that the cached question really asks the same thing.
+
+```python
+async def semantic_lookup(index, tenant: str, kb_version: str,
+                          query_vec: list[float], threshold: float = 0.95) -> str | None:
+    hits = await index.search(
+        namespace=f"semcache:{tenant}:{kb_version}", vector=query_vec, top_k=1
+    )
+    if hits and hits[0].score >= threshold:
+        return hits[0].payload["answer"]
+    return None
+```
+
+**Edge cases.** A single threshold rarely fits every intent. Log the near misses (scores just under the threshold) and review them. Without that review you cannot tell whether the cache is saving money or giving wrong answers. Cost-side tuning is in [Cost Optimization](/docs/genai-handbook/25-cost-optimization).
+
+## 5.10b Provider-Side Prompt Caching ➕
+
+Response caches skip the model call entirely. Provider prompt caching is a different, complementary saving: the call still happens, but the provider reuses work on the part of the prompt it has already seen.
+
+### The problem: paying again for the same prefix
+
+Every chat turn resends the system prompt, tool definitions, retrieved documents and the whole history. A 20,000-token prefix with a 50-token new question is billed and processed as 20,050 input tokens on every turn, which adds cost and time to first token.
+
+### Why it can be cached (first principles)
+
+To read a prompt, the model computes attention keys and values for every token, the KV cache (see [LLM Internals](/docs/genai-handbook/04-llm-internals)). Those values depend only on the tokens before them. So if two requests start with exactly the same tokens, the provider can keep the KV state for that prefix and skip recomputing it. That is also why the match must be exact from the very first token: change one character early on and everything after it is different.
+
+### Mechanism and implementation
+
+Order the prompt from most stable to least stable: tools, then system prompt, then long documents, then history, then the new message. With Anthropic, you mark where the cacheable prefix ends with `cache_control`. OpenAI caches long prompts automatically (prefixes of at least 1,024 tokens on current models). As of October 2026, Anthropic's default cache lifetime is 5 minutes (a 1-hour option exists), a cache write costs 1.25 times the base input price (2 times for 1 hour), a cache read costs 0.1 times the base price for most models, and a request can have up to 4 explicit breakpoints. The minimum cacheable prefix depends on the model, from 512 to 4,096 tokens. Check the current pricing page before you rely on these numbers.
+
+```python
+import logging
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()
+log = logging.getLogger("llm")
+
+async def answer(history: list[dict], policy_doc: str) -> str:
+    resp = await client.messages.create(
+        model="claude-sonnet-5-5",
+        max_tokens=1024,
+        system=[
+            {"type": "text", "text": "You are the support assistant for Acme."},
+            # Everything up to and including this block becomes a cacheable prefix
+            {"type": "text", "text": policy_doc, "cache_control": {"type": "ephemeral"}},
+        ],
+        messages=history,
+    )
+    u = resp.usage
+    log.info("cache read=%s write=%s uncached=%s",
+             u.cache_read_input_tokens, u.cache_creation_input_tokens, u.input_tokens)
+    return resp.content[0].text
+```
+
+### Edge cases and failure modes
+
+- **Silent misses.** A timestamp, user name or request ID in the system prompt makes every prefix unique. Tool definitions serialized in a different order do the same. Watch `cache_read_input_tokens`: if it stays at zero, something early in the prompt changes on every call.
+- **Below the minimum.** Prefixes shorter than the model's minimum are not cached, and there is no error. Writes simply stay at zero.
+- **Low traffic.** With a 5-minute lifetime, an endpoint called every 10 minutes pays the write premium and never gets a read. Use the 1-hour option or do not mark it.
+- **Rate limits.** For most current Claude models, cache reads do not count toward the input-tokens-per-minute limit, so caching also raises your effective throughput.
+
+## 5.11 Real-World Use Cases
+
+A typical FastAPI-based GenAI server handles:
+- Authentication via JWT.
+- Rate limiting via Redis.
+- Request validation via Pydantic.
+- Streaming responses to the client via SSE.
+- Streaming requests to the LLM via async HTTP.
+- Caching at both raw and semantic levels.
+- Background logging to an observability backend.
+- Tool calls dispatched to internal microservices.
+- Graceful shutdown that drains in-flight requests.
+
+None of this requires exotic Python. It requires discipline about which features to use and which to leave alone.
+
+## 5.12 Production Architecture
+
+<Mermaid chart={`flowchart TD
+  C["Client (browser, mobile)"] -->|"SSE / WebSocket"| F["FastAPI server (async)"]
+  F --> R["Redis (cache, rate limit, sessions)"]
+  F --> V["Vector DB (retrieval)"]
+  F --> L["LLM provider (streaming HTTPS)"]
+  F --> T["Tool microservices (HTTP)"]
+  F --> O["Observability backend (async push)"]
+`} />
+
+Multiple FastAPI workers behind a reverse proxy (typically nginx or a cloud load balancer). Each worker is a separate process. Within a worker, asyncio handles many concurrent requests on a single thread.
+
+## 5.13 Tradeoffs
+
+- **Async everywhere vs only at the edges.** Pure async is cleanest. But many libraries (some database drivers, some ML libraries) are sync only. Mixing requires care.
+- **Pydantic v1 vs v2.** v2 is much faster and is the default in new projects. v1 still exists in legacy code; migration is a real effort.
+- **FastAPI vs lightweight alternatives (Starlette, Litestar).** FastAPI is opinionated and feature-rich. Litestar is more performant in some benchmarks. For most teams, FastAPI's ecosystem outweighs the performance margin.
+
+## 5.14 Scaling Challenges
+
+- **Worker count.** Too few and you cannot use all CPUs; too many and memory blows up. Typical heuristic: one worker per CPU core, but tune empirically.
+- **Connection limits.** Each WebSocket holds a connection; each SSE stream holds a connection. Load balancer and OS file descriptor limits matter at scale.
+- **GC pressure.** Long-lived async workers accumulate objects. Memory-profile under load and consider periodic worker restarts.
+
+## 5.15 Security Concerns
+
+- Pydantic validation prevents many injection-style attacks at the request boundary.
+- Streaming endpoints can leak more than intended if you forget to filter intermediate model output before sending to the client.
+- Never log raw prompts or completions without redaction; PII slips in unexpectedly.
+- Tool calls launched from within an LLM endpoint must enforce the *user's* permissions, not the server's. This is the most common security mistake in agent code.
+
+## 5.16 Deployment Guide
+
+A standard packaging path: containerize the FastAPI app, run it under uvicorn or gunicorn with uvicorn workers, expose behind a reverse proxy with TLS termination, and ship logs and metrics via OpenTelemetry. Health endpoints expose readiness and liveness. The model itself either calls out to a provider API or sits in a separate inference container (vLLM, TGI) co-located via Kubernetes. Chapter 15 details deployment in depth.
+
+## 5.16a Packaging and Dependencies with uv ➕
+
+The deployment path above assumes the container installs exactly the dependencies you tested with, and in Python that is the step that most often goes wrong.
+
+### The problem: environments that drift
+
+A `requirements.txt` with loose versions installs something different every week. A pinned one does not record the dependencies of your dependencies, or which wheels were chosen for which platform. GenAI projects make this worse: a single PyTorch install is gigabytes, CUDA builds differ from CPU builds, and SDKs such as `anthropic`, `openai` and `pydantic` release often. The result is "works on my laptop, fails in CI", and slow image builds.
+
+### Why a lockfile fixes it
+
+A lockfile records the fully resolved dependency graph: every package, its exact version and the hashes of its files, for every platform you target. Installs then copy the graph instead of solving it again. uv (from Astral) is a Python package and project manager written in Rust that keeps `pyproject.toml` as the source of what you asked for and `uv.lock` as the cross-platform record of what was resolved. It also installs Python versions, so the interpreter version is pinned with the project.
+
+### Implementation
+
+```bash
+uv init chat-service && cd chat-service   # pyproject.toml, .python-version, a starter file
+uv add fastapi uvicorn anthropic "pydantic>=2" redis
+uv add --dev pytest ruff
+uv run uvicorn app:app --reload          # syncs the environment with the lockfile, then runs
+uv lock --upgrade-package anthropic      # move one dependency, keep the rest as locked
+uv sync --locked                         # CI: fail if uv.lock does not match pyproject.toml
+```
+
+A container build that caches dependencies in their own layer, following the uv Docker guide:
+
+```dockerfile
+FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+WORKDIR /app
+
+# Dependencies first: this layer is rebuilt only when the lockfile changes
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-install-project --no-dev
+
+COPY . /app
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev
+
+ENV PATH="/app/.venv/bin:$PATH"
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### Edge cases and failure modes
+
+- **`--locked` versus `--frozen`.** `--locked` fails when the lockfile is out of date with `pyproject.toml`, which is what you want in CI. `--frozen` skips that check. Use it only when the check cannot run yet, such as an early build layer in a workspace whose member projects are not copied in.
+- **GPU wheels.** PyTorch publishes CUDA and CPU builds on its own package indexes. Configure the index in `pyproject.toml` as the uv PyTorch guide describes, or the lock may resolve a CPU wheel and your GPU image runs on CPU without any error.
+- **Pin the image tag.** `ghcr.io/astral-sh/uv:latest` changes under you. Pin a uv version in production images, the same way you pin Python.
+- **Do not mix tools.** Running `pip install` inside a uv-managed environment changes it behind the lockfile's back. The next `uv sync` removes what pip added.
+
+## 5.17 Monitoring Strategy
+
+Track per-route latency, error rates, tokens in/out per request, time-to-first-token, time-to-last-token, request cancellation rate, cache hit rate, and worker memory and CPU. The two metrics most teams forget: input token p99 (which catches prompt-bloat regressions) and time-to-first-token p99 (which catches inference-server queueing).
+
+## 5.18 Cost Optimization
+
+Caching first. Smaller models second. Routing third — send easy requests to a small cheap model and hard ones to a frontier model. The right router can cut bills by 70% without quality loss; the wrong router cuts quality by 70% without cost savings, so measure.
+
+## 5.19 Interview Questions
+
+- Explain the GIL and how it affects FastAPI.
+- When would you use multiprocessing instead of asyncio?
+- Walk through the lifecycle of a streaming chat request.
+- How does Pydantic enforce LLM output schemas?
+- What changes about your architecture when you add WebSocket support?
+- ➕ Why can an `async def` FastAPI route that calls a sync database driver be slower than a plain `def` route? **FastAPI runs plain `def` routes in a thread pool, but runs `async def` routes on the event loop, so a blocking call inside `async def` stalls every request on that worker.**
+- ➕ A user closes the tab mid-answer. What has to happen for billing to stop? **The server cancels the generator, `CancelledError` is raised at the next `await`, the SDK's stream context closes the provider connection, and nothing swallows the cancellation (no bare `except`, no detached task still reading).**
+- ➕ Native structured output versus validate-and-retry? **Native output constrains decoding so the text always parses against the schema; validate-and-retry only checks afterwards. Both still need business-rule validation, a `stop_reason` check for truncation or refusal, and a check that values are true.**
+- ➕ Why might provider prompt caching show zero cache reads? **Something early in the prompt changes on every call (a timestamp, user name or tool order), the prefix is below the model's minimum, or traffic is sparser than the cache lifetime.**
+- ➕ When does free-threaded Python help a GenAI service? **When pure-Python CPU work runs in threads. PyTorch, Rust tokenizers and NumPy already release the GIL during heavy calls, and an extension without free-threading support can turn the GIL back on.**
+
+## 5.20 Hands-on Exercises
+
+1. Sketch on paper the components of a chat API that supports streaming, retries, and per-user rate limits.
+2. Identify three places in a GenAI app where blocking code might sneak into an async handler.
+3. Estimate the additional cost (in connections and memory) of upgrading 10,000 SSE clients to WebSocket clients with bidirectional traffic.
+
+## 5.21 Common Mistakes
+
+- Mixing sync and async without understanding which is which — calling a sync ORM in an async handler blocks the event loop.
+- Forgetting cancellation. The user closed the tab; the LLM call is still running and billing.
+- Treating Pydantic as a documentation tool rather than a validation contract. The whole point is failing fast on bad inputs.
+- Logging unbounded fields (prompts, completions) without truncation; log storage costs explode.
+
+## 5.22 Enterprise Best Practices
+
+Use Pydantic for both request schemas and LLM output schemas. Standardize on FastAPI plus uvicorn workers. Treat streaming as the default response type, not an optional feature. Build a thin abstraction layer over LLM providers so swapping is a config change. Make cancellation a first-class concern in every async path that hits external services.
+
+## Sources
+
+- Python docs, [What's new in Python 3.14](https://docs.python.org/3/whatsnew/3.14.html) (PEP 779 free-threading support, `concurrent.interpreters`, `python -m asyncio ps`), and the [free-threading HOWTO](https://docs.python.org/3/howto/free-threading-python.html).
+- Python docs, [asyncio task API](https://docs.python.org/3/library/asyncio-task.html) (TaskGroup, `asyncio.timeout`, keeping task references) and [asyncio development and debugging](https://docs.python.org/3/library/asyncio-dev.html).
+- FastAPI docs, [Server-Sent Events](https://fastapi.tiangolo.com/tutorial/server-sent-events/) (added in 0.135.0, pings and headers) and [Custom Response](https://fastapi.tiangolo.com/advanced/custom-response/) (cancellation only at `await` points).
+- Anthropic docs, [Python SDK](https://platform.claude.com/docs/en/cli-sdks-libraries/sdks/python) (timeouts, retries, streaming helpers), [Structured outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs), [Prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), [Rate limits](https://platform.claude.com/docs/en/api/rate-limits) and [Errors](https://platform.claude.com/docs/en/api/errors). Pricing and limits read in October 2026.
+- OpenAI docs, [Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
+- Pydantic docs, [Validators](https://docs.pydantic.dev/latest/concepts/validators/) and [JSON Schema](https://docs.pydantic.dev/latest/concepts/json_schema/).
+- uv docs, [Working on projects](https://docs.astral.sh/uv/guides/projects/) and [Using uv in Docker](https://docs.astral.sh/uv/guides/integration/docker/).

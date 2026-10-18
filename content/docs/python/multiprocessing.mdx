@@ -1,0 +1,536 @@
+---
+title: "Multiprocessing"
+description: "Using separate processes for CPU-bound Python: ProcessPoolExecutor, fork vs spawn vs forkserver, pickling costs, shared memory, Managers, the main-module guard, Gunicorn workers, and how to measure speedups honestly."
+---
+
+With the GIL, threads can't run Python bytecode in parallel. The standard way around that is to run **several Python interpreters as separate OS processes**. Each process has its own GIL, its own heap and its own memory, so they really do run on separate cores. The price is that **nothing is shared by default**: data has to be serialised (pickled) and copied between processes.
+
+All snippets here were run on **CPython 3.14.6 on Windows** with 16 logical cores, where the only start method is `spawn`. Timings depend heavily on hardware and OS. On Linux, `fork` and `forkserver` start workers much faster.
+
+<Callout title="Coming from JS">
+`multiprocessing` is Python's version of Node's `child_process.fork()` plus `cluster`, with a much higher-level API. A `ProcessPoolExecutor` is like a pool of `worker_threads` (as in the `piscina` library), except each worker is a whole OS process instead of a V8 isolate in the same process. Messages are pickled instead of structured-cloned, and the equivalent of `SharedArrayBuffer` is `multiprocessing.shared_memory`.
+</Callout>
+
+## Processes for CPU-bound work
+
+The lowest-level API is `multiprocessing.Process`, which mirrors `threading.Thread`:
+
+```python
+import multiprocessing as mp
+import os
+
+def work(label):
+    print(f"{label}: pid={os.getpid()} parent={os.getppid()}")
+
+if __name__ == "__main__":
+    print(f"main: pid={os.getpid()}", flush=True)
+    p = mp.Process(target=work, args=("child",))
+    p.start()
+    p.join()
+    print("exit code:", p.exitcode)
+```
+
+```text title="Output (pids differ every run)"
+main: pid=16296
+child: pid=20888 parent=16296
+exit code: 0
+```
+
+The `flush=True` matters. When stdout is a pipe it is block-buffered, so without it the child's line can appear *before* the parent's, even though the parent printed first.
+
+Unlike a thread, a process **can** be stopped from outside: `p.terminate()` sends SIGTERM (or calls `TerminateProcess` on Windows), and `p.kill()` sends SIGKILL. Its `finally` blocks won't run, and any lock it held in shared state stays held.
+
+## `ProcessPoolExecutor`
+
+In practice you use `concurrent.futures.ProcessPoolExecutor`. It has the same API as `ThreadPoolExecutor` (`submit`, `map`, futures), so switching between them is a one-word change.
+
+```python
+import os, time
+from concurrent.futures import ProcessPoolExecutor
+
+def count_primes(limit):
+    count = 0
+    for n in range(2, limit):
+        if all(n % d for d in range(2, int(n ** 0.5) + 1)):
+            count += 1
+    return count
+
+if __name__ == "__main__":
+    jobs = [200_000] * 8
+    start = time.perf_counter()
+    serial = [count_primes(j) for j in jobs]
+    t_serial = time.perf_counter() - start
+
+    start = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=8) as pool:
+        parallel = list(pool.map(count_primes, jobs))
+    t_par = time.perf_counter() - start
+
+    assert serial == parallel
+    print(f"cpu_count : {os.cpu_count()}")
+    print(f"serial    : {t_serial:.2f}s")
+    print(f"8 procs   : {t_par:.2f}s  speedup {t_serial / t_par:.1f}x")
+```
+
+```text title="Output (timings vary)"
+cpu_count : 16
+serial    : 5.40s
+8 procs   : 1.10s  speedup 4.9x
+```
+
+Eight processes gave 4.9x, not 8x. The gap comes from pool startup (spawning eight interpreters), 16 *logical* cores being only 8 physical cores with hyper-threading, CPU frequency dropping when all cores are busy, and the parent collecting results. See [measuring honestly](#measuring-speedups-honestly).
+
+What the executor does underneath:
+
+<Mermaid chart={`flowchart LR
+  M["Main process<br/>submit / map"] --> CQ["call queue<br/>pickled fn + args"]
+  CQ --> W1["Worker 1<br/>own interpreter + GIL"]
+  CQ --> W2["Worker 2"]
+  CQ --> W3["Worker N"]
+  W1 --> RQ["result queue<br/>pickled result or exception"]
+  W2 --> RQ
+  W3 --> RQ
+  RQ --> T["Manager thread<br/>in main process"]
+  T --> F["sets Future results"]`} />
+
+1. `submit` puts a work item in a dict and wakes a background **manager thread** in the parent.
+2. That thread pickles `(fn, args, kwargs)` and writes it to a pipe-backed **call queue**.
+3. An idle worker unpickles it, runs it, and pickles the result or exception onto the **result queue**.
+4. The manager thread unpickles the result and completes the `Future`.
+
+Useful knobs:
+
+- `max_workers` defaults to the number of CPUs available to the process (`os.process_cpu_count()` since 3.13). On Windows it is capped at 61.
+- `max_tasks_per_child=N` (3.11+) replaces a worker after N tasks, which limits memory leaks in native libraries.
+- `initializer=fn, initargs=(...)` runs once per worker. Use it to load a model or open a connection once instead of on every task.
+- `mp_context=multiprocessing.get_context("spawn")` chooses the start method.
+- 3.14 adds `terminate_workers()` and `kill_workers()` for forceful shutdown.
+
+If a worker dies abruptly (segfault, OOM killer, `os._exit`), every pending future fails with `BrokenProcessPool` and the pool is unusable. You must create a new one.
+
+## Start methods: fork vs spawn vs forkserver
+
+How does a new Python process get your code? There are three strategies.
+
+```python
+import multiprocessing as mp
+if __name__ == "__main__":
+    print("default:  ", mp.get_start_method())
+    print("available:", mp.get_all_start_methods())
+```
+
+```text title="Output (Windows)"
+default:   spawn
+available: ['spawn']
+```
+
+On Linux with 3.14 this prints `forkserver` and `['forkserver', 'fork', 'spawn']`.
+
+| | `fork` | `spawn` | `forkserver` |
+|---|---|---|---|
+| How | `os.fork()` copies the parent process (copy-on-write) | starts a fresh `python` executable, which re-imports your main module | starts one clean server process early, then forks workers from *it* |
+| Startup speed | fastest | slowest (full interpreter start plus imports) | fast after the server is up |
+| What the child inherits | everything: globals, open files, locks, **only the calling thread** | only what you pass (pickled) | the server's clean state plus pickled args |
+| Thread-safe | **No** | Yes | Yes |
+| Platforms | POSIX only | all | POSIX only |
+| Default | Linux before 3.14 | Windows always, macOS since 3.8 | Linux and other POSIX (not macOS) since **3.14** |
+
+### Why `fork` is dangerous, and why the default changed
+
+`fork()` copies the whole memory of the parent, but **only the thread that called `fork`** exists in the child. If another thread held a lock at that moment (the logging module's lock, a malloc arena lock, an OpenSSL lock, a DB driver's lock), the child gets a copy of that lock in the *locked* state, with no thread that will ever release it. The child then hangs the first time it touches that lock. These bugs are rare, timing-dependent, and miserable to debug.
+
+Modern programs nearly always have background threads, often started by libraries you didn't write (gRPC, monitoring agents, thread pools). So:
+
+- **3.8**: macOS switched to `spawn`, because Apple's system frameworks crash after `fork`.
+- **3.12**: CPython started emitting a `DeprecationWarning` when you `os.fork()` from a process that has multiple threads.
+- **3.14**: the default on Linux and other POSIX platforms (except macOS) became **`forkserver`**. This applies to `multiprocessing` and `ProcessPoolExecutor`.
+
+<Mermaid chart={`flowchart TB
+  subgraph F["fork"]
+    P1["Parent with threads<br/>and held locks"] -->|"os.fork copies all memory"| C1["Child<br/>1 thread, locks maybe stuck"]
+  end
+  subgraph S["spawn"]
+    P2["Parent"] -->|"exec new python"| C2["Child<br/>re-imports main module"]
+  end
+  subgraph FS["forkserver"]
+    P3["Parent"] -->|"started early"| SV["Server<br/>single-threaded, clean"]
+    SV -->|"fork on request"| C3["Child"]
+  end`} />
+
+What this means for your code on 3.14 Linux:
+
+- Code that relied on children **inheriting globals** (a big dict loaded at import time and then read by workers, or a module-level connection) behaves differently. With `fork` the child saw the parent's current values. With `forkserver` and `spawn` the child only sees what module import produces plus what you pass as arguments.
+- Everything you pass must be **picklable**, because nothing is inherited.
+- If you really want `fork` (for example to share a large read-only dataset by copy-on-write), ask for it explicitly and make sure no threads exist when you fork:
+
+```python
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+
+ctx = mp.get_context("fork")                       # explicit, POSIX only
+with ProcessPoolExecutor(max_workers=4, mp_context=ctx) as pool:
+    ...
+```
+
+Prefer `get_context()` over the global `mp.set_start_method()`, which can only be called once and affects every library in the process.
+
+<Callout type="warn">
+Copy-on-write sharing under `fork` is weaker in CPython than it sounds. Merely *reading* a Python object writes to its reference count, which dirties the memory page and forces the OS to copy it. The cyclic GC also touches object headers. A forked child slowly duplicates the "shared" memory. `gc.freeze()` before forking helps with the GC part. Immortal objects (3.12+) help for some built-in objects.
+</Callout>
+
+## Pickling: requirements and costs
+
+Everything that crosses a process boundary (the function, its arguments, its return value, any exception) goes through `pickle`.
+
+### Requirements
+
+Functions are pickled **by reference**: pickle stores the module name and the qualified name, and the worker re-imports it.
+
+```python
+import pickle, threading
+
+def top_level(x):
+    return x * 2
+
+print(len(pickle.dumps(top_level)), "bytes:", pickle.dumps(top_level))
+for obj in (lambda x: x, threading.Lock(), open(__file__)):
+    try:
+        pickle.dumps(obj)
+    except Exception as exc:
+        print(f"{type(obj).__name__:>16}: {type(exc).__name__}: {exc}")
+```
+
+```text title="Output (addresses vary)"
+37 bytes: b'\x80\x05\x95\x1a\x00\x00\x00\x00\x00\x00\x00\x8c\x08__main__\x94\x8c\ttop_level\x94\x93\x94.'
+        function: PicklingError: Can't pickle <function <lambda> at 0x0000014BFD011E80>: it's not found as __main__.<lambda>
+            lock: TypeError: cannot pickle '_thread.lock' object
+   TextIOWrapper: TypeError: cannot pickle 'TextIOWrapper' instances
+```
+
+The function's pickle is just the strings `__main__` and `top_level`. No code is sent. So:
+
+- **Lambdas, nested functions and closures can't be sent** (the worker can't find them by name). Use module-level functions, plus `functools.partial` for bound arguments.
+- **Locks, open files, sockets, DB connections and generators can't be sent.** Create them inside the worker, for example in `initializer`.
+- **The function must be importable in the worker.** Under `spawn`, a function defined in a notebook cell or in an interactive session often isn't.
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+
+if __name__ == "__main__":
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        fut = pool.submit(lambda x: x * 2, 21)
+        try:
+            print(fut.result())
+        except Exception as exc:
+            print(type(exc).__name__, "-", exc)
+```
+
+```text title="Output (address varies)"
+PicklingError - Can't pickle <function <lambda> at 0x000002667C7375E0>: it's not found as __main__.<lambda>
+```
+
+### Costs
+
+Pickling is **CPU work in the parent, plus a copy through a pipe, plus unpickling in the child**. And then the same again for the result. When the work per byte is small, the transfer can cost more than the work:
+
+```python
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+def total(chunk):
+    return sum(chunk)
+
+def noop(_):
+    return None
+
+if __name__ == "__main__":
+    data = list(range(20_000_000))
+    chunks = [data[i::8] for i in range(8)]
+
+    start = time.perf_counter()
+    local = sum(data)
+    print(f"plain sum in parent   : {time.perf_counter() - start:.2f}s")
+
+    with ProcessPoolExecutor(max_workers=8) as pool:
+        start = time.perf_counter()
+        list(pool.map(noop, range(8)))           # warm up: spawn the workers
+        print(f"pool startup (spawn)  : {time.perf_counter() - start:.2f}s")
+
+        start = time.perf_counter()
+        remote = sum(pool.map(total, chunks))    # pickles 20M ints to workers
+        print(f"8 procs incl. pickling: {time.perf_counter() - start:.2f}s")
+    assert local == remote
+```
+
+```text title="Output (timings vary)"
+plain sum in parent   : 0.10s
+pool startup (spawn)  : 0.15s
+8 procs incl. pickling: 1.00s
+```
+
+Eight processes were **10x slower** than one, because summing is cheap and moving 20 million ints is not.
+
+The per-task overhead also matters. `pool.map` sends one item per message by default. For many tiny tasks, batch them with `chunksize`:
+
+```python
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+def tiny(x):
+    return x + 1
+
+if __name__ == "__main__":
+    items = range(20_000)
+    with ProcessPoolExecutor(max_workers=8) as pool:
+        list(pool.map(tiny, range(8)))           # warm up
+        for chunksize in (1, 1000):
+            start = time.perf_counter()
+            list(pool.map(tiny, items, chunksize=chunksize))
+            print(f"chunksize={chunksize:<5}: {time.perf_counter() - start:.2f}s")
+    start = time.perf_counter()
+    [tiny(x) for x in items]
+    print(f"no processes  : {time.perf_counter() - start:.3f}s")
+```
+
+```text title="Output (timings vary a lot by OS)"
+chunksize=1    : 4.28s
+chunksize=1000 : 0.02s
+no processes  : 0.003s
+```
+
+Rules of thumb:
+
+- Send **small inputs, do big work, return small outputs**. Pass a file path or a database ID, not the data.
+- Use `chunksize` for many small items.
+- For large arrays, use shared memory (next section) instead of pickling.
+
+## Shared memory
+
+`multiprocessing.shared_memory.SharedMemory` (3.8+) allocates a named block of OS shared memory. Any process can attach to it by name and read or write the same bytes **with no copying**. It is raw bytes, like a `SharedArrayBuffer`. You interpret it with `struct`, `memoryview`, or a NumPy array built on `shm.buf`.
+
+```python
+from multiprocessing import shared_memory
+from concurrent.futures import ProcessPoolExecutor
+import struct
+
+N = 8  # eight float64 slots
+
+def fill(name, index):
+    shm = shared_memory.SharedMemory(name=name)      # attach by name, no copy
+    try:
+        struct.pack_into("d", shm.buf, index * 8, index ** 2)
+    finally:
+        shm.close()                                  # detach this process
+
+if __name__ == "__main__":
+    shm = shared_memory.SharedMemory(create=True, size=N * 8)
+    try:
+        with ProcessPoolExecutor(max_workers=4) as pool:
+            list(pool.map(fill, [shm.name] * N, range(N)))
+        print(list(struct.unpack_from(f"{N}d", shm.buf)))
+    finally:
+        shm.close()
+        shm.unlink()                                 # free the OS segment (once)
+```
+
+```text title="Output"
+[0.0, 1.0, 4.0, 9.0, 16.0, 25.0, 36.0, 49.0]
+```
+
+With NumPy, the typical pattern is `arr = np.ndarray(shape, dtype, buffer=shm.buf)` in both parent and workers. Only the name, shape and dtype are pickled.
+
+Traps:
+
+- **`close()` vs `unlink()`.** Every process calls `close()` to detach. Exactly one process (the creator) calls `unlink()` to destroy the segment. Forget `unlink()` on Linux and the memory lives in `/dev/shm` until reboot.
+- **No locking.** Workers here write to separate slots, so no lock is needed. If two processes update the same bytes, protect them with a `multiprocessing.Lock`.
+- **Bytes only.** You can't put a Python dict in shared memory. `ShareableList` stores a fixed-length list of ints, floats, bools, short strings, bytes and `None`.
+
+For a single shared number, `multiprocessing.Value` is simpler. It is a C value in shared memory with its own lock:
+
+```python
+import multiprocessing as mp
+
+def work(counter, n):
+    for _ in range(n):
+        with counter.get_lock():        # Value carries its own lock
+            counter.value += 1
+
+if __name__ == "__main__":
+    counter = mp.Value("i", 0)          # a C int in shared memory
+    procs = [mp.Process(target=work, args=(counter, 10_000)) for _ in range(4)]
+    for p in procs: p.start()
+    for p in procs: p.join()
+    print(counter.value)
+```
+
+```text title="Output"
+40000
+```
+
+`counter.value += 1` is a read-modify-write, exactly like with threads, so it needs the lock.
+
+## `Manager`: shared Python objects via a server
+
+A `Manager` starts a separate **server process** that holds real Python objects (`dict`, `list`, `Lock`, `Queue`, `Namespace`). Other processes get **proxies**. Every method call on a proxy is pickled, sent to the server over a socket or pipe, executed there, and the result is sent back.
+
+```python
+from multiprocessing import Manager
+from concurrent.futures import ProcessPoolExecutor
+
+def record(results, lock, word):
+    with lock:                                   # the proxy ops are separate round trips
+        results[word] = results.get(word, 0) + len(word)
+
+if __name__ == "__main__":
+    with Manager() as manager:
+        results = manager.dict()
+        lock = manager.Lock()
+        words = ["alpha", "beta", "gamma", "alpha"]
+        with ProcessPoolExecutor(max_workers=4) as pool:
+            list(pool.map(record, [results] * 4, [lock] * 4, words))
+        print(type(results).__name__, dict(sorted(results.items())))
+```
+
+```text title="Output"
+DictProxy {'alpha': 10, 'beta': 4, 'gamma': 5}
+```
+
+- **Convenient, slow.** Each operation is an IPC round trip, which is thousands of times slower than a local dict. It's fine for coordination and status, not for hot loops.
+- **Each single call is atomic on the server, but sequences are not.** `results.get(...)` then `results[...] = ...` are two round trips, so the lock is still needed.
+- **Nested mutation is lost.** `results["k"].append(1)` changes a *copy* of the list returned to you. Re-assign it: `lst = results["k"]; lst.append(1); results["k"] = lst`.
+- Managers can also serve over the network, which makes them a tiny RPC system.
+
+| Mechanism | What is shared | Speed | Use for |
+|---|---|---|---|
+| Arguments and return values | pickled copies | depends on size | most work: small in, small out |
+| `Queue` and `Pipe` | pickled messages | moderate | streaming work and results |
+| `Value` and `Array` | C scalars or arrays | fast | counters, flags, numeric buffers |
+| `shared_memory` | raw bytes | fastest, zero copy | large arrays, NumPy |
+| `Manager` | real Python objects via proxies | slow | coordination, shared status |
+
+## The `if __name__ == "__main__"` requirement
+
+Under `spawn` and `forkserver`, a child process **re-imports your main script** (as a module named `__mp_main__`) to find your functions. Any top-level code runs again in every child. If that top-level code creates a pool, each child tries to create its own pool while it is still starting, and so on.
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+import os
+print(f"module body runs in pid {os.getpid()}", flush=True)
+
+def double(x):
+    return x * 2
+
+with ProcessPoolExecutor(max_workers=2) as pool:   # no __main__ guard!
+    print(list(pool.map(double, [1, 2, 3])))
+```
+
+```text title="Output (trimmed, Windows)"
+module body runs in pid 16276
+module body runs in pid 17476
+module body runs in pid 8812
+Traceback (most recent call last):
+  ...
+RuntimeError:
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+        ...
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+concurrent.futures.process.BrokenProcessPool: A process in the process pool was terminated abruptly while the future was running or pending.
+```
+
+The module body ran three times: once in the parent and once in each child. CPython detects the recursion and raises `RuntimeError` instead of creating processes forever.
+
+The fix is to put everything that should run only once (creating pools, starting processes, parsing CLI args, heavy setup) under the guard:
+
+```python
+def double(x):          # module level: importable by workers
+    return x * 2
+
+def main():
+    with ProcessPoolExecutor() as pool:
+        print(list(pool.map(double, [1, 2, 3])))
+
+if __name__ == "__main__":
+    main()
+```
+
+Two more consequences of re-importing:
+
+- **Expensive module-level work runs in every worker** (loading a 2 GB model at import time means loading it N times). Move it into the guard or into a pool `initializer`.
+- Since 3.14 made `forkserver` the default on Linux, scripts that "worked fine without the guard" on Linux under `fork` now hit this same error there too.
+
+## Process pools in web servers: Gunicorn workers
+
+Web servers use processes for the same reason: to use every core despite the GIL.
+
+**Gunicorn** is a pre-fork server. A master process loads the config, opens the listening socket, and then calls `os.fork()` to create N worker processes. All of them `accept()` on the same inherited socket, and the kernel spreads connections between them. The master only supervises: it restarts dead workers, handles `HUP` for graceful reloads, and kills workers that exceed `--timeout`.
+
+<Mermaid chart={`flowchart TB
+  C["Clients"] --> S["Shared listen socket :8000"]
+  M["Gunicorn master<br/>supervises, restarts"] -. fork .-> W1["Worker 1<br/>own GIL"]
+  M -. fork .-> W2["Worker 2<br/>own GIL"]
+  M -. fork .-> W3["Worker N<br/>own GIL"]
+  S --> W1
+  S --> W2
+  S --> W3`} />
+
+- **Worker count.** The classic Gunicorn advice is `2 * cores + 1` for sync workers. For async workers (`uvicorn.workers.UvicornWorker`, or `uvicorn --workers N`), about one per core is typical, because each worker is already handling many connections on its event loop.
+- **`--preload`** imports the app in the master *before* forking, which saves memory through copy-on-write and catches import errors early. The trap is anything created at import time that must not be shared, such as DB connection pools, threads and open sockets. Create those per worker, in a post-fork hook or in the app's startup event.
+- **`--max-requests N`** recycles workers periodically to contain memory leaks, much like `max_tasks_per_child`.
+- Gunicorn calls `os.fork()` itself, so the 3.14 change in the `multiprocessing` default doesn't affect how it creates workers.
+- **Don't create a `ProcessPoolExecutor` per request.** Create one per worker process at startup, and keep the pool small (workers times pool size can easily oversubscribe the CPU). Larger systems move CPU-heavy jobs out of the web tier into a task queue (Celery, RQ, Arq, Dramatiq) with its own worker processes.
+
+<Callout title="Coming from JS">
+This is the same pattern as Node's `cluster` module or PM2's cluster mode: a primary process plus one worker per core sharing a port. The difference is the reason. Node workers exist because JS is single-threaded. Python workers exist because of the GIL. With asyncio inside each worker (Uvicorn), a Python deployment looks almost exactly like `pm2 start app.js -i max`.
+</Callout>
+
+## Measuring speedups honestly
+
+Parallel benchmarks are easy to fool yourself with. A checklist:
+
+1. **Compare against the best serial version**, not a deliberately slow one. Often a better algorithm, a vectorised NumPy call, or `functools.lru_cache` beats eight processes.
+2. **Include everything the user waits for**: pool startup, pickling inputs, pickling results. Or measure startup separately and state it, like the warm-up step above.
+3. **Use `time.perf_counter()`**, run several times, and report the median. The first run pays for imports and cold caches.
+4. **Know your cores.** `os.cpu_count()` counts *logical* cores. Hyper-threads share execution units, so 16 logical cores often behave like about 8 physical ones for CPU-heavy code. In containers, use `os.process_cpu_count()` (3.13+) or check cgroup limits. A pod limited to 2 CPUs on a 64-core host doesn't benefit from 64 workers.
+5. **Watch for oversubscription.** NumPy, PyTorch and BLAS libraries start their own thread pools. Eight processes each running 16 BLAS threads fight over the CPU. Set `OMP_NUM_THREADS=1` (or similar) in the workers.
+6. **Expect Amdahl's law.** If 10% of the job is serial (reading input, merging results), the maximum speedup is 10x no matter how many cores you add.
+7. **Check the work per task.** If a task takes less than about a millisecond, IPC overhead dominates. Batch it.
+
+## Interview questions
+
+1. **Why use processes instead of threads for CPU-bound Python?**
+   **Each process has its own interpreter and GIL, so Python bytecode runs truly in parallel. Threads in one GIL process take turns.**
+
+2. **What are the three start methods, and what changed in 3.14?**
+   **`fork` copies the parent, `spawn` starts a fresh interpreter, and `forkserver` forks from a clean helper process. In 3.14 the default on Linux and other POSIX (not macOS) changed from `fork` to `forkserver`, because forking a multi-threaded process can leave locks stuck in the child.**
+
+3. **Why can't you pass a lambda to `ProcessPoolExecutor.submit`?**
+   **Functions are pickled by module and qualified name, and the worker must import them. A lambda has no importable name, so pickling fails.**
+
+4. **Why is the `if __name__ == "__main__"` guard required?**
+   **With `spawn` and `forkserver`, children re-import the main module. Unguarded top-level code that creates processes would run again in every child. CPython detects this and raises `RuntimeError`.**
+
+5. **When does multiprocessing make code slower?**
+   **When the work per task is small compared with pickling, IPC and startup costs, for example sending large data for a cheap operation or many tiny tasks without `chunksize`.**
+
+6. **How do you share a large NumPy array between processes without copying?**
+   **Allocate it in `multiprocessing.shared_memory`, create arrays over `shm.buf` in each process, pass only the name, shape and dtype, and have the creator `unlink()` it at the end.**
+
+7. **What is a `Manager`, and what is its downside?**
+   **A server process that holds real Python objects and hands out proxies. It is flexible, but every operation is an IPC round trip, and sequences of operations still need a lock.**
+
+8. **What does Gunicorn's `--preload` do, and what is the trap?**
+   **It imports the app in the master before forking, which shares memory through copy-on-write and catches import errors early. Resources created at import time (connections, threads) get shared by every forked worker, so create them per worker instead.**
+
+## Recap
+
+- Processes sidestep the GIL: each has its own interpreter, so CPU-bound Python scales across cores.
+- `ProcessPoolExecutor` has the same API as the thread pool. Use `initializer`, `max_tasks_per_child` and `chunksize`.
+- `fork` is fast but unsafe with threads. `spawn` is safe but slow. `forkserver` is the 3.14 default on Linux, and `spawn` stays the default on Windows and macOS.
+- Everything crossing the boundary is pickled. Use module-level functions, send small inputs, and return small outputs.
+- Use `shared_memory`, `Value` and `Array` for zero-copy data, and `Manager` for convenient but slow shared objects.
+- Always guard entry-point code with `if __name__ == "__main__"`.
+- Gunicorn and Uvicorn run one process per worker for the same reason. Size the workers to real cores.
+- Measure honestly: include overhead, count physical cores, avoid oversubscription, and remember Amdahl's law.

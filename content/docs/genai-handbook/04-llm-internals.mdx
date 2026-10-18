@@ -1,0 +1,1030 @@
+---
+title: "4. LLM Internals"
+description: "A Large Language Model is, internally, a stack of transformer blocks plus an input embedding layer plus an output projection. Conceptually trivial. The..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth on topics the chapter already covers.
+  - ➕ **Beyond the handbook**: topics the chapter does not cover, added because a GenAI engineer should know them.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams.
+</Callout>
+
+## 4.1 Concept Explanation
+
+A Large Language Model is, internally, a stack of transformer blocks plus an input embedding layer plus an output projection. Conceptually trivial. The reason LLMs are hard is everything *around* the model: tokenization, positional encoding, KV caching, sampling, batching, and quantization. This chapter explains what is happening inside the box while your application talks to it.
+
+Understanding internals lets you reason about cost and latency without guessing. When a customer asks "why is the second user's response slower," you should be able to point at KV cache eviction. When the bill spikes, you should be able to point at the prompt that 10x'd input tokens via a long retrieval result.
+
+## 4.2 Transformer Architecture Recap
+
+A modern LLM is a *decoder-only* transformer. It is autoregressive — it predicts one token at a time, each new token conditioned on every previous token.
+
+<Mermaid chart={`flowchart TD
+  TOK["Tokens"] --> EMB["Embedding lookup"]
+  EMB --> POS["+ Positional encoding"]
+  POS --> B1["Transformer Block 1"]
+  B1 --> B2["Transformer Block 2"]
+  B2 --> DOTS["..."]
+  DOTS --> BN["Transformer Block N"]
+  BN --> LN["Final layer norm"]
+  LN --> OUT["Output projection (to vocab)"]
+  OUT --> LOG["Logits over vocabulary"]
+  LOG --> SAM["Sampling (temp/top-k/top-p)"]
+  SAM --> NEXT["Next token"]
+  NEXT -.->|"appended to the input, repeat"| TOK`} />
+
+Each transformer block contains multi-head self-attention followed by a feed-forward network, with residual connections and normalization. The block is repeated N times — 32 for a typical 7B model, 80 for a 70B, 96+ for the largest frontier models.
+
+## 4.3 Attention Internals
+
+Self-attention takes the sequence so far and, for each position, computes a weighted blend of all positions. The weighting comes from three learned projections:
+
+- **Query (Q)** — what this position is looking for.
+- **Key (K)** — what each position offers.
+- **Value (V)** — the actual content each position contributes.
+
+For each token, its Q is compared against every K via a dot product. The resulting scores are scaled, passed through softmax to become weights, and used to take a weighted sum of the V vectors. The output is a new representation of each position that incorporates information from the entire sequence.
+
+The cost of full attention is *O(n²)* per layer. For 4,000 tokens, that is 16 million dot products per layer per head per sequence. For 100,000 tokens, that is 10 billion — and this is per layer, multiplied across dozens of layers. Long context is genuinely expensive.
+
+The step-by-step computation with every tensor shape, and a NumPy implementation, is in section 2.12a of [Mathematics for GenAI](/docs/genai-handbook/02-mathematics-for-genai).
+
+## 4.3a FlashAttention: Same Maths, Less Memory Traffic 🔧
+
+The quadratic cost above has two parts, compute and memory, and FlashAttention removes most of the memory part without changing the result, which is why every modern inference and training stack uses it.
+
+### The problem with the textbook implementation
+
+**Problem.** The straightforward implementation writes the full `[heads, T, T]` score matrix to GPU memory, reads it back for softmax, writes the weights, and reads them again to multiply by `V`.
+
+**Why it hurts.** As section 2.3a of [Mathematics for GenAI](/docs/genai-handbook/02-mathematics-for-genai) shows, GPUs are often limited by memory traffic, not arithmetic. The score matrix grows with `T²`, so at long contexts most of attention's time goes into moving that matrix in and out of HBM, and its size alone can exceed memory.
+
+### The mechanism: tiling with an online softmax
+
+**Mechanism.** FlashAttention (Dao et al., 2022) processes keys and values in tiles that fit in the GPU's fast on-chip SRAM and never stores the full score matrix. The difficulty is softmax: it needs the maximum and the sum over the *whole* row before normalizing. The *online softmax* trick keeps a running maximum `m`, a running sum `l` and a running output, and rescales them whenever a new tile raises the maximum. The final answer is exact, not an approximation.
+
+**Implementation.** One query row, processed tile by tile, matches the full computation:
+
+```python
+import numpy as np
+
+def attention_row_full(q, K, V):
+    s = K @ q / np.sqrt(q.size)
+    p = np.exp(s - s.max())
+    return (p / p.sum()) @ V
+
+def attention_row_tiled(q, K, V, tile=4):
+    m, l = -np.inf, 0.0                     # running max and running sum of exp
+    acc = np.zeros(V.shape[1])              # running weighted sum of values
+    for start in range(0, K.shape[0], tile):
+        s = K[start:start + tile] @ q / np.sqrt(q.size)
+        m_new = max(m, s.max())
+        rescale = np.exp(m - m_new)         # shrink what we accumulated so far
+        p = np.exp(s - m_new)
+        l = l * rescale + p.sum()
+        acc = acc * rescale + p @ V[start:start + tile]
+        m = m_new
+    return acc / l                          # normalize once at the end
+
+rng = np.random.default_rng(0)
+q, K, V = rng.standard_normal(64), rng.standard_normal((50, 64)), rng.standard_normal((50, 64))
+print(np.allclose(attention_row_full(q, K, V), attention_row_tiled(q, K, V)))   # True
+```
+
+### What it changes for you
+
+- **Memory becomes linear in sequence length** for the attention computation, which is what makes 100K-token prompts fit at all. Compute is still quadratic: FlashAttention makes long context feasible, not cheap.
+- **You get it without writing it.** PyTorch's `F.scaled_dot_product_attention` dispatches to a flash kernel when the device, dtype and mask allow it, and vLLM, SGLang and TensorRT-LLM ship their own. Later versions (FlashAttention-2 and -3) improve parallelism and target newer GPUs.
+
+### Edge cases
+
+- **Custom masks can disable the fast path.** An arbitrary dense attention mask may force a slower kernel. Prefer the built-in causal flag and the library's supported mask types.
+- **Numerical results differ in the last bits** from the textbook version because the additions happen in a different order (see 1.1a in [Introduction to GenAI](/docs/genai-handbook/01-introduction-to-genai)). Compare with a tolerance, not exact equality.
+- **Attention weights are never materialized.** Interpretability code that needs the weight matrix must fall back to the slow path.
+
+## 4.4 Multi-Head Attention
+
+Rather than computing one attention pattern, transformers compute many in parallel — typically 16, 32, or more — and concatenate the results. Each head can specialize. One might focus on syntactic relationships (subject-verb agreement), another on coreference (pronouns pointing to nouns earlier), another on positional patterns, another on factual recall.
+
+You cannot directly inspect what each head is doing in production, but interpretability research has revealed reliable patterns. The operational lesson is that multi-head attention is what gives transformers their representational depth: many specialized lookups happening simultaneously.
+
+## 4.4a Sharing Keys and Values: MQA, GQA and MLA ➕
+
+Multi-head attention as described above gives every head its own keys and values, and that choice turns out to be the main driver of KV cache size, so most models since 2023 share or compress them.
+
+### Multi-query and grouped-query attention
+
+**Problem.** Every head's K and V vectors must be cached for every token (next section), so cache size is proportional to the number of K/V heads.
+
+**Why sharing works.** Queries need to be diverse, because each head asks a different question. Keys and values turn out to tolerate sharing with little quality loss. Multi-query attention (MQA, Shazeer 2019) uses one K/V head for all query heads, cutting the cache by the head count but costing some quality. Grouped-query attention (GQA, Ainslie et al. 2023) is the middle ground: query heads are split into groups and each group shares one K/V head. Llama 3.1 8B uses 32 query heads and 8 K/V heads, and Llama 3.1 70B uses 64 and 8, so their caches are 4 and 8 times smaller than full multi-head attention would need.
+
+**Implementation.** For the maths, each K/V head is simply reused by its group:
+
+```python
+import torch
+import torch.nn.functional as F
+
+B, T, H_q, H_kv, d = 1, 16, 32, 8, 128
+q = torch.randn(B, H_q, T, d)
+k = torch.randn(B, H_kv, T, d)        # this is all the cache stores: 8 heads, not 32
+v = torch.randn(B, H_kv, T, d)
+
+group = H_q // H_kv                    # 4 query heads share each K/V head
+out = F.scaled_dot_product_attention(
+    q, k.repeat_interleave(group, dim=1), v.repeat_interleave(group, dim=1), is_causal=True
+)
+print(out.shape)                       # torch.Size([1, 32, 16, 128])
+# Recent PyTorch versions also accept enable_gqa=True and skip the explicit repeat.
+```
+
+### Multi-head latent attention
+
+**Mechanism.** DeepSeek-V2 introduced multi-head latent attention (MLA): instead of caching per-head K and V, each token caches one small compressed latent vector, and per-head keys and values are reconstructed from it by learned up-projections at attention time. The DeepSeek-V2 paper reports a 93.3 percent smaller KV cache than its earlier 67B dense model. DeepSeek-V3 kept the design.
+
+### Edge cases
+
+- **The ratio is in the config.** `num_key_value_heads` versus `num_attention_heads` in a model's `config.json` tells you the sharing factor, and you need it for the KV maths in 4.5a.
+- **Tensor parallelism limits.** With 8 K/V heads, splitting a model across more than 8 GPUs forces K/V heads to be duplicated, so memory savings shrink at high parallelism.
+- **Converting MHA checkpoints.** A model trained with full heads can be converted to GQA by averaging K/V heads, but it needs additional training to recover quality; it is not a free switch.
+
+## 4.5 KV Cache — The Optimization That Makes Generation Tractable
+
+When a model generates a 1,000-token response, naïvely it would re-process the entire context plus all generated tokens for each new token — quadratic cost per token, cubic overall. KV caching prevents this.
+
+The trick: for each token already processed, the K and V projections never change. So we cache them. When generating token N+1, we only compute Q for the new token and reuse all cached K and V vectors. This collapses per-token cost from O(n²) to O(n) and makes interactive generation feasible.
+
+The cost: KV cache memory. For a 70B model with 80 layers and 8K context, the KV cache is roughly 20 GB *per user*. This is why batch sizes are limited even on big GPUs, and why paged attention (vLLM) was invented — to manage KV cache memory like virtual memory, allocating and freeing pages dynamically rather than reserving fixed slots.
+
+## 4.5a KV Cache Maths and Capacity Planning 🔧
+
+The "roughly 20 GB per user" figure above comes from a one-line formula, and working it through shows why that number is now much smaller for most models and how to size a GPU for a given number of users.
+
+### Memory per token
+
+**Mechanism.** For every token, every layer stores one key vector and one value vector per K/V head:
+
+```text
+KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes_per_element
+KV bytes per sequence = KV bytes per token × tokens in the sequence
+```
+
+| Model shape | Layers | K/V heads | Head dim | Per token (BF16) | 8K tokens |
+| --- | --- | --- | --- | --- | --- |
+| 70B with full multi-head attention | 80 | 64 | 128 | 2.5 MiB | about 21 GB |
+| Llama 3.1 70B (GQA) | 80 | 8 | 128 | 320 KiB | about 2.7 GB |
+| Llama 3.1 8B (GQA) | 32 | 8 | 128 | 128 KiB | about 1.1 GB |
+
+The handbook's 20 GB figure is the full multi-head case. Grouped-query attention (4.4a) divides it by the sharing factor. At the full 128K context, though, a single Llama 3.1 8B sequence still needs 16 GiB of cache, as much as the model's weights.
+
+### Capacity planning in code
+
+**Problem.** You need to know how many concurrent sequences a GPU can serve before requests queue.
+
+**Implementation (Python).**
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ModelShape:
+    layers: int
+    kv_heads: int
+    head_dim: int
+    kv_bytes_per_element: int  # 2 for BF16/FP16, 1 for an FP8 KV cache
+
+
+def kv_bytes_per_token(m: ModelShape) -> int:
+    return 2 * m.layers * m.kv_heads * m.head_dim * m.kv_bytes_per_element
+
+
+def max_concurrent_sequences(
+    gpu_bytes: float,
+    weight_bytes: float,
+    model: ModelShape,
+    avg_tokens_per_sequence: int,
+    memory_utilization: float = 0.9,  # vLLM's default gpu_memory_utilization
+    activation_reserve_bytes: float = 2e9,  # rough headroom for activations and runtime
+) -> int:
+    kv_budget = gpu_bytes * memory_utilization - weight_bytes - activation_reserve_bytes
+    if kv_budget <= 0:
+        raise ValueError("Model weights do not fit")
+    return int(kv_budget // (kv_bytes_per_token(model) * avg_tokens_per_sequence))
+
+
+llama8b = ModelShape(layers=32, kv_heads=8, head_dim=128, kv_bytes_per_element=2)
+print(kv_bytes_per_token(llama8b))  # 131072 bytes = 128 KiB
+# 80 GB GPU, 16 GB of BF16 weights, sequences averaging 4K tokens (prompt + output)
+print(max_concurrent_sequences(80e9, 16e9, llama8b, 4096))  # 100
+```
+
+### Edge cases and failure modes
+
+- **Average versus worst case.** Paged attention allocates as sequences grow, so the average matters for throughput, but a burst of long-context requests can exhaust the cache. Servers then *preempt* sequences (pause and recompute or swap them), which shows up as sudden latency spikes. Cap `max_tokens` and maximum context per tenant.
+- **Quantized KV cache.** An FP8 cache halves memory per token and is supported by the major inference servers, with a small quality risk that you should evaluate.
+- **Prefix sharing.** Requests that share a system prompt can share its cached pages ([AI Inference Systems](/docs/genai-handbook/13-ai-inference-systems) covers prefix caching), so effective capacity depends on traffic shape.
+- **Sliding-window and MLA models** break the simple formula: windowed layers cap tokens per layer (4.6b), and MLA caches a latent vector instead of per-head K and V.
+- **Tensor parallelism splits the cache** across GPUs along with the K/V heads, so per-GPU numbers divide by the parallel degree, up to the number of K/V heads.
+
+## 4.6 Positional Encoding Internals
+
+The transformer architecture itself does not know which token came first. Positional encoding is what gives it order. Three families matter today:
+
+**Sinusoidal (absolute) encodings** — fixed sine and cosine waves of different frequencies added to embeddings. Used by the original transformer and BERT.
+
+**Learned positional embeddings** — a separate embedding per position, learned during training. Used by early GPT models. Cannot extrapolate beyond training length.
+
+**Rotary Position Embeddings (RoPE)** — rotates Q and K vectors in a position-dependent way before the dot product. The angle of rotation encodes position. RoPE generalizes better to longer contexts and is the standard in modern open models (Llama, Mistral, Qwen).
+
+Operational consequence: when you see claims about "32K context window" or "128K context window," they almost always involve RoPE plus a scaling trick (NTK, YaRN, linear interpolation) to extend the model beyond its training length without full retraining.
+
+## 4.6a RoPE in Code, and How Context Is Extended 🔧
+
+The section above names RoPE and the scaling tricks; this one implements RoPE, proves the property that makes it work, and explains what NTK scaling and YaRN actually change.
+
+### Rotating pairs of dimensions
+
+**Problem.** Attention scores should depend on how far apart two tokens are, not on their absolute positions.
+
+**Mechanism.** RoPE (Su et al., 2021) splits each query and key vector into pairs of dimensions and rotates each pair by an angle `position × θ_i`. The frequencies `θ_i = base^(−2i/d)` range from fast (the first pairs rotate a lot per token) to very slow. When you take the dot product of a query rotated by angle `m·θ` with a key rotated by `n·θ`, the result depends only on `(m − n)·θ`, so relative distance is built into every score.
+
+**Implementation.**
+
+```python
+import torch
+
+def rope_frequencies(head_dim: int, base: float = 10_000.0) -> torch.Tensor:
+    return 1.0 / base ** (torch.arange(0, head_dim, 2).float() / head_dim)   # [d/2]
+
+def apply_rope(x, positions, base=10_000.0, scale=1.0):
+    """x: [..., T, d]; positions: [T]. scale > 1 is linear position interpolation."""
+    angles = (positions.float() / scale)[:, None] * rope_frequencies(x.shape[-1], base)[None, :]
+    cos, sin = angles.cos(), angles.sin()          # [T, d/2]
+    x1, x2 = x[..., 0::2], x[..., 1::2]            # pairs (0,1), (2,3), ...
+    out = torch.empty_like(x)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out
+
+q, k = torch.randn(1, 64), torch.randn(1, 64)
+def score(m, n):
+    return (apply_rope(q, torch.tensor([m])) * apply_rope(k, torch.tensor([n]))).sum().item()
+print(score(5, 2), score(105, 102))   # equal up to rounding: only the distance 3 matters
+```
+
+### Why models break past their training length
+
+**Why it happens.** The slow-rotating pairs complete only a fraction of a turn within the training length. Beyond it, they reach angles the model never saw, and attention patterns degrade abruptly.
+
+### Position interpolation, NTK-aware scaling and YaRN
+
+- **Linear position interpolation** (Chen et al., 2023) divides positions by the extension factor, the `scale` argument above, so a 4x longer sequence fits into the trained angle range. It works with a short fine-tune, but it also squeezes the fast pairs that encode nearby-token order, which hurts short-range precision.
+- **NTK-aware scaling** raises the `base` instead. That leaves the fast pairs almost untouched and stretches mainly the slow ones, and it works reasonably even without fine-tuning.
+- **YaRN** (Peng et al., 2023) interpolates each frequency band by a different amount (none for fast pairs, full for slow ones, a ramp in between) and adds a small temperature correction to the attention logits. The paper reports extending Llama 2 to 128K context with far less fine-tuning data than earlier methods.
+- **Production example.** Llama 3.1's published config uses a per-frequency scheme of this kind (`rope_type: "llama3"`, factor 8) together with a large base of 500,000 to reach 131,072 tokens.
+
+### Failure modes
+
+- **Interleaved versus half-split layout.** The code above pairs adjacent dimensions. Hugging Face's Llama implementation pairs dimension `i` with `i + d/2` (`rotate_half`). Both are valid, but loading weights trained with one layout into code using the other produces fluent garbage.
+- **Advertised versus effective context.** A model that accepts 128K tokens may only use part of it reliably. Benchmarks such as RULER (Hsieh et al., 2024) found that many long-context models degrade well before their advertised limit, so test retrieval at the lengths you plan to use.
+- **Server config must match.** Serving a model without its `rope_scaling` settings (for example a hand-edited config) silently degrades long prompts while short ones look fine.
+
+## 4.6b ALiBi and Sliding-Window Attention ➕
+
+RoPE is not the only way to handle position and length; two other designs show up in model configs and change how memory and long inputs behave.
+
+### ALiBi: a distance penalty instead of a position embedding
+
+**Problem.** Learned and sinusoidal position embeddings do not extrapolate past the training length.
+
+**Mechanism.** ALiBi (Press et al., 2021) adds no position embedding at all. It adds a fixed penalty to each attention score proportional to the distance between query and key, with a different slope per head (a geometric sequence), so some heads focus locally and others look far back. The paper trained on 1,024-token sequences and evaluated on longer ones with little loss. BLOOM and MPT used it.
+
+```python
+import torch
+
+def alibi_bias(n_heads: int, T: int) -> torch.Tensor:
+    slopes = torch.tensor([2 ** (-8 * (h + 1) / n_heads) for h in range(n_heads)])
+    distance = torch.arange(T)[None, :] - torch.arange(T)[:, None]     # j - i, negative for past keys
+    bias = slopes[:, None, None] * distance[None, :, :]                 # [H, T, T]
+    future = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+    return bias.masked_fill(future, float("-inf"))   # pass as a float attn_mask to SDPA
+```
+
+**Edge case.** The fixed penalty makes very distant tokens nearly invisible, so ALiBi extrapolates in the sense of "does not break", not "recalls facts from far back". Most recent open models chose RoPE with scaling instead.
+
+### Sliding-window attention
+
+**Problem.** Full attention's KV cache grows without bound as the conversation grows.
+
+**Mechanism.** Each layer attends only to the last `W` tokens. Information still travels further, because layer 2 sees tokens that already summarized their own windows, so the reach grows roughly with `W × layers`. Mistral 7B used a 4,096-token window with a rolling KV buffer, so cache memory per sequence stops growing at `W`. Several later model families interleave windowed layers with a few full-attention layers to keep some exact long-range recall.
+
+**Failure modes.** Exact recall of a detail far outside the window (a number from the first page of a long document) is unreliable in purely windowed models. When you compute KV memory (4.5a), windowed layers use `min(tokens, W)` instead of the full token count, and the server must support the model's window layout to get the savings.
+
+## 4.7 Tokenization — Where Reality Meets the Model
+
+Models do not see characters or words. They see *tokens*, which are sub-word fragments produced by a tokenizer. A token might be "the", "ing", " unhappiness", or "🦄". The tokenizer is a separate artifact trained once and frozen for the model's lifetime.
+
+Why sub-word? Pure word-level tokenization explodes vocabulary size and chokes on rare or novel words. Pure character-level tokenization keeps vocabulary tiny but forces the model to process very long sequences. Sub-word splits the difference: common words become single tokens, rare or compound words split into pieces.
+
+Implications you live with:
+- "Token count" is what gets billed, not characters or words. English is roughly 0.75 tokens per word; code and non-English languages can be 2× or more tokens per word.
+- Two different models likely have two different tokenizers, so the same text has different token counts and costs.
+- Tokenizer quirks affect output. Trailing spaces, leading newlines, and unusual punctuation can fragment into multiple tokens and confuse the model.
+
+## 4.8 BPE and SentencePiece — How Tokenizers Are Built
+
+**Byte Pair Encoding (BPE)** starts with single bytes and iteratively merges the most frequent adjacent pair into a new token. After many merges, frequent fragments like "ing" or " the" become single tokens. GPT models and Llama use BPE variants.
+
+**SentencePiece** is Google's library that supports BPE and a related algorithm called *unigram language model* tokenization. It treats text as raw bytes (no language-specific preprocessing), which makes it robust to any language. T5, Llama, and many multilingual models use SentencePiece.
+
+The operational difference rarely matters at the application layer. What matters is consistency: never mix tokenizers between training and inference for the same model.
+
+## 4.8a Tokenization in Depth: BPE by Hand and the Bugs It Causes 🔧
+
+The two sections above describe what tokenizers do; this one trains a tiny BPE tokenizer, explains the byte-level variant every modern LLM uses, and walks through the tokenizer quirks that cause real production bugs.
+
+### Training BPE by hand
+
+**Mechanism.** BPE starts from single symbols, counts every adjacent pair in the training corpus (weighted by word frequency), merges the most frequent pair into a new symbol, and repeats. The ordered list of merges *is* the tokenizer. Encoding a new word replays the merges in the same order.
+
+```python
+from collections import Counter
+
+def merge_pair(symbols, pair):
+    out, i = [], 0
+    while i < len(symbols):
+        if i + 1 < len(symbols) and (symbols[i], symbols[i + 1]) == pair:
+            out.append(symbols[i] + symbols[i + 1])
+            i += 2
+        else:
+            out.append(symbols[i])
+            i += 1
+    return tuple(out)
+
+def train_bpe(words, num_merges):
+    vocab = Counter(tuple(w) + ("</w>",) for w in words)   # word as symbols, with frequency
+    merges = []
+    for _ in range(num_merges):
+        pairs = Counter()
+        for symbols, freq in vocab.items():
+            for a, b in zip(symbols, symbols[1:]):
+                pairs[(a, b)] += freq
+        if not pairs:
+            break
+        best = max(pairs, key=pairs.get)
+        merges.append(best)
+        vocab = Counter({merge_pair(s, best): f for s, f in vocab.items()})
+    return merges
+
+def encode(word, merges):
+    symbols = tuple(word) + ("</w>",)
+    for pair in merges:
+        symbols = merge_pair(symbols, pair)
+    return symbols
+
+corpus = "low low low low lower lower newest newest newest widest widest".split()
+merges = train_bpe(corpus, 6)
+print(merges)  # [('l','o'), ('lo','w'), ('e','s'), ('es','t'), ('est','</w>'), ('low','</w>')]
+print(encode("lowest", merges))   # ('low', 'est</w>'): an unseen word built from learned pieces
+```
+
+### Byte-level BPE
+
+**Problem.** Character-level BPE needs every possible character in its base vocabulary, and Unicode has over 150,000 of them. Unseen characters become an "unknown" token and information is lost.
+
+**Mechanism.** GPT-2 introduced byte-level BPE: the base vocabulary is the 256 possible byte values, and text is converted to UTF-8 bytes before merging. Any string, in any language, including emoji and binary junk, can be encoded with no unknown tokens. A pre-tokenization regex first splits text into chunks (words with their leading space, runs of digits, punctuation) so merges never cross those boundaries. OpenAI's `cl100k_base` and `o200k_base` encodings and Llama 3's 128K-token tokenizer work this way.
+
+### Counting tokens in Python
+
+**Implementation.** For OpenAI-family encodings, `tiktoken` counts tokens locally:
+
+```python
+import tiktoken
+
+enc = tiktoken.get_encoding("o200k_base")
+
+
+def fits_budget(text: str, max_tokens: int) -> bool:
+    return len(enc.encode(text)) <= max_tokens
+
+
+print(len(enc.encode("hello world")))  # 2
+print(enc.encode(" hello"), enc.encode("hello"))  # [40617] [24912]: two different token ids
+```
+
+**Edge case.** This count is exact only for models that use that encoding. Other providers use different tokenizers, so for billing and hard context limits rely on the `usage` numbers returned by the API (or the provider's token-counting endpoint) and treat local counts as estimates with a safety margin.
+
+### Quirk 1: leading spaces and capitalization create different tokens
+
+**Problem.** A classifier that reads the logprob of "yes" misses most of the probability mass, a stop sequence never fires, or a `logit_bias` has no effect.
+
+**Why it happens.** Byte-level BPE attaches the leading space to the word, so `"yes"`, `" yes"`, `"Yes"` and `" Yes"` are four unrelated token ids. **Mechanism of the fix:** handle all variants (as in 2.7a of [Mathematics for GenAI](/docs/genai-handbook/02-mathematics-for-genai)), and avoid ending a prompt with a trailing space, which forces the model to continue with an unusual space-less token.
+
+### Quirk 2: numbers are split into chunks
+
+**Problem.** Models miscount digits, mangle long IDs and phone numbers, and do arithmetic poorly.
+
+**Why it happens.** A number is not one token. `cl100k_base` and `o200k_base` split digit runs into chunks of up to three digits, and other tokenizers split differently or one digit per token, so "1234567" reaches the model as arbitrary pieces. **Mechanism of the fix:** for exact values, do not trust the model to copy or compute: pass IDs through tool calls or template substitution, and do arithmetic in code.
+
+### Quirk 3: under-trained "glitch" tokens
+
+**Problem.** A specific string makes the model behave bizarrely: it refuses, repeats, or substitutes another word.
+
+**Why it happens.** The tokenizer is trained on a different corpus from the model. Strings that were frequent in the tokenizer corpus but rare in model training (the famous `SolidGoldMagikarp` case in GPT-2/GPT-3-era tokenizers was a Reddit username) get their own token whose embedding barely trained. **Edge case:** this is mostly a curiosity in current models, but it shows why user-supplied strings should never be assumed to tokenize "normally".
+
+### Quirk 4: multi-byte characters split across stream chunks
+
+**Problem.** Streamed text in a Python service shows `�` characters in Hindi, Tamil, Chinese or emoji output, but the same answer is fine when not streamed.
+
+**Why it happens.** One character can be 2 to 4 UTF-8 bytes, and a byte-level token or a network chunk can end in the middle of one. Decoding each chunk separately turns the partial bytes into replacement characters. Hosted APIs usually send complete characters in their deltas, but your own proxies, raw HTTP readers and self-hosted token streams are exposed.
+
+```python
+import codecs
+
+import httpx
+
+
+async def read_text(res: httpx.Response) -> str:  # a response opened with client.stream(...)
+    # Wrong: decodes each chunk on its own and corrupts split characters
+    # async for chunk in res.aiter_raw():
+    #     text += chunk.decode("utf-8", errors="replace")
+
+    # Right: an incremental decoder holds incomplete byte sequences until the next chunk
+    # (httpx's res.aiter_text() does this for you; this is the mechanism underneath)
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    text = ""
+    async for chunk in res.aiter_raw():
+        text += decoder.decode(chunk)
+    text += decoder.decode(b"", final=True)  # flush; raises if the stream ended mid-character
+    return text
+```
+
+**Edge case.** The same applies when feeding streamed text to a text-to-speech engine in a voice agent: cut sentences on decoded text, never on raw byte offsets.
+
+### Quirk 5: non-English text costs more
+
+**Problem.** The same conversation costs more and fills the context window sooner in some languages.
+
+**Why it happens.** Merges are learned from the tokenizer's training mix, which is dominated by English and code, so other scripts get fewer merges and more tokens per word. Newer tokenizers with larger vocabularies (for example `o200k_base` compared with `cl100k_base`) reduce the gap but do not close it. **Mechanism of the fix:** measure tokens per message on real traffic per language and budget context and pricing from those numbers, not from English averages.
+
+## 4.8b Chat Templates and Special Tokens ➕
+
+Tokenizers handle more than text: a chat request is a list of messages, and turning that list into one token sequence is a separate, model-specific step that the chapter does not cover.
+
+### How messages become tokens
+
+**Problem.** The model only accepts one flat token sequence, but your API call sends `system`, `user` and `assistant` messages.
+
+**Mechanism.** Each model family defines a *chat template* that wraps messages in reserved special tokens learned during post-training. Llama 3's format, for example, looks like this:
+
+```text
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+What is RoPE?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+```
+
+The final assistant header is the *generation prompt*: it tells the model it is its turn. Generation stops when the model emits the end-of-turn token.
+
+**Implementation.** Hugging Face stores the template (a Jinja template) in the tokenizer config, and inference servers such as vLLM apply it to chat requests:
+
+```python
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+messages = [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is RoPE?"},
+]
+prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+print(prompt)   # the exact string, special tokens included, that the model sees
+```
+
+### Failure modes
+
+- **Wrong or missing template.** Sending raw text to a chat model's completion endpoint, or serving a fine-tuned model with its base model's template, gives noticeably worse answers with no error. When self-hosting, confirm the server picked up the right template, and override it explicitly when it did not.
+- **Missing generation prompt.** Without `add_generation_prompt=True` the model may continue the *user's* message instead of answering.
+- **Duplicated special tokens.** Applying the template and then letting the tokenizer add a beginning-of-text token again gives a doubled token, a common and subtle fine-tuning bug.
+- **Special-token injection.** If user text containing a string such as `<|eot_id|>` is encoded with special tokens enabled, the user can close their own turn and forge a system or assistant turn. Encode user content with special tokens disallowed (tiktoken raises on them by default) and let only the template insert them. Broader prompt-injection defenses are in [Security for GenAI](/docs/genai-handbook/20-security-for-genai).
+- **Training/serving mismatch.** A model fine-tuned on one template must be served with exactly that template, including whitespace. Store the template with the model version ([Fine-tuning and Training](/docs/genai-handbook/23-finetuning-training) covers data formatting).
+
+## 4.9 Embedding Models
+
+Embedding models are transformer encoders (not decoders) trained to produce a single fixed-size vector for an entire input. The training objective is contrastive — pull semantically similar pairs together, push dissimilar ones apart.
+
+Three families dominate open-source today: **BGE** (BAAI General Embeddings), **E5** (Microsoft), and **Instructor** (HKUNLP). Commercial options include OpenAI's text-embedding-3 series, Cohere's Embed v3, and Voyage AI's models.
+
+Embedding models are typically 100M–1B parameters — much smaller than chat models — because the task is simpler. They run on a single small GPU at high throughput and dominate the cost of any large-scale RAG ingestion pipeline.
+
+## 4.10 Decoder-only vs Encoder-Decoder
+
+**Decoder-only** (GPT, Llama, Claude, Gemini in current configurations): one stack, causal attention, predicts next token autoregressively. Dominant for chat and code.
+
+**Encoder-decoder** (T5, BART, original transformer): two stacks. Encoder reads the input bidirectionally, decoder generates output autoregressively while cross-attending to the encoder's output. Still strong for translation and summarization.
+
+**Encoder-only** (BERT, RoBERTa, embedding models): one stack, bidirectional attention, no generation. Used for classification, embeddings, and retrieval.
+
+In production GenAI today, decoder-only dominates for generation and encoder-only for retrieval. Encoder-decoder is more common in specialized tasks like translation pipelines.
+
+## 4.10a Mixture of Experts ➕
+
+Beyond the encoder/decoder split, there is a second architectural axis the chapter does not cover: whether every parameter is used for every token. Many of the largest open models are *mixture-of-experts* (MoE) decoders, and they behave differently in cost and serving.
+
+### The problem MoE solves
+
+**Problem.** In a dense model, compute per token grows with parameter count (`2 × N` FLOPs, see 2.3a in [Mathematics for GenAI](/docs/genai-handbook/02-mathematics-for-genai)). More knowledge means proportionally slower and costlier tokens.
+
+**Mechanism.** An MoE layer replaces the single feed-forward network in each block with `E` expert FFNs plus a small *router*. For each token, the router scores all experts, picks the top `k` (often 1, 2 or 8 out of dozens or hundreds), and mixes only their outputs. Total parameters grow with `E`, but compute per token grows only with `k`. Mixtral 8x7B has 8 experts with top-2 routing: about 47B total parameters but about 13B active per token. DeepSeek-V3 has 671B total and 37B active.
+
+### A minimal MoE layer
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SwiGLU(nn.Module):                      # same expert FFN as chapter 3, section 3.10b
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.gate, self.up = nn.Linear(dim, hidden, bias=False), nn.Linear(dim, hidden, bias=False)
+        self.down = nn.Linear(hidden, dim, bias=False)
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+class MoE(nn.Module):
+    def __init__(self, dim=512, hidden=1376, n_experts=8, top_k=2):
+        super().__init__()
+        self.router = nn.Linear(dim, n_experts, bias=False)
+        self.experts = nn.ModuleList(SwiGLU(dim, hidden) for _ in range(n_experts))
+        self.top_k = top_k
+
+    def forward(self, x):                                   # x: [N tokens, D]
+        router_logits = self.router(x)                      # [N, E]
+        weights, chosen = router_logits.topk(self.top_k, dim=-1)   # [N, k]
+        weights = weights.softmax(dim=-1)                   # renormalize over the chosen experts
+        out = torch.zeros_like(x)
+        for e, expert in enumerate(self.experts):
+            token_idx, slot = (chosen == e).nonzero(as_tuple=True)
+            if token_idx.numel():                           # only tokens routed to expert e
+                out[token_idx] += weights[token_idx, slot, None] * expert(x[token_idx])
+        return out, router_logits, chosen
+
+moe = MoE()
+y, logits, chosen = moe(torch.randn(10, 512))
+print(y.shape, chosen[:3])     # torch.Size([10, 512]) and each token's two experts
+```
+
+### Keeping experts balanced
+
+**Problem.** Left alone, the router tends to send most tokens to a few experts. Those experts get more training, become better, attract more tokens, and the rest go unused (routing collapse).
+
+**Mechanism.** The Switch Transformer paper (Fedus et al., 2021) added an auxiliary loss that is smallest when tokens and router probability are spread evenly across experts:
+
+```python
+def load_balance_loss(router_logits, chosen, n_experts):
+    probs = router_logits.softmax(dim=-1)                               # [N, E]
+    token_share = F.one_hot(chosen[:, 0], n_experts).float().mean(0)    # share of tokens per expert
+    prob_share = probs.mean(0)                                          # mean router probability
+    return n_experts * (token_share * prob_share).sum()                 # 1.0 when perfectly even
+```
+
+DeepSeek-V3 instead adjusts a per-expert bias on the routing scores during training, which its report calls auxiliary-loss-free balancing, to avoid the auxiliary loss pulling against the language-modeling objective.
+
+### What MoE means for serving
+
+- **Memory follows total parameters, compute follows active parameters.** All experts must be in GPU memory (or very quickly reachable), so a 671B MoE needs multi-GPU memory even though each token costs like a ~37B dense model.
+- **Batches touch many experts.** One token uses `k` experts, but a batch of hundreds of tokens touches nearly all of them, so decode bandwidth savings are smaller than the active-parameter ratio suggests (see 2.3a).
+- **Expert parallelism.** Large MoE deployments place different experts on different GPUs and send tokens between them with all-to-all communication, which needs fast interconnects ([Distributed Systems for AI](/docs/genai-handbook/21-distributed-systems-for-ai)).
+
+### Failure modes
+
+- **Capacity overflow.** Some implementations give each expert a fixed per-batch capacity and drop or reroute tokens that exceed it, which slightly changes outputs depending on what else is in the batch, another source of nondeterminism (1.1a in [Introduction to GenAI](/docs/genai-handbook/01-introduction-to-genai)).
+- **Fine-tuning instability.** Router weights are sensitive. Many fine-tuning recipes freeze the router or use a lower learning rate for it.
+- **Misleading size comparisons.** "47B" and "13B active" are both true for Mixtral. Compare MoE and dense models on quality, memory and cost per token separately, never on one parameter number.
+
+## 4.11 Context Windows
+
+The context window is the maximum number of tokens the model can attend to in a single forward pass. Typical values:
+
+- 4K — older models like original GPT-3.5 and Llama 2.
+- 8K to 32K — many current open models.
+- 128K — current Claude, GPT-4, Llama 3.
+- 200K to 1M+ — frontier models, often with sliding-window attention or other tricks.
+
+A longer context is not free. Inference cost grows roughly linearly with input length thanks to KV caching, but memory grows linearly too — and there is a quality cost when models try to recall facts from deep within a long context (the "lost in the middle" effect). Larger context is a tool, not a default; in most production cases, retrieval (RAG) is cheaper and more accurate than stuffing.
+
+## 4.12 Hallucination
+
+A hallucination is a confident-sounding statement that is factually wrong. The model generates it because text-likelihood, not truth, is what it was trained to optimize. If the most likely-sounding continuation is wrong, the model says it.
+
+Mitigations form a layered defense:
+- Retrieval grounds the model in real documents and reduces invented facts.
+- Citation prompts force the model to point at specific source passages.
+- Lower temperature reduces creative drift.
+- Tool use replaces model "knowledge" with API calls for facts (current time, latest price, recent events).
+- Post-generation validation rejects outputs that fail format checks or cite non-existent sources.
+- LLM-as-judge or human-in-the-loop verification catches what the prior layers miss.
+
+No single mitigation eliminates hallucination. Production systems layer them.
+
+## 4.13 Sampling Methods
+
+**Greedy decoding** picks the most likely next token at each step. Deterministic, fast, but produces repetitive and dull text.
+
+**Temperature sampling** scales the logits before softmax. Lower temperature = sharper distribution = more decisive choices. Higher = flatter = more diverse and risky.
+
+**Top-k sampling** keeps only the k most likely tokens and renormalizes.
+
+**Top-p (nucleus) sampling** keeps the smallest set of tokens whose cumulative probability is at least p. Adaptive — narrow when the model is confident, wide when uncertain. Most modern systems default to top-p around 0.9.
+
+**Beam search** explores multiple candidate continuations in parallel and keeps the best. Good for tasks with a clear "right answer" like translation. Bad for open-ended generation; produces stilted, repetitive text. Largely replaced by top-p in modern chat.
+
+**Speculative decoding** uses a small "draft" model to propose several tokens at a time, then verifies them in parallel with the big model. When the draft model agrees with the big model — which it does most of the time on easy tokens — generation speeds up substantially with no quality loss.
+
+A runnable sampler with temperature, top-k, top-p and min-p is in section 2.13a of [Mathematics for GenAI](/docs/genai-handbook/02-mathematics-for-genai). The speculative decoding algorithm is covered in [AI Inference Systems](/docs/genai-handbook/13-ai-inference-systems).
+
+## 4.13a Repetition, Frequency and Presence Penalties 🔧
+
+Greedy and low-temperature decoding are described above as repetitive; penalties are the logit adjustments that servers offer to fight that, and they have sharp edges.
+
+### How the penalties work
+
+**Problem.** The model loops ("I can help. I can help. I can help.") or keeps reusing the same phrases.
+
+**Why it happens.** Once a phrase is in the context, attention makes repeating it more likely, and each repetition strengthens the pattern. Low temperature removes the randomness that would break the loop.
+
+**Mechanism.** Penalties lower the logits of tokens that already appeared, before sampling. Two styles exist:
+
+- **Additive (OpenAI-style).** `frequency_penalty` subtracts an amount proportional to how many times a token has appeared, and `presence_penalty` subtracts a fixed amount if it appeared at all.
+- **Multiplicative (CTRL-style, `repetition_penalty` in Hugging Face and vLLM).** Positive logits of seen tokens are divided by the penalty and negative ones multiplied, so seen tokens always become less likely.
+
+**Implementation.**
+
+```python
+import numpy as np
+
+def apply_penalties(logits, generated_ids, frequency=0.0, presence=0.0, repetition=1.0):
+    logits = logits.astype(np.float64).copy()
+    counts = np.bincount(generated_ids, minlength=logits.size)
+    seen = counts > 0
+    logits -= frequency * counts + presence * seen          # additive style
+    if repetition != 1.0:                                    # multiplicative style
+        pos, neg = seen & (logits > 0), seen & (logits <= 0)
+        logits[pos] /= repetition
+        logits[neg] *= repetition
+    return logits
+
+logits = np.array([3.0, 2.5, 1.0, -0.5])
+history = [0, 0, 0, 3]                         # token 0 used three times, token 3 once
+print(apply_penalties(logits, history, frequency=0.3, presence=0.2))
+# token 0: 3.0 - 0.9 - 0.2 = 1.9, now below token 1 (2.5): the loop breaks
+```
+
+### Failure modes
+
+- **Penalizing repetition you need.** JSON keys, code identifiers, a customer's name and table headers *must* repeat. Penalties on structured-output or code requests cause misspelled keys and invented variable names. Disable them for those calls.
+- **Prompt tokens may or may not count.** Some implementations penalize tokens that appear in the prompt as well as in the output, which makes the model avoid words from the retrieved context, exactly the words a RAG answer should use. Check your server's documentation.
+- **Fix the cause first.** Loops are often caused by greedy decoding, a too-low temperature or a truncated prompt. Raising temperature slightly or adding min-p is usually safer than a strong penalty.
+
+## 4.13b Constrained Decoding ➕
+
+Sampling controls shape *which* token is likely, but a whole family of production features (JSON mode, structured outputs, enum outputs, grammar-constrained generation) relies on a stronger step the chapter does not describe: forbidding invalid tokens outright.
+
+### The mechanism: masking logits with a grammar
+
+**Problem.** Even a well-prompted model occasionally emits invalid JSON, an extra sentence before the JSON, or a value outside an allowed enum, and downstream parsing breaks.
+
+**Why prompting is not enough.** Sampling is probabilistic (2.7 in [Mathematics for GenAI](/docs/genai-handbook/02-mathematics-for-genai)). A format the model follows 99.5 percent of the time still breaks 5 requests in every thousand.
+
+**Mechanism.** At every decoding step the server tracks where the output is in a grammar (a regular expression, a JSON schema or a context-free grammar compiled to a state machine) and sets the logit of every token that would make the output invalid to negative infinity. The model can only sample valid continuations, so the result is valid *by construction*. Willard and Louf (2023, the Outlines library) showed how to precompute, for each grammar state, which vocabulary tokens are allowed, which makes this fast. vLLM, SGLang, llama.cpp and hosted "structured output" features use this approach.
+
+**Implementation.** A toy version that restricts output to a fixed set of label sequences:
+
+```python
+import numpy as np
+
+def constrained_greedy(next_logits, options):
+    """next_logits(prefix) -> logits over the vocabulary; options: allowed token-id sequences."""
+    prefix = []
+    while True:
+        live = [o for o in options if o[:len(prefix)] == prefix]
+        if any(len(o) == len(prefix) for o in live):
+            return prefix                       # a complete allowed sequence
+        allowed = sorted({o[len(prefix)] for o in live})
+        logits = next_logits(prefix)
+        mask = np.full(logits.shape, -np.inf)
+        mask[allowed] = 0.0                     # everything else becomes impossible
+        prefix.append(int(np.argmax(logits + mask)))
+
+# Labels "urgent" = [17, 4], "normal" = [9], "spam" = [23, 5, 5] in some vocabulary of 30 tokens
+rng = np.random.default_rng(0)
+fake_model = lambda prefix: rng.standard_normal(30)
+print(constrained_greedy(fake_model, [[17, 4], [9], [23, 5, 5]]))   # always one of the labels
+```
+
+### Failure modes
+
+- **Valid is not correct.** The output will parse, but the values can still be wrong or invented. Keep semantic validation after parsing.
+- **Forcing the format too early hurts quality.** If the schema leaves no room to think, the model must commit to an answer in its first tokens. Put a free-text `reasoning` field before the answer fields, or let a reasoning model think first and constrain only the final output.
+- **Prefixes and stop tokens.** In the toy, an option that is a prefix of another ends early. Real engines include the end-of-sequence token in the grammar so the model decides when it is done.
+- **Unsupported schema features.** Each engine supports a subset of JSON Schema (recursive definitions, some formats and pattern constraints are commonly limited). Test your actual schema, and expect a compile step on first use of a new schema.
+- The prompt-level side of JSON mode and structured outputs is covered in [Prompt Engineering](/docs/genai-handbook/12-prompt-engineering).
+
+## 4.14 Quantization
+
+Quantization reduces the numerical precision of model weights to save memory and increase throughput. Common levels:
+
+- **FP16/BF16** — 16-bit. The native training precision for most modern LLMs.
+- **INT8** — 8-bit integer. Roughly 2× memory savings versus FP16, minor quality loss.
+- **INT4** — 4-bit integer. 4× memory savings versus FP16. Quality loss is noticeable but acceptable for many tasks. Enables running 70B models on consumer GPUs.
+- **GGUF / GPTQ / AWQ** — different quantization formats with different tradeoffs. GGUF dominates llama.cpp ecosystems. AWQ and GPTQ dominate GPU inference servers.
+
+Quantization is lossy. Always benchmark the quantized model on your tasks before assuming "INT4 is fine."
+
+## 4.14a How Quantization Works, in Code 🔧
+
+The list above names the precision levels; this section shows the arithmetic underneath, why outliers make it hard, and what the named methods do differently. Hardware support is covered in [GPU Systems](/docs/genai-handbook/14-gpu-systems) and the cost impact in [Cost Optimization](/docs/genai-handbook/25-cost-optimization).
+
+### Scale, round, clip
+
+**Mechanism.** Symmetric integer quantization maps each float weight to an integer with one shared scale: `scale = max(|w|) / qmax`, `q = round(w / scale)`, and at inference `w ≈ q × scale`. For INT8, `qmax` is 127. For INT4 it is 7, so only 16 levels are available. The rounding error per weight is at most half a step, so the error grows with the scale, and the scale is set by the *largest* weight in the group.
+
+### Why groups matter: outliers
+
+**Problem.** A handful of unusually large values forces a large scale on the whole tensor, and every ordinary weight then rounds to zero or one level.
+
+**Implementation.** The same weights quantized three ways, with a few injected outliers:
+
+```python
+import numpy as np
+
+def quantize_symmetric(w, bits, group_size=None):
+    qmax = 2 ** (bits - 1) - 1
+    g = w.reshape(-1, group_size or w.size)            # one scale per group
+    scale = np.abs(g).max(axis=1, keepdims=True) / qmax
+    q = np.clip(np.round(g / scale), -qmax - 1, qmax).astype(np.int8)
+    return q, scale
+
+def dequantize(q, scale, shape):
+    return (q.astype(np.float32) * scale).reshape(shape)
+
+rng = np.random.default_rng(0)
+w = (rng.standard_normal(4096 * 128) * 0.02).astype(np.float32)
+w[::5000] = 0.5                                        # a few outliers
+
+for bits, group in [(8, None), (4, None), (4, 128)]:
+    q, s = quantize_symmetric(w, bits, group)
+    err = np.abs(dequantize(q, s, w.shape) - w).mean() / np.abs(w).mean()
+    print(f"int{bits} group={group or 'tensor'}: relative error {err:.1%}")
+# int8 group=tensor: relative error 6.1%
+# int4 group=tensor: relative error 92.0%   (almost every weight rounds to 0)
+# int4 group=128: relative error 14.5%      (outliers only hurt their own group)
+```
+
+**Cost of groups.** Each group stores its own scale, typically in FP16. With groups of 128, INT4 costs `4 + 16/128 = 4.125` bits per weight instead of 4, a small price for the accuracy gain. This is why INT4 formats are almost always group-wise.
+
+### What the named methods add
+
+- **LLM.int8()** (Dettmers et al., 2022) found that large models develop a few activation feature dimensions with extreme values. It keeps those dimensions in FP16 and quantizes the rest to INT8.
+- **GPTQ** (Frantar et al., 2022) quantizes weights one column at a time and adjusts the remaining unquantized weights to compensate for the error just introduced, using second-order information from a small calibration set.
+- **AWQ** (Lin et al., 2023) observes that a small share of weight channels matter most, identified by the size of the *activations* that multiply them, and scales those channels up before quantization so they lose less precision.
+- **GGUF** is a file format (from llama.cpp) that packs many such schemes, named like `Q4_K_M`, with per-block scales for CPU and Apple-silicon inference.
+
+### Weights, activations and the KV cache
+
+**Mechanism.** *Weight-only* quantization (W4A16: INT4 weights, BF16 activations) shrinks memory and speeds up memory-bound decode, but the matrix multiplication still runs in BF16 after dequantizing. *Weight-and-activation* quantization (W8A8 in INT8 or FP8) also uses the faster low-precision tensor cores, which helps compute-bound prefill and large batches. The KV cache can be quantized separately (4.5a).
+
+### Failure modes
+
+- **Calibration data mismatch.** GPTQ and AWQ calibrate on sample text. Calibrating on English web text and serving code or another language can degrade exactly your workload.
+- **Average benchmarks hide tail damage.** Quantized models often keep their headline scores while losing reliability on long reasoning chains, rare languages or strict formats. Evaluate on your own task set, including structured-output validity rates.
+- **Small models suffer more.** Fewer parameters means less redundancy, so 4-bit quantization costs a small model relatively more quality than a large one.
+
+## 4.15 Inference Pipeline End-to-End
+
+<Mermaid chart={`flowchart TD
+  UI["User input"] --> TK["Tokenizer → token IDs"]
+  TK --> PF["Prefill phase: process all input tokens in parallel,<br/>compute K and V for every layer, store in KV cache"]
+  PF --> RQ
+  subgraph DEC["Decode phase: one token at a time, for each new token"]
+    RQ["Run Q through cached K/V"] --> CL["Compute logits"]
+    CL --> SM["Sample"]
+    SM --> AP["Append token to KV cache"]
+    AP -->|"next token"| RQ
+  end
+  AP --> DT["Detokenizer → user-visible text"]
+  DT --> ST["Stream tokens to client"]`} />
+
+The prefill phase is parallel and compute-bound. The decode phase is sequential and memory-bandwidth-bound. This split is why production inference servers like vLLM treat them as different scheduling problems.
+
+## 4.16 GPU Memory Flow During Inference
+
+<Mermaid chart={`flowchart LR
+  subgraph IDLE["GPU VRAM at idle"]
+    direction TB
+    I1["Model weights (e.g., 14 GB for 7B FP16)"] --- I2["Empty space"]
+  end
+  subgraph ONE["GPU VRAM during one user's request"]
+    direction TB
+    O1["Model weights"] --- O2["KV cache for this user (grows per token)"]
+    O2 --- O3["Activations (small, transient)"]
+  end
+  subgraph MANY["GPU VRAM during 16 concurrent users"]
+    direction TB
+    M1["Model weights (shared)"] --- M2["KV cache user 1"]
+    M2 --- M3["KV cache user 2"]
+    M3 --- M4["..."]
+    M4 --- M5["KV cache user 16"]
+  end
+  IDLE --> ONE --> MANY`} />
+
+The model weights are *shared* across all concurrent users — batching is essentially free from a memory perspective. The KV cache, however, is *per-user* and is what limits concurrency. Paged attention (vLLM) treats KV cache as virtual memory pages so the GPU can pack more users in by avoiding fragmentation.
+
+## 4.16a Reasoning Models and Test-Time Compute ➕
+
+The pipeline and memory picture above assume a reply of a few hundred tokens; reasoning models change that by generating thousands of hidden "thinking" tokens before the answer, which moves cost, latency and memory into the decode phase. Chapter 30 notes the trend; this section covers how it works and how to engineer for it.
+
+### What is different inside
+
+**Problem.** Standard chat models answer in one pass and fail on problems that need several dependent steps (multi-step maths, debugging, planning).
+
+**Why thinking helps.** Each generated token gets one forward pass of compute. A model that writes out intermediate steps gets many forward passes, and can use earlier steps as working memory through attention. Chain-of-thought prompting ([Prompt Engineering](/docs/genai-handbook/12-prompt-engineering)) exploits this from the outside. Reasoning models are trained to do it on their own.
+
+**Mechanism.** After normal pre-training and post-training, these models get large-scale reinforcement learning on tasks with *verifiable* rewards: maths with known answers, code checked by unit tests. The model generates long reasoning traces, and traces that reach correct answers are reinforced. OpenAI's o1 announcement (2024) reported accuracy improving with both more RL training compute and more thinking at test time. DeepSeek-R1 (2025) published a recipe based on the GRPO algorithm and reported that self-checking and backtracking behaviors appeared from RL alone in its R1-Zero variant.
+
+### Ways to spend test-time compute
+
+- **Sequential: think longer.** One long reasoning trace. This is what reasoning models do natively, and APIs expose it as an effort level or token budget.
+- **Parallel: sample several and pick.** Generate `N` candidates and choose by majority vote (self-consistency) or with a verifier. This works with any model.
+- **Verifier-guided search.** A reward model or checker scores partial or complete solutions to guide which ones to extend.
+
+Snell et al. (2024) found that the best strategy depends on problem difficulty, and that on problems where a smaller model already has a reasonable success rate, compute-optimal test-time scaling can beat a 14 times larger model at matched FLOPs. Hard problems still need a stronger base model.
+
+**Implementation: best-of-N with a real verifier (Python).** When you can check an answer mechanically, parallel sampling plus a check is often cheaper and more reliable than a bigger model:
+
+```python
+import asyncio
+import os
+from collections.abc import Awaitable, Callable
+
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import create_async_engine
+
+
+async def best_of_n[T](
+    generate: Callable[[], Awaitable[str]],
+    verify: Callable[[str], Awaitable[T | None]],
+    n: int = 4,
+) -> T:
+    results = await asyncio.gather(*(generate() for _ in range(n)), return_exceptions=True)
+    for r in results:
+        if isinstance(r, BaseException):
+            continue
+        verified = await verify(r)
+        if verified is not None:
+            return verified
+    raise RuntimeError(f"None of {n} candidates passed verification")
+
+
+# Verifier for generated SQL: Postgres parses and plans it without running it
+engine = create_async_engine(os.environ["READONLY_DATABASE_URL"])
+
+
+async def verify_sql(sql: str) -> str | None:
+    try:
+        async with engine.connect() as conn:
+            await conn.exec_driver_sql(f"EXPLAIN {sql}")
+        return sql
+    except DBAPIError:
+        return None
+```
+
+`EXPLAIN` checks syntax, table and column names without executing the query. Use a read-only role anyway, because a generated statement could still be a write.
+
+### Controlling reasoning through an API
+
+**Mechanism.** Providers expose a depth control instead of (or alongside) sampling parameters. As of 2026, for example, Anthropic's Messages API uses `thinking={"type": "adaptive"}` with an `effort` level on newer Claude models, where older models took a fixed `budget_tokens`. OpenAI exposes a reasoning effort setting. Parameter names change between model generations, so check the current docs for the model you use.
+
+```python
+import os
+
+import anthropic
+
+client = anthropic.AsyncAnthropic()
+
+
+async def answer_with_reasoning(question: str) -> str:
+    res = await client.messages.create(
+        model=os.environ.get("REASONING_MODEL", "claude-opus-5-5"),  # supports adaptive thinking
+        max_tokens=16_000,  # hard ceiling on thinking + answer together
+        thinking={"type": "adaptive"},
+        output_config={"effort": "medium"},  # trade depth for cost and latency
+        messages=[{"role": "user", "content": question}],
+    )
+    if res.stop_reason == "max_tokens":
+        raise RuntimeError("Ran out of tokens while reasoning: raise max_tokens or lower effort")
+    if res.stop_reason == "refusal":
+        raise RuntimeError("The model declined to answer")
+    return "".join(b.text for b in res.content if b.type == "text")
+```
+
+### Systems consequences
+
+- **Thinking tokens are output tokens.** They are billed at output prices even when you only see a summary, and they occupy KV cache like any other generated token (4.5a). Log the reasoning-token count the API reports, per request, so cost dashboards do not under-count.
+- **Latency moves to time-to-first-answer-token.** A reasoning model may think for seconds to minutes before the first visible word. That rules it out for turn-by-turn voice agents with sub-second budgets. A common pattern is a fast model for the live turn and a reasoning model for background work (planning, verification, summaries) whose results feed the next turns.
+- **Decode-heavy load.** Long outputs mean the memory-bandwidth-bound decode phase dominates GPU time, which changes capacity planning for self-hosted reasoning models.
+
+### Failure modes
+
+- **Overthinking.** Reasoning models can spend thousands of tokens on easy questions. Route simple requests to a non-reasoning model or a low effort level.
+- **Truncated thoughts.** If `max_tokens` is reached during thinking, you get no answer at all, only a bill. Handle that stop reason explicitly, as above.
+- **Multi-turn tool use needs the thinking blocks back.** Some APIs require you to pass previous thinking blocks back unchanged in tool-use loops. Stripping them in your message history breaks the conversation or degrades it.
+- **Sampling parameters may be ignored or rejected**, and prompts that dictate step-by-step procedures can make results worse. Describe the goal and constraints and let the model plan.
+
+## 4.17 Tradeoffs
+
+| Choice | Win | Cost |
+|---|---|---|
+| Longer context | More information available to the model | Quadratic compute, linear memory, "lost in the middle" |
+| Lower temperature | More predictable, factual outputs | Less creative, occasional repetition |
+| Quantized weights | Cheaper inference, smaller GPUs | Some quality loss, more complex tooling |
+| Bigger model | Better reasoning, broader knowledge | Higher cost, slower, harder to host |
+| Smaller model + RAG + tools | Cheap and accurate | More moving parts, more engineering |
+
+## 4.18 Common Mistakes
+
+- Assuming output tokens are billed the same as input tokens (output is usually more expensive).
+- Forgetting that system prompts are tokens too and inflate every request.
+- Using greedy decoding and being surprised by repetition.
+- Treating quantization as free without measuring downstream quality.
+- Ignoring the difference between prefill and decode latency in SLAs.
+
+## 4.19 Interview Questions
+
+- Walk through the inference pipeline end to end.
+- Why is KV cache memory the limit on concurrent users?
+- Explain RoPE and why it enables long context.
+- Speculative decoding — why does it work without quality loss?
+- Compare INT8 and INT4 quantization tradeoffs.
+
+**➕ More questions:**
+
+- *How much KV cache does Llama 3.1 8B need per token, and why is it less than older models?* — **`2 × 32 layers × 8 KV heads × 128 × 2 bytes` = 128 KiB. Grouped-query attention shares each K/V head across 4 query heads, so the cache is 4 times smaller than with full multi-head attention.**
+- *Is FlashAttention an approximation?* — **No. It computes exact attention in tiles with an online softmax and never writes the full score matrix to memory, so memory becomes linear in sequence length while compute stays quadratic.**
+- *Why does a mixture-of-experts model need so much GPU memory if it is cheap per token?* — **All experts must be resident, so memory follows total parameters. Only compute follows the active parameters.**
+- *Why is INT4 quantization almost always group-wise?* — **One outlier sets the scale for its whole group. Small groups confine the damage, at a cost of about 0.125 extra bits per weight for groups of 128.**
+- *How do JSON-schema structured outputs guarantee valid JSON?* — **The server tracks the grammar state and masks every token that would make the output invalid, so only valid continuations can be sampled. Valid does not mean correct.**
+- *What is a chat template, and how can it be attacked?* — **The model-specific format that wraps messages in special tokens. If user text is encoded with special tokens enabled, a user can forge turn boundaries.**
+- *When would you not use a reasoning model?* — **Tight latency budgets such as live voice turns, simple high-volume requests, and cases where a mechanical verifier with best-of-N sampling is cheaper.**
+
+## 4.20 Hands-on Exercises
+
+1. For a 13B model with 40 layers, head dim 128, 40 heads, and an 8K context, estimate KV cache size per user in FP16.
+2. Take a paragraph of your own writing. Count words. Use an online tokenizer for any popular model to count tokens. Compute the ratio.
+3. Sketch where prefill ends and decode begins in a chat interface that streams responses.
+
+## 4.21 Enterprise Best Practices
+
+Pick the smallest model that meets quality and benchmark it on your actual tasks, not generic leaderboards. Standardize the tokenizer used for billing and context budgeting. Track prefill latency and decode latency separately; they have different optimization paths. Monitor KV cache hit rate and concurrent slot usage in production inference clusters. Prefer top-p around 0.9 with temperature 0.2–0.7 as a safe default for factual chat workloads, and only deviate with measurement.
+
+## Sources
+
+Sources for the 🔧 and ➕ additions:
+
+- Dao et al., "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness" (2022): https://arxiv.org/abs/2205.14135
+- Milakov and Gimelshein, "Online normalizer calculation for softmax" (2018): https://arxiv.org/abs/1805.02867
+- Shazeer, "Fast Transformer Decoding: One Write-Head is All You Need" (MQA, 2019): https://arxiv.org/abs/1911.02150
+- Ainslie et al., "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints" (2023): https://arxiv.org/abs/2305.13245
+- DeepSeek-AI, "DeepSeek-V2" (multi-head latent attention, 2024): https://arxiv.org/abs/2405.04434
+- DeepSeek-AI, "DeepSeek-V3 Technical Report" (671B total, 37B active, 2024): https://arxiv.org/abs/2412.19437
+- Llama 3.1 8B and 70B model configs (layers, KV heads, RoPE scaling): https://huggingface.co/meta-llama/Llama-3.1-8B and https://huggingface.co/meta-llama/Llama-3.1-70B
+- Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (vLLM, 2023): https://arxiv.org/abs/2309.06180
+- Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding" (2021): https://arxiv.org/abs/2104.09864
+- Chen et al., "Extending Context Window of Large Language Models via Positional Interpolation" (2023): https://arxiv.org/abs/2306.15595
+- Peng et al., "YaRN: Efficient Context Window Extension of Large Language Models" (2023): https://arxiv.org/abs/2309.00071
+- Hsieh et al., "RULER: What's the Real Context Size of Your Long-Context Language Models?" (2024): https://arxiv.org/abs/2404.06654
+- Press et al., "Train Short, Test Long: Attention with Linear Biases" (ALiBi, 2021): https://arxiv.org/abs/2108.12409
+- Jiang et al., "Mistral 7B" (sliding-window attention, 2023): https://arxiv.org/abs/2310.06825
+- Sennrich et al., "Neural Machine Translation of Rare Words with Subword Units" (BPE, 2016): https://arxiv.org/abs/1508.07909
+- Radford et al., "Language Models are Unsupervised Multitask Learners" (GPT-2, byte-level BPE, 2019): https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+- OpenAI tiktoken (encodings, special-token handling): https://github.com/openai/tiktoken
+- Rumbelow and Watkins, "SolidGoldMagikarp (plus, prompt generation)" (2023): https://www.lesswrong.com/posts/aPeJE8bSo6rAFoLqg/solidgoldmagikarp-plus-prompt-generation
+- Python docs, `codecs.getincrementaldecoder`: https://docs.python.org/3/library/codecs.html#codecs.getincrementaldecoder
+- Meta Llama 3 prompt format: https://www.llama.com/docs/model-cards-and-prompt-formats/meta-llama-3/
+- Hugging Face Transformers docs, "Chat templates": https://huggingface.co/docs/transformers/chat_templating
+- Fedus et al., "Switch Transformers" (2021): https://arxiv.org/abs/2101.03961
+- Jiang et al., "Mixtral of Experts" (2024): https://arxiv.org/abs/2401.04088
+- OpenAI API reference, `frequency_penalty` and `presence_penalty`: https://platform.openai.com/docs/api-reference/chat
+- Keskar et al., "CTRL" (repetition penalty, 2019): https://arxiv.org/abs/1909.05858
+- Willard and Louf, "Efficient Guided Generation for Large Language Models" (Outlines, 2023): https://arxiv.org/abs/2307.09702
+- Dettmers et al., "LLM.int8()" (2022): https://arxiv.org/abs/2208.07339
+- Frantar et al., "GPTQ" (2022): https://arxiv.org/abs/2210.17323
+- Lin et al., "AWQ: Activation-aware Weight Quantization" (2023): https://arxiv.org/abs/2306.00978
+- OpenAI, "Learning to Reason with LLMs" (o1, 2024): https://openai.com/index/learning-to-reason-with-llms/
+- DeepSeek-AI, "DeepSeek-R1" (2025): https://arxiv.org/abs/2501.12948
+- Snell et al., "Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters" (2024): https://arxiv.org/abs/2408.03314
+- Anthropic docs, extended and adaptive thinking (as of 2026): https://platform.claude.com/docs/en/build-with-claude/extended-thinking

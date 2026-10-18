@@ -1,0 +1,865 @@
+---
+title: "Responses, errors and status codes"
+description: "What happens to your return value (jsonable_encoder vs Pydantic serialization), response_model and return annotations, input/output model splits so passwords never leak, response_model_exclude_unset, status codes, custom Response classes, headers and cookies, HTTPException, custom exception handlers, overriding the validation error handler, and one consistent error envelope for every failure."
+---
+
+The [previous chapter](/docs/fastapi/path-query-and-body-parameters) covered data coming **in**. This one covers data going **out**: how a Python return value becomes HTTP bytes, how to control exactly which fields leave your server, how to choose status codes and response types, and how to make every error, whether it's yours, the framework's or a crash, look the same to clients.
+
+All output below is real, from FastAPI 0.143.0, Pydantic 2.14.1 and Starlette 1.8.0. For the general ideas, see [Serialization and deserialization](/docs/backend-first-principles/07-serialization-deserialization) and [Error handling and fault tolerance](/docs/backend-first-principles/16-error-handling-fault-tolerance).
+
+## What happens to your return value
+
+After your endpoint returns, FastAPI takes one of three paths:
+
+<Mermaid chart={`flowchart TD
+  R["endpoint returns a value"] --> A{"is it a Response object?"}
+  A -- yes --> S["sent as is<br/>no validation, no filtering"]
+  A -- no --> B{"does the route have a response model?<br/>response_model or return annotation"}
+  B -- yes --> V["Pydantic validates against the model,<br/>then serializes straight to JSON bytes"]
+  B -- no --> J["jsonable_encoder converts to plain types,<br/>then JSONResponse runs json.dumps"]
+  V --> O["HTTP response"]
+  J --> O
+  S --> O`} />
+
+1. **You returned a `Response`** (`JSONResponse`, `HTMLResponse`, `RedirectResponse`, ...): FastAPI sends it untouched.
+2. **The route has a response model**: the value is validated against it, filtered to its fields, and serialized by Pydantic's Rust core directly to JSON bytes.
+3. **No response model**: the value goes through `jsonable_encoder` and then `json.dumps` inside `JSONResponse`.
+
+The difference between 2 and 3 matters for correctness and security, so let's look at both.
+
+## `jsonable_encoder`: making anything JSON-safe
+
+`json.dumps` only understands `dict`, `list`, `str`, `int`, `float`, `bool` and `None`. `jsonable_encoder` walks your data recursively and converts everything else to those types:
+
+```python
+import dataclasses, datetime, decimal, enum, uuid, json
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel
+
+
+class Status(enum.Enum):
+    active = "active"
+
+
+@dataclasses.dataclass
+class Point:
+    x: int
+    y: int
+
+
+class Tag(BaseModel):
+    name: str
+    created: datetime.datetime
+
+
+data = {
+    "when": datetime.datetime(2026, 10, 13, 9, 30, tzinfo=datetime.timezone.utc),
+    "day": datetime.date(2026, 10, 13),
+    "took": datetime.timedelta(seconds=90),
+    "id": uuid.UUID("12345678-1234-5678-1234-567812345678"),
+    "price": decimal.Decimal("19.99"),
+    "status": Status.active,
+    "point": Point(1, 2),
+    "tag": Tag(name="new", created=datetime.datetime(2026, 1, 1)),
+    "letters": frozenset({"a"}),
+    "raw": b"bytes",
+}
+
+try:
+    json.dumps(data)
+except TypeError as e:
+    print("json.dumps:", e)
+
+encoded = jsonable_encoder(data)
+for k, v in encoded.items():
+    print(f"{k:<8} {type(v).__name__:<6} {v!r}")
+```
+
+```text title="Output"
+json.dumps: Object of type datetime is not JSON serializable
+when     str    '2026-10-13T09:30:00+00:00'
+day      str    '2026-10-13'
+took     float  90.0
+id       str    '12345678-1234-5678-1234-567812345678'
+price    float  19.99
+status   str    'active'
+point    dict   {'x': 1, 'y': 2}
+tag      dict   {'name': 'new', 'created': '2026-01-01T00:00:00'}
+letters  list   ['a']
+raw      str    'bytes'
+```
+
+Datetimes become ISO 8601 strings, UUIDs and enums become strings, dataclasses and Pydantic models become dicts, and sets become lists. Note two lossy conversions:
+
+- `timedelta` becomes a float number of seconds.
+- **`Decimal` becomes a `float`.** For money, that is a real problem: floats can't represent most decimal fractions exactly. A response model fixes it, as you'll see next.
+
+`jsonable_encoder` is also useful on its own, for example to turn a model into something you can store in a JSON column or a cache.
+
+## `response_model` and return annotations
+
+There are two ways to give a route a response model:
+
+```python
+@app.get("/users/{user_id}")
+async def get_user(user_id: int) -> UserOut:          # 1. return annotation
+    ...
+
+@app.get("/users/{user_id}", response_model=UserOut)  # 2. decorator argument
+async def get_user(user_id: int) -> Any:
+    ...
+```
+
+The return annotation is preferred: your editor and type checker see it too. Use `response_model=` when the function returns something of a **different** type than the documented shape, typically a dict or an ORM object, and you don't want the type checker to complain. If both are given, `response_model` wins. `response_model=None` turns the feature off for a route.
+
+The response model does three jobs:
+
+1. **Validates** the return value. If your code returns the wrong shape, it's a server bug, and you get a 500 instead of sending garbage.
+2. **Filters** the data down to the model's declared fields.
+3. **Documents** the response schema in OpenAPI.
+
+### The input/output split: passwords never leak
+
+The classic case: a user signs up with a password. The password must go **in**, but must never come **out**.
+
+```python
+import decimal, json
+from typing import Any
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, EmailStr
+
+app = FastAPI()
+
+
+class UserBase(BaseModel):
+    username: str
+    email: EmailStr
+    full_name: str | None = None
+
+
+class UserIn(UserBase):
+    password: str
+
+
+class UserOut(UserBase):
+    id: int
+
+
+class UserInDB(UserOut):
+    hashed_password: str
+
+
+DB: dict[int, UserInDB] = {}
+
+
+def fake_hash(pw: str) -> str:
+    return "hashed$" + pw[::-1]
+
+
+@app.post("/leaky")
+async def leaky(user: UserIn):
+    return user                                  # echoes the password back
+
+
+@app.post("/users", status_code=201)
+async def create_user(user: UserIn) -> UserOut:
+    record = UserInDB(id=len(DB) + 1, hashed_password=fake_hash(user.password),
+                      **user.model_dump(exclude={"password"}))
+    DB[record.id] = record
+    return record                                # a UserInDB, filtered down to UserOut
+
+
+@app.get("/users/{user_id}", response_model=UserOut)
+async def get_user(user_id: int) -> Any:
+    return DB[user_id].model_dump()              # a plain dict, still validated and filtered
+
+
+class Price(BaseModel):
+    amount: decimal.Decimal
+
+
+@app.get("/price-dict")
+async def price_dict():
+    return {"amount": decimal.Decimal("19.99")}
+
+
+@app.get("/price-model")
+async def price_model() -> Price:
+    return Price(amount=decimal.Decimal("19.99"))
+
+
+c = TestClient(app)
+body = {"username": "ada", "email": "ada@example.com", "password": "hunter2"}
+print("leaky   ", c.post("/leaky", json=body).json())
+r = c.post("/users", json=body)
+print("create  ", r.status_code, r.json())
+print("get     ", c.get("/users/1").json())
+print("decimal ", c.get("/price-dict").text, c.get("/price-model").text)
+schema = c.get("/openapi.json").json()
+print(json.dumps(schema["paths"]["/users"]["post"]["responses"]["201"]["content"]))
+print(list(schema["components"]["schemas"]["UserOut"]["properties"]))
+```
+
+```text title="Output"
+leaky    {'username': 'ada', 'email': 'ada@example.com', 'full_name': None, 'password': 'hunter2'}
+create   201 {'username': 'ada', 'email': 'ada@example.com', 'full_name': None, 'id': 1}
+get      {'username': 'ada', 'email': 'ada@example.com', 'full_name': None, 'id': 1}
+decimal  {"amount":19.99} {"amount":"19.99"}
+{"application/json": {"schema": {"$ref": "#/components/schemas/UserOut"}}}
+['username', 'email', 'full_name', 'id']
+```
+
+- `/leaky` has no response model, so `jsonable_encoder` dumps **every** field, including the plaintext password. This is the bug the pattern exists to prevent.
+- `/users` returns a `UserInDB` (with `hashed_password`), but the annotation says `UserOut`. FastAPI serializes the value **as a `UserOut`**: Pydantic uses the declared type's schema, so fields that `UserOut` doesn't declare are never written, even though the object has them.
+- `/users/{user_id}` returns a plain dict containing `hashed_password`. It is validated into `UserOut`, and the extra key is ignored.
+- With a model, the `Decimal` is serialized as the **string** `"19.99"`, which preserves precision. Without one, it was the float `19.99`.
+
+The layering `UserBase` → `UserIn` / `UserOut` → `UserInDB` is worth copying: shared fields live in one place, and each class says exactly what crosses one boundary. The [Databases with SQLAlchemy](/docs/fastapi/databases-with-sqlalchemy) chapter adds `from_attributes=True` so ORM objects can be returned directly.
+
+<Callout title="Why not just return a subclass and rely on duck typing?">
+In Pydantic v1, serializing a subclass instance could include the subclass's extra fields. Pydantic v2 serializes by the **declared** type, which is what makes the "return `UserInDB`, annotate `UserOut`" pattern safe. Test it anyway: a response test that asserts `"password" not in response.json()` is cheap insurance. See [Testing](/docs/fastapi/testing).
+</Callout>
+
+### Excluding unset, default and `None` fields
+
+Sometimes the client should only see the fields that were actually set, for example for a `PATCH`-style resource with many optional fields. The `response_model_exclude_*` options control that:
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+
+
+class Item(BaseModel):
+    name: str
+    description: str | None = None
+    price: float
+    tax: float = 10.5
+    tags: list[str] = []
+
+
+ITEMS = {
+    "foo": {"name": "Foo", "price": 50.2},
+    "bar": {"name": "Bar", "description": "The bartenders", "price": 62, "tax": 20.2},
+    "baz": {"name": "Baz", "description": None, "price": 50.2, "tax": 10.5, "tags": []},
+}
+
+
+@app.get("/items/{key}", response_model=Item)
+async def full(key: str):
+    return ITEMS[key]
+
+
+@app.get("/items/{key}/unset", response_model=Item, response_model_exclude_unset=True)
+async def unset(key: str):
+    return ITEMS[key]
+
+
+@app.get("/items/{key}/none", response_model=Item, response_model_exclude_none=True)
+async def none(key: str):
+    return ITEMS[key]
+
+
+@app.get("/items/{key}/name", response_model=Item, response_model_include={"name", "price"})
+async def name_only(key: str):
+    return ITEMS[key]
+
+
+@app.get("/broken")
+async def broken() -> Item:
+    return {"name": "No price"}
+
+
+@app.get("/bypass")
+async def bypass() -> Item:
+    return JSONResponse({"name": "No price", "secret": "leaked"})
+
+
+c = TestClient(app, raise_server_exceptions=False)
+for path in ["/items/foo", "/items/foo/unset", "/items/bar/unset", "/items/baz/unset",
+             "/items/baz/none", "/items/bar/name"]:
+    print(f"{path:<18} {c.get(path).text}")
+r = c.get("/broken")
+print("/broken  ", r.status_code, r.text)
+print("/bypass  ", c.get("/bypass").text)
+
+c2 = TestClient(app)
+try:
+    c2.get("/broken")
+except Exception as e:
+    print(type(e).__name__)
+    print(str(e))
+```
+
+```text title="Output (traceback path trimmed)"
+/items/foo         {"name":"Foo","description":null,"price":50.2,"tax":10.5,"tags":[]}
+/items/foo/unset   {"name":"Foo","price":50.2}
+/items/bar/unset   {"name":"Bar","description":"The bartenders","price":62.0,"tax":20.2}
+/items/baz/unset   {"name":"Baz","description":null,"price":50.2,"tax":10.5,"tags":[]}
+/items/baz/none    {"name":"Baz","price":50.2,"tax":10.5,"tags":[]}
+/items/bar/name    {"name":"Bar","price":62.0}
+/broken   500 Internal Server Error
+/bypass   {"name":"No price","secret":"leaked"}
+ResponseValidationError
+1 validation error:
+  {'type': 'missing', 'loc': ('response', 'price'), 'msg': 'Field required', 'input': {'name': 'No price'}}
+
+  File "c4c.py", line 44, in broken
+    GET /broken
+```
+
+- **`exclude_unset`** keeps only fields that were present in the input data. `foo` set only `name` and `price`, so the defaults are dropped. `baz` explicitly set every field, even to their default values, so all of them stay. "Unset" means "never assigned", not "equal to the default". (For "equal to the default", use `response_model_exclude_defaults`.)
+- **`exclude_none`** drops fields whose value is `None`.
+- **`include` / `exclude`** pick fields by name. They work, but a separate output model is clearer and shows up correctly in the docs, whereas `include` still documents the full model.
+- **`/broken`** returned a dict missing a required field. That is a **server** bug, so the client gets a plain 500, and the server raises `ResponseValidationError` with the exact problem and the endpoint's location. The test client re-raises it so tests fail loudly.
+- **`/bypass`** returned a `JSONResponse` directly. Response objects skip validation and filtering entirely, so the `secret` field leaked even though the annotation says `Item`. If you return a `Response`, you own its content.
+
+## Status codes
+
+```python
+from pathlib import Path
+from fastapi import FastAPI, Response, status
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               PlainTextResponse, RedirectResponse)
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+TASKS = {1: "write docs"}
+
+
+@app.post("/tasks", status_code=status.HTTP_201_CREATED)
+async def create_task(title: str):
+    TASKS[len(TASKS) + 1] = title
+    return {"id": len(TASKS)}
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: int):
+    TASKS.pop(task_id, None)
+
+
+@app.put("/tasks/{task_id}")
+async def upsert_task(task_id: int, title: str, response: Response):
+    created = task_id not in TASKS
+    TASKS[task_id] = title
+    if created:
+        response.status_code = 201          # decided at runtime
+    return {"id": task_id, "created": created}
+
+
+@app.get("/page", response_class=HTMLResponse)
+async def page():
+    return "<h1>Hello</h1>"
+
+
+@app.get("/health", response_class=PlainTextResponse)
+async def health():
+    return "ok"
+
+
+@app.get("/old-docs")
+async def old_docs():
+    return RedirectResponse("/docs")
+
+
+@app.get("/moved", response_class=RedirectResponse, status_code=301)
+async def moved():
+    return "/new-home"
+
+
+@app.get("/report")
+async def report():
+    return FileResponse(Path(__file__).with_name("report.csv"), filename="report.csv")
+
+
+@app.get("/teapot")
+async def teapot():
+    return JSONResponse({"detail": "short and stout"}, status_code=418,
+                        headers={"X-Brew": "earl-grey"})
+
+
+c = TestClient(app, follow_redirects=False)
+def show(method, path, **kw):
+    r = c.request(method, path, **kw)
+    keep = ("content-type", "content-length", "location", "content-disposition", "etag", "last-modified", "x-brew")
+    headers = {k: v for k, v in r.headers.items() if k in keep}
+    print(f"{method} {path} -> {r.status_code} {headers} body={r.text!r}")
+
+show("POST", "/tasks?title=test")
+show("DELETE", "/tasks/1")
+show("PUT", "/tasks/9?title=new")
+show("PUT", "/tasks/9?title=again")
+show("GET", "/page")
+show("GET", "/health")
+show("GET", "/old-docs")
+show("GET", "/moved")
+show("GET", "/report")
+show("GET", "/teapot")
+```
+
+```text title="Output"
+POST /tasks?title=test -> 201 {'content-length': '8', 'content-type': 'application/json'} body='{"id":2}'
+DELETE /tasks/1 -> 204 {'content-type': 'application/json'} body=''
+PUT /tasks/9?title=new -> 201 {'content-length': '23', 'content-type': 'application/json'} body='{"id":9,"created":true}'
+PUT /tasks/9?title=again -> 200 {'content-length': '24', 'content-type': 'application/json'} body='{"id":9,"created":false}'
+GET /page -> 200 {'content-length': '14', 'content-type': 'text/html; charset=utf-8'} body='<h1>Hello</h1>'
+GET /health -> 200 {'content-length': '2', 'content-type': 'text/plain; charset=utf-8'} body='ok'
+GET /old-docs -> 307 {'content-length': '0', 'location': '/docs'} body=''
+GET /moved -> 301 {'content-length': '0', 'location': '/new-home'} body=''
+GET /report -> 200 {'content-type': 'application/vnd.ms-excel', 'content-disposition': 'attachment; filename="report.csv"', 'content-length': '22', 'last-modified': 'Tue, 13 Oct 2026 11:28:03 GMT', 'etag': '"2f6c9f6d7aae285eef4e85f8887f3450"'} body='id,name\n1,ada\n2,grace\n'
+GET /teapot -> 418 {'x-brew': 'earl-grey', 'content-length': '28', 'content-type': 'application/json'} body='{"detail":"short and stout"}'
+```
+
+- `status_code=` on the decorator sets the **default** success status and documents it in OpenAPI. Use the named constants in `fastapi.status` (`HTTP_201_CREATED`, `HTTP_404_NOT_FOUND`, ...) so the meaning is readable.
+- **204 No Content** must not have a body, and FastAPI strips it even if your function returned something. The function above returns `None` implicitly.
+- To pick the status **at runtime** without building your own response, declare a `response: Response` parameter. FastAPI injects a temporary response object, and copies its status code, headers and cookies onto the real response. The return value is still validated and serialized normally.
+
+Which code to use when:
+
+| Situation | Code |
+|---|---|
+| read succeeded | 200 OK |
+| resource created (`POST`) | 201 Created, ideally with a `Location` header |
+| accepted for async processing | 202 Accepted |
+| success, nothing to return (`DELETE`) | 204 No Content |
+| malformed request, or a business rule violated | 400 Bad Request |
+| not authenticated | 401 Unauthorized, with a `WWW-Authenticate` header |
+| authenticated but not allowed | 403 Forbidden |
+| resource doesn't exist | 404 Not Found |
+| state conflict (duplicate, version mismatch) | 409 Conflict |
+| validation failed | 422 Unprocessable Content (FastAPI's default) |
+| rate limited | 429 Too Many Requests, with `Retry-After` |
+| bug on the server | 500 Internal Server Error |
+| upstream dependency failed or timed out | 502 Bad Gateway / 503 Service Unavailable / 504 Gateway Timeout |
+
+The backend lesson [HTTP](/docs/backend-first-principles/05-http) covers the full set.
+
+## Custom Response classes
+
+Every response class is a Starlette `Response` subclass that knows how to turn content into bytes and which `Content-Type` to set:
+
+| Class | Use it for | Notes from the output above |
+|---|---|---|
+| `JSONResponse` | the default. JSON via `json.dumps` | returning it directly skips the response model |
+| `HTMLResponse` | server-rendered pages | `text/html; charset=utf-8` |
+| `PlainTextResponse` | health checks, plain strings | `text/plain; charset=utf-8` |
+| `RedirectResponse` | redirects | **307** by default, which keeps the method and body. Pass `status_code=301`, `302`, `303` or `308` as needed |
+| `FileResponse` | serving a file from disk | streams the file in chunks, sets `Content-Length`, `Last-Modified` and an `ETag`, and `filename=` adds `Content-Disposition: attachment` |
+| `StreamingResponse` | any iterator or async iterator of chunks | see [WebSockets and streaming](/docs/fastapi/websockets-and-streaming) and [Streaming LLM responses](/docs/fastapi/streaming-llm-responses) |
+
+There are two ways to use them:
+
+- **`response_class=` on the decorator**: you return plain content (`"<h1>Hello</h1>"`), and FastAPI wraps it in that class. The OpenAPI docs show the right media type. For `RedirectResponse` you return the URL.
+- **Return an instance**: full control over content, status, headers and media type, but no response model processing.
+
+<Callout type="warn">
+`FileResponse` guesses the media type from the file extension using the OS's MIME database. On this Windows machine, a `.csv` came back as `application/vnd.ms-excel` instead of `text/csv`. If clients depend on the type, pass `media_type="text/csv"` explicitly.
+</Callout>
+
+## Headers and cookies
+
+```python
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+@app.post("/login")
+async def login(response: Response):
+    response.headers["X-Login-Count"] = "1"
+    response.set_cookie("session", "abc123", httponly=True, secure=True,
+                        samesite="lax", max_age=3600)
+    return {"ok": True}
+
+
+@app.post("/logout")
+async def logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie("session")
+    return response
+
+
+@app.get("/secure")
+async def secure(token: str | None = None):
+    if token is None:
+        raise HTTPException(status_code=401, detail="Not authenticated",
+                            headers={"WWW-Authenticate": "Bearer"})
+    if token != "good":
+        raise HTTPException(status_code=403,
+                            detail={"code": "token_revoked", "hint": "log in again"})
+    return {"ok": True}
+
+
+c = TestClient(app)
+r = c.post("/login")
+print(r.status_code, r.json(), "| x-login-count:", r.headers["x-login-count"])
+print("set-cookie:", r.headers["set-cookie"])
+r = c.post("/logout")
+print("set-cookie:", r.headers["set-cookie"])
+r = c.get("/secure")
+print(r.status_code, r.json(), "| www-authenticate:", r.headers["www-authenticate"])
+r = c.get("/secure?token=bad")
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+200 {'ok': True} | x-login-count: 1
+set-cookie: session=abc123; HttpOnly; Max-Age=3600; Path=/; SameSite=lax; Secure
+set-cookie: session=""; expires=Tue, 13 Oct 2026 11:28:13 GMT; Max-Age=0; Path=/; SameSite=lax
+401 {'detail': 'Not authenticated'} | www-authenticate: Bearer
+403 {'detail': {'code': 'token_revoked', 'hint': 'log in again'}}
+```
+
+- The injected `response: Response` parameter is the easiest way to add headers and cookies while still returning data that goes through the response model.
+- `set_cookie` builds the `Set-Cookie` header with all the attributes. For session cookies, always set `httponly=True` (JavaScript can't read it), `secure=True` (HTTPS only) and a `samesite` policy. See [Authentication and security](/docs/fastapi/authentication-and-security).
+- `delete_cookie` doesn't delete anything on the server. It sends the same cookie with an empty value and `Max-Age=0`, and the browser removes it.
+
+## `HTTPException`
+
+`raise HTTPException(status_code, detail, headers)` is how an endpoint (or a dependency, at any depth) stops processing and returns an error. It is an **exception**, not a return value, so it unwinds through every function call in between. That is why it's so convenient inside [dependencies](/docs/fastapi/dependency-injection): `get_current_user()` can raise 401 and the endpoint never runs.
+
+The default handler turns it into `{"detail": <detail>}` with the given status and headers. As the 403 above shows, `detail` can be any JSON-serializable value, not only a string.
+
+There are two `HTTPException` classes:
+
+- `starlette.exceptions.HTTPException`, raised by Starlette itself, for example by the router for 404 and 405.
+- `fastapi.HTTPException`, a **subclass** of it that you raise in your code. It allows any JSON value as `detail` and accepts `headers`.
+
+That subclass relationship matters as soon as you register handlers.
+
+## Custom exception handlers
+
+An exception handler maps an exception class to a response. Register one with `@app.exception_handler(SomeException)`. Then any code inside a request can raise that exception, and the handler builds the reply:
+
+```python
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+print("fastapi HTTPException subclasses starlette's:", issubclass(HTTPException, StarletteHTTPException))
+
+app = FastAPI()
+
+
+class InsufficientFunds(Exception):
+    def __init__(self, balance: int, needed: int):
+        self.balance, self.needed = balance, needed
+
+
+@app.exception_handler(InsufficientFunds)
+async def insufficient_funds_handler(request: Request, exc: InsufficientFunds):
+    return JSONResponse(status_code=409, content={
+        "detail": f"balance {exc.balance} is less than {exc.needed}",
+        "path": request.url.path,
+    })
+
+
+@app.exception_handler(HTTPException)        # only the FastAPI subclass
+async def http_handler(request: Request, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={"custom": exc.detail})
+
+
+@app.post("/pay")
+async def pay(amount: int):
+    raise InsufficientFunds(balance=10, needed=amount)
+
+
+@app.get("/missing")
+async def missing():
+    raise HTTPException(404, "Item not found")
+
+
+@app.get("/boom")
+async def boom():
+    return 1 / 0
+
+
+c = TestClient(app, raise_server_exceptions=False)
+for m, p in [("POST", "/pay?amount=50"), ("GET", "/missing"), ("GET", "/no-such-route"), ("GET", "/boom")]:
+    r = c.request(m, p)
+    print(f"{m} {p:<15} -> {r.status_code} {r.headers['content-type']:<26} {r.text}")
+```
+
+```text title="Output"
+fastapi HTTPException subclasses starlette's: True
+POST /pay?amount=50  -> 409 application/json           {"detail":"balance 10 is less than 50","path":"/pay"}
+GET /missing        -> 404 application/json           {"custom":"Item not found"}
+GET /no-such-route  -> 404 application/json           {"detail":"Not Found"}
+GET /boom           -> 500 text/plain; charset=utf-8  Internal Server Error
+```
+
+Three lessons in four lines:
+
+- **Domain exceptions keep endpoints clean.** Service code raises `InsufficientFunds` without knowing anything about HTTP, and one handler decides it means 409. That keeps your business logic free of status codes. See [Controllers, services, repositories and middleware](/docs/backend-first-principles/10-controllers-services-repositories-middleware).
+- **A handler for `fastapi.HTTPException` misses the router's 404.** The router raises the Starlette base class, and handlers match by the exception's class hierarchy (most specific registered class first). Register the handler for `starlette.exceptions.HTTPException` to catch both.
+- **An unhandled exception becomes a plain-text 500.** `ServerErrorMiddleware`, the outermost layer, catches it. That's not JSON, so a client that always parses JSON breaks on it.
+
+Where each handler runs, using the middleware stack from [ASGI and the request lifecycle](/docs/fastapi/asgi-and-the-request-lifecycle):
+
+<Mermaid chart={`flowchart TB
+  SE["ServerErrorMiddleware<br/>handler for Exception or 500<br/>logs, then re-raises"] --> UM["your middleware"]
+  UM --> EM["ExceptionMiddleware<br/>handlers for HTTPException,<br/>RequestValidationError, your classes"]
+  EM --> RT["router and endpoint"]
+  RT -. "raise InsufficientFunds" .-> EM
+  RT -. "raise HTTPException" .-> EM
+  RT -. "validation fails" .-> EM
+  RT -. "ZeroDivisionError" .-> SE`} />
+
+Handlers for `Exception` (or status `500`) are installed in `ServerErrorMiddleware`, outside your own middleware. All other handlers live in `ExceptionMiddleware`, inside it. So an exception raised **in your middleware** can only be caught by the `Exception` handler.
+
+## Overriding the validation error handler
+
+`RequestValidationError` is an exception too, raised by FastAPI when parameter validation fails, and you can replace its handler. Here it is changed to return 400 with a flat `field: message` map:
+
+```python
+import json
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    print("errors():", exc.errors())
+    print("body:", exc.body)
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"message": "invalid request",
+                 "fields": {".".join(map(str, e["loc"][1:])): e["msg"] for e in exc.errors()}},
+    )
+
+
+class Signup(BaseModel):
+    email: str = Field(pattern=r".+@.+")
+    age: int = Field(ge=13)
+
+
+@app.post("/signup")
+async def signup(data: Signup):
+    return data
+
+
+c = TestClient(app)
+r = c.post("/signup", json={"email": "nope", "age": 9})
+print(r.status_code, json.dumps(r.json(), indent=2))
+```
+
+```text title="Output"
+errors(): [{'type': 'string_pattern_mismatch', 'loc': ('body', 'email'), 'msg': "String should match pattern '.+@.+'", 'input': 'nope', 'ctx': {'pattern': '.+@.+'}}, {'type': 'greater_than_equal', 'loc': ('body', 'age'), 'msg': 'Input should be greater than or equal to 13', 'input': 9, 'ctx': {'ge': 13}}]
+body: {'email': 'nope', 'age': 9}
+400 {
+  "message": "invalid request",
+  "fields": {
+    "email": "String should match pattern '.+@.+'",
+    "age": "Input should be greater than or equal to 13"
+  }
+}
+```
+
+The exception carries everything: `exc.errors()` is the list you saw in the default 422 (with `loc` as tuples), and `exc.body` is the parsed body. The handler decides what the client sees. Dropping `input` from the response is a good default, because it can echo back secrets.
+
+If you only want to **add** something (logging, metrics) and keep the default response, call FastAPI's own handler from yours: `from fastapi.exception_handlers import request_validation_exception_handler`, then `return await request_validation_exception_handler(request, exc)`.
+
+## A consistent error envelope
+
+Clients are much simpler to write when **every** error has the same shape: your domain errors, `HTTPException`, the router's 404 and 405, validation errors and crashes. Here is a complete setup:
+
+```python
+import logging, uuid
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+log = logging.getLogger("api")
+
+
+class ErrorBody(BaseModel):
+    code: str
+    message: str
+    details: Any = None
+    request_id: str
+
+
+class ErrorEnvelope(BaseModel):
+    error: ErrorBody
+
+
+class AppError(Exception):
+    status_code = 400
+    code = "bad_request"
+
+    def __init__(self, message: str, details: Any = None):
+        super().__init__(message)
+        self.message, self.details = message, details
+
+
+class NotFound(AppError):
+    status_code, code = 404, "not_found"
+
+
+class Conflict(AppError):
+    status_code, code = 409, "conflict"
+
+
+def envelope(request: Request, status: int, code: str, message: str,
+             details: Any = None, headers: dict | None = None) -> JSONResponse:
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    body = ErrorEnvelope(error=ErrorBody(code=code, message=message,
+                                         details=details, request_id=request_id))
+    return JSONResponse(body.model_dump(), status_code=status,
+                        headers={**(headers or {}), "X-Request-ID": request_id})
+
+
+def install_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AppError)
+    async def app_error(request: Request, exc: AppError):
+        return envelope(request, exc.status_code, exc.code, exc.message, exc.details)
+
+    @app.exception_handler(StarletteHTTPException)       # catches router 404/405 too
+    async def http_error(request: Request, exc: StarletteHTTPException):
+        code = {401: "unauthenticated", 403: "forbidden", 404: "not_found",
+                405: "method_not_allowed"}.get(exc.status_code, "http_error")
+        return envelope(request, exc.status_code, code, str(exc.detail),
+                        headers=getattr(exc, "headers", None))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        details = [{"field": ".".join(map(str, e["loc"])), "message": e["msg"], "type": e["type"]}
+                   for e in exc.errors()]
+        return envelope(request, 422, "validation_error", "Request is invalid", details)
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, exc: Exception):
+        log.exception("unhandled error")                 # full traceback goes to the logs
+        return envelope(request, 500, "internal_error", "Something went wrong")
+
+
+app = FastAPI(responses={422: {"model": ErrorEnvelope}, 404: {"model": ErrorEnvelope}})
+install_error_handlers(app)
+
+
+class Order(BaseModel):
+    sku: str
+    quantity: int
+
+
+@app.post("/orders", status_code=201)
+async def create_order(order: Order):
+    if order.sku == "dup":
+        raise Conflict("Order already exists", {"sku": order.sku})
+    return order
+
+
+@app.get("/orders/{order_id}")
+async def get_order(order_id: int):
+    raise NotFound(f"Order {order_id} does not exist")
+
+
+@app.get("/admin")
+async def admin():
+    raise HTTPException(401, "Not authenticated", headers={"WWW-Authenticate": "Bearer"})
+
+
+@app.get("/crash")
+async def crash():
+    {}["missing"]
+
+
+logging.basicConfig(level=logging.CRITICAL)   # keep the demo output short
+c = TestClient(app, raise_server_exceptions=False)
+H = {"X-Request-ID": "req-42"}
+cases = [
+    ("POST", "/orders", {"json": {"sku": "dup", "quantity": 1}}),
+    ("POST", "/orders", {"json": {"sku": "a1", "quantity": "lots"}}),
+    ("GET", "/orders/7", {}),
+    ("GET", "/admin", {}),
+    ("GET", "/nowhere", {}),
+    ("DELETE", "/admin", {}),
+    ("GET", "/crash", {}),
+]
+for method, path, kw in cases:
+    r = c.request(method, path, headers=H, **kw)
+    extra = f"  www-authenticate={r.headers['www-authenticate']}" if "www-authenticate" in r.headers else ""
+    print(f"{method} {path} -> {r.status_code}{extra}\n  {r.text}")
+```
+
+```text title="Output"
+POST /orders -> 409
+  {"error":{"code":"conflict","message":"Order already exists","details":{"sku":"dup"},"request_id":"req-42"}}
+POST /orders -> 422
+  {"error":{"code":"validation_error","message":"Request is invalid","details":[{"field":"body.quantity","message":"Input should be a valid integer, unable to parse string as an integer","type":"int_parsing"}],"request_id":"req-42"}}
+GET /orders/7 -> 404
+  {"error":{"code":"not_found","message":"Order 7 does not exist","details":null,"request_id":"req-42"}}
+GET /admin -> 401  www-authenticate=Bearer
+  {"error":{"code":"unauthenticated","message":"Not authenticated","details":null,"request_id":"req-42"}}
+GET /nowhere -> 404
+  {"error":{"code":"not_found","message":"Not Found","details":null,"request_id":"req-42"}}
+DELETE /admin -> 405
+  {"error":{"code":"method_not_allowed","message":"Method Not Allowed","details":null,"request_id":"req-42"}}
+GET /crash -> 500
+  {"error":{"code":"internal_error","message":"Something went wrong","details":null,"request_id":"req-42"}}
+```
+
+Seven very different failures, one shape. The design choices:
+
+- **`code` is for machines, `message` is for humans.** Clients branch on `code` (`conflict`, `validation_error`), which never changes when you reword a message.
+- **A small exception hierarchy** (`AppError` → `NotFound`, `Conflict`) carries the status and code with the class, so raising code stays one line.
+- **The `StarletteHTTPException` handler** catches both your `HTTPException`s and the router's 404 and 405, and it forwards `headers` so `WWW-Authenticate` and `Allow` survive.
+- **The 500 handler logs the traceback and returns nothing internal.** Stack traces, SQL and file paths in a response help attackers, not users. `ServerErrorMiddleware` also re-raises the exception after sending the response, so the server's own error logging and the test client still see it.
+- **`request_id`** ties a client's error report to your logs. Here it is echoed from the `X-Request-ID` header or generated. In a real app, a middleware assigns it to every request (see [Middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks) and [Logging, monitoring and observability](/docs/backend-first-principles/18-logging-monitoring-observability)).
+- **`responses=` on the app** documents the envelope in OpenAPI, so generated clients know the error shape:
+
+```python
+import json
+spec = c.get("/openapi.json").json()
+print(json.dumps(spec["paths"]["/orders"]["post"]["responses"]["422"]))
+print(json.dumps(spec["paths"]["/orders/{order_id}"]["get"]["responses"]["404"]))
+```
+
+```text title="Output"
+{"description": "Unprocessable Content", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}}
+{"content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}, "description": "Not Found"}
+```
+
+If you'd rather follow a standard than invent a shape, [RFC 9457 "Problem Details"](https://www.rfc-editor.org/rfc/rfc9457) defines `type`, `title`, `status`, `detail` and `instance` fields with the media type `application/problem+json`. The handler structure is identical. Only `envelope()` changes.
+
+## Traps
+
+- **Returning data with no response model.** Every field of the object goes out, including passwords and internal flags. Always declare a return type or `response_model` on endpoints that return stored data.
+- **Returning a `Response` object and expecting the response model to filter it.** Responses skip validation and filtering entirely.
+- **Reusing the input model as the output model.** `UserIn` contains the password. Split models per direction.
+- **`Decimal` without a response model** is serialized as a float, which loses precision. With a model, it's a string.
+- **Confusing `exclude_unset` with `exclude_defaults`.** A field explicitly set to its default value is "set".
+- **Registering a handler for `fastapi.HTTPException` and expecting it to catch 404 for unknown routes.** The router raises Starlette's base class. Register for `starlette.exceptions.HTTPException`.
+- **Forgetting the 500 handler.** The default 500 is `text/plain`, so JSON clients crash while parsing the error.
+- **Putting tracebacks or exception messages in 500 responses.** Log them with the request ID, and return a generic message.
+- **Returning the default 422 to the public.** Its `input` field echoes what the client sent. Strip it in a custom handler.
+- **`RedirectResponse` defaults to 307**, not 302. That's usually right for APIs (method preserved), but after a form `POST` that should land on a `GET` page, use 303.
+- **`FileResponse` media types depend on the OS MIME database.** Pass `media_type` explicitly when it matters.
+- **Catching exceptions too broadly in endpoints** (`except Exception: return {"ok": False}`) hides bugs and returns 200 for failures. Let them propagate to the handlers.
+
+## Summary
+
+- A return value is either sent as-is (a `Response`), validated and serialized by Pydantic (a response model is set), or converted by `jsonable_encoder` and `json.dumps` (no model).
+- A response model validates, **filters** and documents. Split input and output models (`UserIn`, `UserOut`, `UserInDB`) so secrets never leave the server. Pydantic v2 serializes by the declared type.
+- `response_model_exclude_unset`, `_exclude_none`, `_include` and `_exclude` trim output. Separate models are usually clearer.
+- Set the success status with `status_code=`. Change it at runtime, and add headers and cookies, through an injected `response: Response`.
+- Response classes (`JSONResponse`, `HTMLResponse`, `PlainTextResponse`, `RedirectResponse`, `FileResponse`, `StreamingResponse`) control the bytes and the `Content-Type`.
+- `HTTPException` unwinds from any depth. Domain exceptions plus handlers keep HTTP out of your business logic.
+- Register handlers for your `AppError` base, `starlette.exceptions.HTTPException`, `RequestValidationError` and `Exception` to give every failure one envelope with a machine-readable `code` and a `request_id`.

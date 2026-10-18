@@ -1,0 +1,702 @@
+---
+title: "8. Embeddings"
+description: "An embedding is a fixed-size vector that represents the meaning of a piece of content — a word, sentence, paragraph, image, or audio clip. Two pieces of..."
+---
+
+<Callout type="info">
+  How to read this chapter:
+  - 📘 **Handbook**: the original chapter text, unchanged apart from diagrams redrawn as Mermaid.
+  - 🔧 **Going deeper**: code and extra depth on topics the handbook already covers.
+  - ➕ **Beyond the handbook**: topics the original chapter does not cover at all.
+</Callout>
+
+## 8.1 Concept Explanation
+
+An embedding is a fixed-size vector that represents the meaning of a piece of content — a word, sentence, paragraph, image, or audio clip. Two pieces of content that mean similar things end up with vectors that point in similar directions. This single property turns search from keyword matching into semantic understanding.
+
+Without embeddings, "how do I reset my password" matches the documentation page titled "Password Reset Procedure" only if the keywords overlap. With embeddings, the two are recognized as semantically equivalent regardless of wording. Every retrieval-augmented system, semantic search engine, and recommendation system in the modern stack rests on this.
+
+## 8.2 Internal Working
+
+An embedding model is a neural network — typically a transformer encoder — trained so that semantically similar inputs map to nearby vectors and dissimilar inputs map to distant vectors. The training objective is contrastive: given positive pairs (a question and its answer, two paraphrases) and negative pairs (unrelated content), pull the positives together and push the negatives apart in vector space.
+
+After training, the model is frozen. To embed text, you pass it through the encoder, which outputs a fixed-size vector (typically 384, 768, 1024, 1536, 3072, or 4096 dimensions). The vector is then ready for comparison via cosine similarity or dot product.
+
+Conceptually: imagine a giant high-dimensional sphere. Each piece of text is a point on the sphere. Similar texts cluster; unrelated texts spread out. Retrieval is finding the points nearest to your query point.
+
+## 8.3 Why Vectors Work as Meaning
+
+Linguistic meaning is relational. "King" is to "queen" as "man" is to "woman." That relation, in a well-trained embedding space, becomes vector arithmetic: the direction from "king" to "queen" is approximately the same as the direction from "man" to "woman." This is not a parlor trick — it reflects the fact that the model learned a geometry that mirrors human semantic structure.
+
+For retrieval, the relational property matters less than the *similarity* property. We rarely do arithmetic on embeddings in production. We do nearest-neighbor search.
+
+## 8.4 Similarity Metrics in Practice
+
+**Cosine similarity** is the angle between two vectors, normalized to [-1, 1]. It is the default in most production systems because it is robust to vector magnitude and works naturally on normalized embeddings.
+
+**Dot product** is cosine similarity multiplied by both magnitudes. If both vectors are unit-normalized, dot product equals cosine similarity, and dot product is computed faster on most hardware. Most modern embedding models output normalized vectors precisely so you can use dot product.
+
+**Euclidean (L2) distance** is the straight-line distance. Less common for semantic search but sometimes used in image retrieval or when vector magnitude itself carries meaning.
+
+The choice rarely affects results when embeddings are normalized. The choice does affect index format and query speed; vector databases let you pick.
+
+### Normalization and metric choice in code 🔧
+
+The claim "dot product equals cosine on unit vectors" is worth seeing in code, because it decides which operator and index class you use.
+
+**Problem.** Teams pick a metric in the vector DB that does not match how the model was trained, or they mix normalized and unnormalized vectors in one index. Rankings then shift in ways that are hard to debug.
+
+**Why it happens (first principles).** Cosine similarity is `dot(a, b) / (norm(a) * norm(b))`. If every vector has norm 1, the denominator is 1 and cosine collapses to the dot product. If norms vary, the dot product rewards long vectors, so a document can rank high because its vector is long, not because it is close in direction. L2 distance on unit vectors is also tied to cosine: `L2(a, b)^2 = 2 - 2 * cos(a, b)`, so all three metrics produce the same ranking once vectors are normalized.
+
+**Mechanism.** Normalize once at write time and once at query time, then use the cheapest operator. In pgvector the operators are `<=>` (cosine distance), `<#>` (negative inner product) and `<->` (L2). The index must be built with the matching operator class (`vector_cosine_ops`, `vector_ip_ops`, `vector_l2_ops`), or the planner will not use it.
+
+**Implementation.**
+
+```python
+import numpy as np
+
+
+# Normalize to unit length so cosine, dot product and L2 all rank the same way.
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32)
+    norm = np.linalg.norm(v)
+    if norm == 0:
+        raise ValueError("zero vector: embedding call probably failed")
+    return v / norm
+
+
+def dot(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape:
+        raise ValueError(f"dim mismatch {a.shape} vs {b.shape}")
+    return float(a @ b)
+```
+
+```sql
+-- Vectors are stored normalized, so inner product is safe and slightly cheaper.
+CREATE INDEX ON chunks USING hnsw (embedding vector_ip_ops);
+-- <#> returns the NEGATIVE inner product, so ascending order = most similar first.
+SELECT id FROM chunks ORDER BY embedding <#> $1 LIMIT 10;
+```
+
+**Edge cases and failure modes.**
+- `<#>` is negated so that "smaller is better" holds for every operator. Forgetting this and sorting descending returns the least similar rows.
+- A query that uses `<=>` against an index built with `vector_ip_ops` falls back to a sequential scan. Check with `EXPLAIN`.
+- A zero vector (often the result of an empty string or a failed call that returned a default) has no direction. Cosine is undefined for it. Reject it at ingestion.
+- If you truncate Matryoshka vectors yourself (see 8.11a), the result is no longer unit length. Normalize again.
+
+## 8.5 Major Embedding Models
+
+**OpenAI embeddings** — text-embedding-3-small and text-embedding-3-large. Pay-per-token, no infrastructure to manage, strong out-of-the-box quality. The "small" model at 1536 dimensions hits a great cost/quality point. Both support Matryoshka truncation — you can store fewer dimensions for cost savings without re-embedding.
+
+**Cohere Embed v3** — strong multilingual support, separate models for documents and queries (an asymmetric retrieval setup that improves quality).
+
+**Voyage AI** — leaderboard-topping embedding models with strong domain-specific variants (code, finance, law).
+
+**BGE (BAAI General Embeddings)** — leading open-source family. bge-large, bge-m3 (multilingual + multi-vector), and reranker variants. Free to self-host. m3 is notable for handling 8K context.
+
+**E5 (Microsoft)** — open-source family with multilingual variants. e5-mistral-7b uses a Mistral backbone for strong reasoning-heavy retrieval.
+
+**Instructor models (HKUNLP)** — accept an instruction alongside the text ("Represent this medical question for retrieval"), letting one model serve many domains.
+
+**Sentence-Transformers (SBERT)** — the classic open-source family, still widely used. Smaller models like all-MiniLM-L6-v2 produce 384-dim embeddings cheaply.
+
+**Nomic, Jina, Mixedbread** — newer open-source labs producing competitive embeddings, often with permissive licenses.
+
+## 8.6 Embedding Generation in Production
+
+The ingestion pipeline:
+1. Source documents from your data systems.
+2. Chunk them (Chapter 10 covers chunking strategy in depth).
+3. Embed each chunk.
+4. Store embeddings plus metadata in a vector database.
+
+Throughput considerations:
+- A single A10G GPU can embed thousands of chunks per second with a small embedding model.
+- Batching matters; embedding 32 chunks at once is much more than 32× faster than one at a time.
+- API-based embedding is cheap until volume is huge; self-hosted wins at scale but requires GPU operations expertise.
+
+### A batched ingestion worker in Python 🔧
+
+The four steps above look trivial until you run them over a million chunks, so here is what a production worker actually has to do.
+
+**Problem.** A naive loop (one API call per chunk, one `INSERT` per row) is slow, hits rate limits, re-pays for unchanged text on every run, and leaves the table half written when it crashes.
+
+**Why it happens.** Each embedding request has a fixed overhead (network round trip, request scheduling on the provider's GPUs) that dominates when the payload is one short chunk. GPUs are throughput machines: a batch of 64 inputs costs little more wall time than one. On the database side, every single-row insert is its own transaction with its own WAL flush.
+
+**Mechanism.**
+1. Hash each chunk's text (plus the model name). If the hash is already stored, skip it. This is what makes re-runs cheap.
+2. Send the remaining chunks in batches, with a small concurrency limit so you stay under the provider's tokens-per-minute quota.
+3. Write each batch in one transaction with an idempotent upsert, so a retry after a crash does no harm.
+
+**Implementation** (OpenAI Python SDK, async SQLAlchemy 2.x, and the `pgvector` Python package for the `Vector` column type):
+
+```python
+import hashlib
+from dataclasses import dataclass
+
+from openai import AsyncOpenAI
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import Column, MetaData, Table, Text, select
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import create_async_engine
+
+openai = AsyncOpenAI(max_retries=5)  # SDK retries 429 and 5xx with backoff
+engine = create_async_engine("postgresql+psycopg://...")
+MODEL = "text-embedding-3-small"
+BATCH = 64
+
+chunks = Table(
+    "chunks",
+    MetaData(),
+    Column("id", Text, primary_key=True),
+    Column("doc_id", Text),
+    Column("text", Text),
+    Column("content_hash", Text),
+    Column("embedding_model", Text),
+    Column("embedding", Vector(1536)),  # serializes Python lists / numpy arrays
+)
+
+
+@dataclass(frozen=True)
+class Chunk:
+    id: str
+    doc_id: str
+    text: str
+
+
+def hash_of(text: str) -> str:
+    return hashlib.sha256(f"{MODEL}\0{text}".encode()).hexdigest()
+
+
+async def embed_chunks(items: list[Chunk]) -> None:
+    # 1. Skip chunks whose (model, text) hash is already stored.
+    hashes = [hash_of(c.text) for c in items]
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            select(chunks.c.content_hash).where(chunks.c.content_hash.in_(hashes))
+        )
+        seen = set(result.scalars())
+    todo = [(c, h) for c, h in zip(items, hashes, strict=True) if h not in seen]
+
+    # 2. Batch the API calls.
+    for i in range(0, len(todo), BATCH):
+        batch = todo[i : i + BATCH]
+        res = await openai.embeddings.create(model=MODEL, input=[c.text for c, _ in batch])
+
+        rows = []
+        for item in res.data:
+            c, h = batch[item.index]  # use .index, do not rely on list order
+            rows.append({
+                "id": c.id, "doc_id": c.doc_id, "text": c.text,
+                "content_hash": h, "embedding_model": MODEL, "embedding": item.embedding,
+            })
+
+        # 3. One transaction per batch, idempotent upsert.
+        stmt = insert(chunks)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[chunks.c.id],
+            set_={
+                "text": stmt.excluded.text,
+                "content_hash": stmt.excluded.content_hash,
+                "embedding_model": stmt.excluded.embedding_model,
+                "embedding": stmt.excluded.embedding,
+            },
+        )
+        async with engine.begin() as conn:  # COMMIT on success, ROLLBACK on exception
+            await conn.execute(stmt, rows)
+```
+
+**Edge cases and failure modes.**
+- **Per-request limits.** Providers cap both the number of inputs and the total tokens per request. A batch of 64 long chunks can exceed the token cap even though 64 short ones would not. Batch by token count, not just by item count, when chunk sizes vary.
+- **Empty strings.** An empty input is either rejected or embedded to something meaningless. Filter them before the call.
+- **Hash must include the model.** Otherwise switching models (8.12b) looks like "nothing changed" and the old vectors survive.
+- **Partial failures.** If batch 40 of 100 fails after retries, batches 1 to 39 are committed and the hash check makes the re-run resume where it stopped. That is the point of idempotency.
+- **Index maintenance during bulk loads.** Inserting millions of rows into a table that already has an HNSW index is much slower than loading first and building the index after. See [9.7a](/docs/genai-handbook/09-vector-databases).
+
+## 8.6a Input length limits and silent truncation ➕
+
+Batching raises a question the handbook does not address: what happens when a chunk is longer than the embedding model can read.
+
+### The problem
+
+Every embedding model has a maximum input length measured in tokens. Text past that limit is either rejected with an error or silently cut off. Silent truncation is the dangerous case: the chunk is stored, it has a valid vector, and nothing in the logs says that its second half was never read.
+
+### Why it happens
+
+A transformer encoder has a fixed positional range (learned or extended positions up to some maximum), and attention cost grows with sequence length. Libraries handle overlong input by truncating to the model's `max_seq_length` rather than failing, because failing would break batch jobs. Examples worth knowing (check each model card, as defaults change):
+- The OpenAI `text-embedding-3` models accept up to 8,192 input tokens and return an error above that.
+- `sentence-transformers/all-MiniLM-L6-v2` truncates input longer than 256 word pieces, without an error. Its training data used even shorter sequences.
+- Long-context open models (for example BGE-M3 at 8,192 tokens) exist, but quality over very long inputs is usually lower than over passage-sized inputs, because a single vector has to summarize more content.
+
+### Mechanism: measure, then decide
+
+Count tokens with the model's own tokenizer before embedding. If a chunk is over the limit, re-chunk it. Do not rely on truncation.
+
+```python
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+limit = model.max_seq_length            # 256 for this model
+tok = model.tokenizer
+
+def overlong(texts: list[str]) -> list[int]:
+    """Indexes of texts the model would silently truncate."""
+    out = []
+    for i, t in enumerate(texts):
+        n = len(tok(t, add_special_tokens=True)["input_ids"])
+        if n > limit:
+            out.append(i)
+    return out
+
+chunks = ["short text", "a very long section " * 200]
+print(overlong(chunks))  # [1]  -> re-chunk these before encoding
+```
+
+### Edge cases and failure modes
+
+- **Tokenizer mismatch.** Your chunker probably counts tokens with an LLM tokenizer (for example `tiktoken`), while the embedding model uses a different one. A 512-token chunk by one tokenizer can be 600 by another. Measure with the embedding model's tokenizer.
+- **Prefixes count.** The `query:` / `passage:` prefixes from 8.7 and any contextual header (see [Contextual retrieval](/docs/genai-handbook/10-rag)) take tokens from the same budget.
+- **Chunk size vs model limit.** A model that accepts 8,192 tokens does not mean 8,192-token chunks are a good idea. Retrieval precision usually drops as chunks get longer, since one vector has to represent several topics. Chunk for retrieval quality, then check the limit as a safety net.
+
+## 8.7 Asymmetric vs Symmetric Embeddings
+
+**Symmetric** — the same model embeds both queries and documents. Used when query and document are similar in length and style.
+
+**Asymmetric** — separate (or differently prompted) encoders for queries and documents. Used when queries are short ("how do I reset my password") and documents are long (a passage of help docs). Asymmetric setups typically outperform symmetric for question-answering retrieval.
+
+Practical pattern: prefix queries with a marker ("query: how do I reset my password") and documents with another ("passage: To reset your password, navigate to..."). Many BGE and E5 models expect this convention.
+
+### Applying the prefixes correctly 🔧
+
+The prefix convention is easy to state and easy to get subtly wrong, so here is the mechanism and a working example.
+
+**Why prefixes work.** Asymmetric models were trained on (query, passage) pairs where each side carried its marker. The marker is a token sequence the encoder learned to condition on: with `query:` it produces a vector tuned to "what is being asked", with `passage:` a vector tuned to "what this text contains". Leave the marker out and you feed the model inputs unlike anything it saw in training, so quality drops, often by a few points of recall and with no error.
+
+**Implementation** (sentence-transformers; the `prompt` argument prepends a string to every input):
+
+```python
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("intfloat/e5-base-v2")
+
+docs = ["To reset your password, open Settings and choose Security.",
+        "Invoices are emailed on the first business day of each month."]
+doc_vecs = model.encode(docs, prompt="passage: ", normalize_embeddings=True, batch_size=64)
+q_vec = model.encode("how do I reset my password", prompt="query: ", normalize_embeddings=True)
+
+scores = doc_vecs @ q_vec        # unit vectors, so dot product == cosine
+print(scores.argsort()[::-1])    # [0 1]
+```
+
+**Edge cases and failure modes.**
+- **Each model family has its own markers.** E5 uses `query: ` and `passage: `. BGE English v1.5 recommends an instruction prefix on queries only and nothing on passages. Instructor and many LLM-based embedders take a full task instruction. Copy the exact strings from the model card, including the trailing space.
+- **Symmetric tasks.** For clustering or duplicate detection, both sides are "documents". E5 suggests `query: ` on both sides for symmetric tasks. Using `passage:` on one and `query:` on the other for a duplicate check skews scores.
+- **Prefixes must be identical at write and read time, forever.** Store the prefix in the same metadata as the model version (8.20). Changing it is a re-embed, just like changing the model.
+- **Managed APIs.** Cohere exposes this as an `input_type` parameter (`search_query` vs `search_document`) instead of a text prefix. OpenAI's `text-embedding-3` models are used without prefixes.
+
+## 8.7a Late interaction: ColBERT and multi-vector retrieval ➕
+
+Asymmetric encoders still squeeze each passage into one vector, and late interaction is the main alternative that does not.
+
+### The problem: one vector loses detail
+
+A single vector for a 400-token passage is an average over everything in it. If the query is about one specific clause, that clause's signal is diluted by the rest of the passage. This is why single-vector (bi-encoder) retrieval misses passages that a careful reader would call relevant, and why rerankers (10.9) help so much.
+
+### Why it happens (first principles)
+
+A bi-encoder must decide what to keep before it has seen the query, since documents are encoded offline. A cross-encoder reads query and document together, so it can attend to exactly the relevant tokens, but it cannot be precomputed and is far too slow to run over a whole corpus. Late interaction sits in between: encode documents offline, but keep one vector per token, and do the query-document interaction at search time with a cheap operation.
+
+### Mechanism: MaxSim
+
+ColBERT (Khattab and Zaharia, 2020) encodes a query into `m` token vectors and a document into `n` token vectors. The score is:
+
+```text
+score(q, d) = sum over each query token i of  max over document tokens j of  dot(q_i, d_j)
+```
+
+Each query token finds its best matching document token, and the matches are added up. A query about "refund window for annual plans" can then match "refund", "window" and "annual" in different parts of the passage, each at full strength.
+
+```python
+import numpy as np
+
+def maxsim(q_tokens: np.ndarray, d_tokens: np.ndarray) -> float:
+    """q_tokens: (m, dim), d_tokens: (n, dim); rows are L2-normalized."""
+    sim = q_tokens @ d_tokens.T          # (m, n) token-to-token similarities
+    return float(sim.max(axis=1).sum())  # best doc token per query token, summed
+
+rng = np.random.default_rng(0)
+norm = lambda x: x / np.linalg.norm(x, axis=1, keepdims=True)
+q = norm(rng.normal(size=(8, 128)))
+docs = [norm(rng.normal(size=(n, 128))) for n in (120, 300, 80)]
+ranked = sorted(range(len(docs)), key=lambda i: maxsim(q, docs[i]), reverse=True)
+```
+
+### Implementation in practice
+
+You rarely write ColBERT search from scratch. Practical routes:
+- **Reranker mode.** Retrieve 100 to 200 candidates with a normal single-vector index, then rescore them with MaxSim. You store token vectors only for the candidate set or compute them on the fly. This is the easiest way to get most of the gain.
+- **Native multi-vector support.** Some engines (for example Vespa, and Qdrant's multivector fields) store several vectors per point and compute MaxSim themselves. BGE-M3, mentioned in 8.5, can output dense, sparse and multi-vector representations from one model.
+- **Full ColBERT index.** ColBERTv2 (Santhanam et al., 2021) compresses token vectors with centroids plus small residuals, and its PLAID engine prunes candidates using centroids before exact scoring.
+
+### Edge cases and failure modes
+
+- **Storage.** One vector per token is the obvious cost. A 400-token passage at 128 dimensions in float16 is about 100 KB, compared with 3 KB for one 1536-dim float16 vector. Compression (ColBERTv2 residuals, or binary token vectors) is mandatory at scale.
+- **Not a plain ANN problem.** Standard HNSW indexes one vector per row. Multi-vector search needs either engine support or a two-stage design (candidates first, MaxSim second).
+- **Query length matters.** The score is a sum over query tokens, so longer queries get larger scores. That is fine for ranking within one query, but do not compare raw scores across queries or use a fixed threshold.
+- **Visual documents.** The same idea powers ColPali-style retrieval over page images, where each image patch is a "token". It inherits the same storage cost.
+
+## 8.8 Multilingual Embeddings
+
+Multilingual embedding models map content from different languages into a shared space. "Wie zurücksetzen mein Passwort" and "How do I reset my password" should produce nearby vectors.
+
+Strong choices: BGE-M3, Cohere multilingual, OpenAI text-embedding-3, paraphrase-multilingual-MiniLM. Quality varies by language; English is always best, major European languages are good, lower-resource languages range from acceptable to poor.
+
+## 8.9 Image and Multimodal Embeddings
+
+CLIP-style models embed images and text into a shared space. A photo of a dog and the text "a dog" produce nearby vectors. This enables cross-modal retrieval: search images with text, search text with images.
+
+Multimodal embeddings extend this to combinations: image-plus-caption, document-screenshot-plus-text. Modern multimodal RAG often uses image embeddings to retrieve scanned PDF pages directly, skipping OCR.
+
+## 8.10 Production Architecture
+
+<Mermaid chart={`flowchart TD
+  A["Source documents"] --> B["Document loader<br/>(PDF, HTML, MD, code, audio, image)"]
+  B --> C["Chunker<br/>(size, overlap, structure-aware)"]
+  C --> D["Metadata enricher<br/>(source, timestamp, author, ACL)"]
+  D --> E["Embedding model<br/>(batched, GPU-accelerated)"]
+  E --> F["Vector DB<br/>(Pinecone, Qdrant, Weaviate, etc.)"]
+  F -.-> G["Optional: BM25 index<br/>for hybrid retrieval"]
+  G -.-> H["Optional: Knowledge graph<br/>for entity links"]`} />
+
+Each step is independently scalable and replaceable. Ingestion is usually batch (one-time backfill plus incremental); retrieval is online and latency-sensitive.
+
+## 8.11 Tradeoffs
+
+- **Dimensionality.** Higher dimensions capture more nuance but cost more storage and bandwidth. Matryoshka models let you pick at query time.
+- **API vs self-hosted.** API is fast to start. Self-hosted is cheaper at scale (millions of documents) and lets you fine-tune.
+- **General vs domain-specific.** Specialized models (legal, medical, code) outperform general models in their domains. Pay the cost of evaluation to find out which side you are on.
+- **Asymmetric vs symmetric.** Asymmetric helps Q&A; symmetric is fine for clustering and de-duplication.
+
+## 8.11a Matryoshka embeddings and dimension truncation 🔧
+
+The handbook mentions Matryoshka truncation three times (8.5, 8.11, 8.16) without explaining how it works or how to use it safely, so this section fills that in.
+
+### The problem
+
+Storage, memory and search cost all scale linearly with dimension. A 3,072-dim float32 vector is 12 KB, so 10 million of them are about 123 GB before any index overhead. You want smaller vectors, but you do not want to train or host a second model.
+
+### Why truncation normally fails, and why Matryoshka models are different
+
+In an ordinary embedding model, information is spread across all dimensions with no ordering. Dropping the last half of the vector removes an arbitrary half of the signal, and quality falls sharply. Matryoshka Representation Learning (Kusupati et al., 2022) changes the training objective: the same contrastive loss is applied to the first 64, 128, 256, ... dimensions as well as the full vector, and the losses are summed. The model is therefore pushed to put the most important information in the leading dimensions, like nested dolls. A prefix of the vector is itself a usable, lower-resolution embedding.
+
+The sentence-transformers documentation reports a Matryoshka-trained model keeping about 98% of its STSBenchmark performance at 8.3% of the original size, against about 96.5% for an ordinary model at the same size. OpenAI reports that `text-embedding-3-large` shortened to 256 dimensions still beats the older `text-embedding-ada-002` at its full 1,536. Treat both as indicative and measure on your own data.
+
+### Mechanism: two ways to truncate
+
+1. **Ask the provider.** The OpenAI embeddings API takes a `dimensions` parameter for `text-embedding-3` models and returns an already-shortened, normalized vector.
+2. **Truncate yourself.** Keep the first `k` values, then L2-normalize again. The OpenAI guide calls out the renormalization step explicitly. Doing it yourself lets you store the full vector once and derive several sizes from it.
+
+### Implementation
+
+```python
+import numpy as np
+from openai import OpenAI
+
+from vector_math import l2_normalize  # from 8.4
+
+openai = OpenAI()
+
+# Option 1: provider-side truncation (vector comes back normalized).
+small = openai.embeddings.create(
+    model="text-embedding-3-large",
+    input="how do I reset my password",
+    dimensions=256,
+)
+
+# Option 2: keep the full vector, derive a short one locally.
+full = np.array(
+    openai.embeddings.create(
+        model="text-embedding-3-large",
+        input="how do I reset my password",
+    ).data[0].embedding
+)  # 3072 dims
+
+
+def truncate(v: np.ndarray, k: int) -> np.ndarray:
+    return l2_normalize(v[:k])
+
+
+v512 = truncate(full, 512)
+```
+
+```python
+from sentence_transformers import SentenceTransformer
+
+# truncate_dim makes every encode() call return the first 256 dims.
+model = SentenceTransformer("nomic-ai/nomic-embed-text-v1.5", truncate_dim=256,
+                            trust_remote_code=True)
+vecs = model.encode(["search_document: To reset your password, open Settings."],
+                    normalize_embeddings=True)
+print(vecs.shape)  # (1, 256)
+```
+
+A common production pattern is **funnel search**: index short vectors (for example 256 dims) for the fast first pass, then rescore the top few hundred candidates with the full vector stored alongside. In pgvector this is an expression index on a truncated, half-precision copy (see [9.7a](/docs/genai-handbook/09-vector-databases)).
+
+### Edge cases and failure modes
+
+- **Only Matryoshka-trained models truncate gracefully.** Check the model card. Truncating `all-MiniLM-L6-v2` or an older `ada-002` vector gives poor results.
+- **Renormalize after slicing.** A sliced unit vector has norm below 1. If you then use inner product, scores are biased toward vectors that happened to keep more of their mass in the prefix.
+- **Query and documents must use the same `k`.** Comparing a 256-dim query with 1,024-dim documents fails with a dimension error in most databases. In NumPy code, slicing mistakes can silently compare different spaces.
+- **Index limits drive the choice.** pgvector can index `vector` columns only up to 2,000 dimensions and `halfvec` up to 4,000, so a full 3,072-dim vector needs `halfvec` or truncation before it can have an HNSW index.
+- **Quality loss is not uniform.** Short vectors lose more on fine-grained distinctions (similar product names, legal clauses) than on topical matching. Evaluate on the hard queries, not the average.
+
+## 8.12 Scaling Challenges
+
+- **Storage.** Ten million 1536-dim float32 vectors = 60 GB raw. Quantization (PQ, scalar quantization, binary embeddings) cuts this 4× to 32× with modest quality loss.
+- **Index build time.** Building an ANN index for hundreds of millions of vectors can take hours. Plan for incremental updates rather than full rebuilds.
+- **Refresh cycles.** When you update the embedding model, you must re-embed everything. Budget the cost up front.
+
+## 8.12a Quantizing embeddings: int8, binary and rescoring 🔧
+
+The storage bullet above quotes "4× to 32×" savings, and this section shows where those numbers come from and how to keep quality while getting them. (How a vector database stores and indexes quantized vectors, including product quantization, is in [Chapter 9](/docs/genai-handbook/09-vector-databases).)
+
+### The problem
+
+At 1,024 dimensions, a float32 vector is 4,096 bytes. 250 million of them are about 954 GB, which must sit in RAM for fast HNSW search. Most of that precision does not change which documents come back.
+
+### Why it works (first principles)
+
+Retrieval needs only the *ranking* of documents to be right, not the exact similarity values. Embedding values for a given dimension also tend to sit in a narrow range. Two consequences follow:
+- **int8 scalar quantization** maps each dimension's observed range onto 256 levels. Rounding error per value is small relative to the differences between documents, so rankings barely change. Size drops 4×.
+- **Binary quantization** keeps only the sign of each value (positive becomes 1, otherwise 0). This keeps which side of each axis the vector lies on, which is surprisingly informative in high dimensions. Size drops 32×, and similarity becomes Hamming distance (XOR, then count the 1 bits), which CPUs compute in a couple of instructions per 64 bits.
+
+### Mechanism: retrieve coarse, rescore fine
+
+Quantization loses some ranking quality, and **rescoring** wins most of it back:
+1. Search the quantized index for `rescore_multiplier × k` candidates (for example 4 × 10 = 40).
+2. Recompute similarity for those candidates with the float32 query against either the full-precision document vectors (kept on disk or in a cheaper store) or the unpacked binary vectors.
+3. Return the top `k`.
+
+Hugging Face's benchmark of this approach reports binary retrieval keeping about 92.5% of float32 retrieval quality without rescoring and about 96% with it, int8 keeping about 97 to 99%, and search speedups of roughly 25× (binary) and 3.7× (int8). The figures are from early 2024 on MTEB retrieval tasks, and the losses depend on the model, so re-measure.
+
+### Implementation
+
+```python
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.quantization import quantize_embeddings
+
+model = SentenceTransformer("mixedbread-ai/mxbai-embed-large-v1")  # 1024 dims
+QP = "Represent this sentence for searching relevant passages: "
+
+docs = load_corpus()  # your list[str]
+doc_f32 = model.encode(docs, normalize_embeddings=True, batch_size=64)
+
+# Binary: 1024 dims -> 128 bytes per vector (bits packed into uint8)
+doc_bin = quantize_embeddings(doc_f32, precision="ubinary")
+
+# int8: needs calibration data to learn each dimension's range
+doc_i8 = quantize_embeddings(doc_f32, precision="int8", calibration_embeddings=doc_f32[:10_000])
+
+def search(query: str, k: int = 10, multiplier: int = 4) -> list[int]:
+    q_f32 = model.encode(query, prompt=QP, normalize_embeddings=True)
+    q_bin = quantize_embeddings(q_f32.reshape(1, -1), precision="ubinary")
+
+    # Stage 1: Hamming distance over packed bits (lower is closer)
+    ham = np.unpackbits(np.bitwise_xor(doc_bin, q_bin), axis=1).sum(axis=1)
+    cand = np.argsort(ham)[: k * multiplier]
+
+    # Stage 2: rescore candidates with full precision (doc_f32 can live on disk / mmap)
+    scores = doc_f32[cand] @ q_f32
+    return cand[np.argsort(-scores)[:k]].tolist()
+```
+
+In production you would not scan with NumPy. FAISS (`IndexBinaryFlat`, `IndexBinaryHNSW`), Qdrant, Weaviate, and pgvector's `bit` type with `binary_quantize()` all do the Hamming stage natively. The pgvector version is in [9.7a](/docs/genai-handbook/09-vector-databases).
+
+### Edge cases and failure modes
+
+- **Low-dimensional models suffer more.** Binary quantization of a 384-dim model keeps only 384 bits, and quality falls further than for 1,024-dim models. It works best with 1,024 dimensions or more, and with models trained or known to tolerate it.
+- **int8 calibration drift.** The ranges are learned from a calibration sample. If the corpus shifts (new language, new domain), values fall outside the ranges and get clipped. Re-calibrate when you re-embed.
+- **Rescoring needs the originals somewhere.** If you throw away float32 vectors, you can only rescore against unpacked bits, which recovers less. Keeping them on disk (memory-mapped) is usually cheap compared with RAM.
+- **The multiplier is a recall/latency dial.** Too small and the true best documents never reach stage 2. Tune it on a golden set (see 8.15) the same way you tune `ef_search`.
+- **Quantization stacks with Matryoshka.** You can truncate to 512 dimensions and then binarize, but losses compound. Measure the combination, not each step alone.
+
+## 8.12b Embedding model migration without downtime 🔧
+
+The refresh bullet says "re-embed everything", and the interview question and Exercise 3 ask how to do it without interrupting search, so here is the full procedure.
+
+### The problem
+
+You want to move from model A to model B (better quality, cheaper, longer context). Every stored vector must be regenerated, which can take days and cost real money, and search must keep working the whole time.
+
+### Why you cannot mix the two
+
+Two embedding models produce unrelated coordinate systems. Even with the same dimension, "dimension 17" means nothing in common between them, so the cosine similarity between a model-A query and a model-B document is noise. The dimensions also often differ, so they cannot share a typed column. Search must use exactly one model for both query and documents at any moment.
+
+### Mechanism: expand, backfill, verify, switch, contract
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Expand
+  Expand: Expand - add column or table for model B and keep reading A
+  Expand --> DualWrite
+  DualWrite: Dual-write - new and changed chunks get A and B vectors
+  DualWrite --> Backfill
+  Backfill: Backfill - batch job embeds old chunks with B
+  Backfill --> Verify
+  Verify: Verify - build B index then run golden set and shadow reads
+  Verify --> Backfill: quality or coverage gap
+  Verify --> Cutover
+  Cutover: Cutover - flag flips reads to B for query and docs
+  Cutover --> Verify: regression so flip flag back to A
+  Cutover --> Contract
+  Contract: Contract - stop writing A then drop A column and index
+  Contract --> [*]`} />
+
+1. **Expand.** Add storage for model B next to model A. Reads stay on A.
+2. **Dual-write.** The ingestion worker (8.6) writes both vectors for every new or changed chunk. This stops the backlog from growing while you backfill.
+3. **Backfill.** A resumable batch job embeds every chunk that has no B vector yet.
+4. **Verify.** Build the B index, then compare A and B on the golden set (recall@k, MRR) and on shadow traffic (run B in parallel for a sample of real queries and log both result lists).
+5. **Cutover.** Flip a flag that makes queries embed with B and search the B index. Keep A intact so rollback is one flag flip.
+6. **Contract.** After a soak period, stop writing A and drop its column and index.
+
+### Implementation (Postgres + pgvector)
+
+```sql
+-- 1. Expand: a new nullable column, sized for model B
+ALTER TABLE chunks ADD COLUMN embedding_b vector(1024);
+
+-- 4. Index it without blocking writes (after the backfill, so the build is one pass)
+CREATE INDEX CONCURRENTLY chunks_embedding_b_hnsw
+  ON chunks USING hnsw (embedding_b vector_cosine_ops);
+```
+
+```python
+import os
+
+from pgvector import Vector
+from sqlalchemy import text
+
+# 3. Resumable backfill with keyset pagination (no OFFSET, no long transactions)
+async def backfill(batch_size: int = 256) -> None:
+    last_id = ""
+    while True:
+        async with engine.connect() as conn:
+            rows = (await conn.execute(
+                text("""
+                    SELECT id, text FROM chunks
+                     WHERE embedding_b IS NULL AND id > :last_id
+                     ORDER BY id LIMIT :n
+                """),
+                {"last_id": last_id, "n": batch_size},
+            )).all()
+        if not rows:
+            break
+        vecs = await embed_with_model_b([r.text for r in rows])  # batched call
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("""
+                    UPDATE chunks AS c SET embedding_b = CAST(v.e AS vector)
+                      FROM unnest(CAST(:ids AS text[]), CAST(:es AS text[])) AS v(id, e)
+                     WHERE c.id = v.id
+                """),
+                {"ids": [r.id for r in rows], "es": [Vector(v).to_text() for v in vecs]},
+            )
+        last_id = rows[-1].id
+
+
+# 5. Cutover: one flag decides BOTH the query model and the column.
+if os.environ.get("EMBEDDING_READ") == "b":
+    READ = {"embed": embed_with_model_b, "column": "embedding_b"}
+else:
+    READ = {"embed": embed_with_model_a, "column": "embedding"}
+
+
+async def search(q: str, k: int = 10) -> list:
+    [qv] = await READ["embed"]([q])
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(f"SELECT id, text FROM chunks ORDER BY {READ['column']} <=> CAST(:q AS vector) LIMIT :k"),
+            {"q": Vector(qv).to_text(), "k": k},
+        )
+        return result.all()
+```
+
+The column name comes from a fixed whitelist (the two branches above), never from user input, so interpolating it is safe.
+
+### Edge cases and failure modes
+
+- **Query and documents from different models.** The single most common migration bug. Couple the two in one config object, as above, so they cannot drift.
+- **Cached query embeddings.** If you cache query vectors, include the model name in the cache key, or the cutover serves stale A vectors against the B index.
+- **Thresholds do not transfer.** A "similarity above 0.8 means relevant" rule tuned on model A is meaningless for model B, whose score distribution differs. Re-tune every threshold, and any score-based fusion weights.
+- **Table bloat.** Updating every row in Postgres writes a new row version for each. Expect the table to roughly double until `VACUUM` reclaims space, and watch disk. For very large tables, a separate `chunk_embeddings_b` table avoids rewriting the text rows.
+- **Index build resources.** Building HNSW for tens of millions of rows needs a large `maintenance_work_mem` and hours of CPU. `CONCURRENTLY` avoids locking writes, but the build still competes with production load.
+- **Cost estimate.** Total tokens in the corpus × price per token, plus a margin for retries. Do it before you start, as 8.12 says.
+
+## 8.13 Security Concerns
+
+- Embeddings can leak information. Membership inference attacks can sometimes determine whether a given document was in your index. Mitigate with access controls and, if needed, differential privacy noise.
+- Vector indices often lack the access control sophistication of databases. Enforce ACLs at the application layer, filtering vector results by user-visible scopes.
+- Tenant isolation: separate indices per tenant for hard isolation, or include tenant ID in every vector's metadata for soft isolation with filtering.
+
+## 8.14 Deployment Guide
+
+For API-based embedding, deployment is trivial — call the endpoint. For self-hosted, package the embedding model inside an inference server (Triton, TEI, vLLM in embedding mode), expose a gRPC or REST endpoint, autoscale based on queue depth. Co-locate with the vector DB if possible to minimize network latency during ingestion.
+
+## 8.15 Monitoring Strategy
+
+- Embedding generation throughput and latency.
+- Embedding model version and config (catch silent drift).
+- Index size, query latency, recall (offline evaluation against a golden set).
+- Hit rate from the application — how often does retrieval surface useful chunks.
+- Cost per million embeddings.
+
+## 8.16 Cost Optimization
+
+- Use smaller dimensions if quality allows. Matryoshka models let you truncate.
+- Use binary or scalar quantization for storage-heavy workloads.
+- Batch aggressively during ingestion.
+- Self-host once token volume justifies the operational overhead.
+- Re-embed selectively (only changed documents) rather than full rebuilds.
+
+## 8.17 Interview Questions
+
+- Why are embeddings useful for search?
+- Explain cosine similarity and when you would use dot product instead.
+- What changes when you switch from a 384-dim model to a 1536-dim model?
+- Why use asymmetric embeddings for question-answering?
+- How do you handle the embedding-model upgrade migration?
+- ➕ Why can you truncate a `text-embedding-3` vector to 256 dimensions but not an `all-MiniLM-L6-v2` vector? **Matryoshka training puts the most important information in the leading dimensions, so a prefix is a valid embedding. Ordinary models spread information across all dimensions. Renormalize after truncating.**
+- ➕ Binary quantization cuts storage 32×. How do you get the quality back? **Over-fetch candidates with Hamming distance (for example 4× k), then rescore them with the float32 query against full-precision vectors kept on disk.**
+- ➕ What does ColBERT do that a bi-encoder cannot? **It keeps one vector per token and scores with MaxSim (each query token's best match, summed), so fine-grained matches are not averaged away. The cost is much larger storage.**
+- ➕ Your retrieval quality is fine on short documents but poor on long ones, with no errors. What do you check first? **Silent truncation at the model's `max_seq_length`. Count tokens with the embedding model's own tokenizer and re-chunk overlong inputs.**
+- ➕ During a model migration, what single bug breaks search completely? **Embedding the query with one model and searching vectors from the other. Bind the query model and the vector column to one flag.**
+
+## 8.18 Hands-on Exercises
+
+1. Estimate storage cost for 50M chunks at 1024 dimensions in float32. Now repeat with int8.
+2. Sketch the ingestion pipeline for 100k PDFs. Identify the throughput bottleneck.
+3. Design an embedding-version-rollover plan that does not interrupt production search.
+
+## 8.19 Common Mistakes
+
+- Mixing embeddings from different models in the same index.
+- Forgetting to normalize embeddings when the model expects normalized input.
+- Re-embedding the entire corpus when only a small fraction changed.
+- Skipping the asymmetric "query:" / "passage:" prefixes that the model expects.
+- Using a general-purpose model for a domain-specific corpus when a specialized model exists.
+
+## 8.20 Enterprise Best Practices
+
+Standardize on one embedding model per index. Record the model name and version in vector metadata. Build a re-embedding pipeline before you need one. Measure retrieval quality on a real evaluation set, not vendor benchmarks. Treat the embedding model upgrade as a planned migration, not an emergency.
+
+## Sources
+
+- OpenAI, [Vector embeddings guide](https://developers.openai.com/api/docs/guides/embeddings) (default dimensions, `dimensions` parameter, renormalizing after manual truncation, 8,192-token input limit). Checked October 2026.
+- Kusupati et al., [Matryoshka Representation Learning](https://arxiv.org/abs/2205.13147), NeurIPS 2022.
+- Sentence Transformers, [Matryoshka embeddings](https://sbert.net/examples/sentence_transformer/training/matryoshka/README.html) (`truncate_dim`, retention figures).
+- Hugging Face, [Binary and Scalar Embedding Quantization for Significantly Faster and Cheaper Retrieval](https://huggingface.co/blog/embedding-quantization) (2024; `quantize_embeddings`, rescoring, retention and speedup figures).
+- Khattab and Zaharia, [ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT](https://arxiv.org/abs/2004.12832), SIGIR 2020.
+- Santhanam et al., [ColBERTv2: Effective and Efficient Retrieval via Lightweight Late Interaction](https://arxiv.org/abs/2112.01488), NAACL 2022.
+- [sentence-transformers/all-MiniLM-L6-v2 model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (256 word-piece truncation).
+- [intfloat/e5-base-v2 model card](https://huggingface.co/intfloat/e5-base-v2) (`query:` / `passage:` prefixes).
+- [pgvector README](https://github.com/pgvector/pgvector) (operators, operator classes, index dimension limits).

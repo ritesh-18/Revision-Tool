@@ -1,0 +1,719 @@
+---
+title: "Path, query and body parameters"
+description: "Every way a FastAPI endpoint receives data: path parameters and type conversion, Enum paths, query parameters (optional, defaults, lists), Annotated with Path, Query, Body, Header and Cookie, validation constraints, Pydantic body models, nested models, query and header models, form data and file uploads, the exact rules FastAPI uses to decide where each parameter comes from, and the real 422 error JSON."
+---
+
+An HTTP request carries data in five places: the **path**, the **query string**, the **headers** (cookies are a header), and the **body**, which may be JSON, a form, or a multipart upload. In FastAPI you never read those places by hand. You declare a function parameter, and FastAPI decides where it comes from, converts it, and validates it.
+
+That decision happens once, when the route is registered (see [ASGI and the request lifecycle](/docs/fastapi/asgi-and-the-request-lifecycle)). This page covers each source, then the exact rules, then the error format you get when validation fails. All output is real, from FastAPI 0.143.0 and Pydantic 2.14.1. The examples use `TestClient`, which calls the app in-process.
+
+For the language-agnostic background, see [HTTP](/docs/backend-first-principles/05-http) and [Validations and transformations](/docs/backend-first-principles/09-validations-transformations).
+
+## Path parameters and type conversion
+
+A name in curly braces in the path template becomes a path parameter. The router captures it as a **string**, and FastAPI converts it to the annotated type with Pydantic:
+
+```python
+import json
+from enum import Enum
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+@app.get("/users/me")
+async def read_me():
+    return {"user": "the current user"}
+
+
+@app.get("/users/{user_id}")
+async def read_user(user_id: int):
+    return {"user_id": user_id, "type": type(user_id).__name__}
+
+
+class ModelName(str, Enum):
+    alexnet = "alexnet"
+    resnet = "resnet"
+    lenet = "lenet"
+
+
+@app.get("/models/{model_name}")
+async def get_model(model_name: ModelName):
+    if model_name is ModelName.alexnet:
+        return {"model": model_name, "note": "deep learning FTW"}
+    return {"model": model_name, "value": model_name.value}
+
+
+@app.get("/files/{file_path:path}")
+async def read_file(file_path: str):
+    return {"file_path": file_path}
+
+
+c = TestClient(app)
+def show(path):
+    r = c.get(path)
+    print(f"GET {path} -> {r.status_code} {json.dumps(r.json())}")
+
+show("/users/42")
+show("/users/me")
+show("/users/4.2")
+show("/models/resnet")
+show("/models/alexnet")
+show("/models/gpt")
+show("/files/home/ada/notes.txt")
+print(json.dumps(c.get("/openapi.json").json()["components"]["schemas"]["ModelName"]))
+```
+
+```text title="Output"
+GET /users/42 -> 200 {"user_id": 42, "type": "int"}
+GET /users/me -> 200 {"user": "the current user"}
+GET /users/4.2 -> 422 {"detail": [{"type": "int_parsing", "loc": ["path", "user_id"], "msg": "Input should be a valid integer, unable to parse string as an integer", "input": "4.2"}]}
+GET /models/resnet -> 200 {"model": "resnet", "value": "resnet"}
+GET /models/alexnet -> 200 {"model": "alexnet", "note": "deep learning FTW"}
+GET /models/gpt -> 422 {"detail": [{"type": "enum", "loc": ["path", "model_name"], "msg": "Input should be 'alexnet', 'resnet' or 'lenet'", "input": "gpt", "ctx": {"expected": "'alexnet', 'resnet' or 'lenet'"}}]}
+GET /files/home/ada/notes.txt -> 200 {"file_path": "home/ada/notes.txt"}
+{"type": "string", "enum": ["alexnet", "resnet", "lenet"], "title": "ModelName"}
+```
+
+What happened:
+
+- `"42"` became the int `42`. `"4.2"` was rejected, because a path parameter annotated `int` must be a whole number. Pydantic's lax mode accepts numeric **strings**, not floats with a fractional part.
+- **Enum paths** restrict the value to a fixed set. Inside the function, `model_name` is a real `ModelName` member, so you can compare with `is`. The allowed values are published in the OpenAPI schema, so Swagger UI shows a dropdown. Inheriting from `str` makes the members serialize as plain strings.
+- `{file_path:path}` uses Starlette's `path` convertor, whose regex also matches `/`. Without it, `/files/home/ada/notes.txt` would be a 404, because the default `[^/]+` stops at the first slash.
+
+### Route order: first match wins
+
+`/users/me` worked above only because it was declared **before** `/users/{user_id}`. Swap them:
+
+```python
+@app.get("/users/{user_id}")
+async def read_user(user_id: int):
+    return {"user_id": user_id}
+
+
+@app.get("/users/me")            # registered second: never reached
+async def read_me():
+    return {"user": "me"}
+```
+
+```text title="Output"
+GET /users/me -> 422 {"detail": [{"type": "int_parsing", "loc": ["path", "user_id"], "msg": "Input should be a valid integer, unable to parse string as an integer", "input": "me"}]}
+```
+
+The router matched `/users/{user_id}` first (its regex accepts any segment), and **then** FastAPI failed to convert `"me"` to an int. Routing does not backtrack after a validation failure. Always declare fixed paths before parameterized ones.
+
+## Query parameters
+
+Any simple-typed parameter that is **not** in the path becomes a query parameter. A default value makes it optional. No default makes it required:
+
+```python
+import json
+from typing import Annotated
+from fastapi import FastAPI, Query
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+@app.get("/items")
+async def list_items(
+    skip: int = 0,                       # optional, default 0
+    limit: int = 10,
+    q: str | None = None,                # optional, may be absent
+    in_stock: bool = False,
+    tag: Annotated[list[str], Query()] = [],  # repeated ?tag=a&tag=b
+):
+    return {"skip": skip, "limit": limit, "q": q, "in_stock": in_stock, "tag": tag}
+
+
+@app.get("/search")
+async def search(term: str):            # no default: required
+    return {"term": term}
+
+
+c = TestClient(app)
+def show(path):
+    r = c.get(path)
+    print(f"GET {path} -> {r.status_code} {json.dumps(r.json())}")
+
+show("/items")
+show("/items?skip=20&limit=5&q=lamp")
+for v in ["true", "1", "yes", "on", "off", "maybe"]:
+    show(f"/items?in_stock={v}")
+show("/items?tag=red&tag=blue")
+show("/search")
+```
+
+```text title="Output"
+GET /items -> 200 {"skip": 0, "limit": 10, "q": null, "in_stock": false, "tag": []}
+GET /items?skip=20&limit=5&q=lamp -> 200 {"skip": 20, "limit": 5, "q": "lamp", "in_stock": false, "tag": []}
+GET /items?in_stock=true -> 200 {"skip": 0, "limit": 10, "q": null, "in_stock": true, "tag": []}
+GET /items?in_stock=1 -> 200 {"skip": 0, "limit": 10, "q": null, "in_stock": true, "tag": []}
+GET /items?in_stock=yes -> 200 {"skip": 0, "limit": 10, "q": null, "in_stock": true, "tag": []}
+GET /items?in_stock=on -> 200 {"skip": 0, "limit": 10, "q": null, "in_stock": true, "tag": []}
+GET /items?in_stock=off -> 200 {"skip": 0, "limit": 10, "q": null, "in_stock": false, "tag": []}
+GET /items?in_stock=maybe -> 422 {"detail": [{"type": "bool_parsing", "loc": ["query", "in_stock"], "msg": "Input should be a valid boolean, unable to interpret input", "input": "maybe"}]}
+GET /items?tag=red&tag=blue -> 200 {"skip": 0, "limit": 10, "q": null, "in_stock": false, "tag": ["red", "blue"]}
+GET /search -> 422 {"detail": [{"type": "missing", "loc": ["query", "term"], "msg": "Field required", "input": null}]}
+```
+
+- Every query value arrives as a string. `"20"` became `20` because of the `int` annotation.
+- `bool` accepts `true/false`, `1/0`, `yes/no` and `on/off` (case-insensitive). Anything else is a 422, not a silent `False`.
+- `str | None = None` is the idiom for "optional, and I want to know if it was missing". The type says what values are allowed. The default says whether the parameter is required.
+- A **list** query parameter needs an explicit `Query()`. Without it, FastAPI would treat `list[str]` as a JSON **body** field (see the rules below). With it, `?tag=red&tag=blue` collects every repeated value.
+
+<Callout title="Mutable defaults are safe here">
+`= []` as a default looks like the classic [mutable default argument](/docs/python/functions-and-arguments) bug. For FastAPI parameters it is safe: the default is copied for each request. An endpoint that does `tag.append("x")` and returns `tag` answers `['x']` on the first call and `['x']` again on the second, not `['x', 'x']`.
+</Callout>
+
+## `Annotated` with `Path`, `Query`, `Header` and `Cookie`
+
+When you need more than a type and a default (constraints, an alias, a description), you attach a **marker** with `Annotated`. The type stays the first argument, the marker carries the metadata, and the real default stays a normal Python default:
+
+```python
+import json
+from typing import Annotated
+from fastapi import FastAPI, Path, Query, Header, Cookie
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+@app.get("/products/{product_id}")
+async def read_product(
+    product_id: Annotated[int, Path(ge=1, description="Database id")],
+    q: Annotated[str | None, Query(min_length=3, max_length=50, pattern=r"^[a-z ]+$")] = None,
+    page: Annotated[int, Query(ge=1, le=1000)] = 1,
+    item_query: Annotated[str | None, Query(alias="item-query")] = None,
+    user_agent: Annotated[str | None, Header()] = None,
+    x_request_id: Annotated[str | None, Header()] = None,
+    session: Annotated[str | None, Cookie()] = None,
+):
+    return {"product_id": product_id, "q": q, "page": page, "item_query": item_query,
+            "user_agent": user_agent, "x_request_id": x_request_id, "session": session}
+
+
+c = TestClient(app)
+r = c.get("/products/7?q=desk lamp&page=2&item-query=xyz",
+          headers={"X-Request-ID": "req-123"}, cookies={"session": "abc"})
+print(r.status_code, json.dumps(r.json(), indent=2))
+r = c.get("/products/0?q=AB&page=5000")
+print(r.status_code, json.dumps(r.json(), indent=2))
+params = c.get("/openapi.json").json()["paths"]["/products/{product_id}"]["get"]["parameters"]
+for p in params:
+    print(p["in"], p["name"], json.dumps({k: v for k, v in p["schema"].items() if k != "title"}))
+```
+
+```text title="Output"
+200 {
+  "product_id": 7,
+  "q": "desk lamp",
+  "page": 2,
+  "item_query": "xyz",
+  "user_agent": "testclient",
+  "x_request_id": "req-123",
+  "session": "abc"
+}
+422 {
+  "detail": [
+    {
+      "type": "greater_than_equal",
+      "loc": [
+        "path",
+        "product_id"
+      ],
+      "msg": "Input should be greater than or equal to 1",
+      "input": "0",
+      "ctx": {
+        "ge": 1
+      }
+    },
+    {
+      "type": "string_too_short",
+      "loc": [
+        "query",
+        "q"
+      ],
+      "msg": "String should have at least 3 characters",
+      "input": "AB",
+      "ctx": {
+        "min_length": 3
+      }
+    },
+    {
+      "type": "less_than_equal",
+      "loc": [
+        "query",
+        "page"
+      ],
+      "msg": "Input should be less than or equal to 1000",
+      "input": "5000",
+      "ctx": {
+        "le": 1000
+      }
+    }
+  ]
+}
+path product_id {"type": "integer", "minimum": 1, "description": "Database id"}
+query q {"anyOf": [{"type": "string", "minLength": 3, "maxLength": 50, "pattern": "^[a-z ]+$"}, {"type": "null"}]}
+query page {"type": "integer", "maximum": 1000, "minimum": 1, "default": 1}
+query item-query {"anyOf": [{"type": "string"}, {"type": "null"}]}
+header user-agent {"anyOf": [{"type": "string"}, {"type": "null"}]}
+header x-request-id {"anyOf": [{"type": "string"}, {"type": "null"}]}
+cookie session {"anyOf": [{"type": "string"}, {"type": "null"}]}
+```
+
+Things to notice:
+
+- **Header names are converted.** `user_agent` reads the `User-Agent` header and `x_request_id` reads `X-Request-ID`. Python names can't contain hyphens, so FastAPI replaces `_` with `-`, and HTTP header lookup is case-insensitive anyway. Pass `Header(convert_underscores=False)` if you really need an underscore in a header name (most proxies drop such headers).
+- **`alias`** maps a Python name to a different wire name. `item_query` is read from `?item-query=...`.
+- **All three errors came back at once.** FastAPI validates every parameter and collects the errors before deciding to return 422.
+- **Only the first failing constraint per field is reported.** `"AB"` also violates the lowercase `pattern`, but Pydantic stopped checking `q` at `min_length`.
+- The constraints become OpenAPI keywords (`minimum`, `maxLength`, `pattern`), so client generators and Swagger UI know them too.
+
+### Why `Annotated` and not `= Query(...)`
+
+The older style puts the marker in the default slot: `page: int = Query(1, ge=1)`. It still works, but `Annotated` is better for three reasons:
+
+1. The default is a real default. You can call `read_product(product_id=7)` directly in a test and get `page=1`, instead of `page` being a `Query` object.
+2. The type and its constraints can be reused as an alias: `Page = Annotated[int, Query(ge=1, le=1000)]`, then `page: Page = 1` on every list endpoint.
+3. Other tools (type checkers, Pydantic itself) understand `Annotated` metadata.
+
+See [Type hints basics](/docs/python/type-hints-basics) and [Advanced typing](/docs/python/advanced-typing) for how `Annotated` works.
+
+### Constraints you can use
+
+These keywords work in `Path`, `Query`, `Header`, `Cookie`, `Body`, `Form` and in Pydantic's `Field`:
+
+| Keyword | Applies to | Meaning |
+|---|---|---|
+| `gt`, `ge`, `lt`, `le` | numbers | greater than, greater or equal, less than, less or equal |
+| `multiple_of` | numbers | value must be a multiple |
+| `min_length`, `max_length` | strings, lists | length bounds |
+| `pattern` | strings | regular expression the value must match |
+| `alias` | all | the name on the wire |
+| `title`, `description`, `examples` | all | documentation only |
+| `deprecated` | all | marks the parameter as deprecated in OpenAPI |
+| `include_in_schema` | all | `False` hides the parameter from the docs |
+
+## Request bodies with Pydantic models
+
+A parameter annotated with a Pydantic model is read from the **JSON body**. FastAPI parses the JSON, hands the dict to the model's validator, and passes you the model instance:
+
+```python
+import json
+from typing import Annotated
+from fastapi import FastAPI, Body
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field, HttpUrl, EmailStr
+
+app = FastAPI()
+
+
+class Image(BaseModel):
+    url: HttpUrl
+    alt: str = ""
+
+
+class Item(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    price: float = Field(gt=0)
+    tags: set[str] = set()
+    images: list[Image] = []
+
+
+class Owner(BaseModel):
+    email: EmailStr
+    name: str
+
+
+@app.post("/items")
+async def create_item(item: Item):
+    return {"received": item, "python_type": type(item).__name__,
+            "tags_type": type(item.tags).__name__}
+
+
+@app.put("/items/{item_id}")
+async def update_item(
+    item_id: int,
+    item: Item,
+    owner: Owner,
+    importance: Annotated[int, Body(ge=1, le=5)],
+):
+    return {"item_id": item_id, "item": item, "owner": owner, "importance": importance}
+
+
+@app.post("/embedded")
+async def embedded(item: Annotated[Item, Body(embed=True)]):
+    return item
+
+
+c = TestClient(app)
+def show(r):
+    print(r.status_code, json.dumps(r.json()))
+
+show(c.post("/items", json={"name": "Lamp", "price": "19.5", "tags": ["home", "home"],
+                            "images": [{"url": "https://example.com/a.png"}]}))
+show(c.put("/items/3", json={
+    "item": {"name": "Lamp", "price": 19.5},
+    "owner": {"email": "ada@example.com", "name": "Ada"},
+    "importance": 5}))
+show(c.post("/embedded", json={"name": "Lamp", "price": 1}))
+show(c.post("/embedded", json={"item": {"name": "Lamp", "price": 1}}))
+```
+
+```text title="Output"
+200 {"received": {"name": "Lamp", "price": 19.5, "tags": ["home"], "images": [{"url": "https://example.com/a.png", "alt": ""}]}, "python_type": "Item", "tags_type": "set"}
+200 {"item_id": 3, "item": {"name": "Lamp", "price": 19.5, "tags": [], "images": []}, "owner": {"email": "ada@example.com", "name": "Ada"}, "importance": 5}
+422 {"detail": [{"type": "missing", "loc": ["body", "item"], "msg": "Field required", "input": null}]}
+200 {"name": "Lamp", "price": 1.0, "tags": [], "images": []}
+```
+
+The body rules:
+
+- **One model parameter: the body *is* the model.** `create_item` expects `{"name": ..., "price": ...}` at the top level.
+- **Pydantic's lax mode coerces.** `"19.5"` (a string) became the float `19.5`, the duplicate tag was removed because the field is a `set`, and the nested `images` list became `Image` objects with defaults filled in. If you want `"19.5"` rejected, use strict types. See [Pydantic and runtime validation](/docs/python/pydantic-and-runtime-validation).
+- **Several body parameters: the body is an object keyed by parameter name.** `update_item` takes `item`, `owner` and `importance` as top-level keys. `importance` is an `int`, which would normally be a query parameter, so `Body()` forces it into the body.
+- **`Body(embed=True)`** applies the keyed form to a single model. The first `/embedded` call fails because FastAPI now expects `{"item": {...}}`.
+
+Under the hood, when there are several body parameters, FastAPI builds a hidden model (named like `Body_update_item_items__item_id__put` in OpenAPI) with one field per parameter, and validates the whole body against it in one pass.
+
+### Nested models, broken JSON, and the Content-Type check
+
+Errors in nested data point to the exact spot with a `loc` path. Here is the same model, with two mistakes in the body, then malformed JSON, then valid JSON sent without a `Content-Type` header:
+
+```python
+import json
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field, HttpUrl
+
+app = FastAPI()
+
+
+class Image(BaseModel):
+    url: HttpUrl
+
+
+class Item(BaseModel):
+    name: str
+    price: float = Field(gt=0)
+    images: list[Image] = []
+
+
+@app.post("/items")
+async def create_item(item: Item):
+    return item
+
+
+c = TestClient(app)
+def show(label, r):
+    print(f"# {label}\n{r.status_code} {json.dumps(r.json())}")
+
+show("nested error", c.post("/items", json={
+    "name": "Lamp", "price": 0,
+    "images": [{"url": "https://example.com/a.png"}, {"url": "not a url"}]}))
+show("broken JSON", c.post("/items", content=b'{"name": "Lamp", ',
+                           headers={"content-type": "application/json"}))
+show("no content-type", c.post("/items", content=b'{"name": "Lamp", "price": 1}'))
+```
+
+```text title="Output"
+# nested error
+422 {"detail": [{"type": "greater_than", "loc": ["body", "price"], "msg": "Input should be greater than 0", "input": 0, "ctx": {"gt": 0.0}}, {"type": "url_parsing", "loc": ["body", "images", 1, "url"], "msg": "Input should be a valid URL, relative URL without a base", "input": "not a url", "ctx": {"error": "relative URL without a base"}}]}
+# broken JSON
+422 {"detail": [{"type": "json_invalid", "loc": ["body", 17], "msg": "JSON decode error", "input": {}, "ctx": {"error": "Expecting property name enclosed in double quotes"}}]}
+# no content-type
+422 {"detail": [{"type": "model_attributes_type", "loc": ["body"], "msg": "Input should be a valid dictionary or object to extract fields from", "input": "{\"name\": \"Lamp\", \"price\": 1}"}]}
+```
+
+- `["body", "images", 1, "url"]` reads as "the body, field `images`, index 1, field `url`". A frontend can map that straight to a form field.
+- For broken JSON, the second `loc` element is the **character offset** (17) where the parser gave up.
+- **Without a `Content-Type: application/json` header, FastAPI does not parse the body as JSON.** It passes the raw bytes on, and the model rejects them. This strict check is the default in current FastAPI (it protects against some cross-site request tricks that send JSON as `text/plain`). If you must accept clients that omit the header, pass `strict_content_type=False` to `FastAPI()` or to an `APIRouter`. (In this version the path decorators like `@app.post` don't accept it.)
+
+## Query-parameter and header models
+
+When many endpoints share the same group of query parameters (pagination, sorting, filters), you can declare them once as a Pydantic model and mark the parameter with `Query()`. The same works with `Header()` and `Cookie()`:
+
+```python
+import json
+from typing import Annotated, Literal
+from fastapi import FastAPI, Header, Query
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+
+class ListParams(BaseModel):
+    model_config = {"extra": "forbid"}
+    limit: int = Field(10, gt=0, le=100)
+    offset: int = Field(0, ge=0)
+    order_by: Literal["created_at", "price"] = "created_at"
+    tags: list[str] = []
+
+
+@app.get("/catalog")
+async def catalog(params: Annotated[ListParams, Query()]):
+    return params
+
+
+class CommonHeaders(BaseModel):
+    x_tenant: str
+    x_trace_id: str | None = None
+
+
+@app.get("/whoami")
+async def whoami(headers: Annotated[CommonHeaders, Header()]):
+    return headers
+
+
+c = TestClient(app)
+def show(label, r):
+    print(f"# {label}\n{r.status_code} {json.dumps(r.json())}")
+
+show("query model", c.get("/catalog?limit=5&order_by=price&tags=a&tags=b"))
+show("unknown query param", c.get("/catalog?limit=5&colour=red"))
+show("header model", c.get("/whoami", headers={"X-Tenant": "acme", "X-Trace-Id": "t-9"}))
+show("missing header", c.get("/whoami"))
+print(json.dumps([(p["in"], p["name"], p["required"]) for p in
+                  c.get("/openapi.json").json()["paths"]["/catalog"]["get"]["parameters"]]))
+```
+
+```text title="Output"
+# query model
+200 {"limit": 5, "offset": 0, "order_by": "price", "tags": ["a", "b"]}
+# unknown query param
+422 {"detail": [{"type": "extra_forbidden", "loc": ["query", "colour"], "msg": "Extra inputs are not permitted", "input": "red"}]}
+# header model
+200 {"x_tenant": "acme", "x_trace_id": "t-9"}
+# missing header
+422 {"detail": [{"type": "missing", "loc": ["header", "x_tenant"], "msg": "Field required", "input": {"host": "testserver", "accept": "*/*", "accept-encoding": "gzip, deflate, zstd", "connection": "keep-alive", "user-agent": "testclient"}}]}
+[["query", "limit", false], ["query", "offset", false], ["query", "order_by", false], ["query", "tags", false]]
+```
+
+- The model's fields are **flattened** into individual query parameters in OpenAPI, so clients see `limit`, `offset`, `order_by` and `tags`, not one `params` object.
+- `extra="forbid"` turns a typo like `?colour=red` into a 422 instead of being silently ignored. That catches client bugs early.
+- `Literal[...]` restricts `order_by` to known columns, which also stops users from sorting by arbitrary fields.
+- Look at the `input` of the missing-header error: it contains **every request header**. If the request had an `Authorization` or `Cookie` header, the default 422 response would echo it back. That is one more reason to customize the validation error handler (see [Responses, errors and status codes](/docs/fastapi/responses-errors-and-status-codes)).
+
+## Form data and file uploads
+
+HTML forms and file uploads don't send JSON. They send `application/x-www-form-urlencoded` or `multipart/form-data`. Mark parameters with `Form()` or `File()`, or annotate them as `UploadFile`. Parsing these needs the `python-multipart` package, which `fastapi[standard]` installs.
+
+```python
+import json
+from typing import Annotated
+from fastapi import FastAPI, Form, File, UploadFile
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+
+
+@app.post("/login")
+async def login(username: Annotated[str, Form()], password: Annotated[str, Form()]):
+    return {"username": username, "password_length": len(password)}
+
+
+class Signup(BaseModel):
+    username: str
+    age: int
+
+
+@app.post("/signup")
+async def signup(data: Annotated[Signup, Form()]):
+    return data
+
+
+@app.post("/upload")
+async def upload(
+    file: UploadFile,
+    description: Annotated[str, Form()] = "",
+):
+    head = await file.read(5)
+    await file.seek(0)
+    whole = await file.read()
+    return {
+        "filename": file.filename,
+        "content_type": file.content_type,
+        "size": file.size,
+        "spooled_type": type(file.file).__name__,
+        "first_bytes": head.decode(),
+        "total_read": len(whole),
+        "description": description,
+    }
+
+
+@app.post("/upload-many")
+async def upload_many(files: list[UploadFile]):
+    return [{"name": f.filename, "size": f.size} for f in files]
+
+
+@app.post("/small")
+async def small(data: Annotated[bytes, File()]):
+    return {"type": type(data).__name__, "len": len(data)}
+
+
+c = TestClient(app)
+def show(label, r):
+    print(f"# {label}\n{r.status_code} {json.dumps(r.json())}")
+
+show("form", c.post("/login", data={"username": "ada", "password": "s3cret!"}))
+show("form as json", c.post("/login", json={"username": "ada", "password": "s3cret!"}))
+show("form model", c.post("/signup", data={"username": "ada", "age": "36"}))
+show("upload", c.post("/upload", files={"file": ("notes.txt", b"hello world\n" * 1000, "text/plain")},
+                      data={"description": "my notes"}))
+show("many", c.post("/upload-many", files=[("files", ("a.txt", b"a" * 10, "text/plain")),
+                                          ("files", ("b.csv", b"b" * 20, "text/csv"))]))
+show("bytes", c.post("/small", files={"data": ("x.bin", b"\x00\x01\x02", "application/octet-stream")}))
+r = c.get("/openapi.json").json()["paths"]["/upload"]["post"]["requestBody"]
+print(json.dumps(r["content"]))
+```
+
+```text title="Output"
+# form
+200 {"username": "ada", "password_length": 7}
+# form as json
+422 {"detail": [{"type": "missing", "loc": ["body", "username"], "msg": "Field required", "input": null}, {"type": "missing", "loc": ["body", "password"], "msg": "Field required", "input": null}]}
+# form model
+200 {"username": "ada", "age": 36}
+# upload
+200 {"filename": "notes.txt", "content_type": "text/plain", "size": 12000, "spooled_type": "SpooledTemporaryFile", "first_bytes": "hello", "total_read": 12000, "description": "my notes"}
+# many
+200 [{"name": "a.txt", "size": 10}, {"name": "b.csv", "size": 20}]
+# bytes
+200 {"type": "bytes", "len": 3}
+{"multipart/form-data": {"schema": {"$ref": "#/components/schemas/Body_upload_upload_post"}}}
+```
+
+How it works:
+
+- A route with any `Form` or `File` parameter reads the body with `await request.form()` instead of parsing JSON. That's why sending the same fields **as JSON** to `/login` fails: the form parser finds no fields.
+- **`UploadFile`** wraps a `SpooledTemporaryFile`. Starlette keeps each uploaded file in memory up to 1 MB and then rolls it over to a temporary file on disk, so a 2 GB upload doesn't need 2 GB of RAM. Its methods (`read`, `seek`, `write`, `close`) are `async`: once the file has rolled over to disk, they run the underlying file call in the thread pool so disk IO doesn't block the event loop. You also get `filename`, `content_type`, `size` and `headers`.
+- **`bytes` with `File()`** reads the whole file into memory. That's fine for small files, but dangerous for large ones.
+- `list[UploadFile]` accepts the same field name repeated.
+- Uploaded files are closed automatically when the request ends, by the `AsyncExitStackMiddleware` from the previous chapter. If you need the content later (in a background task, for example), read or copy it before returning.
+
+<Callout type="warn">
+**You can't mix a JSON body with form fields or files in one request.** The body has exactly one content type, and HTTP sends it once. If you need structured metadata with an upload, send it as a form field holding a JSON string and validate it yourself with `Model.model_validate_json(...)`, or use two requests (create the record, then upload to it). Also, Starlette caps each non-file form **field** at 1 MB and the number of fields and files at 1000 each, but sets **no limit on the total upload size**. Enforce one at your proxy or in a middleware.
+</Callout>
+
+## How FastAPI decides where each parameter comes from
+
+Now the rules can be stated exactly. When a route is registered, FastAPI looks at each parameter of the function and applies the first rule that matches:
+
+<Mermaid chart={`flowchart TD
+  A["parameter in the signature"] --> B{"explicit marker?<br/>Path, Query, Header,<br/>Cookie, Body, Form, File"}
+  B -- yes --> M["use that source"]
+  B -- no --> C{"Depends?"}
+  C -- yes --> D["dependency, solved recursively"]
+  C -- no --> E{"special type?<br/>Request, Response,<br/>WebSocket, BackgroundTasks"}
+  E -- yes --> F["inject the object"]
+  E -- no --> G{"name in the path template?"}
+  G -- yes --> P["path parameter"]
+  G -- no --> H{"UploadFile?"}
+  H -- yes --> FI["file"]
+  H -- no --> I{"scalar type?<br/>int, str, float, bool,<br/>Enum, UUID, date, Decimal"}
+  I -- yes --> Q["query parameter"]
+  I -- no --> BO["body<br/>models, dicts, bare lists"]`} />
+
+You can see the decisions by inspecting the route's `dependant`:
+
+```python
+import datetime, uuid
+from typing import Annotated
+from fastapi import FastAPI, Query, Request
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Note(BaseModel):
+    text: str
+
+@app.post("/orgs/{org_id}/notes")
+async def endpoint(
+    org_id: uuid.UUID,                      # name appears in the path
+    since: datetime.date,                   # singular type -> query
+    tags: list[str],                        # list of singular types -> ?
+    labels: Annotated[list[str], Query()],  # explicit
+    note: Note,                             # Pydantic model -> body
+    meta: dict[str, int],                   # dict -> ?
+    request: Request,                       # special type, injected
+):
+    return {}
+
+d = app.routes[-1].dependant
+for kind in ("path_params", "query_params", "header_params", "cookie_params", "body_params"):
+    print(f"{kind:<14}", [f.name for f in getattr(d, kind)])
+print("request_param_name", d.request_param_name)
+```
+
+```text title="Output"
+path_params    ['org_id']
+query_params   ['since', 'labels']
+header_params  []
+cookie_params  []
+body_params    ['tags', 'note', 'meta']
+request_param_name request
+```
+
+- `tags: list[str]` without a marker went to the **body**, not the query. A list is not a "scalar", so the fallback rule applies. This surprises almost everyone once. If you want a list from the query string, write `Annotated[list[str], Query()]`.
+- `dict[str, int]` is also body.
+- With three body parameters (`tags`, `note`, `meta`), the body must be an object with those three keys.
+- `request` is not validated at all. FastAPI just passes the Starlette `Request`.
+
+Headers and cookies are **never** inferred. They always need an explicit `Header()` or `Cookie()`.
+
+## Anatomy of the 422 error
+
+Every validation failure in this chapter produced the same structure, so it's worth reading once carefully:
+
+```json title="Response"
+{
+  "detail": [
+    {
+      "type": "greater_than_equal",
+      "loc": ["path", "product_id"],
+      "msg": "Input should be greater than or equal to 1",
+      "input": "0",
+      "ctx": { "ge": 1 }
+    }
+  ]
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `detail` | always a **list**, one entry per problem, all collected in one pass |
+| `type` | a stable, machine-readable error code from Pydantic (`missing`, `int_parsing`, `string_too_short`, `extra_forbidden`, `json_invalid`, ...). Clients should branch on this, not on `msg` |
+| `loc` | where the problem is. The first element is the source (`path`, `query`, `header`, `cookie`, `body`), and the rest is the path inside it (field names and list indexes) |
+| `msg` | a human-readable English message |
+| `input` | the value that failed, as received. For path and query parameters it is still the original **string** (`"0"`, not `0`) |
+| `ctx` | extra details for the error type, such as the limit that was violated |
+
+The status code is **422 Unprocessable Content**: the request was well-formed HTTP, but its content failed validation. Some teams prefer 400. You can change the status and the shape with a custom handler, which is covered in [Responses, errors and status codes](/docs/fastapi/responses-errors-and-status-codes). For why validating at the edge matters at all, see [Validations and transformations](/docs/backend-first-principles/09-validations-transformations).
+
+## Traps
+
+- **Declaring `/users/{user_id}` before `/users/me`.** The first matching route wins, and then the conversion of `"me"` fails with a 422. Declare fixed paths first.
+- **`list[str]` without `Query()`** becomes a JSON body field, not a repeated query parameter.
+- **Sending JSON without `Content-Type: application/json`.** FastAPI won't parse it, and the error (`model_attributes_type`) doesn't mention the header. Check the header first when a client says "valid JSON is rejected".
+- **Expecting `?flag=maybe` to be `False`.** Invalid booleans are a 422.
+- **Assuming lax coercion is strict.** `"19.5"` is accepted for a `float` and `"36"` for an `int`. Use strict types if a string should be an error.
+- **Reading big uploads as `bytes`.** That loads the whole file into memory. Use `UploadFile` and read in chunks.
+- **Expecting an upload size limit.** There isn't one by default. Put one in your reverse proxy or a middleware.
+- **Trying to send a JSON body and a file together.** It's impossible in one HTTP body. Use a form field with a JSON string, or two requests.
+- **Using an uploaded file after the response is sent.** It is closed when the request ends.
+- **Returning the default 422 to untrusted clients without thinking.** The `input` field echoes what was sent, including every header when a header model fails.
+
+## Summary
+
+- The data in a request lives in the path, query, headers, cookies and body. A FastAPI parameter declares which one, implicitly or with a marker.
+- The rules, in order: explicit marker, `Depends`, special types, name in the path, `UploadFile`, scalar type (query), everything else (body).
+- `Annotated[type, Marker(...)]` adds constraints, aliases and docs while keeping real Python defaults. Constraints become OpenAPI keywords.
+- One model parameter is the whole body. Several body parameters make an object keyed by name. `Body(embed=True)` forces the keyed form.
+- Query, header and cookie **models** group related parameters, and `extra="forbid"` turns typos into errors.
+- Forms and files use `Form()`, `File()` and `UploadFile`. Uploads are spooled to disk after 1 MB and closed when the request ends.
+- Every validation failure becomes one **422** with a list of `{type, loc, msg, input, ctx}` entries, produced before your function runs.

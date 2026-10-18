@@ -1,0 +1,712 @@
+---
+title: "Project Structure and Settings"
+description: "Going from one main.py to a real project: APIRouter and include_router, layout by feature vs by layer, routers to services to repositories, configuration with pydantic-settings, API versioning, OpenAPI customisation and generating a typed client."
+---
+
+Every FastAPI tutorial fits in one `main.py`. Real services don't. Once you have twenty endpoints, a database, auth and three environments, you need answers to four questions: where does each piece of code live, how do the pieces find each other, where does configuration come from, and how do clients learn the shape of your API.
+
+FastAPI gives you three tools for this, and none of them is magic:
+
+- **`APIRouter`**: a bag of routes plus shared defaults (prefix, tags, dependencies). You attach it to the app with `include_router`.
+- **Dependency injection** ([`Depends`](/docs/fastapi/dependency-injection)): how a route gets its service, its database session and its settings without importing globals.
+- **Pydantic** (via `pydantic-settings`): typed, validated configuration read from the environment.
+
+All outputs below were produced with CPython 3.14.6, FastAPI 0.143.0, Pydantic 2.14.1 and pydantic-settings 2.15.0.
+
+## `APIRouter`: a mini app without a server
+
+An `APIRouter` has the same decorators as `FastAPI` (`.get`, `.post`, `.websocket`, ...). The difference is that a router is not an ASGI application you run. It is a **collection of route definitions** waiting to be included in an app. Defaults you set on the router apply to every route it contains.
+
+```python
+from typing import Annotated
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi.testclient import TestClient
+
+def require_api_key(x_api_key: Annotated[str | None, Header()] = None):
+    print("  dependency ran")
+    if x_api_key != "secret":
+        raise HTTPException(status_code=401, detail="bad api key")
+
+router = APIRouter(
+    prefix="/items",
+    tags=["items"],
+    dependencies=[Depends(require_api_key)],
+)
+
+@router.get("/")
+async def list_items():
+    return [{"id": 1}]
+
+@router.get("/{item_id}")
+async def get_item(item_id: int):
+    return {"id": item_id}
+
+app = FastAPI()
+app.include_router(router)
+
+for path, ops in app.openapi()["paths"].items():
+    for method, op in ops.items():
+        print(method.upper(), path, op["tags"], op["operationId"])
+
+client = TestClient(app)
+r = client.get("/items/")
+print(r.status_code, r.json())
+r = client.get("/items/7", headers={"X-API-Key": "secret"})
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+GET /items/ ['items'] list_items_items__get
+GET /items/{item_id} ['items'] get_item_items__item_id__get
+  dependency ran
+401 {'detail': 'bad api key'}
+  dependency ran
+200 {'id': 7}
+```
+
+What each router argument does:
+
+| Argument | Effect on every route in the router |
+|---|---|
+| `prefix="/items"` | prepended to the path. `"/"` becomes `/items/`. The prefix must start with `/` and must not end with `/` |
+| `tags=["items"]` | added to the operation's tags, which group endpoints in `/docs` and in generated clients |
+| `dependencies=[Depends(f)]` | `f` runs before the endpoint, like a guard. Its return value is discarded |
+| `responses={404: {...}}` | extra documented responses, merged into each operation |
+| `default_response_class=...` | the response class used when a route doesn't set one |
+
+`dependencies=[...]` is the idiomatic way to protect a whole group of routes: an auth check, a feature flag, a rate limit. The dependency runs once per request, before the endpoint, and if it raises `HTTPException` the endpoint never runs. You saw that above: the dependency ran both times, the first request was rejected, the second reached `get_item`.
+
+<Callout title="Router-level vs include-level arguments">
+`include_router(router, prefix=..., tags=..., dependencies=...)` accepts the same arguments, and they **stack** on top of the router's own. The current recommendation is to put a router's own identity (its prefix, its tags, its guard) on the `APIRouter` itself, and use the include-level arguments only for things the *app* decides, such as a version prefix like `/api/v1`.
+</Callout>
+
+### What `include_router` does underneath
+
+In older FastAPI versions, `include_router` **copied** each route into the app at the moment you called it. Routes you added to the router afterwards were silently missing. FastAPI 0.143 no longer copies. The app stores a lightweight `_IncludedRouter` node that points at the original router plus the include-time context (prefix, tags, dependencies), and it computes the effective routes lazily, caching them until the router changes.
+
+You can see both effects: the same router can be included twice under different prefixes, and a route added after the include still shows up.
+
+```python
+from fastapi import APIRouter, FastAPI
+from fastapi.testclient import TestClient
+
+users = APIRouter(prefix="/users", tags=["users"])
+
+@users.get("/{user_id}")
+async def get_user(user_id: int):
+    return {"id": user_id}
+
+app = FastAPI()
+app.include_router(users, prefix="/api/v1")
+app.include_router(users, prefix="/api/v2", tags=["v2"])
+
+@users.get("/")          # added AFTER include_router
+async def list_users():
+    return []
+
+print(sorted(app.openapi()["paths"]))
+c = TestClient(app)
+print(c.get("/api/v1/users/").status_code, c.get("/api/v2/users/3").json())
+```
+
+```text title="Output"
+['/api/v1/users/', '/api/v1/users/{user_id}', '/api/v2/users/', '/api/v2/users/{user_id}']
+200 {'id': 3}
+```
+
+<Callout type="warn">
+Don't rely on the "added after include" behaviour if your code also has to run on older FastAPI releases, where that `GET /api/v1/users/` would be a 404. The portable habit is still: define all routes in the router module, then include it. Also note that `app.routes` in 0.143 shows the included router as a single `_IncludedRouter` entry rather than a flat list of routes, so scripts that walk `app.routes` to list endpoints should read `app.openapi()["paths"]` instead.
+</Callout>
+
+Routers can include other routers too (`parent.include_router(child)`). Prefixes, tags and dependencies accumulate down the tree. A request to `/api/v1/admin/users` might pass through three levels of dependencies: the app's, the admin router's and the endpoint's own.
+
+<Mermaid chart={`flowchart LR
+  A["FastAPI app<br/>dependencies: request_id"] -->|"include_router prefix=/api/v1"| B["api router"]
+  B -->|include_router| C["users router<br/>prefix=/users"]
+  B -->|include_router| D["admin router<br/>prefix=/admin<br/>dependencies: require_admin"]
+  D --> E["GET /api/v1/admin/stats"]
+  C --> F["POST /api/v1/users/"]`} />
+
+## A recommended layout
+
+There are two common ways to split a FastAPI project into files.
+
+**By layer** groups files by technical role:
+
+```text
+app/
+  main.py
+  routers/      users.py  orders.py  products.py
+  schemas/      users.py  orders.py  products.py
+  services/     users.py  orders.py  products.py
+  repositories/ users.py  orders.py  products.py
+  models/       users.py  orders.py  products.py
+```
+
+**By feature** (also called "by domain" or "vertical slices") groups everything about one business concept together:
+
+```text
+app/
+  main.py               # create_app(): builds the FastAPI app, includes routers
+  core/
+    config.py           # Settings and get_settings
+    db.py               # engine, sessionmaker, get_session dependency
+    security.py         # password hashing, JWT helpers, get_current_user
+  users/
+    router.py           # HTTP: paths, status codes, Depends
+    schemas.py          # Pydantic request and response models
+    service.py          # business rules
+    repository.py       # SQL queries
+    models.py           # SQLAlchemy ORM tables
+  orders/
+    router.py  schemas.py  service.py  repository.py  models.py
+tests/
+  conftest.py
+  users/test_router.py  users/test_service.py
+pyproject.toml
+.env.example
+```
+
+| | By layer | By feature |
+|---|---|---|
+| Finding code for one feature | open five folders | open one folder |
+| A change to "orders" touches | files in every layer folder | files in `orders/` |
+| Works well for | small apps, under about ten endpoints | anything that grows, and teams that own features |
+| Risk | layers become dumping grounds (`services/utils.py`) | features reach into each other's internals |
+| Deleting or extracting a feature | hunt across folders | delete or move one folder |
+
+The by-feature layout scales better because changes usually follow features, not layers. A ticket says "let users change their email", not "edit all repositories". Keep cross-cutting code (config, DB setup, security, logging) in `core/`, and let features import from `core/` but avoid features importing each other's repositories. If `orders` needs a user, it calls the `users` service, which keeps the rules about users in one place.
+
+## Routers, services, repositories
+
+The layout is only half of it. The other half is the direction of calls:
+
+<Mermaid chart={`flowchart TB
+  R["router.py<br/>HTTP in and out: paths, status codes,<br/>HTTPException, response models"] --> S["service.py<br/>business rules: validation across fields,<br/>permissions, orchestration"]
+  S --> P["repository.py<br/>persistence: SQL, ORM queries,<br/>no business decisions"]
+  P --> DB[("Database")]
+  D["Depends wiring"] -.->|"provides service"| R
+  D -.->|"provides repository and session"| S`} />
+
+Each layer has one job and knows nothing about the layer above it:
+
+- The **router** translates HTTP into a function call and the result back into HTTP. It owns status codes and `HTTPException`. It holds no business rules.
+- The **service** holds the rules ("emails are unique and case-insensitive", "only the owner may cancel an order"). It raises **domain exceptions**, not `HTTPException`, so it can be called from a CLI, a background job or a test without any HTTP in sight.
+- The **repository** knows how to read and write rows. It has no opinion about whether an operation is allowed.
+
+Here is a small but complete feature. The repository is in-memory to keep the example short. In a real app it would take an `AsyncSession` (see [databases with SQLAlchemy](/docs/fastapi/databases-with-sqlalchemy)).
+
+```python title="app/users/repository.py"
+class UserRepository:
+    """Knows how to store and load users. Nothing about HTTP."""
+
+    def __init__(self) -> None:
+        self._rows: dict[int, dict] = {}
+        self._next_id = 1
+
+    async def get_by_email(self, email: str) -> dict | None:
+        return next((r for r in self._rows.values() if r["email"] == email), None)
+
+    async def add(self, email: str, name: str) -> dict:
+        row = {"id": self._next_id, "email": email, "name": name}
+        self._rows[row["id"]] = row
+        self._next_id += 1
+        return row
+```
+
+```python title="app/users/service.py"
+from app.users.repository import UserRepository
+from app.users.schemas import UserCreate
+
+
+class EmailTaken(Exception):
+    pass
+
+
+class UserService:
+    """Business rules. Nothing about HTTP, nothing about SQL."""
+
+    def __init__(self, repo: UserRepository) -> None:
+        self.repo = repo
+
+    async def register(self, data: UserCreate) -> dict:
+        email = data.email.lower()
+        if await self.repo.get_by_email(email):
+            raise EmailTaken(email)
+        return await self.repo.add(email, data.name.strip())
+```
+
+```python title="app/users/router.py"
+from typing import Annotated
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from app.users.repository import UserRepository
+from app.users.schemas import UserCreate, UserOut
+from app.users.service import EmailTaken, UserService
+
+router = APIRouter(prefix="/users", tags=["users"])
+
+_repo = UserRepository()          # stand-in for a DB session-backed repo
+
+
+def get_user_service() -> UserService:
+    return UserService(_repo)
+
+
+ServiceDep = Annotated[UserService, Depends(get_user_service)]
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+async def create_user(data: UserCreate, service: ServiceDep) -> UserOut:
+    try:
+        row = await service.register(data)
+    except EmailTaken:
+        raise HTTPException(status.HTTP_409_CONFLICT, "email already registered")
+    return UserOut(**row)
+```
+
+```python title="app/main.py"
+from fastapi import FastAPI
+
+from app.core.config import get_settings
+from app.users.router import router as users_router
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(
+        title="Shop API",
+        docs_url="/docs" if settings.env != "prod" else None,
+    )
+    app.include_router(users_router, prefix="/api/v1")
+    return app
+
+
+app = create_app()
+```
+
+```python title="run_demo.py"
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+r = client.post("/api/v1/users/", json={"email": "Ada@Example.com", "name": " Ada "})
+print(r.status_code, r.json())
+r = client.post("/api/v1/users/", json={"email": "ada@example.com", "name": "Ada"})
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+201 {'id': 1, 'email': 'ada@example.com', 'name': 'Ada'}
+409 {'detail': 'email already registered'}
+```
+
+In a database-backed version, the wiring is a chain of dependencies, and FastAPI resolves it per request:
+
+```python
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+def get_user_repo(session: SessionDep) -> UserRepository:
+    return UserRepository(session)
+
+def get_user_service(repo: Annotated[UserRepository, Depends(get_user_repo)]) -> UserService:
+    return UserService(repo)
+```
+
+Because the session is a dependency, every repository and service in one request shares **the same session** (FastAPI caches a dependency's value within a request), so they also share one transaction.
+
+<Callout title="Is the service layer always worth it?">
+No. For a CRUD endpoint whose only "rule" is "insert this row", a service class that forwards every call is ceremony. A pragmatic rule: start with router plus repository, and introduce a service when a second caller appears (a background job, a CLI, another feature) or when the router starts containing `if` statements about business rules. Keep `HTTPException` out of anything below the router from day one, though. That habit costs nothing and keeps the lower layers reusable.
+</Callout>
+
+### `create_app()`: an app factory
+
+Building the app inside a function, rather than at module import time, has two benefits. Tests can build a fresh app with different settings, and import-time side effects (reading env vars, opening connections) are concentrated in one place. Uvicorn can call the factory directly with `uvicorn app.main:create_app --factory`. Most projects also keep a module-level `app = create_app()` so `fastapi run` and `uvicorn app.main:app` work without flags.
+
+## Configuration with `pydantic-settings`
+
+The [twelve-factor](/docs/backend-first-principles/17-configuration-management) rule is: configuration that varies between deployments (URLs, secrets, pool sizes, feature flags) comes from the **environment**, not from code. Reading `os.environ["DB_POOL_SIZE"]` by hand gives you strings, no validation, and a crash at the first request that happens to use a missing variable. `pydantic-settings` turns environment variables into a validated Pydantic model at startup.
+
+```python title="app/core/config.py"
+from functools import lru_cache
+from pydantic import BaseModel, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class DatabaseSettings(BaseModel):
+    url: str = "sqlite+aiosqlite:///./dev.db"
+    pool_size: int = 5
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="APP_",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
+
+    env: str = "dev"
+    debug: bool = False
+    jwt_secret: SecretStr
+    allowed_origins: list[str] = []
+    db: DatabaseSettings = DatabaseSettings()
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+```text title=".env"
+APP_ENV=dev
+APP_JWT_SECRET=change-me-in-prod
+APP_DB__POOL_SIZE=20
+APP_ALLOWED_ORIGINS=["http://localhost:3000"]
+```
+
+```python
+from app.core.config import get_settings
+s = get_settings()
+print(s.env, s.debug, s.db, s.allowed_origins)
+print(repr(s.jwt_secret), s.jwt_secret)
+print(s.jwt_secret.get_secret_value())
+print(s.model_dump())
+print(get_settings() is s)
+```
+
+```text title="Output"
+dev False url='sqlite+aiosqlite:///./dev.db' pool_size=20 ['http://localhost:3000']
+SecretStr('**********') **********
+change-me-in-prod
+{'env': 'dev', 'debug': False, 'jwt_secret': SecretStr('**********'), 'allowed_origins': ['http://localhost:3000'], 'db': {'url': 'sqlite+aiosqlite:///./dev.db', 'pool_size': 20}}
+True
+```
+
+How it works: `BaseSettings` is a Pydantic model whose `__init__` first collects values from several **sources**, then validates them like any model. Field names map to env var names (`env_prefix` + field name, case-insensitive by default). What each config option did:
+
+- **`env_prefix="APP_"`**: only `APP_*` variables are considered, so `PATH` or `HOME` can never collide with a field.
+- **`env_file=".env"`**: values are also read from a dotenv file, relative to the **current working directory**, not to `config.py`.
+- **`env_nested_delimiter="__"`**: `APP_DB__POOL_SIZE` reaches into the nested `db` model. Nested settings are plain `BaseModel`s, not `BaseSettings`.
+- **Complex types** (`list`, `dict`, nested models) are parsed from JSON strings: `APP_ALLOWED_ORIGINS=["http://localhost:3000"]`.
+- **`SecretStr`** hides the value in `repr`, `str`, `model_dump()` and therefore in logs and tracebacks. You must call `.get_secret_value()` explicitly, which makes every place that touches the raw secret easy to find with grep.
+
+### Where values come from, and in what order
+
+```python
+import os
+from app.core.config import Settings
+
+os.environ["APP_DB__POOL_SIZE"] = "50"      # real env var beats .env
+os.environ["APP_DEBUG"] = "yes"
+s = Settings()
+print(s.db.pool_size, s.debug)
+
+s = Settings(debug=False)                   # init kwargs beat everything
+print(s.debug)
+
+os.environ["APP_DB__POOL_SIZE"] = "lots"
+try:
+    Settings()
+except Exception as e:
+    print(type(e).__name__)
+    print(e)
+```
+
+```text title="Output"
+50 True
+False
+ValidationError
+1 validation error for Settings
+db.pool_size
+  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='lots', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.14/v/int_parsing
+```
+
+<Mermaid chart={`flowchart LR
+  A["1. init kwargs<br/>Settings(debug=False)"] --> B["2. environment variables"]
+  B --> C["3. .env file"]
+  C --> D["4. secrets_dir files"]
+  D --> E["5. field defaults"]`} />
+
+The first source that has a value wins. That ordering is what makes the setup work in every environment: developers use `.env`, containers and CI set real environment variables (which override `.env`), and Kubernetes or Docker secrets can be mounted as files with `secrets_dir="/run/secrets"`.
+
+Also notice `"yes"` became `True`: settings use Pydantic's lax mode, so `1`, `true`, `on`, `yes` are all truthy booleans.
+
+Run from a directory without the `.env` file, the required secret is missing and the app refuses to start:
+
+```text title="Output"
+1 validation error for Settings
+jwt_secret
+  Field required [type=missing, input_value={}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.14/v/missing
+```
+
+This is the point: a misconfigured deployment fails **at boot**, with a message naming the field, instead of at 3 a.m. when the first login happens. Call `get_settings()` in `create_app()` or in the lifespan so validation happens on startup.
+
+<Callout type="warn">
+Commit a `.env.example` with every variable and dummy values. Never commit `.env`. And remember `env_file` is resolved against the working directory: if you run `pytest` or `uvicorn` from a different folder, the file is silently not found and you only get defaults (or a "Field required" error).
+</Callout>
+
+### The cached `get_settings` dependency
+
+Why `@lru_cache` on a function instead of a module-level `settings = Settings()`?
+
+1. **One parse per process.** `Settings()` reads the environment and a file. `lru_cache` makes every later call return the same object (`get_settings() is s` printed `True`).
+2. **No import-time side effects.** A module-level instance is built the moment anything imports `config.py`, including test collection, before your tests had a chance to set environment variables.
+3. **Overridable in tests.** Used as a dependency, it can be swapped with `app.dependency_overrides`.
+
+```python
+from typing import Annotated
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from app.core.config import Settings, get_settings
+
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+app = FastAPI()
+
+
+@app.get("/info")
+async def info(settings: SettingsDep):
+    return {"env": settings.env, "pool_size": settings.db.pool_size}
+
+
+client = TestClient(app)
+print(client.get("/info").json())
+print(get_settings.cache_info())
+
+app.dependency_overrides[get_settings] = lambda: Settings(
+    env="test", jwt_secret="x", db={"pool_size": 1}
+)
+print(client.get("/info").json())
+app.dependency_overrides.clear()
+
+get_settings.cache_clear()
+print(get_settings.cache_info())
+```
+
+```text title="Output"
+{'env': 'dev', 'pool_size': 20}
+CacheInfo(hits=0, misses=1, maxsize=128, currsize=1)
+{'env': 'test', 'pool_size': 1}
+CacheInfo(hits=0, misses=0, maxsize=128, currsize=0)
+```
+
+`dependency_overrides` only affects values injected through `Depends`. Code that calls `get_settings()` directly (like `create_app()`) still gets the cached object, which is why tests that change env vars must also call `get_settings.cache_clear()`. More on that in [testing](/docs/fastapi/testing).
+
+<Callout title="Settings are read-only at runtime">
+Treat settings as immutable for the life of the process. If a value needs to change without a redeploy (feature flags, rate limits per customer), it isn't configuration in the twelve-factor sense: put it in a database or a flag service and read it per request.
+</Callout>
+
+## API versioning
+
+Once a mobile app or a partner integration depends on your API, you can't change a response shape without breaking them. Versioning lets old and new shapes coexist while clients migrate. The options, from most to least common:
+
+| Strategy | Example | Pros | Cons |
+|---|---|---|---|
+| URL path prefix | `/api/v1/users` | visible, cacheable, trivial to route, works in a browser | the URL is "the resource" and now has a version in it |
+| Header | `Accept: application/vnd.shop.v2+json` or `X-API-Version: 2` | clean URLs | invisible in logs and links, harder to test with curl, needs custom routing |
+| Query param | `/users?version=2` | easy | mixes versioning with filtering, easy to forget |
+| No versions, evolve additively | add fields, never remove | no duplication | needs discipline. Breaking changes are impossible by definition |
+
+The path prefix is the boring default and FastAPI supports it directly. There are two ways to build it.
+
+**One app, versioned routers** (`include_router(users_v1, prefix="/api/v1")`): one OpenAPI document containing both versions, shared middleware and lifespan. Good when versions differ in a handful of endpoints.
+
+**Mounted sub-applications**: each version is a full `FastAPI` app with its own docs.
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI(title="Shop")
+v1 = FastAPI(title="Shop v1")
+v2 = FastAPI(title="Shop v2")
+
+
+@v1.get("/users/{user_id}")
+async def get_user_v1(user_id: int):
+    return {"id": user_id, "name": "Ada Lovelace"}
+
+
+@v2.get("/users/{user_id}")
+async def get_user_v2(user_id: int):
+    return {"id": user_id, "first_name": "Ada", "last_name": "Lovelace"}
+
+
+app.mount("/v1", v1)
+app.mount("/v2", v2)
+
+c = TestClient(app)
+print(c.get("/v1/users/1").json())
+print(c.get("/v2/users/1").json())
+print(c.get("/v2/openapi.json").json()["info"]["title"])
+print(c.get("/v2/docs").status_code)
+print(list(c.get("/openapi.json").json()["paths"]))
+```
+
+```text title="Output"
+{'id': 1, 'name': 'Ada Lovelace'}
+{'id': 1, 'first_name': 'Ada', 'last_name': 'Lovelace'}
+Shop v2
+200
+[]
+```
+
+`mount` is a Starlette feature: requests under `/v2` are handed to the sub-app with `root_path` set to `/v2`, so the sub-app's docs know their own URL. The parent's OpenAPI document is empty because mounted apps are opaque to it. Note that **the parent's lifespan runs, but a mounted sub-app's lifespan does not**, so keep shared resources (DB engine, HTTP clients) in the parent.
+
+Whatever you choose, version the **contract**, not the code. v1 and v2 handlers usually call the same service and differ only in their Pydantic response models. Mark old operations with `deprecated=True` so the docs and generated clients flag them, and send a `Deprecation` or `Sunset` header so clients see it at runtime. See [OpenAPI](/docs/backend-first-principles/29-openapi) for the wider picture.
+
+## Customising the OpenAPI document
+
+FastAPI builds the OpenAPI schema the first time something asks for it (`/openapi.json` or `app.openapi()`) and caches it on `app.openapi_schema`. Everything in it comes from your code: paths and methods from the decorators, parameter and body schemas from type hints, response schemas from return types and `response_model`.
+
+```python
+from fastapi import APIRouter, FastAPI
+from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
+
+
+def custom_id(route: APIRoute) -> str:
+    return f"{route.tags[0]}-{route.name}"
+
+
+tags_metadata = [
+    {"name": "users", "description": "Sign-up and profiles."},
+    {"name": "orders", "description": "Placing and tracking orders.",
+     "externalDocs": {"description": "Order states", "url": "https://example.com/orders"}},
+]
+
+app = FastAPI(
+    title="Shop API",
+    version="1.4.0",
+    summary="Public API for the shop.",
+    openapi_tags=tags_metadata,
+    generate_unique_id_function=custom_id,
+)
+
+users = APIRouter(prefix="/users", tags=["users"])
+orders = APIRouter(prefix="/orders", tags=["orders"])
+
+
+@users.get("/{user_id}")
+async def get_user(user_id: int):
+    return {"id": user_id}
+
+
+@orders.post("/", operation_id="placeOrder", summary="Place an order")
+async def create_order():
+    return {"ok": True}
+
+
+@orders.get("/internal/reindex", include_in_schema=False)
+async def reindex():
+    return {"reindexed": True}
+
+
+app.include_router(users)
+app.include_router(orders)
+
+schema = app.openapi()
+print([t["name"] for t in schema["tags"]])
+for path, ops in schema["paths"].items():
+    for method, op in ops.items():
+        print(method.upper(), path, "->", op["operationId"], "|", op.get("summary"))
+print(TestClient(app).get("/orders/internal/reindex").json())
+print(app.openapi() is schema)
+```
+
+```text title="Output"
+['users', 'orders']
+GET /users/{user_id} -> users-get_user | Get User
+POST /orders/ -> placeOrder | Place an order
+{'reindexed': True}
+True
+```
+
+The knobs, and why you'd touch them:
+
+- **`openapi_tags`** gives each tag a description and an order in `/docs`. Tags are listed in the order you declare them.
+- **`operation_id`** is the unique name of an operation. Code generators turn it into a method name, so the default `get_item_items__item_id__get` becomes `getItemItemsItemIdGet()` in TypeScript. Set it per route, or set **`generate_unique_id_function`** on the app or router to derive it (above: `users-get_user`, which generators turn into `UsersService.getUser()`).
+- **`summary`** defaults to the function name in title case (`Get User`). The function's docstring becomes the `description`.
+- **`include_in_schema=False`** hides a route from the schema and docs. The route still **works**, as the reindex call shows. Hiding is not access control: protect internal routes with a dependency, a separate port or the proxy.
+- **`docs_url=None`, `redoc_url=None`, `openapi_url=None`** on `FastAPI(...)` turn off the docs pages or the whole schema endpoint, for example in production for a private API.
+- **`deprecated=True`** on a route or router marks operations as deprecated.
+
+For anything else (adding a logo, `servers`, security schemes the decorators can't express), override the generator: wrap `fastapi.openapi.utils.get_openapi(...)`, edit the dict, store it in `app.openapi_schema`, and assign your function to `app.openapi`. Because of the cache, `app.openapi() is schema` was `True`: the schema is built once.
+
+## Generating a typed client from `openapi.json`
+
+The OpenAPI document is a machine-readable contract, so you don't need to hand-write the frontend's API layer. Export the schema without starting a server:
+
+```python title="export_openapi.py"
+import json
+from app.main import app
+
+with open("openapi.json", "w") as f:
+    json.dump(app.openapi(), f, indent=2)
+
+schema = app.openapi()
+print(list(schema["paths"]))
+print(list(schema["components"]["schemas"]))
+```
+
+```text title="Output"
+['/api/v1/users/']
+['HTTPValidationError', 'UserCreate', 'UserOut', 'ValidationError']
+```
+
+Then feed it to a generator (these commands weren't run here, they need Node or extra Python packages):
+
+```bash
+# TypeScript: types plus a fetch client
+npx @hey-api/openapi-ts -i openapi.json -o src/client
+
+# Types only, for use with your own fetch wrapper
+npx openapi-typescript openapi.json -o src/api-types.ts
+
+# A Python client package (attrs models plus httpx)
+uvx openapi-python-client generate --path openapi.json
+```
+
+<Mermaid chart={`flowchart LR
+  A["Pydantic models and route decorators"] --> B["app.openapi()"]
+  B --> C["openapi.json committed or built in CI"]
+  C --> D["TypeScript client"]
+  C --> E["Python client"]
+  C --> F["Contract diff check in CI"]`} />
+
+Good practice:
+
+1. Generate the schema in CI from the backend, and either commit the generated client or regenerate it in the frontend's build. A schema diff in a pull request shows reviewers exactly which contract changed.
+2. Set meaningful operation IDs (`generate_unique_id_function`), otherwise method names in the client are long and change when you rename a path.
+3. Declare return types or `response_model` on every route. A route that returns a bare `dict` has an empty response schema, and the generated client returns `unknown`.
+4. Add a breaking-change check (tools such as `oasdiff` compare two schemas) so a removed field fails CI instead of failing the mobile app.
+
+## Traps
+
+- **Trailing slashes.** A router with `prefix="/users"` and a route `"/"` serves `/users/`. A request to `/users` gets a **307 redirect** to `/users/`, which some clients don't follow for `POST`. Pick one style and make the frontend use it.
+- **`prefix` ending in `/`** (`prefix="/users/"`) fails with an assertion when the router is created.
+- **Walking `app.routes`** to list endpoints no longer gives a flat list in FastAPI 0.143 (you get an `_IncludedRouter` node). Read `app.openapi()["paths"]`.
+- **`HTTPException` in services** couples business logic to HTTP. Raise domain exceptions and translate them in the router or in an exception handler.
+- **Module-level `settings = Settings()`** runs at import time, before tests can set env vars. Use a cached `get_settings()`.
+- **Forgetting `cache_clear()`** after changing env vars in a test: `lru_cache` keeps returning the old settings object.
+- **`.env` is relative to the working directory**, not to your code. Missing file means silent fallback to defaults.
+- **Nested settings need `env_nested_delimiter`.** Without it, `APP_DB__POOL_SIZE` is ignored.
+- **Logging a `str` instead of a `SecretStr`.** Once you call `get_secret_value()` and store the result, the protection is gone. Call it at the last moment, in the code that needs the raw value.
+- **`include_in_schema=False` is not security.** The route is still reachable.
+- **Mounted sub-apps don't run their own lifespan.** Put startup and shutdown work in the top-level app.
+- **Default operation IDs** make ugly, unstable client method names. Set `generate_unique_id_function`.
+
+## Key points
+
+- `APIRouter` is a group of routes with shared `prefix`, `tags` and `dependencies`. `include_router` attaches it to the app, and arguments stack across levels.
+- In FastAPI 0.143, included routers are referenced, not copied, and effective routes are computed lazily.
+- Organise by feature once the app grows. Keep cross-cutting code in `core/`.
+- Routers speak HTTP, services hold rules, repositories hold queries. Wire them with `Depends` so tests can swap any layer.
+- `pydantic-settings` validates configuration at startup. Precedence: init kwargs, env vars, `.env`, secrets files, defaults.
+- `SecretStr` keeps secrets out of logs. A cached `get_settings()` dependency parses once and is overridable in tests.
+- Version with a path prefix by default, version the contract (response models), and mark old routes `deprecated`.
+- The OpenAPI document is generated from your types. Tune tags, operation IDs and visibility, then generate typed clients from it.
+
+Next: [testing](/docs/fastapi/testing) shows how `dependency_overrides`, the app factory and these settings come together in a test suite.

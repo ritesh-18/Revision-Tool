@@ -1,0 +1,888 @@
+---
+title: "Decorators"
+description: Decorators from first principles, from the f = deco(f) desugaring to decorators with arguments, methods, classes, stacking, state, async, and real backend patterns like retry, auth and route registration.
+---
+
+Decorators are everywhere in Python backends: `@app.get("/users")` in FastAPI, `@pytest.fixture`, `@dataclass`, `@lru_cache`, `@property`. They look like NestJS decorators, but the mechanism is much simpler: **a decorator is a callable that takes a function (or class) and returns something to use in its place.** Everything on this page follows from that sentence and from closures (see [Scope, LEGB and Closures](/docs/python/scope-legb-and-closures)).
+
+<Callout type="info">
+  Snippets run on **CPython 3.14.6**. Timing numbers vary from run to run.
+</Callout>
+
+## Decorators are sugar for `f = deco(f)`
+
+### What it is
+
+```python
+def shout(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs).upper()
+    return wrapper
+
+@shout
+def greet(name):
+    """Greet someone."""
+    return f"hello {name}"
+
+def greet2(name):
+    return f"hello {name}"
+greet2 = shout(greet2)          # exactly what @shout does
+
+print(greet("ada"), greet2("bob"))
+print(greet.__name__, greet.__doc__)
+```
+
+```text title="Output"
+HELLO ADA HELLO BOB
+wrapper None
+```
+
+`@shout` above a `def` means: create the function, pass it to `shout`, and bind **whatever `shout` returns** to the name `greet`. Here that's `wrapper`, a closure that holds the original function in a cell. The last line shows the cost of a naive wrapper: the name and docstring now belong to `wrapper`. We fix that below with `functools.wraps`.
+
+### Underneath: the bytecode
+
+```python
+import dis
+dis.dis(compile("@deco\ndef f(): pass", "<demo>", "exec"))
+```
+
+```text title="Output"
+  0           RESUME                   0
+
+  1           LOAD_NAME                0 (deco)
+
+  2           LOAD_CONST               0 (<code object f at 0x000001E81D882330, file "<demo>", line 1>)
+              MAKE_FUNCTION
+
+  1           CALL                     0
+
+  2           STORE_NAME               1 (f)
+              LOAD_CONST               1 (None)
+              RETURN_VALUE
+```
+
+The order is precise: **the decorator expression is evaluated first** (`LOAD_NAME deco`), then the function is created, then `deco` is called with it, and only then is the result stored under `f`. One subtle difference from writing `f = deco(f)` by hand: with `@`, the undecorated function is **never** bound to the name `f`, not even briefly. Since Python 3.9 (PEP 614), the part after `@` can be any expression, such as `@handlers["auth"]` or `@app.get("/x")`.
+
+### Decorators run at import time
+
+The decorator runs **once, when the `def` executes**, which for module-level functions means at import time. The wrapper runs on every call.
+
+```python
+registry = []
+
+def register(fn):
+    print(f"registering {fn.__name__}")
+    registry.append(fn)
+    return fn                    # return the SAME function: no wrapper
+
+print("module starts")
+
+@register
+def create_user(): ...
+
+@register
+def delete_user(): ...
+
+print("module body done, registry:", [f.__name__ for f in registry])
+```
+
+```text title="Output"
+module starts
+registering create_user
+registering delete_user
+module body done, registry: ['create_user', 'delete_user']
+```
+
+That's how frameworks discover routes, CLI commands, Celery tasks and pytest fixtures: importing the module runs the decorators, and the decorators register the functions. It's also why "my route isn't found" bugs are often "that module was never imported". A decorator doesn't have to wrap anything. Returning the function unchanged is a valid and common design.
+
+<Mermaid chart={`flowchart LR
+  A["def greet ...<br/>function object created"] --> B["shout(greet) called once<br/>at definition time"]
+  B --> C["returns wrapper<br/>closure holding fn in a cell"]
+  C --> D["name greet now points<br/>to wrapper"]
+  D --> E["greet('ada') calls wrapper<br/>which calls the original fn"]`} />
+
+## Writing decorators step by step
+
+### Step 1: a general wrapper
+
+A wrapper should accept `*args, **kwargs` and forward them, so it works with any signature, and it must **return** the original function's result (forgetting the `return` is the most common decorator bug: every decorated function then returns `None`).
+
+### Step 2: preserve metadata with `functools.wraps`
+
+```python
+import functools, inspect
+
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        print(f"-> {fn.__name__}{args}")
+        return fn(*args, **kwargs)
+    return wrapper
+
+@logged
+def transfer(src: str, dst: str, amount: int = 0) -> bool:
+    """Move money between accounts."""
+    return True
+
+print(transfer("a", "b", 5))
+print(transfer.__name__, "|", transfer.__doc__)
+print(transfer.__wrapped__)
+print(inspect.signature(transfer))        # follows __wrapped__
+print(transfer.__qualname__, transfer.__module__)
+```
+
+```text title="Output"
+-> transfer('a', 'b', 5)
+True
+transfer | Move money between accounts.
+<function transfer at 0x000002228FD1AE50>
+(src: str, dst: str, amount: int = 0) -> bool
+transfer __main__
+```
+
+Compare with no `wraps`:
+
+```python
+import inspect
+def logged(fn):
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+    return wrapper
+
+@logged
+def transfer(src: str, dst: str, amount: int = 0) -> bool:
+    """Move money between accounts."""
+    return True
+print(transfer.__name__, transfer.__doc__, inspect.signature(transfer))
+```
+
+```text title="Output"
+wrapper None (*args, **kwargs)
+```
+
+`wraps(fn)` is itself a decorator (a `partial` of `functools.update_wrapper`). It copies `__module__`, `__name__`, `__qualname__`, `__doc__`, `__annotations__` and `__type_params__`, merges `fn.__dict__` into the wrapper's, and sets `wrapper.__wrapped__ = fn`. This isn't cosmetic:
+
+- **Frameworks introspect signatures.** FastAPI reads `inspect.signature(endpoint)` to decide which parameters are path, query or body. `inspect.signature` follows `__wrapped__`, so with `wraps` your endpoint keeps its real parameters. Without it, FastAPI sees `*args, **kwargs`.
+- **Logs, tracebacks, metrics and `help()`** show the right name.
+- **Registries keyed by `__name__`** don't collide on `"wrapper"`.
+- `fn.__wrapped__` gives tests a way to call the undecorated function.
+
+**Always use `@functools.wraps(fn)` on wrappers.**
+
+### Step 3: decorators with arguments
+
+`@repeat(3)` is two steps: first `repeat(3)` is **called** and must return a decorator, then that decorator is applied to the function. So you need three levels of functions:
+
+```python
+import functools
+
+def repeat(times):                       # 1. takes the decorator's arguments
+    def decorator(fn):                   # 2. takes the function
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):    # 3. takes the call's arguments
+            return [fn(*args, **kwargs) for _ in range(times)]
+        return wrapper
+    return decorator
+
+@repeat(3)
+def roll():
+    return "dice"
+
+print(roll())
+# what @repeat(3) does: repeat(3) runs first and returns 'decorator'
+def ping(): return "pong"
+ping = repeat(2)(ping)
+print(ping())
+```
+
+```text title="Output"
+['dice', 'dice', 'dice']
+['pong', 'pong']
+```
+
+Each level is a closure over the one outside it: `wrapper` sees both `fn` and `times`.
+
+The classic mistake is forgetting the parentheses. Then `repeat` receives the function as `times`, and the name ends up bound to the inner `decorator`:
+
+```python
+import functools
+def repeat(times):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return [fn(*args, **kwargs) for _ in range(times)]
+        return wrapper
+    return decorator
+
+@repeat                  # oops: forgot (3)
+def roll():
+    return "dice"
+
+print(roll)              # 'roll' is now the inner 'decorator' function
+try:
+    roll()
+except TypeError as err:
+    print("TypeError:", err)
+```
+
+```text title="Output"
+<function repeat.<locals>.decorator at 0x000001CC06D0F530>
+TypeError: repeat.<locals>.decorator() missing 1 required positional argument: 'fn'
+```
+
+### Step 4: optional arguments (`@retry` and `@retry(...)`)
+
+To support both forms, make the function the first, optional positional parameter and make every option keyword-only:
+
+```python
+import functools
+
+def retry(fn=None, *, attempts=3):
+    if fn is None:                       # used as @retry(attempts=5)
+        return functools.partial(retry, attempts=attempts)
+    @functools.wraps(fn)                 # used as bare @retry
+    def wrapper(*args, **kwargs):
+        return f"{fn.__name__} with up to {attempts} attempts"
+    return wrapper
+
+@retry
+def a(): ...
+
+@retry(attempts=5)
+def b(): ...
+
+print(a())
+print(b())
+```
+
+```text title="Output"
+a with up to 3 attempts
+b with up to 5 attempts
+```
+
+This is the pattern behind `@dataclass` vs `@dataclass(frozen=True)` and `@pytest.fixture` vs `@pytest.fixture(scope="module")`. Keyword-only options matter: they make `@retry(5)` an error rather than silently treating `5` as the function.
+
+## Decorating methods
+
+A function-based decorator works on methods with no changes, because `wrapper` is a plain function, and plain functions are **descriptors**: when accessed through an instance, they bind `self` automatically. `self` simply arrives as `args[0]`:
+
+```python
+import functools
+
+def logged(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        print(f"call {fn.__qualname__} args={args[1:]} self={type(args[0]).__name__}")
+        return fn(*args, **kwargs)
+    return wrapper
+
+class UserService:
+    @logged
+    def find(self, user_id):
+        return {"id": user_id}
+
+print(UserService().find(7))
+print(type(UserService.__dict__["find"]).__name__)
+```
+
+```text title="Output"
+call UserService.find args=(7,) self=UserService
+{'id': 7}
+function
+```
+
+If the wrapper needs `self` explicitly, write `def wrapper(self, *args, **kwargs)`.
+
+### The trap: decorators written as classes
+
+A class with `__call__` is a natural way to write a stateful decorator, and it works on plain functions. But an instance of such a class is **not** a descriptor, so on a method `self` is never bound:
+
+```python
+import functools
+
+class CountCalls:
+    def __init__(self, fn):
+        functools.update_wrapper(self, fn)
+        self.fn = fn
+        self.calls = 0
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.fn(*args, **kwargs)
+
+@CountCalls
+def add(a, b):
+    return a + b
+add(1, 2); add(3, 4)
+print(add.calls, add.__name__)
+
+class Repo:
+    @CountCalls
+    def get(self, key):
+        return key
+
+try:
+    Repo().get("k")
+except TypeError as err:
+    print("TypeError:", err)
+```
+
+```text title="Output"
+2 add
+TypeError: Repo.get() missing 1 required positional argument: 'key'
+```
+
+`"k"` landed in the `self` slot. The fix is to implement `__get__` and bind like a function does:
+
+```python
+import functools, types
+
+class CountCalls:
+    def __init__(self, fn):
+        functools.update_wrapper(self, fn)
+        self.fn = fn
+        self.calls = 0
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.fn(*args, **kwargs)
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self
+        return types.MethodType(self, instance)   # bind like a function would
+
+class Repo:
+    @CountCalls
+    def get(self, key):
+        return key
+
+r = Repo()
+print(r.get("a"), r.get("b"), Repo.get.calls)
+```
+
+```text title="Output"
+a b 2
+```
+
+Note that `calls` is shared by all instances here, since there is one `CountCalls` object per method, on the class. Mixing with `@staticmethod`, `@classmethod` and `@property` also depends on order: put your function decorator **below** them (closest to the `def`), so they wrap your already-decorated function.
+
+## Class decorators
+
+The same rule applies to classes: `@deco` above `class C` means `C = deco(C)`. A class decorator usually **modifies the class in place and returns it**, or registers it. `@dataclass`, `@total_ordering` and plugin or model registries all work this way.
+
+```python
+def auto_repr(cls):
+    fields = list(cls.__init__.__code__.co_varnames[1:cls.__init__.__code__.co_argcount])
+    def __repr__(self):
+        args = ", ".join(f"{f}={getattr(self, f)!r}" for f in fields)
+        return f"{cls.__name__}({args})"
+    cls.__repr__ = __repr__
+    return cls
+
+MODELS = {}
+def model(name):
+    def deco(cls):
+        MODELS[name] = cls
+        return cls
+    return deco
+
+@model("user")
+@auto_repr
+class User:
+    def __init__(self, id, email):
+        self.id = id
+        self.email = email
+
+print(User(1, "a@x.io"))
+print(MODELS)
+```
+
+```text title="Output"
+User(id=1, email='a@x.io')
+{'user': <class '__main__.User'>}
+```
+
+Class decorators are the simple alternative to metaclasses: they run once, after the class is built, and they're explicit at the definition site. Unlike metaclasses, they're **not inherited**: a subclass of `User` isn't automatically registered. When you need that, use `__init_subclass__` (see [descriptors and metaclasses](/docs/python/descriptors-and-metaclasses)).
+
+## Stacking order
+
+Decorators are applied **bottom-up** (closest to the `def` first), so at call time the **top** one runs first, outermost:
+
+```python
+import functools
+
+def tag(name):
+    def deco(fn):
+        print(f"applying {name}")
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            print(f"  enter {name}")
+            result = fn(*args, **kwargs)
+            print(f"  exit {name}")
+            return result
+        return wrapper
+    return deco
+
+@tag("outer")
+@tag("inner")
+def work():
+    print("    working")
+
+print("calling")
+work()
+```
+
+```text title="Output"
+applying inner
+applying outer
+calling
+  enter outer
+  enter inner
+    working
+  exit inner
+  exit outer
+```
+
+It's `work = outer(inner(work))`, like layers of an onion, or like middleware. Order matters in practice:
+
+- `@app.get(...)` must be the **top** decorator, so the framework registers the fully wrapped function. If it's below `@require_auth`, the framework registers the unprotected function.
+- Put `@cache` **outside** `@timed` and you time only misses. Inside, and you time cache hits too.
+- Put a retry **outside** a timeout, and every attempt gets its own timeout. Inside, one timeout covers all attempts.
+
+<Mermaid chart={`flowchart LR
+  C["caller"] --> O["outer wrapper<br/>enter outer"]
+  O --> I["inner wrapper<br/>enter inner"]
+  I --> W["original work()"]
+  W --> I2["exit inner"]
+  I2 --> O2["exit outer"]
+  O2 --> R["result to caller"]`} />
+
+## Decorators that keep state
+
+The decorator runs once per decorated function, so anything it creates is per-function state. Two common places to keep it: an attribute on the wrapper (visible from outside), or a closure variable with `nonlocal` (private).
+
+```python
+import functools
+
+def count_calls(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        wrapper.calls += 1               # state on the wrapper function object
+        return fn(*args, **kwargs)
+    wrapper.calls = 0
+    return wrapper
+
+def rate_limit(max_calls):
+    def deco(fn):
+        used = 0                         # state in a closure cell
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            nonlocal used
+            if used >= max_calls:
+                raise RuntimeError(f"{fn.__name__}: limit of {max_calls} reached")
+            used += 1
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
+
+@count_calls
+def ping(): return "pong"
+ping(); ping(); ping()
+print(ping.calls)
+
+@rate_limit(2)
+def send_sms(to): return f"sent to {to}"
+print(send_sms("a"), send_sms("b"))
+try:
+    send_sms("c")
+except RuntimeError as err:
+    print("RuntimeError:", err)
+```
+
+```text title="Output"
+3
+sent to a sent to b
+RuntimeError: send_sms: limit of 2 reached
+```
+
+Traps with state: it's **process-wide** (shared across all requests and threads, so `used += 1` from several threads can race; add a `threading.Lock` if it matters), it's **per process** (four Uvicorn workers means four separate counters), and it lives as long as the function, usually forever. Real rate limits belong in Redis or the API gateway.
+
+## Real backend examples
+
+### Timing
+
+```python
+import functools, time, logging
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger("perf")
+
+def timed(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:                                   # runs even if fn raises
+            elapsed = time.perf_counter() - start
+            log.info("%s took %.1f ms", fn.__qualname__, elapsed * 1000)
+    return wrapper
+
+@timed
+def slow_query():
+    time.sleep(0.2)
+    return 42
+
+print(slow_query())
+```
+
+```text title="Output"
+42
+INFO slow_query took 200.3 ms
+```
+
+(Logging writes to stderr, so it can appear after the `print` output.) Use `perf_counter`, not `time.time`, for durations: it's monotonic and high resolution. The `try`/`finally` makes sure failures are timed too.
+
+### Retry with exponential backoff
+
+```python
+import functools, random, time
+
+def retry(*, attempts=3, base_delay=0.1, max_delay=2.0, jitter=0.0, exceptions=(Exception,)):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, attempts + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as exc:
+                    if attempt == attempts:
+                        raise                       # out of attempts: re-raise the last error
+                    delay = min(max_delay, base_delay * 2 ** (attempt - 1))
+                    delay += random.uniform(0, jitter)
+                    print(f"  attempt {attempt} failed ({exc!r}), sleeping {delay:.2f}s")
+                    time.sleep(delay)
+        return wrapper
+    return deco
+
+calls = 0
+
+@retry(attempts=4, base_delay=0.05, exceptions=(ConnectionError,))
+def call_payment_api():
+    global calls
+    calls += 1
+    if calls < 3:
+        raise ConnectionError("upstream reset")
+    return {"status": "ok", "calls": calls}
+
+print(call_payment_api())
+
+@retry(attempts=2, base_delay=0.01, exceptions=(ConnectionError,))
+def always_down():
+    raise ConnectionError("still down")
+
+try:
+    always_down()
+except ConnectionError as err:
+    print("gave up:", err)
+
+@retry(attempts=5, exceptions=(ConnectionError,))
+def bad_input():
+    raise ValueError("not retryable")
+try:
+    bad_input()
+except ValueError as err:
+    print("not retried:", err)
+```
+
+```text title="Output"
+  attempt 1 failed (ConnectionError('upstream reset')), sleeping 0.05s
+  attempt 2 failed (ConnectionError('upstream reset')), sleeping 0.10s
+{'status': 'ok', 'calls': 3}
+  attempt 1 failed (ConnectionError('still down')), sleeping 0.01s
+gave up: still down
+not retried: not retryable
+```
+
+Production notes: retry only **transient** errors (pass a narrow `exceptions` tuple, never bare `Exception` around a `ValueError`), only retry **idempotent** operations (or send an idempotency key), add **jitter** in production so many clients don't retry in lockstep, and use a bare `raise` so the original traceback survives. In real projects, the `tenacity` library provides all of this.
+
+### Async functions need async wrappers
+
+A sync wrapper around an `async def` function only times the creation of the coroutine object, not the awaited work:
+
+```python
+import asyncio, functools, time
+
+def naive_timed(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = fn(*args, **kwargs)     # for an async fn this just creates a coroutine
+        print(f"{fn.__name__} took {(time.perf_counter() - start) * 1000:.0f} ms")
+        return result
+    return wrapper
+
+@naive_timed
+async def fetch_user(user_id):
+    await asyncio.sleep(0.1)
+    return {"id": user_id}
+
+print(asyncio.run(fetch_user(1)))
+```
+
+```text title="Output"
+fetch_user took 0 ms
+{'id': 1}
+```
+
+Check with `inspect.iscoroutinefunction` and return an `async def` wrapper that `await`s. It also keeps the decorated function recognisable as a coroutine function, which FastAPI uses to decide whether to await it or run it in a threadpool:
+
+```python
+import asyncio, functools, inspect, time
+
+def timed(fn):
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                print(f"{fn.__name__} (async) took {(time.perf_counter() - start) * 1000:.0f} ms")
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            print(f"{fn.__name__} took {(time.perf_counter() - start) * 1000:.0f} ms")
+    return wrapper
+
+@timed
+async def fetch_user(user_id):
+    await asyncio.sleep(0.1)
+    return {"id": user_id}
+
+print(inspect.iscoroutinefunction(fetch_user))
+print(asyncio.run(fetch_user(1)))
+```
+
+```text title="Output"
+True
+fetch_user (async) took 110 ms
+{'id': 1}
+```
+
+In an async retry decorator, use `await asyncio.sleep(delay)`, never `time.sleep`, which would block the whole event loop.
+
+### Caching with a TTL
+
+`functools.lru_cache` has no expiry (see [lambdas and functools](/docs/python/lambdas-and-functools)). A small TTL cache is a good exercise:
+
+```python
+import functools, time
+
+def ttl_cache(seconds):
+    def deco(fn):
+        store = {}
+        @functools.wraps(fn)
+        def wrapper(*args):
+            now = time.monotonic()
+            hit = store.get(args)
+            if hit and now - hit[1] < seconds:
+                return hit[0]
+            value = fn(*args)
+            store[args] = (value, now)
+            return value
+        wrapper.cache_clear = store.clear
+        return wrapper
+    return deco
+
+@ttl_cache(seconds=0.2)
+def get_feature_flags(tenant):
+    print(f"  loading flags for {tenant}")
+    return {"beta": True}
+
+get_feature_flags("acme"); get_feature_flags("acme")
+time.sleep(0.25)
+get_feature_flags("acme")
+```
+
+```text title="Output"
+  loading flags for acme
+  loading flags for acme
+```
+
+The second call was a hit. The third came after the TTL and reloaded. This version never removes expired keys (unbounded memory) and isn't thread-safe. For real use, take `cachetools.TTLCache` with a lock, or Redis when several processes must share the cache.
+
+### Authorisation checks
+
+```python
+import functools
+from dataclasses import dataclass
+
+class Forbidden(Exception):
+    pass
+
+@dataclass
+class User:
+    name: str
+    roles: set
+
+def require_role(*roles):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(user, *args, **kwargs):
+            if not set(roles) & user.roles:
+                raise Forbidden(f"{user.name} needs one of {sorted(roles)}")
+            return fn(user, *args, **kwargs)
+        return wrapper
+    return deco
+
+@require_role("admin", "owner")
+def delete_project(user, project_id):
+    return f"{user.name} deleted project {project_id}"
+
+print(delete_project(User("ana", {"admin"}), 42))
+try:
+    delete_project(User("bob", {"viewer"}), 42)
+except Forbidden as err:
+    print("Forbidden:", err)
+```
+
+```text title="Output"
+ana deleted project 42
+Forbidden: bob needs one of ['admin', 'owner']
+```
+
+In FastAPI you'd normally express this with **dependencies** (`Depends(require_role("admin"))`) rather than a decorator, because dependencies show up in the OpenAPI schema and get the request injected. Flask and Django use decorators like this one (`@login_required`, `@permission_required`).
+
+### Registering routes, the FastAPI and Flask way
+
+`@app.get("/users/{id}")` is a decorator **factory method**: `app.get(path)` returns a decorator that stores `(method, path, fn)` in the app's route table and returns `fn` unchanged. Here's a minimal router that does the same:
+
+```python
+import re
+
+class Router:
+    def __init__(self):
+        self.routes = []
+
+    def route(self, method, path):
+        pattern = re.compile("^" + re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", path) + "$")
+        def deco(fn):
+            self.routes.append((method, pattern, fn))
+            return fn                       # register only, don't wrap
+        return deco
+
+    def get(self, path):
+        return self.route("GET", path)
+
+    def post(self, path):
+        return self.route("POST", path)
+
+    def dispatch(self, method, url, **body):
+        for m, pattern, fn in self.routes:
+            match = pattern.match(url)
+            if m == method and match:
+                return fn(**match.groupdict(), **body)
+        return 404, "not found"
+
+app = Router()
+
+@app.get("/users/{user_id}")
+def get_user(user_id):
+    return 200, {"id": int(user_id)}
+
+@app.post("/users")
+def create_user(name):
+    return 201, {"name": name}
+
+print(app.dispatch("GET", "/users/7"))
+print(app.dispatch("POST", "/users", name="ada"))
+print(app.dispatch("GET", "/nope"))
+print([(m, fn.__name__) for m, _, fn in app.routes])
+```
+
+```text title="Output"
+(200, {'id': 7})
+(201, {'name': 'ada'})
+(404, 'not found')
+[('GET', 'get_user'), ('POST', 'create_user')]
+```
+
+The real FastAPI adds one big step at registration time: it calls `inspect.signature` on your function and reads the type hints to build validation (with Pydantic), dependency injection and the OpenAPI schema. Because `fn` is returned unchanged, you can still call `get_user(...)` directly in unit tests.
+
+<Callout title="Coming from JS">
+  NestJS decorators look the same but are a different mechanism. TypeScript decorators (legacy `experimentalDecorators`, or the TC39 standard ones in TS 5+) receive a **target plus context** (class, method name, property descriptor), work on classes, methods, accessors, properties and, in legacy mode, **parameters** (`@Body()`, `@Param('id')`), and Nest stores metadata with `reflect-metadata` for its DI container to read later.
+
+  Python decorators are just callables that take a function or class and **return a replacement**. They only go on `def` and `class` statements, with no parameter decorators. The same jobs are done differently: route metadata goes into a registry (as above), and parameter sources come from **type hints and defaults** (`user_id: int`, `body: CreateUser`, `Depends(...)`), which FastAPI reads with `inspect.signature`. One more difference: a Python decorator can **replace** the function with a wrapper that runs code on each call. A Nest method decorator would do that by rewriting `descriptor.value`.
+</Callout>
+
+## Typing decorators with `ParamSpec`
+
+A decorator annotated as `Callable[..., Any]` erases the decorated function's signature for type checkers: after decoration, mypy and Pyright accept any arguments. `ParamSpec` captures the **whole parameter list** so the wrapper can promise "same parameters, same return type". Since Python 3.12 you can declare it inline with the `[**P, R]` syntax:
+
+```python
+import functools
+from collections.abc import Callable
+
+def logged[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        print(f"calling {fn.__name__}")
+        return fn(*args, **kwargs)
+    return wrapper
+
+@logged
+def add(a: int, b: int) -> int:
+    return a + b
+
+print(add(2, 3))
+print(logged.__type_params__)
+```
+
+```text title="Output"
+calling add
+5
+(P, R)
+```
+
+Now `add("x", 3)` is a type error in your editor, exactly as it would be without the decorator. On older versions, write `P = ParamSpec("P")` and `R = TypeVar("R")` from `typing`. `Concatenate` handles decorators that add or remove a leading parameter (like injecting a `db` session). See [Advanced typing](/docs/python/advanced-typing) for the details.
+
+## Interview questions
+
+1. **What does `@deco` above a function actually do?**
+   **It evaluates `deco`, creates the function, calls `deco(function)`, and binds the return value to the function's name. It's `f = deco(f)`, run once at definition time.**
+
+2. **Why use `functools.wraps`?**
+   **It copies the name, docstring, module, annotations and so on onto the wrapper and sets `__wrapped__`, so logs, `help()`, registries and `inspect.signature` (which FastAPI relies on) see the original function.**
+
+3. **How do you write a decorator that takes arguments?**
+   **Use three levels: an outer function takes the arguments and returns a decorator, which takes the function and returns a wrapper. `@repeat(3)` calls `repeat(3)` first.**
+
+4. **In what order are stacked decorators applied and run?**
+   **They're applied bottom-up (nearest the `def` first) and run top-down at call time. `@a @b def f` is `f = a(b(f))`.**
+
+5. **Why might a class-based decorator break on methods?**
+   **An instance with `__call__` isn't a descriptor, so `self` isn't bound. Implement `__get__` (returning `types.MethodType(self, instance)`) or use a function-based decorator.**
+
+6. **How do you decorate an `async def` function correctly?**
+   **Detect it with `inspect.iscoroutinefunction` and return an `async def` wrapper that awaits the call. A sync wrapper would just return the un-awaited coroutine.**
+
+7. **How does `@app.get("/path")` register a route?**
+   **`app.get(path)` returns a decorator that records the function in the app's route table at import time and returns it, usually unchanged.**
+
+8. **How do Python decorators differ from NestJS decorators?**
+   **Python decorators are plain callables that return a replacement for a function or class, with no parameter decorators and no metadata reflection. Nest decorators attach metadata via `reflect-metadata` to classes, methods and parameters for the framework to read.**
+
+## Recap
+
+- `@deco` is `f = deco(f)`, run once at definition (import) time. The returned object replaces the function.
+- Wrappers take `*args, **kwargs`, return the result, and always use `@functools.wraps`.
+- Decorators with arguments add a third level. Keyword-only options plus `fn=None` support both `@d` and `@d(...)`.
+- Function decorators work on methods because functions are descriptors. Class-based ones need `__get__`.
+- Class decorators modify or register a class and are not inherited.
+- Stacking applies bottom-up and runs top-down, and the order changes behaviour (auth, caching, retries, route registration).
+- Decorator state is per function, process-wide and per worker. Lock it or move it to Redis.
+- Async functions need async wrappers. `ParamSpec` keeps decorated signatures type-safe.

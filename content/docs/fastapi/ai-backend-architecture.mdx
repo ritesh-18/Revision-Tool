@@ -1,0 +1,574 @@
+---
+title: "AI backend architecture"
+description: "What an AI backend is, why FastAPI is the default choice for one, the reference architecture (gateway, LLM provider, vector DB, task queue, model server, cache, rate limiter, observability), how LLM workloads differ from CRUD, and a provider-agnostic LLMClient interface you can fake in tests."
+---
+
+An **AI backend** is the server that sits between your users and one or more models. The browser never talks to the LLM provider directly. It talks to your API, and your API decides who may ask what, builds the prompt, calls the model, checks and reshapes the answer, streams it back, records what it cost, and stores what it needs to remember.
+
+Part 1 of this track built a normal web backend. This part builds on it. Almost everything stays the same: routing, validation, dependency injection, lifespan, middleware, testing. What changes is the **shape of the work**. A typical CRUD handler waits a few milliseconds on a database. An LLM handler waits **seconds** on a remote model, pays per token, may stream for half a minute, and can return a different answer every time you ask the same question. This page explains what that changes, lays out the reference architecture, and sets up the one abstraction every later chapter uses: an `LLMClient` interface with a real implementation and a fake one.
+
+All outputs on this page were produced on **CPython 3.14.6** with **FastAPI 0.143**, **Pydantic 2.14** and **anthropic 1.13**. None of them called a paid API. Where a live call would be needed, the page uses a fake model with the same interface and says so.
+
+## Why FastAPI is the default choice
+
+Most AI backends written in Python today are FastAPI apps. That's not fashion. Four properties line up with what LLM work needs.
+
+### 1. Async I/O fits slow model calls
+
+An LLM call is almost pure waiting. Your process sends a request and then sits idle for 2 to 30 seconds while a GPU cluster somewhere else generates tokens. With `async def` endpoints, that waiting costs nothing: the coroutine suspends at `await`, and the [event loop](/docs/python/asyncio) serves other requests in the meantime. One process can hold hundreds of in-flight LLM calls.
+
+Here is the difference measured. Each "LLM call" takes one second. The fake model sleeps with `asyncio.sleep`, exactly like a real network wait. (The `FakeLLM` class is defined [further down this page](#a-fake-that-behaves-like-the-real-thing).)
+
+```python
+import asyncio, time
+import httpx
+from fastapi import FastAPI
+from llm import ChatMessage, FakeLLM
+
+llm = FakeLLM("A slow answer.", latency=1.0)   # pretend every LLM call takes 1 s
+app = FastAPI()
+
+@app.get("/async")
+async def with_await():
+    out = await llm.complete([ChatMessage("user", "hi")])   # yields to the loop while waiting
+    return {"text": out.text}
+
+@app.get("/sync")
+def in_threadpool():
+    time.sleep(1.0)                    # a blocking SDK call, run in the threadpool
+    return {"text": "A slow answer."}
+
+@app.get("/blocking")
+async def blocks_the_loop():
+    time.sleep(1.0)                    # a blocking call inside async def: the bug
+    return {"text": "A slow answer."}
+
+async def fire(path: str, n: int) -> float:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        start = time.perf_counter()
+        responses = await asyncio.gather(*(client.get(path) for _ in range(n)))
+        assert all(r.status_code == 200 for r in responses)
+        return time.perf_counter() - start
+
+async def main():
+    print(f"/async     100 requests: {await fire('/async', 100):.2f}s")
+    print(f"/sync      100 requests: {await fire('/sync', 100):.2f}s")
+    print(f"/blocking    5 requests: {await fire('/blocking', 5):.2f}s")
+
+asyncio.run(main())
+```
+
+```text title="Output"
+/async     100 requests: 1.02s
+/sync      100 requests: 3.06s
+/blocking    5 requests: 5.01s
+```
+
+Three behaviours, three mechanisms:
+
+- **`async def` + `await`**: all 100 calls wait at the same time on one thread. Total time is about one call.
+- **`def`**: FastAPI runs sync endpoints in a thread pool. Starlette's pool (via AnyIO) has **40** threads by default, so 100 one-second calls run in three waves: 40, 40, 20. That's about 3 seconds. It works, but every waiting call holds a whole OS thread.
+- **`async def` with a blocking call inside**: the worst case. `time.sleep` (or a sync SDK client, or `requests.get`) never yields, so the event loop is frozen and the 5 requests run one after another. Every other request on that worker, including `/health`, waits too.
+
+The rule for the whole track: **in `async def` endpoints, use async clients only.** The Anthropic SDK ships both `Anthropic` (sync) and `AsyncAnthropic`. In FastAPI you want the async one. [Calling LLM APIs](/docs/fastapi/calling-llm-apis) shows the blocking bug again with a loop-lag probe, so you can see it in production metrics.
+
+### 2. Pydantic models are LLM schemas
+
+Every serious LLM feature needs a schema. Structured output needs a JSON Schema for the answer. Tool calling needs a JSON Schema for each tool's arguments. FastAPI already makes you describe request and response bodies as [Pydantic models](/docs/python/pydantic-and-runtime-validation), and a Pydantic model **is** a JSON Schema generator and a validator in one class:
+
+```python
+import json
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class Ticket(BaseModel):
+    """A support ticket triaged by the model."""
+    category: Literal["billing", "bug", "feature", "other"]
+    urgency: int = Field(ge=1, le=5, description="1 = can wait, 5 = outage")
+    summary: str
+
+# 1. The same class validates the HTTP request body in FastAPI...
+# 2. ...and its JSON Schema is what you hand the LLM as the output/tool schema.
+print(json.dumps(Ticket.model_json_schema(), indent=2))
+
+# 3. And it validates what the LLM sends back.
+raw = '{"category": "bug", "urgency": 7, "summary": "Login fails"}'
+try:
+    Ticket.model_validate_json(raw)
+except Exception as e:
+    print(e)
+```
+
+```text title="Output"
+{
+  "description": "A support ticket triaged by the model.",
+  "properties": {
+    "category": {
+      "enum": [
+        "billing",
+        "bug",
+        "feature",
+        "other"
+      ],
+      "title": "Category",
+      "type": "string"
+    },
+    "urgency": {
+      "description": "1 = can wait, 5 = outage",
+      "maximum": 5,
+      "minimum": 1,
+      "title": "Urgency",
+      "type": "integer"
+    },
+    "summary": {
+      "title": "Summary",
+      "type": "string"
+    }
+  },
+  "required": [
+    "category",
+    "urgency",
+    "summary"
+  ],
+  "title": "Ticket",
+  "type": "object"
+}
+1 validation error for Ticket
+urgency
+  Input should be less than or equal to 5 [type=less_than_equal, input_value=7, input_type=int]
+    For further information visit https://errors.pydantic.dev/2.14/v/less_than_equal
+```
+
+One class, three jobs: the description the model reads, the contract the model's output must meet, and the type your code works with afterwards. The `description` strings and the docstring end up in the prompt, so they are prompt engineering, not just documentation. [Structured outputs and tool calling](/docs/fastapi/structured-outputs-and-tool-calling) builds on this.
+
+### 3. Streaming is built in
+
+Users judge a chat UI by how fast the first words appear, not by when the last one arrives. FastAPI can return a `StreamingResponse`, and (as of 0.143) it has **native Server-Sent Events**: an endpoint declared with `response_class=EventSourceResponse` can simply `yield` events. WebSockets are first-class too. [Streaming LLM responses](/docs/fastapi/streaming-llm-responses) covers both.
+
+### 4. The Python ML ecosystem is right there
+
+Embedding models, tokenizers, rerankers, PyTorch, ONNX Runtime, NumPy, vector-database clients, evaluation libraries: all Python. A FastAPI service can import them directly instead of calling a second service written in another language. When a model has to run inside your own process, see [Serving your own models](/docs/fastapi/serving-your-own-models).
+
+<Callout title="What FastAPI does not give you">
+FastAPI is a request/response framework. It doesn't queue jobs that run for ten minutes, doesn't survive a worker restart mid-task, and doesn't share state between worker processes. An AI backend needs a few more pieces next to it: a task queue for long jobs, Redis or similar for shared limits and caches, and a database for conversations. The architecture below shows where each one goes.
+</Callout>
+
+## The reference architecture
+
+<Mermaid chart={`flowchart LR
+  C["Client<br/>browser, mobile, other service"] -->|"HTTPS, SSE, WebSocket"| G
+  subgraph API["FastAPI gateway (N workers)"]
+    G["Routes"] --> MW["Auth, rate limit,<br/>request id"]
+    MW --> SVC["Services:<br/>prompting, validation,<br/>tool execution"]
+  end
+  SVC -->|"messages API"| LLM["LLM provider<br/>Anthropic etc."]
+  SVC -->|"similarity search"| VDB[("Vector DB")]
+  SVC -->|"enqueue"| Q[["Task queue"]]
+  Q --> W["Workers:<br/>agents, batch jobs,<br/>ingestion"]
+  W --> LLM
+  SVC -->|"HTTP or gRPC"| MS["Model server<br/>embeddings, rerankers,<br/>fine-tuned models"]
+  SVC <--> R[("Redis:<br/>cache, rate limits,<br/>job status")]
+  SVC --> DB[("Postgres:<br/>users, conversations,<br/>usage")]
+  API -.->|"traces, metrics, token cost"| O["Observability"]
+  W -.-> O`} />
+
+| Component | Job | Covered in |
+|---|---|---|
+| **FastAPI gateway** | Auth, validation, prompt assembly, calling models, streaming responses, mapping errors | this part |
+| **LLM provider** | The model itself, behind an HTTPS API. You pay per input and output token | [Calling LLM APIs](/docs/fastapi/calling-llm-apis) |
+| **Vector DB** | Stores embeddings of your documents and finds the most similar ones for a query | [RAG service](/docs/fastapi/rag-service) |
+| **Task queue + workers** | Runs work that outlives a request: agents, document ingestion, batch scoring | [Agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs) |
+| **Model server** | Hosts models you run yourself (embeddings, classifiers, open-weight LLMs) on GPU or CPU | [Serving your own models](/docs/fastapi/serving-your-own-models) |
+| **Cache** | Returns stored answers for repeated prompts, and stores embeddings so you don't recompute them | [Production AI concerns](/docs/fastapi/production-ai-concerns) |
+| **Rate limiter** | Caps requests **and tokens** per user, so one client can't drain your provider quota or budget | [Production AI concerns](/docs/fastapi/production-ai-concerns) |
+| **Observability** | Traces across the LLM call, latency per stage, tokens and dollars per request, user and route | [Production AI concerns](/docs/fastapi/production-ai-concerns) |
+
+Two design decisions matter most:
+
+1. **The gateway is the only thing that holds provider keys.** Clients authenticate to you. You authenticate to the provider. This is what lets you enforce per-user limits, log usage, swap providers and hide your prompts.
+2. **The gateway stays stateless.** Conversations live in Postgres, limits and job status in Redis, long work in the queue. Any worker can serve any request, so you scale by adding workers. This is the same rule as in the [deployment chapter](/docs/fastapi/deployment-and-performance), and it matters more here because LLM requests are long: a worker that holds a conversation in memory loses it on the next deploy.
+
+### One request through the gateway
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant G as FastAPI
+  participant R as Redis
+  participant L as LLM provider
+  participant D as Postgres
+  C->>G: POST /chat (JWT, message)
+  G->>G: validate body, authenticate
+  G->>R: check request and token budget
+  R-->>G: ok
+  G->>D: load conversation history
+  G->>L: messages.create (system, history, message), stream
+  L-->>G: token, token, token
+  G-->>C: SSE token events
+  L-->>G: final usage (input and output tokens)
+  G-->>C: SSE usage and done events
+  G->>D: save assistant turn and usage
+  G->>R: charge tokens to the user's budget`} />
+
+Notice what the gateway does **after** the model finishes: save the turn, record usage, charge the budget. If the client disconnects halfway, some of that must still happen (you were billed for the tokens generated so far). [Streaming LLM responses](/docs/fastapi/streaming-llm-responses) shows how to handle that.
+
+## How LLM workloads differ from CRUD
+
+| | Typical CRUD endpoint | LLM endpoint |
+|---|---|---|
+| Latency | 5 to 50 ms | 1 to 60 s, sometimes minutes for agents |
+| Response | one JSON body | often a stream of tokens over seconds |
+| Cost per request | close to zero | real money, proportional to tokens in and out |
+| Determinism | same input, same output | same input can give a different output |
+| Failure modes | DB down, bad input | rate limits (429), provider overloaded (529), timeouts, refusals, invalid JSON, truncated output |
+| Correctness check | unit tests with exact asserts | schema validation, evals, human review |
+| Duration limit | fits inside one request | may need a background job |
+
+Each row turns into a design decision.
+
+**Latency of seconds.** By Little's law, the number of requests in flight equals arrival rate times latency. A CRUD API at 200 requests per second with 20 ms latency has about 4 requests in flight. An LLM API at the same 200 requests per second with 8 s latency has about **1,600** in flight. Thread-per-request designs can't hold that. Async can, as the first demo showed. Every hop also needs a timeout that is long enough for a real answer: the load balancer, the reverse proxy, the ASGI server, the HTTP client, and the browser.
+
+**Streaming.** If generation takes 20 seconds, nobody wants to stare at a spinner for 20 seconds. Streaming brings time-to-first-token down to under a second. It also changes error handling: once the first byte is sent, the HTTP status is fixed at 200, so errors after that must travel **inside** the stream.
+
+**Token cost.** Every request has a price you can compute from `usage.input_tokens` and `usage.output_tokens`. That means you should log it per request, cap it per user, cache aggressively (both your own response cache and the provider's prompt cache), and treat a retry loop as a cost multiplier. A bug that retries forever is now a billing incident, not just a performance one.
+
+**Non-determinism.** You can't `assert response == "Paris"`. You validate **structure** with Pydantic, test your own logic against a **fake model** that returns fixed outputs, and measure model quality separately with evals. This is why the provider-agnostic interface below exists.
+
+**Long-running agents.** An agent that calls tools in a loop can run for minutes. HTTP requests that long are fragile: proxies cut them, deploys kill them, clients close the tab. Long work goes to a queue. The API returns a job id at once, and the client follows progress over SSE or polling. See [Agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs).
+
+<Callout type="warn" title="Timeouts compound">
+A proxy timeout of 60 s, a Uvicorn worker that is killed after 30 s, and an SDK whose default read timeout is 10 minutes don't agree with each other. The shortest one wins, and it usually fails with an unhelpful 502 or 504. Decide on one deadline per route and set every layer to match it. The [calling chapter](/docs/fastapi/calling-llm-apis#timeouts) shows how to do this for the SDK.
+</Callout>
+
+## Provider-agnostic design: the `LLMClient` interface
+
+Your route handlers should not import a provider SDK. If they do, three things get hard:
+
+- **Testing.** Every test either hits a paid API or mocks deep inside SDK internals.
+- **Swapping.** Moving one route to a cheaper model, or to another provider, means editing business logic.
+- **Cross-cutting concerns.** Retries, usage logging, concurrency limits and caching get copied into every handler.
+
+The fix is the classic ports-and-adapters move. Define the small interface **your app** needs, write one adapter per provider, and inject it with [dependency injection](/docs/fastapi/dependency-injection).
+
+<Mermaid chart={`flowchart LR
+  R["Route handlers"] -->|"depend on"| P["LLMClient protocol<br/>complete, stream"]
+  A["AnthropicLLM<br/>wraps AsyncAnthropic"] -.->|implements| P
+  F["FakeLLM<br/>scripted, no network"] -.->|implements| P
+  O["OtherProviderLLM"] -.->|implements| P
+  L["lifespan"] -->|"creates one, stores in app.state"| A
+  T["tests"] -->|"dependency_overrides"| F`} />
+
+### The interface
+
+Keep it small. It only describes what your routes use: a full completion, and a stream of events.
+
+```python
+# llm.py
+import asyncio
+import re
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+from anthropic import AsyncAnthropic
+
+Role = Literal["user", "assistant"]
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    role: Role
+    content: str
+
+
+@dataclass(frozen=True)
+class Usage:
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass(frozen=True)
+class Completion:
+    text: str
+    usage: Usage
+    model: str
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    text: str
+
+
+StreamEvent = TextDelta | Usage
+
+
+class LLMClient(Protocol):
+    async def complete(
+        self, messages: list[ChatMessage], *, system: str | None = None, max_tokens: int = 1024
+    ) -> Completion: ...
+
+    def stream(
+        self, messages: list[ChatMessage], *, system: str | None = None, max_tokens: int = 1024
+    ) -> AsyncIterator[StreamEvent]: ...
+```
+
+Some details are deliberate:
+
+- **`Protocol`, not a base class.** Any class with matching methods satisfies it (structural typing), so the fake doesn't need to inherit anything. A type checker still verifies the signatures. See [protocols](/docs/python/abcs-and-protocols).
+- **`stream` is a plain `def` returning `AsyncIterator`.** The implementations are `async def` functions that `yield`, which makes them async generators. Calling one returns the iterator at once, and the caller drives it with `async for`. If you wrote `async def stream(...) -> AsyncIterator` in the protocol, a type checker would expect a coroutine that **returns** an iterator.
+- **Your own types, not SDK types.** `Completion`, `Usage` and `TextDelta` belong to your app. Routes never see an SDK object, so a provider change stays inside one adapter.
+- **The last stream event is `Usage`.** Token counts are only known at the end of a stream. Putting them in the stream lets the route log cost without a second call.
+
+### The real adapter
+
+```python
+class AnthropicLLM:
+    """Adapter: LLMClient on top of the Anthropic SDK."""
+
+    def __init__(self, client: AsyncAnthropic, model: str = "claude-opus-5-5"):
+        self.client = client
+        self.model = model
+
+    def _params(self, messages, system, max_tokens) -> dict:
+        params = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+        }
+        if system:
+            params["system"] = system
+        return params
+
+    async def complete(self, messages, *, system=None, max_tokens=1024) -> Completion:
+        resp = await self.client.messages.create(**self._params(messages, system, max_tokens))
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        return Completion(text, Usage(resp.usage.input_tokens, resp.usage.output_tokens), resp.model)
+
+    async def stream(self, messages, *, system=None, max_tokens=1024):
+        async with self.client.messages.stream(**self._params(messages, system, max_tokens)) as s:
+            async for text in s.text_stream:
+                yield TextDelta(text)
+            final = await s.get_final_message()
+        yield Usage(final.usage.input_tokens, final.usage.output_tokens)
+```
+
+`resp.content` is a **list of blocks**, not a string. Current Claude models can return `thinking` blocks before the text, and tool-using requests return `tool_use` blocks. Filtering on `b.type == "text"` is what keeps the adapter correct as models change. The adapter takes an already-built `AsyncAnthropic` instead of creating one, because the client should be created **once** per process (next chapter explains why).
+
+This adapter was checked against the installed SDK by pointing `AsyncAnthropic` at a mock HTTP transport that returns canned API responses, including a streamed one. The real SDK parsed them and the adapter produced:
+
+```text title="Output (real SDK, mock HTTP transport, no API call)"
+Completion(text='Hi!', usage=Usage(input_tokens=12, output_tokens=1), model='claude-opus-5-5')
+TextDelta(text='Hel')
+TextDelta(text='lo')
+TextDelta(text=' there')
+Usage(input_tokens=12, output_tokens=3)
+```
+
+### A fake that behaves like the real thing
+
+A useful fake is more than `return "hello"`. It has the same async shape, simulates latency with `asyncio.sleep` (so concurrency bugs show up in tests), streams token by token, reports usage, and records what it was asked:
+
+```python
+def split_tokens(text: str) -> list[str]:
+    return re.findall(r"\S+\s*", text)
+
+
+class FakeLLM:
+    """Same interface, no network: scripted replies and simulated latency."""
+
+    def __init__(
+        self,
+        reply: str | Callable[[list[ChatMessage]], str] = "Hello from the fake model.",
+        *,
+        latency: float = 0.0,
+        token_delay: float = 0.0,
+        model: str = "fake-1",
+    ):
+        self.reply, self.latency, self.token_delay, self.model = reply, latency, token_delay, model
+        self.calls: list[list[ChatMessage]] = []
+
+    def _text(self, messages):
+        self.calls.append(messages)
+        return self.reply(messages) if callable(self.reply) else self.reply
+
+    def _usage(self, messages, out_tokens):
+        return Usage(sum(len(split_tokens(m.content)) for m in messages), out_tokens)
+
+    async def complete(self, messages, *, system=None, max_tokens=1024) -> Completion:
+        tokens = split_tokens(self._text(messages))[:max_tokens]
+        await asyncio.sleep(self.latency + self.token_delay * len(tokens))
+        return Completion("".join(tokens), self._usage(messages, len(tokens)), self.model)
+
+    async def stream(self, messages, *, system=None, max_tokens=1024):
+        tokens = split_tokens(self._text(messages))[:max_tokens]
+        await asyncio.sleep(self.latency)
+        for tok in tokens:
+            await asyncio.sleep(self.token_delay)
+            yield TextDelta(tok)
+        yield Usage(self._usage(messages, 0).input_tokens, len(tokens))
+```
+
+The "tokens" here are whitespace-separated words. Real tokenizers split text differently (a token is roughly three quarters of an English word), but for testing your own code the shape is what matters. `reply` can be a function of the conversation, so a test can script a multi-turn exchange.
+
+### Wiring it into the app
+
+Create the client once in the [lifespan](/docs/fastapi/middleware-lifespan-and-background-tasks), keep it on `app.state`, and expose it through a dependency:
+
+```python
+# app.py
+import os
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from anthropic import AsyncAnthropic
+from fastapi import Depends, FastAPI, Request
+from pydantic import BaseModel, Field
+
+from llm import AnthropicLLM, ChatMessage, FakeLLM, LLMClient
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        client = AsyncAnthropic()
+        app.state.llm = AnthropicLLM(client, model="claude-opus-5-5")
+        yield
+        await client.close()
+    else:
+        app.state.llm = FakeLLM("(fake) no API key configured")
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_llm(request: Request) -> LLMClient:
+    return request.app.state.llm
+
+
+LLM = Annotated[LLMClient, Depends(get_llm)]
+
+
+class AskIn(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+
+
+class AskOut(BaseModel):
+    answer: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+
+
+@app.post("/ask", response_model=AskOut)
+async def ask(body: AskIn, llm: LLM) -> AskOut:
+    out = await llm.complete([ChatMessage("user", body.question)], system="Answer in one sentence.")
+    return AskOut(answer=out.text, model=out.model,
+                  input_tokens=out.usage.input_tokens, output_tokens=out.usage.output_tokens)
+```
+
+The fallback to `FakeLLM` when no key is set is a convenience for local development. In production you'd rather fail at startup, so a missing secret can't silently serve fake answers. [Project structure and settings](/docs/fastapi/project-structure-and-settings) shows how to make the key a required setting.
+
+### Testing with the fake
+
+Because the route depends on `get_llm`, a test swaps the implementation with `dependency_overrides` ([testing chapter](/docs/fastapi/testing)):
+
+```python
+# test_app.py
+from fastapi.testclient import TestClient
+
+from app import app, get_llm
+from llm import FakeLLM
+
+def test_ask_uses_the_llm():
+    fake = FakeLLM("Paris is the capital of France.", model="fake-1")
+    app.dependency_overrides[get_llm] = lambda: fake
+    with TestClient(app) as client:
+        r = client.post("/ask", json={"question": "Capital of France?"})
+    app.dependency_overrides.clear()
+
+    print(r.status_code, r.json())
+    print("prompt the model saw:", fake.calls[0])
+    assert r.json()["answer"].startswith("Paris")
+
+def test_empty_question_never_reaches_the_llm():
+    fake = FakeLLM()
+    app.dependency_overrides[get_llm] = lambda: fake
+    with TestClient(app) as client:
+        r = client.post("/ask", json={"question": ""})
+    app.dependency_overrides.clear()
+    print(r.status_code, r.json()["detail"][0]["msg"], "| llm calls:", len(fake.calls))
+    assert r.status_code == 422 and fake.calls == []
+```
+
+```text title="Output (pytest -s)"
+200 {'answer': 'Paris is the capital of France.', 'model': 'fake-1', 'input_tokens': 3, 'output_tokens': 6}
+prompt the model saw: [ChatMessage(role='user', content='Capital of France?')]
+.422 String should have at least 1 character | llm calls: 0
+.
+2 passed in 2.95s
+```
+
+The second test checks something that matters for cost: invalid input is rejected by validation **before** any tokens are spent. `fake.calls` lets you assert on the exact prompt your code built, which is where most real bugs are (wrong history order, missing system prompt, untrimmed context).
+
+<Callout title="What the fake can't test">
+The fake proves that your plumbing is right: routing, validation, streaming, error mapping, concurrency limits, cost accounting. It says nothing about whether the model gives **good** answers to your prompts. That needs evals against the real model: a fixed set of inputs, run on every prompt or model change, scored by rules or by another model. Keep the two separate. Unit tests run on every commit, are free and are deterministic. Evals cost money and are run deliberately.
+</Callout>
+
+### Where cross-cutting concerns go
+
+With one interface, retries, concurrency limits, caching and usage logging become **decorators around an `LLMClient`**, not code copied into routes:
+
+```python
+class LoggingLLM:
+    """Wraps any LLMClient and records token usage."""
+
+    def __init__(self, inner: LLMClient, log: list):
+        self.inner, self.log = inner, log
+
+    async def complete(self, messages, *, system=None, max_tokens=1024):
+        out = await self.inner.complete(messages, system=system, max_tokens=max_tokens)
+        self.log.append((out.model, out.usage))
+        return out
+
+    def stream(self, messages, *, system=None, max_tokens=1024):
+        return self.inner.stream(messages, system=system, max_tokens=max_tokens)
+```
+
+You compose them in the lifespan: `LoggingLLM(LimitedLLM(AnthropicLLM(client)))`. The route still sees one `LLMClient`. The next chapter builds the concurrency limiter this way.
+
+<Callout title="Isn't this what LangChain and LiteLLM do?">
+Partly. Libraries like LiteLLM give you one call signature over many providers. They're useful when you really switch providers often. The cost is a layer between you and each provider's newest features (prompt caching options, structured outputs, thinking settings, server tools), which often lag or get flattened to a common subset. A thin interface **you** own, with one adapter per provider you actually use, keeps those features within reach and stays easy to read. You can still put LiteLLM behind your own `LLMClient` if you need it.
+</Callout>
+
+## A map of this part
+
+| Chapter | What it adds to the gateway |
+|---|---|
+| [Calling LLM APIs](/docs/fastapi/calling-llm-apis) | one shared `AsyncAnthropic`, request models, history, timeouts, retries, mapping provider errors to 503, concurrency limits, fan-out, prompt caching, token accounting |
+| [Streaming LLM responses](/docs/fastapi/streaming-llm-responses) | SDK stream to async generator to SSE, event design, errors mid-stream, cancelling on disconnect, keep-alive, proxies, a JS reader, WebSockets |
+| [Structured outputs and tool calling](/docs/fastapi/structured-outputs-and-tool-calling) | Pydantic schemas as output contracts, validation-retry loops, extraction endpoints, tools, the agentic loop, safe tool execution |
+| [RAG service](/docs/fastapi/rag-service) | chunking, embeddings, a vector store, retrieval and grounded answers with citations |
+| [Agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs) | moving agent loops to a queue, job status, progress streaming, cancellation |
+| [Serving your own models](/docs/fastapi/serving-your-own-models) | loading models in the lifespan, CPU-bound inference off the loop, batching, GPU servers |
+| [Production AI concerns](/docs/fastapi/production-ai-concerns) | token-based rate limits, caching, cost tracking, observability, prompt-injection defences |
+
+For the theory behind real-time transports (SSE vs WebSockets vs polling), see the backend lesson on [real-time backends](/docs/backend-first-principles/26-real-time-backends). For retries, circuit breakers and graceful degradation in general, see [error handling and fault tolerance](/docs/backend-first-principles/16-error-handling-fault-tolerance).
+
+## Traps
+
+- **A sync SDK client inside `async def`.** It freezes the event loop for the whole LLM call. Every request on that worker stalls. Use `AsyncAnthropic`, or make the endpoint a plain `def` so it runs in the thread pool (which caps out at 40 concurrent calls by default).
+- **Calling the provider from the browser.** Your API key leaks, and you lose rate limiting, logging and the ability to change prompts without shipping a new frontend.
+- **Keeping conversations in worker memory.** A second worker, or the next deploy, loses them. Store history in a database keyed by conversation id.
+- **CRUD-sized timeouts.** A 30 s proxy timeout in front of a 60 s generation gives users random 504s. Align every layer's timeout to the route's real budget.
+- **Asserting exact model output in unit tests.** Tests become flaky and expensive. Test your code against a fake, and test the model with evals.
+- **Leaking SDK types into routes.** Once handlers read `resp.content[0].text`, swapping providers or models means touching every route. And `content[0]` isn't even guaranteed to be text.
+- **Forgetting that retries cost money.** Retrying a 20-second generation three times triples the bill and the latency. Retry what's cheap to retry (429, 529 before any output), and cap it.
+
+## Key points
+
+- An AI backend is a normal FastAPI gateway plus an LLM provider, a vector DB, a task queue, a model server, a cache, a rate limiter and observability. The gateway holds the keys and stays stateless.
+- FastAPI fits because LLM calls are slow I/O (async), every LLM feature needs a schema (Pydantic), users need streaming (SSE and WebSockets built in), and the ML ecosystem is in Python.
+- LLM requests are slow, streamed, priced per token, non-deterministic and sometimes very long. Each of those changes how you set timeouts, handle errors, test and deploy.
+- Hide providers behind a small `LLMClient` protocol with `complete` and `stream`. Create the real adapter once in the lifespan, inject it with `Depends`, and replace it with a `FakeLLM` in tests.
+- Put retries, limits, caching and usage logging in wrappers around `LLMClient`, not in route handlers.

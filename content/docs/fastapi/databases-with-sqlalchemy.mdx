@@ -1,0 +1,892 @@
+---
+title: "Databases with SQLAlchemy"
+description: "Async SQLAlchemy 2.x with FastAPI: the engine and connection pool, AsyncSession and the session-per-request yield dependency, Mapped[] models, CRUD endpoints, repository and service layers, transactions and rollback, the N+1 problem and selectinload, why lazy loading fails in async, pool sizing maths, Alembic migrations, and SQLModel."
+---
+
+Most FastAPI services are a thin HTTP layer over a relational database. This chapter wires **SQLAlchemy 2.x in async mode** into FastAPI and explains each moving part: what the engine and pool are, why one session per request is the rule, where the transaction boundary belongs, and why the ORM's favourite convenience (lazy loading) stops working the moment you go async.
+
+All snippets were run on **CPython 3.14.6** with **FastAPI 0.143.0**, **SQLAlchemy 2.1.4** and **aiosqlite**, using `fastapi.testclient.TestClient`. In production you'd use **PostgreSQL** with the **asyncpg** driver. Only the URL changes. For Postgres itself (MVCC, indexes, isolation levels), see [Databases and Postgres](/docs/backend-first-principles/12-databases-postgres).
+
+<Callout title="Install the asyncio extra">
+SQLAlchemy's async layer needs the `greenlet` package, and in SQLAlchemy 2.1 it is no longer installed automatically. Without it, importing `sqlalchemy.ext.asyncio` fails with `ImportError: The SQLAlchemy asyncio module requires that the Python 'greenlet' library is installed`. Install `sqlalchemy[asyncio]`, plus a driver: `aiosqlite` for SQLite or `asyncpg` for Postgres.
+</Callout>
+
+## The layers
+
+<Mermaid chart={`flowchart TB
+  EP["Endpoint<br/>HTTP in, HTTP out"] --> SV["Service<br/>business rules, transaction boundary"]
+  SV --> RP["Repository<br/>queries for one aggregate"]
+  RP --> SE["AsyncSession<br/>unit of work, identity map"]
+  SE --> EN["AsyncEngine<br/>dialect, URL"]
+  EN --> PL["Connection pool<br/>N open connections"]
+  PL --> DR["Driver<br/>asyncpg or aiosqlite"]
+  DR --> DB[("Database")]`} />
+
+- The **engine** is created once per process. It knows the URL and the dialect, and it owns the **pool**.
+- The **pool** keeps a few database connections open, because opening a Postgres connection costs a TCP handshake, TLS, authentication and a backend process fork: several milliseconds each time.
+- A **session** is a short-lived **unit of work**. It borrows a connection from the pool, tracks the objects you load and change (the identity map), and turns those changes into SQL at `flush`/`commit`. It is created per request and is **not** safe to share between concurrent tasks.
+
+## The engine and the pool
+
+```python
+import asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+async def main():
+    engine = create_async_engine("sqlite+aiosqlite:///./demo.db",
+                                 pool_size=5, max_overflow=10, pool_timeout=30)
+    print(type(engine).__name__, type(engine.pool).__name__)
+    print(engine.pool.status())
+    async with engine.connect() as conn:
+        r = await conn.execute(text("select sqlite_version()"))
+        print("sqlite", r.scalar_one())
+        print(engine.pool.status())
+    print(engine.pool.status())
+    await engine.dispose()
+
+    mem = create_async_engine("sqlite+aiosqlite://")
+    print("in-memory pool:", type(mem.pool).__name__)
+    await mem.dispose()
+
+asyncio.run(main())
+```
+
+```text title="Output"
+AsyncEngine AsyncAdaptedQueuePool
+Pool size: 5  Connections in pool: 0 Current Overflow: -5 Current Checked out connections: 0
+sqlite 3.53.1
+Pool size: 5  Connections in pool: 0 Current Overflow: -4 Current Checked out connections: 1
+Pool size: 5  Connections in pool: 1 Current Overflow: -4 Current Checked out connections: 0
+in-memory pool: StaticPool
+```
+
+Read the three status lines in order:
+
+1. The pool starts **empty**. Connections are opened lazily, on first use.
+2. Inside `engine.connect()`, one connection is checked out.
+3. After the block, the connection is **returned to the pool**, not closed. The next request reuses it.
+
+The pool parameters (defaults in brackets):
+
+| Parameter | Meaning |
+|---|---|
+| `pool_size` [5] | connections kept open and idle in the pool |
+| `max_overflow` [10] | extra connections opened under load, closed again when returned |
+| `pool_timeout` [30] | seconds a caller waits for a free connection before `TimeoutError` |
+| `pool_recycle` [-1] | close connections older than N seconds (for proxies or firewalls that drop idle TCP) |
+| `pool_pre_ping` [False] | run a cheap "are you alive" check before handing out a connection |
+
+So one engine can hold at most `pool_size + max_overflow` = 15 connections. The 16th concurrent caller waits. Here is that limit being hit, with a deliberately tiny pool:
+
+```python
+engine = create_async_engine("sqlite+aiosqlite:///./pool.db",
+                             pool_size=2, max_overflow=0, pool_timeout=1)
+
+async def request(i):
+    t0 = time.perf_counter()
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("select 1"))
+            await asyncio.sleep(1.5)            # slow query / slow external call
+        print(f"request {i}: ok after {time.perf_counter() - t0:.1f}s")
+    except Exception as e:
+        print(f"request {i}: {type(e).__name__} after {time.perf_counter() - t0:.1f}s")
+        print("   ", str(e).splitlines()[0])
+
+await asyncio.gather(*(request(i) for i in range(3)))
+```
+
+```text title="Output"
+request 2: TimeoutError after 1.0s
+    QueuePool limit of size 2 overflow 0 reached, connection timed out, timeout 1.00 (Background on this error at: https://sqlalche.me/e/21/3o7r)
+request 0: ok after 1.5s
+request 1: ok after 1.5s
+```
+
+This is the classic production failure: a slow query or a slow external call made **while holding a session** keeps connections checked out, the pool runs dry, and unrelated requests start timing out. Hold connections for as short a time as possible.
+
+<Callout type="warn">
+Create the engine **once per process**, at module level or in the [lifespan](/docs/fastapi/middleware-lifespan-and-background-tasks), and call `await engine.dispose()` on shutdown. An engine created inside a dependency creates a new pool per request, which leaks connections until the database refuses new ones.
+</Callout>
+
+## Models with `Mapped[]`
+
+SQLAlchemy 2.x models are declared with type annotations. `Mapped[T]` tells both SQLAlchemy and your type checker what the attribute holds:
+
+```python
+from datetime import datetime
+
+from sqlalchemy import ForeignKey, String, func
+from sqlalchemy.ext.asyncio import AsyncAttrs
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(AsyncAttrs, DeclarativeBase):
+    pass
+
+
+class Author(Base):
+    __tablename__ = "authors"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    bio: Mapped[str | None]                       # Optional -> nullable column
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    books: Mapped[list["Book"]] = relationship(back_populates="author")
+
+
+class Book(Base):
+    __tablename__ = "books"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    isbn: Mapped[str] = mapped_column(String(13), unique=True)
+    author_id: Mapped[int] = mapped_column(ForeignKey("authors.id"))
+
+    author: Mapped[Author] = relationship(back_populates="books")
+```
+
+How the annotations become columns:
+
+- `Mapped[int]` becomes `INTEGER NOT NULL`. `Mapped[str | None]` becomes a **nullable** column. Nullability comes from the type, so you rarely write `nullable=`.
+- `mapped_column(...)` adds what the type can't express: primary key, length, uniqueness, foreign keys, server defaults.
+- `relationship()` is **not a column**. It is a Python-side link that SQLAlchemy fills by running a query. `Mapped[list["Book"]]` is one-to-many and `Mapped[Author]` is many-to-one.
+- `AsyncAttrs` adds an `awaitable_attrs` accessor for loading relationships explicitly in async code. It's used below.
+
+<Callout title="ORM models vs Pydantic schemas">
+Keep two kinds of classes. **ORM models** describe tables. **Pydantic schemas** describe the API's input and output (see [Pydantic](/docs/python/pydantic-and-runtime-validation)). Mixing them leaks columns like `password_hash` into responses and couples your API to your schema. `ConfigDict(from_attributes=True)` lets a schema read attributes from an ORM object.
+</Callout>
+
+```python
+from pydantic import BaseModel, ConfigDict
+
+class BookIn(BaseModel):
+    title: str
+    isbn: str
+
+class BookOut(BookIn):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+
+class AuthorIn(BaseModel):
+    name: str
+    bio: str | None = None
+    books: list[BookIn] = []
+
+class AuthorOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    bio: str | None
+
+class AuthorWithBooks(AuthorOut):
+    books: list[BookOut]
+
+class AuthorPatch(BaseModel):
+    name: str | None = None
+    bio: str | None = None
+```
+
+## The session-per-request dependency
+
+```python
+from collections.abc import AsyncIterator
+from typing import Annotated
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+DATABASE_URL = "sqlite+aiosqlite:///./books.db"
+# production: "postgresql+asyncpg://user:pass@db-host:5432/books"
+
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_size=5,          # connections kept open
+    max_overflow=10,      # extra connections allowed under burst
+    pool_pre_ping=True,   # test a connection before handing it out
+)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session
+
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+```
+
+What each line does:
+
+- `async_sessionmaker` is a **factory** bound to the engine. Calling `SessionLocal()` is cheap: it creates a Python object and touches no connection yet.
+- The session borrows a connection from the pool on its **first query**, and starts a transaction then (SQLAlchemy 2.x "autobegin").
+- `async with SessionLocal() as session` guarantees `session.close()` on exit. Closing **rolls back** anything not committed and returns the connection to the pool. So a request that crashes halfway leaves no partial writes behind.
+- It's a `yield` dependency, so FastAPI caches it **per request**. Every dependency and service in one request that asks for `SessionDep` gets the **same** session and therefore the same transaction (see [dependency injection](/docs/fastapi/dependency-injection)).
+- `expire_on_commit=False` is explained in the lazy-loading section below. In async code you almost always want it.
+
+Notice that the dependency **does not commit**. With FastAPI 0.143's default `scope="request"`, code after `yield` runs after the response has been sent, so a failing commit there would reach the client as a 200. The [dependency injection](/docs/fastapi/dependency-injection) chapter demonstrates this. The service layer commits explicitly instead.
+
+## Repository and service layers
+
+Three layers, each with one job. The general pattern is covered in [Controllers, services, repositories and middleware](/docs/backend-first-principles/10-controllers-services-repositories-middleware). Here is the FastAPI version.
+
+The **repository** knows how to load and store one kind of object. No HTTP, no commits:
+
+```python
+from collections.abc import Sequence
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+
+class AuthorRepository:
+    """Only knows how to load and store Author rows. No HTTP, no commits."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get(self, author_id: int) -> Author | None:
+        return await self.session.get(Author, author_id)
+
+    async def get_with_books(self, author_id: int) -> Author | None:
+        stmt = (
+            select(Author)
+            .where(Author.id == author_id)
+            .options(selectinload(Author.books))
+        )
+        return await self.session.scalar(stmt)
+
+    async def list(self, *, offset: int, limit: int) -> Sequence[Author]:
+        stmt = select(Author).order_by(Author.id).offset(offset).limit(limit)
+        return (await self.session.scalars(stmt)).all()
+
+    def add(self, author: Author) -> None:
+        self.session.add(author)
+
+    async def delete(self, author: Author) -> None:
+        await self.session.delete(author)
+```
+
+The **service** holds business rules and owns the **transaction boundary**: it decides when a unit of work is complete and commits it. It raises domain exceptions, not `HTTPException`, so it can be reused from a CLI, a worker or a test:
+
+```python
+from sqlalchemy.exc import IntegrityError
+
+
+class AuthorNotFound(Exception):
+    pass
+
+
+class DuplicateError(Exception):
+    pass
+
+
+class AuthorService:
+    """Business rules and the transaction boundary live here."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+        self.repo = AuthorRepository(session)
+
+    async def create(self, data: AuthorIn) -> Author:
+        author = Author(name=data.name, bio=data.bio)
+        author.books = [Book(title=b.title, isbn=b.isbn) for b in data.books]
+        self.repo.add(author)
+        try:
+            await self.session.commit()          # one transaction: author + all books
+        except IntegrityError as exc:
+            await self.session.rollback()        # nothing from this request is kept
+            raise DuplicateError(str(exc.orig)) from exc
+        return author
+
+    async def get(self, author_id: int, *, with_books: bool = False) -> Author:
+        loader = self.repo.get_with_books if with_books else self.repo.get
+        author = await loader(author_id)
+        if author is None:
+            raise AuthorNotFound(author_id)
+        return author
+
+    async def update(self, author_id: int, patch: AuthorPatch) -> Author:
+        author = await self.get(author_id)
+        for field, value in patch.model_dump(exclude_unset=True).items():
+            setattr(author, field, value)
+        await self.session.commit()
+        return author
+
+    async def delete(self, author_id: int) -> None:
+        author = await self.get(author_id)
+        await self.repo.delete(author)
+        await self.session.commit()
+```
+
+The **endpoints** translate HTTP to service calls and domain errors to status codes:
+
+```python
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:            # demo only; use Alembic for real
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+    await engine.dispose()                        # close pooled connections
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_author_service(session: SessionDep) -> AuthorService:
+    return AuthorService(session)
+
+
+ServiceDep = Annotated[AuthorService, Depends(get_author_service)]
+
+
+@app.exception_handler(AuthorNotFound)
+async def not_found(request: Request, exc: AuthorNotFound):
+    return JSONResponse({"detail": f"author {exc.args[0]} not found"}, status_code=404)
+
+
+@app.post("/authors", response_model=AuthorWithBooks, status_code=status.HTTP_201_CREATED)
+async def create_author(data: AuthorIn, service: ServiceDep):
+    try:
+        return await service.create(data)
+    except DuplicateError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@app.get("/authors", response_model=list[AuthorOut])
+async def list_authors(
+    session: SessionDep,
+    offset: int = 0,
+    limit: Annotated[int, Query(le=100)] = 20,
+):
+    return await AuthorRepository(session).list(offset=offset, limit=limit)
+
+
+@app.get("/authors/{author_id}", response_model=AuthorWithBooks)
+async def get_author(author_id: int, service: ServiceDep):
+    return await service.get(author_id, with_books=True)
+
+
+@app.patch("/authors/{author_id}", response_model=AuthorOut)
+async def patch_author(author_id: int, patch: AuthorPatch, service: ServiceDep):
+    return await service.update(author_id, patch)
+
+
+@app.delete("/authors/{author_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_author(author_id: int, service: ServiceDep):
+    await service.delete(author_id)
+```
+
+`conn.run_sync(Base.metadata.create_all)` exists because `create_all` is a synchronous API. `run_sync` runs a sync function against the async connection (through greenlet, explained below).
+
+### Exercising the CRUD endpoints
+
+```python
+import json
+from fastapi.testclient import TestClient
+
+def show(r):
+    query = "?" + r.request.url.query.decode() if r.request.url.query else ""
+    print(r.request.method, r.request.url.path + query, "->", r.status_code)
+    if r.content:
+        print(json.dumps(r.json(), indent=2))
+
+with TestClient(app) as client:      # 'with' runs the lifespan
+    show(client.post("/authors", json={
+        "name": "Ursula K. Le Guin",
+        "books": [{"title": "A Wizard of Earthsea", "isbn": "9780547773742"},
+                  {"title": "The Dispossessed", "isbn": "9780061054884"}],
+    }))
+    show(client.post("/authors", json={"name": "Ted Chiang"}))
+    show(client.get("/authors/1"))
+    show(client.patch("/authors/2", json={"bio": "Short stories."}))
+    show(client.get("/authors?limit=10"))
+    show(client.delete("/authors/2"))
+    show(client.get("/authors/2"))
+```
+
+```text title="Output"
+POST /authors -> 201
+{
+  "id": 1,
+  "name": "Ursula K. Le Guin",
+  "bio": null,
+  "books": [
+    {
+      "title": "A Wizard of Earthsea",
+      "isbn": "9780547773742",
+      "id": 1
+    },
+    {
+      "title": "The Dispossessed",
+      "isbn": "9780061054884",
+      "id": 2
+    }
+  ]
+}
+POST /authors -> 201
+{
+  "id": 2,
+  "name": "Ted Chiang",
+  "bio": null,
+  "books": []
+}
+GET /authors/1 -> 200
+{
+  "id": 1,
+  "name": "Ursula K. Le Guin",
+  "bio": null,
+  "books": [
+    {
+      "title": "A Wizard of Earthsea",
+      "isbn": "9780547773742",
+      "id": 1
+    },
+    {
+      "title": "The Dispossessed",
+      "isbn": "9780061054884",
+      "id": 2
+    }
+  ]
+}
+PATCH /authors/2 -> 200
+{
+  "id": 2,
+  "name": "Ted Chiang",
+  "bio": "Short stories."
+}
+GET /authors?limit=10 -> 200
+[
+  {
+    "id": 1,
+    "name": "Ursula K. Le Guin",
+    "bio": null
+  },
+  {
+    "id": 2,
+    "name": "Ted Chiang",
+    "bio": "Short stories."
+  }
+]
+DELETE /authors/2 -> 204
+GET /authors/2 -> 404
+{
+  "detail": "author 2 not found"
+}
+```
+
+A few things worth noticing:
+
+- The `POST` with books inserted three rows (one author, two books) in **one** commit. SQLAlchemy's unit of work worked out the order: insert the author first to get its `id`, then the books with `author_id` filled in.
+- The `PATCH` used `model_dump(exclude_unset=True)`, so fields the client didn't send are left alone. Only `bio` changed, and SQLAlchemy issued an `UPDATE` for just that column.
+- `GET /authors` returns `AuthorOut`, which has no `books` field. Pydantic never touches `author.books`, so no extra query runs. The response model decides what gets loaded, which matters for the next sections.
+
+## Transactions and rollback on error
+
+The second `POST` below tries to create an author with two books, and the second book's ISBN is already taken:
+
+```python
+with TestClient(app) as client:
+    client.post("/authors", json={"name": "Le Guin",
+                                  "books": [{"title": "Earthsea", "isbn": "111"}]})
+    r = client.post("/authors", json={
+        "name": "Ted Chiang",
+        "books": [{"title": "Exhalation", "isbn": "222"},
+                  {"title": "Duplicate", "isbn": "111"}],   # isbn already taken
+    })
+    print(r.status_code, r.json())
+    print([a["name"] for a in client.get("/authors").json()])
+```
+
+```text title="Output"
+409 {'detail': 'UNIQUE constraint failed: books.isbn'}
+['Le Guin']
+```
+
+The `INSERT` for "Ted Chiang" did execute (the books need its `id`), but inside a transaction that was rolled back when the book insert failed. The database never exposed those rows to anyone, and "Ted Chiang" is not in the list. **All or nothing** is the reason transactions exist.
+
+<Mermaid chart={`sequenceDiagram
+  participant S as Service
+  participant SE as AsyncSession
+  participant DB as Database
+  S->>SE: add author with 2 books
+  S->>SE: commit
+  SE->>DB: BEGIN, implicit at first statement
+  SE->>DB: INSERT author
+  SE->>DB: INSERT books 222 and 111
+  DB-->>SE: UNIQUE constraint failed on 111
+  S->>SE: rollback
+  SE->>DB: ROLLBACK
+  Note over DB: no rows from this request remain`} />
+
+Rules for the transaction boundary:
+
+- **One request, one transaction**, committed once by the service at the end of the use case. Don't commit inside repository methods, or a use case that calls two of them commits half its work.
+- **After an error, the session must be rolled back** before it can be used again. SQLAlchemy refuses further queries on a session whose flush failed (`PendingRollbackError`) until you call `rollback()`.
+- Wrap a multi-step use case in `async with session.begin():` if you prefer a block that commits on success and rolls back on any exception:
+
+```python
+async def transfer(session: AsyncSession, src: int, dst: int, amount: int):
+    async with session.begin():                   # COMMIT on exit, ROLLBACK on exception
+        a = await session.get(Account, src, with_for_update=True)
+        b = await session.get(Account, dst, with_for_update=True)
+        if a.balance < amount:
+            raise InsufficientFunds()             # triggers ROLLBACK
+        a.balance -= amount
+        b.balance += amount
+```
+
+`session.begin()` fails if a transaction is already in progress (for example, because the session already ran a query). Use it at the start of the use case, or use explicit `commit()`/`rollback()` as in `AuthorService`.
+
+- **Unhandled exceptions are also safe.** If the endpoint raises before commit, the `async with SessionLocal()` in the dependency closes the session, which rolls back.
+
+## Why lazy loading fails in async
+
+In sync SQLAlchemy, `author.books` on an unloaded relationship quietly runs a `SELECT`. That's **lazy loading**. In async SQLAlchemy, the same attribute access fails:
+
+```python
+async with Session() as s:
+    authors = (await s.scalars(select(Author))).all()
+    try:
+        print(len(authors[0].books))
+    except Exception as exc:
+        print(type(exc).__name__, ":", str(exc).splitlines()[0])
+```
+
+```text title="Output"
+StatementError : (sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can't call await_() here. Was IO attempted in an unexpected place?
+```
+
+The reason is mechanical. An attribute access is a plain synchronous expression. It cannot `await`. A database round trip in async code **must** be awaited so the event loop can run other tasks while it waits. A sync `__get__` that needs IO has no way to suspend.
+
+How does SQLAlchemy's async layer work at all, then? The ORM core is synchronous code. `AsyncSession` runs that sync code inside a **greenlet**, a lightweight coroutine that can switch stacks without `await` syntax. When the sync code needs IO, it switches back to the async caller, which awaits the driver and switches in again with the result. This only works when the call **started** from an `await session.something()` that set up the greenlet. A bare `author.books` in your endpoint did not, so SQLAlchemy has no way to reach the event loop and raises `MissingGreenlet`. (The "coroutine never awaited" warning you may see alongside it is the abandoned driver call.)
+
+Inside FastAPI it shows up when the **response model** reads a relationship you forgot to load:
+
+```python
+@app.get("/broken/{author_id}", response_model=AuthorWithBooks)
+async def broken(author_id: int, service: ServiceDep):
+    return await service.get(author_id)          # forgot with_books=True
+```
+
+```text title="Output (truncated)"
+ResponseValidationError
+1 validation error:
+  {'type': 'get_attribute_error', 'loc': ('response', 'books'), 'msg': "Error extracting attribute: StatementError: (sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can't call await_() here. Was IO attempted in an unexpected place?\n[SQL: SELECT books.id, books.title, books.isbn, books.author_id \nFROM books \nWHERE ? = books.author_id]
+```
+
+The client sees a 500. The fix is to **load everything the response needs before returning**, using eager loading.
+
+### `expire_on_commit` and the same failure
+
+By default, `commit()` **expires** every object in the session: their loaded attributes are discarded, so the next access reloads fresh values from the database. In sync code that's a hidden `SELECT`. In async code it's the same `MissingGreenlet`:
+
+```python
+ExpiringSession = async_sessionmaker(engine)          # expire_on_commit=True (default)
+async with ExpiringSession() as s:
+    a = await s.get(Author, 1)
+    a.bio = "updated"
+    await s.commit()
+    try:
+        print(a.name)
+    except Exception as exc:
+        print("after commit:", type(exc).__name__)
+```
+
+```text title="Output"
+after commit: StatementError
+```
+
+Even `a.name`, a plain column, now needs a query. That's why the session factory uses `expire_on_commit=False`: after a commit, objects keep the values they had, and the endpoint can return them. The trade-off is that values changed by the database itself (triggers, server defaults computed at update) are not refreshed. Call `await session.refresh(obj)` when you need them.
+
+### Making lazy loads fail loudly
+
+You can make every accidental lazy load an immediate, clear error by setting `lazy="raise"` on the relationship:
+
+```python
+class Team(Base):
+    __tablename__ = "teams"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    members: Mapped[list["Member"]] = relationship(lazy="raise")
+```
+
+```text title="Output"
+InvalidRequestError : 'Team.members' is not available due to lazy='raise'
+```
+
+Many async codebases set `lazy="raise"` on every relationship so that missing eager loads are caught in tests rather than producing confusing greenlet errors.
+
+## The N+1 problem and `selectinload`
+
+Suppose an endpoint lists authors with their books. The naive approach loads authors with one query, then loads each author's books separately. With `AsyncAttrs`, the explicit async lazy load is `await obj.awaitable_attrs.books`. A SQL counter attached to the engine shows the cost:
+
+```python
+from sqlalchemy import event
+
+queries = []
+
+@event.listens_for(engine.sync_engine, "before_cursor_execute")
+def count(conn, cursor, statement, params, context, executemany):
+    queries.append(" ".join(statement.split()))
+
+async with Session() as s:
+    queries.clear()
+    authors = (await s.scalars(select(Author))).all()
+    for a in authors:
+        books = await a.awaitable_attrs.books      # explicit async lazy load
+        print(a.name, [b.title for b in books])
+    print(f"{len(queries)} queries")
+    for q in queries:
+        print("  ", q)
+```
+
+```text title="Output"
+author1 ['book10', 'book11']
+author2 ['book20', 'book21']
+author3 ['book30', 'book31']
+4 queries
+   SELECT authors.id, authors.name, authors.bio, authors.created_at FROM authors
+   SELECT books.id, books.title, books.isbn, books.author_id FROM books WHERE ? = books.author_id
+   SELECT books.id, books.title, books.isbn, books.author_id FROM books WHERE ? = books.author_id
+   SELECT books.id, books.title, books.isbn, books.author_id FROM books WHERE ? = books.author_id
+```
+
+One query for the list, plus **N** queries for the children: **N+1**. With 3 authors that's 4 round trips. With a page of 100 authors it's 101, and each round trip to a networked Postgres costs around a millisecond even when the query itself is instant.
+
+The fix is to tell the query up front which relationships to load:
+
+```python
+from sqlalchemy.orm import selectinload, joinedload
+
+authors = (await s.scalars(
+    select(Author).options(selectinload(Author.books))
+)).all()
+```
+
+```text title="Output"
+selectinload {'author1': 2, 'author2': 2, 'author3': 2} 2 queries
+   SELECT authors.id, authors.name, authors.bio, authors.created_at FROM authors
+   SELECT books.author_id, books.id, books.title, books.isbn FROM books WHERE books.author_id IN (?, ?, ?)
+```
+
+```text title="Output with joinedload (needs .unique() on the result)"
+joinedload {'author1': 2, 'author2': 2, 'author3': 2} 1 queries
+   SELECT authors.id, authors.name, authors.bio, authors.created_at, books_1.id AS id_1, books_1.title, books_1.isbn, books_1.author_id FROM authors LEFT OUTER JOIN books AS books_1 ON authors.id = books_1.author_id
+```
+
+| Strategy | Queries | Best for | Watch out for |
+|---|---|---|---|
+| `selectinload` | 1 + 1 per relationship | one-to-many and many-to-many collections | very large `IN (...)` lists are batched automatically |
+| `joinedload` | 1 | many-to-one (`book.author`), small collections | duplicates parent columns per child row; collections need `.unique()` |
+| `lazy="raise"` | 0, raises | making missing eager loads an error | none, that's the point |
+| lazy (default) | N+1 | never in async request paths | `MissingGreenlet` if accessed synchronously |
+
+`selectinload` is the safe default for collections. Eager loads compose: `selectinload(Author.books).selectinload(Book.reviews)` loads two levels in three queries total.
+
+## Pool size vs threadpool vs workers
+
+Three different limits control how many things happen at once, and they multiply.
+
+<Mermaid chart={`flowchart LR
+  LB["Load balancer"] --> W1["Worker process 1<br/>event loop + 40 threads"]
+  LB --> W2["Worker process 2"]
+  LB --> W3["Worker process 3"]
+  LB --> W4["Worker process 4"]
+  W1 --> P1["Engine pool<br/>5 + 10 overflow"]
+  W2 --> P2["Engine pool"]
+  W3 --> P3["Engine pool"]
+  W4 --> P4["Engine pool"]
+  P1 --> PG[("Postgres<br/>max_connections 100")]
+  P2 --> PG
+  P3 --> PG
+  P4 --> PG`} />
+
+1. **Workers.** Uvicorn or Gunicorn runs N worker processes. Each process imports your module and creates **its own engine and its own pool**. Pools are never shared across processes.
+2. **Concurrency inside a worker.** Async endpoints run on the event loop, so one worker can have hundreds of requests in flight. Sync (`def`) endpoints and dependencies run in AnyIO's threadpool, which defaults to **40** threads per worker.
+3. **The pool.** Each worker can hold at most `pool_size + max_overflow` database connections. Requests beyond that wait up to `pool_timeout` for one.
+
+The maths:
+
+```text title="Connection budget"
+max DB connections = replicas × workers_per_replica × (pool_size + max_overflow)
+
+example: 3 pods × 4 workers × (5 + 10) = 180 connections
+Postgres default max_connections        = 100   -> "too many clients" under load
+```
+
+Practical consequences:
+
+- **Size from the database backwards.** Decide how many connections Postgres can serve well (each one is a server process, and throughput usually peaks at a small multiple of the CPU core count), subtract headroom for migrations, admin and cron jobs, and divide by the total number of worker processes.
+- **Sync endpoints with a sync engine:** if 40 threads can each hold a session but the pool has only 15 connections, 25 threads block waiting for a connection, holding threads that other sync requests need. Either match `pool_size + max_overflow` to the threadpool size or limit the threadpool.
+- **Async endpoints:** concurrency is bounded by the pool, not threads. A burst of 500 requests on one worker means 485 of them wait in the pool queue. That's fine if queries are fast, and a cascade of `TimeoutError`s if they're slow.
+- **Many replicas:** put **PgBouncer** (transaction pooling mode) in front of Postgres and keep application pools small. With asyncpg behind PgBouncer in transaction mode, disable asyncpg's prepared statement cache (`connect_args={"statement_cache_size": 0}`), because prepared statements are per server connection and PgBouncer reassigns those per transaction.
+- **Hold connections briefly.** Never call an LLM, an external API or `asyncio.sleep` while a session has a transaction open. Load, close the transaction, do the slow work, then open a new one to write.
+
+## Alembic migrations
+
+`Base.metadata.create_all()` creates missing tables, but it never alters existing ones. It won't add a column, change a type or rename anything. Real schemas evolve, so you use **migrations**: versioned scripts that move the schema from one revision to the next. Alembic is SQLAlchemy's migration tool.
+
+<Callout type="info">
+The commands and files in this section show the standard workflow. They were not run for this page.
+</Callout>
+
+```bash title="Terminal"
+pip install alembic
+alembic init -t async migrations         # the async template uses an async engine
+```
+
+This creates:
+
+```text title="Layout"
+alembic.ini                 # config, including script_location = migrations
+migrations/
+  env.py                    # how Alembic connects and what metadata to compare
+  script.py.mako            # template for new revision files
+  versions/                 # one file per revision
+```
+
+Edit `migrations/env.py` so Alembic knows your models and your real URL:
+
+```python title="migrations/env.py (the parts you change)"
+from app.models import Base          # import every model module so tables register
+from app.settings import settings
+
+config = context.config
+config.set_main_option("sqlalchemy.url", settings.database_url)
+target_metadata = Base.metadata      # autogenerate compares the DB against this
+```
+
+Then generate and apply revisions:
+
+```bash title="Terminal"
+alembic revision --autogenerate -m "create authors and books"
+alembic upgrade head          # apply all pending revisions
+alembic current               # which revision is the DB at?
+alembic history               # list revisions
+alembic downgrade -1          # undo the last revision
+```
+
+A generated revision looks like this. **Always read it before applying.** Autogenerate can't detect renames (it sees a drop plus an add, which loses data), and it misses some constraint and type changes:
+
+```python title="migrations/versions/3f2a1c_create_authors_and_books.py"
+"""create authors and books
+
+Revision ID: 3f2a1c9d8e7b
+Revises:
+Create Date: 2026-10-13 10:00:00
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = "3f2a1c9d8e7b"
+down_revision = None
+
+
+def upgrade() -> None:
+    op.create_table(
+        "authors",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=100), nullable=False),
+        sa.Column("bio", sa.String(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.text("(CURRENT_TIMESTAMP)"), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("name"),
+    )
+    op.create_table(
+        "books",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("title", sa.String(length=200), nullable=False),
+        sa.Column("isbn", sa.String(length=13), nullable=False),
+        sa.Column("author_id", sa.Integer(), nullable=False),
+        sa.ForeignKeyConstraint(["author_id"], ["authors.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("isbn"),
+    )
+
+
+def downgrade() -> None:
+    op.drop_table("books")
+    op.drop_table("authors")
+```
+
+Alembic stores the current revision in a one-row table, `alembic_version`. `upgrade head` walks the `down_revision` chain from there to the newest file.
+
+Operational rules:
+
+- **Run migrations as a separate deploy step**, not in the app's lifespan. With 4 workers × 3 pods, a lifespan migration runs 12 times concurrently.
+- **Make migrations backward compatible** with the code that's currently running (expand, deploy, then contract). Add a nullable column first, backfill it, then make it `NOT NULL` in a later release.
+- Big tables need care: adding an index on Postgres should use `CREATE INDEX CONCURRENTLY` (`op.create_index(..., postgresql_concurrently=True)` inside `with op.get_context().autocommit_block():`).
+
+## A short note on SQLModel
+
+**SQLModel** (by FastAPI's author) merges the ORM model and the Pydantic model into one class:
+
+```python
+from sqlmodel import Field, SQLModel, select
+from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy.ext.asyncio import create_async_engine
+
+
+class Hero(SQLModel, table=True):          # one class = table + Pydantic model
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True)
+    age: int | None = None
+
+
+async def main():
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    async with AsyncSession(engine) as session:
+        session.add(Hero(name="Deadpond", age=30))
+        await session.commit()
+        heroes = (await session.exec(select(Hero).where(Hero.age > 18))).all()
+        print(heroes)
+        print(heroes[0].model_dump())
+    await engine.dispose()
+```
+
+```text title="Output"
+[Hero(id=1, age=30, name='Deadpond')]
+{'id': 1, 'age': 30, 'name': 'Deadpond'}
+```
+
+It's SQLAlchemy underneath, so everything in this chapter (pool, sessions, `selectinload`, `MissingGreenlet`, Alembic) still applies. It saves boilerplate for simple CRUD. As the API grows, you usually end up writing separate `HeroCreate`/`HeroPublic` classes anyway to stop internal columns leaking, and advanced SQLAlchemy features need you to drop down to SQLAlchemy APIs. Plain SQLAlchemy plus Pydantic schemas is the more explicit choice for larger codebases.
+
+## Common mistakes
+
+1. **Forgetting `sqlalchemy[asyncio]`.** In 2.1, `greenlet` isn't pulled in by default, and the async import fails.
+2. **Creating the engine per request.** Each engine has its own pool. Create it once per process and dispose it on shutdown.
+3. **Sharing one `AsyncSession` across concurrent tasks.** `asyncio.gather(session.execute(a), session.execute(b))` fails with `InvalidRequestError: This session is provisioning a new connection; concurrent operations are not permitted`. Use one session per task.
+4. **Committing in the `yield` dependency's teardown.** It runs after the response is sent by default. Commit in the service.
+5. **Committing inside repository methods.** It breaks atomicity of use cases that touch several repositories.
+6. **Accessing relationships you didn't load.** It's `MissingGreenlet` in async, and N+1 in sync. Use `selectinload`/`joinedload`, and consider `lazy="raise"`.
+7. **Leaving `expire_on_commit=True`** and then returning the committed object. Every attribute access after commit needs IO.
+8. **Holding a session open during slow work.** LLM calls or HTTP calls inside a transaction drain the pool and hold row locks.
+9. **Ignoring the connection budget.** `replicas × workers × (pool_size + max_overflow)` must stay below Postgres `max_connections`.
+10. **Using `create_all` in production, or running Alembic from every worker's lifespan.** Run migrations once, as a deploy step, and review autogenerated files.
+11. **Returning ORM objects without a response model.** Internal columns leak, and relationships may trigger loads during serialization.
+
+## Key points
+
+- The **engine** (one per process) owns a **pool** of connections. A **session** (one per request) is a unit of work that borrows one connection.
+- `async_sessionmaker(engine, expire_on_commit=False)` plus a `yield` dependency gives one session per request, shared by every dependency in that request, and closed (with rollback) at the end.
+- Use `Mapped[]` annotations for models and separate Pydantic schemas with `from_attributes=True` for the API.
+- Repositories query, services own the transaction and commit, and endpoints map domain errors to HTTP codes.
+- A failed flush rolls back the whole unit of work. Roll back the session before reusing it.
+- Lazy loading can't work in async: attribute access can't `await`. Load relationships eagerly with `selectinload` (collections) or `joinedload` (to-one).
+- N+1 means one query per row. Count queries with a `before_cursor_execute` listener in tests.
+- Connection budget: `replicas × workers × (pool_size + max_overflow)`. Use PgBouncer when that grows.
+- Schema changes go through Alembic revisions, reviewed and run once per deploy.
+- SQLModel is SQLAlchemy plus Pydantic in one class. It's convenient for simple apps, and the same rules apply.

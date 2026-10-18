@@ -1,0 +1,1767 @@
+---
+title: "Error Handling and Building Fault Tolerant Systems"
+description: The fault-tolerant mindset applied to the five kinds of backend errors, proactive detection with health checks and monitoring, recovery and containment strategies, a global error handler, and error messages and logs that don't leak secrets.
+---
+
+<Callout type="info">
+  Notes for [Error Handling and Building Fault Tolerant Systems](https://youtu.be/8NaM_9aKS24) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The lesson is deliberately about a **mindset**, not a tool: errors **will** happen (queries fail, APIs time out, users send bad data, business logic hits edge cases), so the question is never *whether* but *how you handle them*. These notes keep that structure and add the code that turns each idea into something you can ship in Python with FastAPI.
+
+<Mermaid chart={`flowchart LR
+  A["Mindset"] --> B["5 error types"]
+  B --> C["Prevention: health checks"]
+  C --> D["Monitoring + observability"]
+  D --> E["Immediate response:<br/>recoverable vs not"]
+  E --> F["Recovery strategies"]
+  F --> G["Propagation + boundaries"]
+  G --> H["Global error handler"]
+  H --> I["Security: messages + logs"]`} />
+
+---
+
+## 1. The five kinds of errors 🎓
+
+<Mermaid chart={`flowchart TD
+  E["Backend errors"] --> L["Logic errors<br/>code runs, result is wrong"]
+  E --> D["Database errors<br/>connection, constraint, query, deadlock"]
+  E --> X["External service errors<br/>network, auth, rate limit, outage"]
+  E --> V["Input validation errors<br/>format, range, required"]
+  E --> C["Configuration errors<br/>missing or wrong settings per environment"]`} />
+
+### 1.1 Logic errors (the sneaky, dangerous ones)
+
+**Problem:** nothing crashes. The code runs and returns a result, but the result is **wrong**. The lesson's example: an e-commerce store applies a discount **twice**, which produces **negative shipping costs**. There is no exception and no alert, and the company **loses money on every order**, possibly for weeks or months until someone notices or a user reports it.
+
+**Why they happen:**
+- **Misunderstood requirements:** something was ambiguous in the discussion with the client or product manager, you wrote down the wrong rule, and without enough testing it went to production.
+- **Incorrectly implemented algorithms:** a complicated discount engine based on user behaviour and purchase history, with one small miscalculation.
+- **Unhandled edge cases:** a user behaviour in the payment or discount flow nobody expected.
+
+When the logic involves **money or security**, these errors can corrupt data and produce wrong business results over a long time.
+
+🔧 **How you actually catch them.** Because there's no exception, you have to **create** the signal:
+
+1. **Encode invariants and fail loudly.** If something must never happen, check it and raise:
+
+```python title="pricing.py"
+from dataclasses import asdict, dataclass
+from decimal import Decimal
+
+
+class InvariantError(Exception):
+    def __init__(self, message: str, context: dict) -> None:
+        super().__init__(message)
+        self.context = context
+
+
+@dataclass(frozen=True)
+class Order:
+    subtotal: Decimal
+    discount: Decimal
+    shipping: Decimal
+
+
+def finalize_order(o: Order) -> Decimal:
+    total = o.subtotal - o.discount + o.shipping
+    # invariants: a broken rule should crash this order, not silently cost money
+    if o.shipping < 0:
+        raise InvariantError("shipping cannot be negative", asdict(o))
+    if o.discount > o.subtotal:
+        raise InvariantError("discount exceeds subtotal", asdict(o))
+    if total < 0:
+        raise InvariantError("order total negative", asdict(o))
+    return total
+```
+
+2. **Make "apply once" structural, not hopeful.** Model applied discounts as a set keyed by discount code (or a DB unique constraint on `(order_id, discount_code)`), so applying the same discount twice is **impossible**, not just unlikely.
+3. **Test properties, not just examples.** Property-based tests (e.g. Hypothesis with pytest) generate thousands of random carts and assert "total ≥ 0" and "discount ≤ subtotal" for all of them. They find the edge cases nobody thought of.
+4. **Monitor business metrics** (section 2.2): average discount per order or margin per order jumping overnight is how logic bugs show up in production.
+
+### 1.2 Database errors
+
+Most backends depend heavily on their database, so these can bring the **whole system** down. The lesson lists four kinds.
+
+#### Connection errors
+**Problem:** the app can't talk to the database. The backend throws 500s and the frontend shows empty screens everywhere.
+
+**Causes:** the network is down, the database server is overloaded, or the **connection pool is exhausted**.
+
+**What a pool is (lesson's explanation):** the backend keeps a few **TCP connections to the database open** and reuses them, so each request doesn't pay for a new TCP handshake (plus database authentication). When all of them are busy and more requests arrive, those requests wait, and eventually fail.
+
+🔧 Pool settings that turn "hang forever" into a fast, handleable error:
+
+```python title="db.py"
+import os
+
+from sqlalchemy.ext.asyncio import create_async_engine
+
+engine = create_async_engine(
+    os.environ["DATABASE_URL"],       # postgresql+psycopg://... (psycopg 3, async)
+    pool_size=20,                     # per process; (processes × pool_size) must stay below Postgres max_connections
+    max_overflow=0,                   # no extra connections beyond pool_size
+    pool_timeout=2,                   # waiting for a free connection longer than this → TimeoutError, not a hang
+    pool_recycle=1800,                # replace connections older than 30 min
+    pool_pre_ping=True,               # detect connections the server dropped while idle, before using them
+    connect_args={"options": "-c statement_timeout=5000"},  # server cancels any query over 5 s (SQLSTATE 57014)
+)
+```
+
+Edge cases: a **slow query holding connections** is the usual cause of exhaustion, not traffic, so the statement timeout protects the pool. With many replicas or serverless functions, put a pooler (PgBouncer, or your provider's) in front of Postgres.
+
+#### Constraint violations
+**Problem:** the operation breaks a rule the database enforces.
+- **Unique:** creating a user with an email that already exists.
+- **Foreign key:** inserting an `orders` row whose `customer_id` doesn't exist in `customers` (the column is a non-nullable foreign key).
+
+If you don't handle these, the raw database error bubbles up and becomes a **500**, instead of a helpful message.
+
+**Two mechanisms, for two kinds of check:**
+- **Strengthen the validation layer** (frontend and backend) so obviously bad data never reaches the DB.
+- But **some checks only the database can do**. Only the DB knows whether an email is unique *right now*: if you check first in code, two concurrent signups can both pass the check. So for those, **let the constraint fire and translate the error** into a friendly response ("this email is already registered, try another").
+
+🔧 Postgres reports the kind of failure as a stable **SQLSTATE** code. Match on the code, never on the message text:
+
+| SQLSTATE | Name | Typical HTTP response |
+|---|---|---|
+| `23505` | unique_violation | 409 Conflict (the lesson uses 400) |
+| `23503` | foreign_key_violation | 404 or 422 (the referenced thing doesn't exist) |
+| `23502` | not_null_violation | 400 |
+| `40P01` | deadlock_detected | Retry the transaction |
+| `40001` | serialization_failure | Retry the transaction |
+| `57014` | query_canceled (e.g. statement timeout) | 503 / 504 |
+| `42P01` | undefined_table | 500 (a bug: typo or missing migration) |
+| `53300` | too_many_connections | 503 |
+
+#### Query errors
+**Problem:** the SQL itself is wrong (a typo such as `custmers` instead of `customers` gives "relation does not exist"), or a query is **too complex and times out**.
+
+🔧 These are **bugs, not user errors**: return a generic 500, log the details, and alert. Prevention: query builders or ORMs with types, migrations run in CI against a real database, and `EXPLAIN` on queries that touch large tables.
+
+#### Deadlocks
+**Problem:** two transactions each hold a lock the other needs, a **circular wait**, so neither can proceed.
+
+🔧 Why it happens and how to engineer around it:
+
+<Mermaid chart={`sequenceDiagram
+  participant T1 as Transaction 1
+  participant DB as Postgres
+  participant T2 as Transaction 2
+  T1->>DB: UPDATE accounts WHERE id = 1 (locks row 1)
+  T2->>DB: UPDATE accounts WHERE id = 2 (locks row 2)
+  T1->>DB: UPDATE accounts WHERE id = 2 (waits for T2)
+  T2->>DB: UPDATE accounts WHERE id = 1 (waits for T1)
+  Note over DB: cycle detected after deadlock_timeout
+  DB-->>T2: ERROR 40P01 deadlock detected (rolled back)
+  DB-->>T1: proceeds`} />
+
+- **Prevent:** always lock rows **in the same order** (for a transfer between accounts A and B, update the lower ID first). Keep transactions short; never call an external API while holding locks.
+- **Recover:** Postgres detects the cycle and aborts one transaction. That transaction is safe to **retry from the start**:
+
+```python title="with_tx_retry.py"
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
+from decimal import Decimal
+
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncConnection
+
+from app.db import engine
+
+RETRYABLE = {"40P01", "40001"}  # deadlock_detected, serialization_failure
+
+
+def sqlstate(e: DBAPIError) -> str | None:
+    return getattr(e.orig, "sqlstate", None)  # psycopg 3 exposes the SQLSTATE code on the driver error
+
+
+async def with_tx_retry[T](fn: Callable[[AsyncConnection], Awaitable[T]], max_attempts: int = 3) -> T:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with engine.begin() as conn:   # BEGIN; COMMIT on success, ROLLBACK on exception
+                return await fn(conn)
+        except DBAPIError as e:
+            if sqlstate(e) not in RETRYABLE or attempt >= max_attempts:
+                raise
+            await asyncio.sleep((20 * 2**attempt + random.uniform(0, 20)) / 1000)  # small backoff with jitter
+
+
+# transfer: lock in a consistent order to avoid deadlocks in the first place
+async def transfer(from_id: int, to_id: int, amount: Decimal) -> None:
+    async def tx(c: AsyncConnection) -> None:
+        await c.execute(
+            text("SELECT 1 FROM accounts WHERE id = ANY(:ids) ORDER BY id FOR UPDATE"),
+            {"ids": sorted([from_id, to_id])},
+        )
+        await c.execute(text("UPDATE accounts SET balance = balance - :amount WHERE id = :id"), {"amount": amount, "id": from_id})
+        await c.execute(text("UPDATE accounts SET balance = balance + :amount WHERE id = :id"), {"amount": amount, "id": to_id})
+
+    await with_tx_retry(tx)
+```
+
+### 1.3 External service errors
+
+Modern apps depend on many outside services: **payment processors**, **email providers**, **object storage** such as S3, **Redis**, and **auth providers** like Auth0 or Clerk. Each is a **point of failure you don't control**. You can't avoid them (rebuilding all of them yourself isn't realistic), so you **expect them to fail and plan for it**. The lesson lists four failure modes.
+
+#### Network failures
+The connection runs over the internet (HTTP, TCP, WebSocket), and the internet isn't perfect: **connection timeouts**, **DNS failures**, **network partitions** (routing problems that split networks apart).
+
+🔧 **The most important mechanism here is a timeout.** Without one, a hung provider holds your request, and your connection, and your memory, for as long as the OS allows. Every outbound call needs a deadline:
+
+```python
+import asyncio
+
+import httpx
+
+
+async def fetch(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    async with asyncio.timeout(3):        # raises TimeoutError after 3 s for the whole call
+        return await client.get(url)
+
+# httpx also has its own per-phase limits: httpx.AsyncClient(timeout=httpx.Timeout(3.0))
+# applies 3 s to connect, read, write and pool acquisition separately, not to the total
+```
+
+#### Authentication errors with providers
+Providers like Clerk or Auth0 reject requests because of **bad credentials**, **expired tokens** or **insufficient permissions**. And the lesson's warning: **using an external auth provider doesn't make you secure by itself**. Your own backend is still part of the flow, and it can still leak sensitive data, for example by writing tokens or user details into logs.
+
+#### Rate limiting
+Providers (OpenAI, Resend and nearly every other API) limit how many requests a client can make in a time window, to protect themselves from abuse. If something in your platform (a traffic spike, or a **logic error** that loops) makes you call them abnormally often, they respond with **`429 Too Many Requests`**.
+
+**Mechanism: exponential backoff.** On a 429, wait (say 1 minute) and retry; if it's still 429, **double the wait** (2 minutes, then 4…) and keep going until it succeeds.
+
+🔧 A production-grade retry helper. Three details matter: **respect `Retry-After`** when the provider tells you how long to wait, add **jitter** so many clients don't retry in lockstep, and **only retry what can succeed later**:
+
+```python title="retry.py"
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import httpx
+
+
+class HttpError(Exception):
+    def __init__(self, status: int, retry_after: float | None = None) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.retry_after = retry_after  # seconds
+
+
+def is_retryable(e: BaseException) -> bool:
+    if isinstance(e, HttpError):
+        return e.status == 429 or e.status >= 500
+    return isinstance(e, (TimeoutError, httpx.TransportError))  # timeouts, connection resets, DNS failures...
+
+
+async def retry[T](
+    fn: Callable[[], Awaitable[T]], *, attempts: int = 5, base: float = 0.5, cap: float = 60.0
+) -> T:
+    attempt = 0
+    while True:
+        try:
+            return await fn()
+        except Exception as e:
+            attempt += 1
+            if attempt >= attempts or not is_retryable(e):
+                raise
+            backoff = min(cap, base * 2 ** (attempt - 1))
+            if isinstance(e, HttpError) and e.retry_after:
+                wait = e.retry_after
+            else:
+                wait = random.uniform(0, backoff)  # "full jitter"
+            await asyncio.sleep(wait)
+
+
+async def call_provider(client: httpx.AsyncClient, method: str, url: str, **kwargs: Any) -> Any:
+    async with asyncio.timeout(5):
+        res = await client.request(method, url, **kwargs)
+    if res.is_error:
+        ra = res.headers.get("retry-after", "")  # seconds, when present
+        raise HttpError(res.status_code, float(ra) if ra.isdigit() and int(ra) > 0 else None)
+    return res.json()
+
+# usage: await retry(lambda: call_provider(client, "POST", url, json=payload))
+```
+
+(The `tenacity` library packages the same policy as a decorator: `@tenacity.retry(stop=stop_after_attempt(5), wait=wait_random_exponential(multiplier=0.5, max=60), retry=retry_if_exception(is_retryable), reraise=True)`. Honouring `Retry-After` needs a custom `wait` function.)
+
+Edge cases:
+- **Retries multiply load.** If each of three layers retries 3 times, one user request can become 27 calls to a struggling service. Retry in **one** layer only.
+- **Only retry idempotent operations**, or send an **idempotency key** so the provider ignores duplicates (critical for payments).
+- **Long backoffs belong in background jobs.** You can't keep an HTTP request open for 4 minutes; inside a request, retry briefly (well under a second), and move anything longer to a queue (see the task queues lesson).
+
+#### Service outages
+Big providers (parts of AWS or GCP) occasionally go down, sometimes from incidents, sometimes for maintenance, and take many of their customers with them. You can't prevent it, so your backend must **degrade gracefully** with **fallbacks**. The lesson's example: if Redis goes down, fall back to an **in-memory cache** or a **second Redis node**, so core flows such as payments and order processing keep working.
+
+🔧 **The mechanism that stops you hammering a dead service: a circuit breaker.** Retries help with short blips; during a real outage they just add load and make every request wait for its timeout. A circuit breaker tracks failures and, past a threshold, **stops calling the service for a while**, failing fast (or using the fallback) instead.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Closed
+  Closed --> Closed: success, or failures below threshold
+  Closed --> Open: failure rate over threshold
+  Open --> Open: calls fail fast and use the fallback
+  Open --> HalfOpen: cool-down elapsed
+  HalfOpen --> Closed: trial call succeeds
+  HalfOpen --> Open: trial call fails`} />
+
+```python title="circuit_breaker.py"
+import json
+import time
+from collections.abc import Awaitable, Callable
+from typing import Literal
+
+
+class CircuitBreaker:
+    def __init__(self, threshold: int = 5, cool_down: float = 30.0) -> None:
+        self.threshold = threshold
+        self.cool_down = cool_down  # seconds
+        self.state: Literal["closed", "open", "half-open"] = "closed"
+        self.failures = 0
+        self.opened_at = 0.0
+
+    async def call[T](self, fn: Callable[[], Awaitable[T]], fallback: Callable[[], Awaitable[T]]) -> T:
+        if self.state == "open":
+            if time.monotonic() - self.opened_at < self.cool_down:
+                return await fallback()                  # fail fast
+            self.state = "half-open"                     # let one trial through
+        try:
+            out = await fn()
+        except Exception:
+            self.failures += 1
+            if self.state == "half-open" or self.failures >= self.threshold:
+                self.state = "open"
+                self.opened_at = time.monotonic()
+            return await fallback()
+        self.state = "closed"
+        self.failures = 0
+        return out
+
+
+# usage: Redis outage → serve from the database instead of failing the request
+redis_breaker = CircuitBreaker(5, 15.0)
+
+
+async def get_product(product_id: int) -> dict | None:
+    async def from_cache() -> dict | None:
+        cached = await redis.get(f"product:{product_id}")
+        return json.loads(cached) if cached else await load_and_cache(product_id)
+
+    async def from_db() -> dict | None:
+        return await products_repo.get(product_id)
+
+    return await redis_breaker.call(from_cache, from_db)
+```
+
+(In production you'd usually use a library such as `pybreaker` (or its asyncio fork `aiobreaker`), which adds state-change listeners for metrics and can keep the breaker's state in Redis so every process shares it. In a real half-open state you'd also allow only **one** trial request at a time; this sketch lets any request through once the cool-down passes.)
+
+### 1.4 Input validation errors
+
+**Problem:** consumers of your API send data that doesn't meet your rules. The validation layer at the **entry point** is your **first line of defence** against bad and malicious input.
+
+Kinds of rules:
+- **Format:** is it a valid email, phone number, date? For custom data too, define the exact format you accept and **reject everything else**, for security and robustness.
+- **Range:** numbers too high or too low, strings too long or too short, arrays with fewer than 3 or more than 100 items.
+- **Required fields:** a mandatory field is missing.
+
+These return **400 Bad Request**, and they're the **easiest errors** to handle: you know the requirements in advance, so you enforce them up front. Unlike external failures (out of your control) and logic errors (hard to see), there's no excuse not to have a strong validation layer.
+
+🔧 With Pydantic (in FastAPI, declaring `CreateBook` as an endpoint's body parameter runs the same validation automatically; section 4 maps its errors to the same 400 shape):
+
+```python title="schemas.py"
+from typing import Annotated
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import ValidationError as PydanticValidationError
+
+from app.errors import ValidationError
+
+
+class CreateBook(BaseModel):
+    model_config = ConfigDict(extra="forbid")      # unknown fields → rejected, not silently ignored
+
+    # the lesson's rule: at most 500 characters
+    name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+    description: Annotated[str, Field(max_length=5_000)] | None = None
+    author_id: UUID
+
+
+def validate[M: BaseModel](model: type[M], data: object) -> M:
+    try:
+        return model.model_validate(data)
+    except PydanticValidationError as e:
+        raise ValidationError(
+            [{"field": ".".join(map(str, err["loc"])), "message": err["msg"]} for err in e.errors()]
+        ) from e
+```
+
+### 1.5 Configuration errors
+
+**Problem:** these appear when moving between **development, staging and production**. The lesson's example: you add `OPENAI_API_KEY` to your local `.env`, your PR is merged, but nobody adds it to production (whether that's set manually or comes from something like AWS Parameter Store). The deploy succeeds. Then:
+
+| Setup | What happens | Verdict |
+|---|---|---|
+| **Config is validated at startup** | The new version **refuses to start**. With **blue-green** deployment (the old version keeps running until the new one is healthy), users never notice; you get a clear "missing OPENAI_API_KEY" error | **Best case** |
+| **No startup validation** | The app starts fine. Later a real user hits the endpoint that needs OpenAI, the key is undefined, and they get a **500 at runtime** | **Worst case** |
+
+**Rule:** validate every **required** configuration value **before the server starts**, and crash immediately if any is missing or malformed. Failing at deploy time beats failing in front of users. (Configuration management gets its own lesson next in the series.)
+
+🔧 Implementation:
+
+```python title="settings.py (imported first, before anything else)"
+import sys
+from typing import Annotated, Literal
+
+from pydantic import Field, PostgresDsn, RedisDsn, ValidationError
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):            # reads APP_ENV, PORT, ... from the environment (case-insensitive)
+    app_env: Literal["development", "staging", "production"]
+    port: int = 8000
+    database_url: PostgresDsn
+    redis_url: RedisDsn
+    openai_api_key: Annotated[str, Field(pattern=r"^sk-")]
+
+
+try:
+    settings = Settings()                # typed; use settings.openai_api_key everywhere instead of os.environ
+except ValidationError as e:
+    # print names only, never values: the values may be secrets (str(e) would include them)
+    problems = [f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors()]
+    print("Invalid configuration:", problems, file=sys.stderr)
+    sys.exit(1)
+```
+
+(Import `settings` at module level in the module that builds your FastAPI app, so a bad configuration stops the process during startup, before Uvicorn accepts a single request.)
+
+---
+
+## 2. Prevention: the best error handling starts before the error 🎓
+
+The lesson's central idea: **find errors before they spread.** Detecting a problem the moment it appears, before it causes real damage, is the best error handling any system can have, whether frontend, backend or infrastructure.
+
+### 2.1 Health checks
+**Basic:** expose an endpoint such as `/health` or `/status`. The body doesn't matter; the **status code** does: 200 means running, 4xx/5xx means something is wrong. External tools keep calling it to confirm the service is alive.
+
+**But "running" isn't "working".** Check that the service can **actually do its job**:
+
+| What | Check | Example |
+|---|---|---|
+| **Database** | Connectivity, **query performance**, data integrity | Run a **representative query**; if one that took 500 ms now takes 4–5 s, something is wrong |
+| **External services** | Can you reach them, and do they work? | **Payments:** periodic test transactions (if the last one 5 minutes ago succeeded, real ones probably will too). **Email:** send test messages to an internal inbox. **Auth:** generate test tokens and validate them against the provider |
+| **Core functionality** | Is the app correctly set up? | Configuration loaded, **required caches populated**, internal data structures consistent |
+
+Together these are **proactive error detection**: being ready for the worst case ahead of time.
+
+🔧 **Liveness vs readiness.** Orchestrators like Kubernetes distinguish two questions, and mixing them up causes outages:
+- **Liveness** ("is the process stuck?"): failing it makes the platform **restart** the container. Keep it trivial. If it checks the database, a DB outage restarts **every** replica in a loop, which makes things worse.
+- **Readiness** ("can I take traffic now?"): failing it only **removes** the instance from the load balancer until it recovers. This is where dependency checks belong.
+- Deep checks (test payments, test emails) run on a **schedule** as synthetic monitoring, not on every probe, or you'll hammer providers and pay for it.
+
+```python title="health.py"
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy import text
+
+from app.clients import engine, redis
+
+router = APIRouter()
+
+
+@router.get("/health/live")
+async def live() -> PlainTextResponse:
+    return PlainTextResponse("ok")                       # process is alive
+
+
+async def check(name: str, fn: Callable[[], Awaitable[object]], slow_ms: int) -> dict:
+    t0 = time.perf_counter()
+    try:
+        async with asyncio.timeout(2):
+            await fn()
+        ms = round((time.perf_counter() - t0) * 1000)
+        return {"name": name, "ok": True, "ms": ms, "degraded": ms > slow_ms}
+    except Exception as e:
+        return {"name": name, "ok": False, "error": str(e) or type(e).__name__}
+
+
+async def postgres_probe() -> None:
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1 FROM books LIMIT 1"))   # representative, cheap
+
+
+@router.get("/health/ready")
+async def ready() -> JSONResponse:
+    results = await asyncio.gather(
+        check("postgres", postgres_probe, 200),
+        check("redis", redis.ping, 50),
+    )
+    ok = all(r["ok"] for r in results)
+    return JSONResponse(
+        {"status": "ready" if ok else "not-ready", "results": results},
+        status_code=200 if ok else 503,
+    )
+```
+
+### 2.2 Monitoring and observability
+(A full lesson on logging, monitoring and observability comes later in the series; here it's about the mindset.)
+
+**Goal:** detect errors **quickly, while they happen**, with **enough context to debug** them.
+
+- **Don't only track error rates; track performance.** Degrading performance is one of the **earliest signs** that something is about to fail, so watching it lets you act before the failure.
+- **Cover every error source:** HTTP errors, database errors, external-service failures, business-logic errors.
+- **Performance metrics:** response times, resource usage, throughput.
+- **Business metrics:** for an e-commerce backend, a sudden **drop in successful transactions** points to a technical problem **even when error rates look normal**. Track successful transactions, successful logins and so on.
+- **Logging:** use **structured logs** (JSON) that are easy to parse and enrich with metadata; aggregate them with tools like **Grafana Loki** to search, visualise and store them.
+
+🔧 Why business metrics catch what error rates miss: a broken "Pay" button that does nothing produces **zero errors**. Only "orders per minute fell 80% compared with the same time last week" reveals it.
+
+```python title="logging_setup.py"
+import json
+import logging
+
+REDACT = {"authorization", "cookie", "password", "card_number", "email"}
+
+
+def redact(value: object) -> object:
+    if isinstance(value, dict):
+        return {k: "[redacted]" if str(k).lower() in REDACT else redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    return value
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "level": record.levelname,
+            "time": self.formatTime(record),
+            "msg": record.getMessage(),
+            **redact(getattr(record, "ctx", {})),       # structured fields passed as extra={"ctx": {...}}
+        }
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry, default=str)
+
+
+handler = logging.StreamHandler()
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
+logger = logging.getLogger("app")
+
+# logger.info("order created", extra={"ctx": {"request_id": "9f2c...", "user_id": "u_123"}})
+# every log line is JSON: {"level": "INFO", "time": ..., "msg": "order created", "request_id": "9f2c...", "user_id": "u_123"}
+```
+
+### 2.3 Classifying errors so alerts mean something ➕
+
+Monitoring every error source produces a flood; the step that turns it into action is deciding, per error, **whether anyone needs to know** and **which errors are really the same one**. (Alerting on SLO burn rates is covered in the DevOps lesson; this is about the errors that feed it.)
+
+#### Expected outcomes vs incidents
+**Problem:** the dashboard shows "4,000 errors in the last hour" and someone gets paged. 3,950 were users typing a wrong password or requesting a deleted book.
+
+**Why it happens:** "error" means two different things. A **validation failure, a 404 or a 409** is the API correctly telling a client "no"; nothing is broken. An **unknown exception, a pool timeout, an unhandled database error** means your system failed to do its job. Counting both in one number hides the second in the noise of the first.
+
+**Mechanism:** classify at the one place that sees every error, the global handler (section 4), and emit a metric with a small fixed set of classes:
+
+| Class | Examples | Who hears about it |
+|---|---|---|
+| `client` | 400 validation, 401, 404, 409 | Nobody, unless the **rate** jumps (a broken frontend deploy) |
+| `dependency` | Provider 5xx or timeout, circuit open, 429 from a provider | Ticket or page depending on duration and user impact |
+| `internal` | Unknown error → 500, invariant violation, DB `42P01` | Page: it's a bug or a broken deploy |
+
+```python title="error_metrics.py"
+from typing import Literal
+
+from fastapi import Request
+from prometheus_client import Counter
+
+from app.errors import AppError, ExternalServiceError
+
+# exported as app_errors_total
+app_errors = Counter("app_errors", "errors by class", ["error_class", "code", "route"])
+
+
+def classify(err: BaseException, status: int) -> Literal["client", "dependency", "internal"]:
+    if isinstance(err, (ExternalServiceError, TimeoutError)):
+        return "dependency"
+    if status < 500:
+        return "client"
+    return "internal"
+
+
+def route_template(request: Request) -> str:
+    route = request.scope.get("route")              # the matched route, e.g. "/books/{book_id}"
+    return getattr(route, "path", "unknown")
+
+
+# inside the global exception handlers (section 4), after choosing the status:
+def record_error(request: Request, err: BaseException, status: int) -> None:
+    code = err.code if isinstance(err, AppError) else "INTERNAL"
+    app_errors.labels(error_class=classify(err, status), code=code, route=route_template(request)).inc()
+```
+
+**Edge cases:**
+- **A spike of 4xx can be your bug.** A frontend release that sends a renamed field turns every request into a 400. Alert on a sudden **change** in the client-error rate per route, not on its absolute level.
+- **Use the route template** (`/books/{book_id}`), never the raw path, as a label; raw paths create one series per ID.
+
+#### Grouping errors by fingerprint
+**Problem:** one broken query produces 50,000 log lines a minute with different IDs in each message, while a brand-new error that appeared after the last deploy shows up 12 times and nobody notices.
+
+**Why it happens:** humans and alerting rules look at **counts of messages**, but the meaningful unit is **distinct causes**. Messages that differ only in an ID look different to a naive grouping.
+
+**Mechanism:** compute a **fingerprint** per error: the error type, the message with variable parts removed, and the top frames of the stack. Count by fingerprint, and alert when a **new** fingerprint appears shortly after a deploy. Error-tracking tools (Sentry and similar) do exactly this; the sketch shows the idea.
+
+```python title="fingerprint.py"
+import hashlib
+import re
+import traceback
+
+
+def fingerprint(err: BaseException) -> str:
+    msg = str(err)
+    msg = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27}", ":uuid", msg, flags=re.IGNORECASE)  # UUIDs
+    msg = re.sub(r"\d+", ":n", msg)                                                # numbers and IDs
+    msg = re.sub(r"'[^']*'", ":s", msg)                                            # quoted values
+    frames = traceback.extract_tb(err.__traceback__)[-3:]                          # innermost 3 frames
+    where = "|".join(f"{f.filename}:{f.name}" for f in frames)                     # file + function, no line numbers
+    key = f"{type(err).__qualname__}|{msg}|{where}"
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+# log {"fingerprint": ..., ...} on every error; alert on fingerprints first seen in the last hour with count > N
+```
+
+**Edge cases:** wrapped errors (section 3.6) should be fingerprinted by their **root cause** as well (follow `__cause__` down the chain), or every wrapper hides the real source. Leaving line numbers out keeps fingerprints stable when unrelated edits shift code; if the same code runs from different install paths (virtualenvs, container images), strip the path prefix so fingerprints match across machines.
+
+---
+
+## 3. Philosophies for handling errors 🎓
+
+### 3.1 Immediate error response
+When an error happens, **your first reaction decides whether it stays minor or becomes a major failure**, and the right reaction depends on the error's type and context.
+
+<Mermaid chart={`flowchart TD
+  E["Error occurs"] --> Q{"Recoverable?<br/>will trying again later work?"}
+  Q -->|"yes: network blip, provider 5xx,<br/>pool momentarily exhausted"| R["Retry with exponential backoff<br/>without adding load to a stressed system"]
+  Q -->|"no: dependency down for long,<br/>bug, bad data"| C["Contain + degrade gracefully"]
+  C --> C1["Serve cached data"]
+  C --> C2["Disable non-essential features"]
+  C --> C3["Offer an alternative path"]
+  R --> F{"Still failing?"}
+  F -->|"yes"| C
+  F -->|"no"| OK["Recovered"]`} />
+
+- **Recoverable errors** (a failed email send, which can wait; network errors; running out of DB connections in the pool): **retries with exponential backoff** work well. The lesson's caution: **don't overwhelm a system that is already stressed**. Your recovery logic must not add load to the very thing that's struggling.
+- **Non-recoverable errors:** **containment and graceful degradation**. Switch to **cached data**, **turn off non-essential features**, offer **alternative functionality**, and **limit the blast radius**.
+
+🔧 Graceful degradation in practice: if the recommendation service is down, the product page still renders, just without "you may also like". That requires deciding **in advance** which features are essential (checkout) and which are optional (recommendations, reviews widget), and wrapping the optional ones so their failure returns an empty result instead of raising.
+
+### 3.2 Retry budgets: retrying without causing a retry storm ➕
+
+The lesson's caution, "don't overwhelm a system that is already stressed", needs a mechanism: per-call backoff (section 1.3) limits how fast **one** request retries, but nothing limits how many requests are retrying **at once**. (Making the retried operation itself safe, with idempotency keys, is covered in the REST API design lesson.)
+
+#### Why per-request backoff isn't enough
+**Problem:** a dependency slows down and 5% of calls time out. Every failed call retries up to 3 times. The extra load pushes failures to 30%, which produces more retries, which pushes failures to 80%. The dependency now receives several times its normal traffic, almost all of it retries, and it can't recover even after the original cause is gone.
+
+**Why it happens:** retries are **positive feedback**. The more the dependency fails, the more load it gets. Backoff with jitter spreads retries over time but doesn't reduce their **total**, and a retry from a request whose user has already given up is pure waste.
+
+**Mechanism:** cap retries as a **fraction of normal traffic**, per client and per dependency. Google's SRE book describes exactly this: a per-request limit (fail after 3 attempts) plus a **per-client retry budget**: retry only while retries are below about **10%** of requests. When a dependency fails broadly, the budget runs out and the client fails fast instead of tripling the load.
+
+#### Implementing a retry budget
+A token bucket that earns a fraction of a token for each normal request and spends a whole token per retry:
+
+```python title="retry_budget.py"
+import asyncio
+import random
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
+
+from app.retry import is_retryable
+
+
+class RetryBudget:
+    def __init__(self, ratio: float = 0.1, max_tokens: float = 100) -> None:
+        self.ratio = ratio
+        self.max_tokens = max_tokens
+        self.tokens = max_tokens
+
+    def on_request(self) -> None:                       # every first attempt earns 0.1
+        self.tokens = min(self.max_tokens, self.tokens + self.ratio)
+
+    def try_retry(self) -> bool:                        # every retry costs 1
+        if self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
+
+
+budgets: defaultdict[str, RetryBudget] = defaultdict(RetryBudget)   # one per dependency
+
+
+async def call_with_budget[T](dep: str, fn: Callable[[], Awaitable[T]], attempts: int = 3) -> T:
+    budget = budgets[dep]
+    budget.on_request()
+    attempt = 0
+    while True:
+        try:
+            return await fn()
+        except Exception as e:
+            attempt += 1
+            if attempt >= attempts or not is_retryable(e):
+                raise
+            if not budget.try_retry():
+                retry_budget_exhausted.labels(dep=dep).inc()
+                raise                                   # fail fast: dependency is broadly sick
+            await asyncio.sleep(random.uniform(0, min(2.0, 0.1 * 2 ** (attempt - 1))))
+```
+
+**Edge cases:**
+- **The budget is per process.** With 50 instances, each has its own bucket, which is fine: the ratio still holds overall.
+- **Export "budget exhausted" as a metric.** It's an early, precise signal that a dependency is failing broadly, often before error-rate alerts fire.
+- **Combine with the circuit breaker** (section 1.3): the budget limits extra load while the breaker is still closed; the breaker stops calls entirely once failure is near-total.
+
+#### Client-side adaptive throttling
+**Problem:** even first attempts can overload a backend that is rejecting most of them; each rejection still costs it a connection and some work.
+
+**Mechanism:** the SRE book's client-side throttling: each client tracks, over a recent window, **requests** it attempted and **accepts** the backend actually handled. When requests exceed `K × accepts` (K is typically 2), the client rejects new calls **locally** with probability `(requests − K × accepts) / requests`, before they reach the backend.
+
+```python title="adaptive_throttle.py"
+import random
+import time
+from collections.abc import Awaitable, Callable
+
+from app.errors import AppError
+
+
+class AdaptiveThrottle:
+    def __init__(self, k: float = 2.0, half_life: float = 30.0) -> None:
+        self.k = k
+        self.half_life = half_life          # seconds
+        self.requests = 0.0
+        self.accepts = 0.0
+        self._last_decay = time.monotonic()
+
+    def _decay(self) -> None:               # decay = rolling window: counts halve every 30 s
+        now = time.monotonic()
+        factor = 0.5 ** ((now - self._last_decay) / self.half_life)
+        self.requests *= factor
+        self.accepts *= factor
+        self._last_decay = now
+
+    async def call[T](self, fn: Callable[[], Awaitable[T]]) -> T:
+        self._decay()
+        p_reject = max(0.0, (self.requests - self.k * self.accepts) / (self.requests + 1))
+        self.requests += 1
+        if random.random() < p_reject:
+            raise AppError(503, "THROTTLED_LOCALLY", "Dependency overloaded")
+        out = await fn()                    # a raised "overloaded" error means not accepted
+        self.accepts += 1
+        return out
+```
+
+**Edge cases:** count only **overload** rejections (429, 503, timeouts) as not accepted; a 404 is an accepted request. K controls how much wasted traffic you tolerate: lower K sheds earlier but may reject requests the backend could have served.
+
+#### Telling callers not to retry
+**Problem:** your API is overloaded and returns 500. The gateway in front retries, the mobile app retries, the partner's SDK retries. Three layers of retries hit you at once.
+
+**Mechanism:** make overload **explicit** and **non-retryable** for the layers that would amplify it. Return `503` (or `429` for per-client limits) with `Retry-After`, and an error code that internal callers treat as "do not retry at this layer". The SRE book's rule: only the layer directly above the overloaded one retries; layers further up see the failure and stop.
+
+```python title="overloaded_response.py"
+class OverloadedError(AppError):
+    def __init__(self, retry_after: int = 5) -> None:
+        super().__init__(503, "OVERLOADED", "Service is busy, please retry shortly")
+        self.retry_after = retry_after  # seconds
+
+
+# in the AppError exception handler (section 4):
+#     headers = {"Retry-After": str(err.retry_after)} if isinstance(err, OverloadedError) else None
+#     return JSONResponse(error_body(err), status_code=err.status, headers=headers)
+# in internal clients: is_retryable(e) returns False when the response code is OVERLOADED
+```
+
+**Edge cases:** clients you don't control (browsers, third-party SDKs) may ignore `Retry-After`. Make sure your own frontend honours it and uses jittered backoff, and protect the API with load shedding (next section) regardless.
+
+### 3.3 Load shedding and admission control ➕
+
+Graceful degradation (section 3.1) turns **features** off when a dependency fails; when the problem is **too much traffic for your own server**, the right response is to refuse some requests quickly so the rest still succeed.
+
+#### Why overload collapses throughput
+**Problem:** at 120% of capacity, you'd expect to serve 100% and fail 20%. Instead, almost every request fails.
+
+**Why it happens:** excess requests don't disappear; they **queue** (in the event loop, the DB pool, the OS accept queue). Every queued request makes later ones wait longer. Once the wait exceeds the client's timeout, your server is doing complete work for requests whose clients have already left, and those clients retry. **Useful throughput (goodput) collapses** even though the CPU is at 100%. The SRE book's guidance is to reject early instead of queuing deeply: a queue many times the size of your worker pool only adds latency. (Why latency explodes near 100% utilisation is covered in scaling part 1.)
+
+**Mechanism:** **admission control**: decide at the door whether a request can be served in time, and reject it immediately with `503` and `Retry-After` if not. A rejection costs microseconds; a request that times out after queueing costs the full work plus a retry.
+
+#### A concurrency limit with a bounded wait
+Limit in-flight requests, allow a **small** queue, and drop requests that wait too long:
+
+```python title="admission.py"
+import asyncio
+
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+
+def overloaded_response() -> JSONResponse:
+    shed_requests.inc()
+    return JSONResponse(
+        {"code": "OVERLOADED", "message": "Service is busy, please retry shortly"},
+        status_code=503,
+        headers={"Retry-After": "2"},
+    )
+
+
+class AdmissionMiddleware:
+    """Pure ASGI middleware: the slot is held until the whole response is sent."""
+
+    def __init__(self, app: ASGIApp, max_in_flight: int = 200, max_queue: int = 100, max_wait: float = 0.5) -> None:
+        self.app = app
+        self.slots = asyncio.Semaphore(max_in_flight)
+        self.max_queue = max_queue
+        self.max_wait = max_wait            # seconds
+        self.waiting = 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if self.slots.locked() and self.waiting >= self.max_queue:
+            await overloaded_response()(scope, receive, send)   # queue full: refuse immediately
+            return
+        self.waiting += 1
+        try:
+            async with asyncio.timeout(self.max_wait):
+                await self.slots.acquire()     # FIFO: the oldest waiter gets the next free slot
+        except TimeoutError:
+            await overloaded_response()(scope, receive, send)   # waited too long: shed it
+            return
+        finally:
+            self.waiting -= 1
+        try:
+            await self.app(scope, receive, send)   # returns when the response is finished or the client aborts
+        finally:
+            self.slots.release()
+
+
+app.add_middleware(AdmissionMiddleware)
+```
+
+**Edge cases:**
+- **Exempt health and readiness probes** from shedding, or the orchestrator restarts a server that is merely busy, which removes capacity exactly when it's needed.
+- **Pick `max_in_flight` from measurement**: load-test to find the concurrency where latency starts to climb, and set the limit just below it. Uvicorn's `--limit-concurrency` option gives you a cruder built-in version: past the limit it answers 503 immediately, with no queue.
+
+#### Event-loop lag as the overload signal in asyncio
+**Problem:** a fixed in-flight limit is wrong when request cost varies: 200 cheap requests are fine, 200 report exports freeze the process.
+
+**Why it happens:** in an asyncio server, every coroutine in the process runs on one event loop in one thread. When it's saturated, every timer and every I/O callback runs late; that delay, **event-loop lag**, directly measures "this process has more work than it can do".
+
+**Mechanism:** sample the lag with a small background coroutine that sleeps for a fixed interval and measures how late it wakes up, and shed new requests while the recent worst case is above a threshold.
+
+```python title="loop_lag.py"
+import asyncio
+
+from fastapi import Request
+
+lag_ms = 0.0
+
+
+async def monitor_loop_lag(interval: float = 0.1) -> None:
+    global lag_ms
+    loop = asyncio.get_running_loop()
+    samples: list[float] = []
+    while True:
+        t0 = loop.time()
+        await asyncio.sleep(interval)
+        samples.append((loop.time() - t0 - interval) * 1000)   # how late the loop woke us
+        if len(samples) >= 10:                                   # every ~1 s, keep the worst sample
+            lag_ms, samples = max(samples), []
+
+# start it in the app's lifespan: run_in_background("loop-lag", monitor_loop_lag())  (section 3.7)
+
+
+@app.middleware("http")
+async def shed_on_lag(request: Request, call_next):
+    if lag_ms > 100 and not request.url.path.startswith("/health"):
+        return overloaded_response()
+    return await call_next(request)
+```
+
+**Edge cases:** lag rises **after** the overload starts (it's measured over the last second), so keep the in-flight limit as the fast guard and lag as the adaptive one. A single CPU-heavy request (a huge `json.loads`) causes lag spikes too; the fix there is moving that work off the event loop (`asyncio.to_thread`, or a process pool for pure-Python CPU work), not shedding.
+
+#### Shedding by priority
+**Problem:** under overload you reject randomly, so checkout requests fail as often as "you may also like" requests.
+
+**Mechanism:** classify requests by **criticality** and shed the least critical first, with lower thresholds for best-effort traffic. Also drop work whose deadline has already passed (section 3.9): if a request has waited longer than its client will wait, finishing it helps nobody.
+
+```python title="priority_shedding.py"
+import re
+from typing import Literal
+
+from fastapi import Request
+
+from app import loop_lag    # read loop_lag.lag_ms at call time, so updates are visible
+
+CRITICAL = [re.compile(p) for p in (r"^/checkout", r"^/payments", r"^/auth")]
+
+
+def priority_of(path: str) -> Literal["critical", "best-effort"]:
+    return "critical" if any(r.match(path) for r in CRITICAL) else "best-effort"
+
+
+@app.middleware("http")
+async def shed_by_priority(request: Request, call_next):
+    limit = 150 if priority_of(request.url.path) == "critical" else 60   # best-effort is refused much earlier
+    if loop_lag.lag_ms > limit:
+        return overloaded_response()
+    return await call_next(request)
+```
+
+**Edge cases:** keep the critical list short and reviewed; if everything is critical, nothing is. Rejected best-effort calls should degrade in the UI (hide the widget), which ties back to the graceful degradation in section 3.1.
+
+### 3.4 Error recovery strategies
+How you recover depends on the error and on how **critical** the feature is.
+
+- **Automatic recovery** handles many errors without humans: **restarting** a service that has stopped responding (this works most of the time), **cleaning up corrupted caches**, **switching to backup systems**. Design these carefully, because automation can make a problem **worse**. Test them deliberately: push the system to its failure thresholds ahead of time and see which recovery works for which service.
+- **Manual recovery** is needed where **human judgement** is required. **Document the procedures** (runbooks) so every team member and new hire knows what to do during an incident, and **test them** so they work quickly under stress.
+- **Data integrity comes first.** Code and services can be redeployed; **data is the only irreplaceable thing** (users, transactions, orders). So: **back up at key moments**, know how to **restore**, be able to **replay transaction logs**, and have the right recovery tools.
+
+🔧 Two things make that real for Postgres: **point-in-time recovery** (base backups + continuous WAL archiving, so you can restore to the second before a bad migration), and **regular restore drills**. A backup that has never been restored is a hope, not a backup.
+
+### 3.5 Failures that span services: sagas and compensation ➕
+
+"Data integrity first" is easy inside one database, where a transaction rolls everything back; a checkout that reserves stock in one service, charges a card at Stripe and books a courier elsewhere has no transaction spanning all three, so a failure halfway leaves real-world side effects behind. (Publishing each step's event reliably is the transactional outbox from the task queues lesson.)
+
+#### Why a distributed transaction doesn't save you
+**Problem:** the card is charged, then the shipment service is down. The customer has paid for an order that will never ship, and nothing automatically undoes the charge.
+
+**Why it happens:** atomicity across systems needs every participant to take part in a protocol such as two-phase commit, holding locks until a coordinator says "commit". Third-party APIs (payment providers, couriers) don't offer that, and even internally 2PC blocks every participant while the coordinator is unreachable.
+
+**Mechanism:** a **saga**: a sequence of **local** steps, each committed on its own, where every step that can be undone has a **compensating action** (a business-level undo: refund, release, cancel). If step N fails, run the compensations for steps N−1 … 1 in reverse order. The system is eventually consistent instead of atomic.
+
+<Mermaid chart={`flowchart LR
+  A["1. Reserve stock"] --> B["2. Charge card"]
+  B --> C["3. Book courier"]
+  C --> D["Order confirmed"]
+  C -.->|"fails"| CB["undo 2: refund card"]
+  CB -.-> CA["undo 1: release stock"]
+  CA -.-> F["Order failed,<br/>customer notified"]`} />
+
+#### An orchestrated saga that survives crashes
+**Problem:** if the process running the saga crashes between "charge" and "book courier", an in-memory saga is forgotten: nothing finishes it and nothing compensates.
+
+**Mechanism:** an **orchestrator** stores the saga's progress in the database after every step, and a background job resumes any saga that isn't finished. Each step and each compensation is idempotent (keyed by saga ID), so resuming may safely repeat the last one.
+
+```python title="checkout_saga.py"
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+@dataclass(frozen=True)
+class Step:
+    name: str
+    run: Callable[[Saga], Awaitable[None]]
+    undo: Callable[[Saga], Awaitable[None]] | None = None
+
+
+steps = [
+    Step("reserve",
+         run=lambda s: inventory.reserve(s.order_id, s.items, idempotency_key=f"{s.id}:reserve"),
+         undo=lambda s: inventory.release(s.order_id, idempotency_key=f"{s.id}:release")),
+    Step("charge",
+         run=lambda s: payments.charge(s.order_id, s.amount, idempotency_key=f"{s.id}:charge"),
+         undo=lambda s: payments.refund(s.order_id, idempotency_key=f"{s.id}:refund")),
+    Step("ship",                                                  # pivot: no undo after this
+         run=lambda s: courier.book(s.order_id, s.address, idempotency_key=f"{s.id}:ship")),
+]
+
+
+# session from async_sessionmaker(engine, expire_on_commit=False), so attributes stay loaded after commit
+async def run_saga(session: AsyncSession, saga_id: str) -> None:
+    s = await session.get_one(Saga, saga_id)
+    if s.status == "running":
+        for i in range(s.completed_steps, len(steps)):
+            try:
+                await steps[i].run(s)
+            except Exception as err:
+                if is_retryable(err):
+                    raise                                         # the job queue retries the same step later
+                s.status, s.error = "compensating", repr(err)
+                await session.commit()
+                break
+            s.completed_steps = i + 1
+            await session.commit()                                # checkpoint
+    if s.status == "compensating":
+        for i in reversed(range(s.completed_steps)):
+            if (undo := steps[i].undo) is not None:
+                await undo(s)                                     # raises → job retries; undo is idempotent
+            s.completed_steps = i
+            await session.commit()
+        s.status = "failed"
+        await session.commit()
+    elif s.completed_steps == len(steps):
+        s.status = "done"
+        await session.commit()
+
+# a recurring job calls run_saga for every saga stuck in "running" or "compensating" for more than a minute
+```
+
+**Edge cases:**
+- **Orchestration vs choreography:** in choreography, services react to each other's events with no central coordinator. It avoids a central component but makes the flow hard to see and debug; for flows with compensations, an explicit orchestrator is usually easier to reason about.
+- **The pivot step:** after the courier is booked, the saga can only move **forward** (retry until it succeeds). Order steps so the hardest-to-undo one comes last.
+
+#### Compensations are business actions, and they can fail too
+**Problem:** "undo the charge" sounds like a rollback, but the customer may already have seen the charge on their statement, and the refund call itself can fail.
+
+**Why it happens:** compensation doesn't erase history; it adds a new fact (a refund) that cancels an old one. And it calls the same unreliable services that caused the failure.
+
+**Mechanism:**
+- **Retry compensations until they succeed** (through the job queue, with backoff), and alert if one stays stuck: a failed compensation is a case for a human with a runbook (section 3.4).
+- **Make intermediate states visible and safe.** Between "stock reserved" and "order confirmed", other requests can see the reservation (sagas have no isolation). Model it explicitly as a `PENDING` state that other flows respect, rather than pretending the order already exists.
+- **Tell the customer what happened**: "payment refunded, order cancelled" is part of the compensation.
+
+**Edge cases:** some actions can't be compensated at all (an email that was sent). Do them **after** the pivot, or phrase them so a follow-up can correct them.
+
+### 3.6 Propagation control
+Not every error should be handled where it occurs. Often it should **propagate upward** to a level with **more context** about what the operation meant.
+
+- In exception-based languages (JavaScript, Python), **catch a low-level exception, wrap it with context, and re-raise** a higher-level one. At the top you then have enough information to **log properly**, return a **meaningful response**, or **trigger recovery**.
+- This must be **deliberate**: uncontrolled propagation can spread to other services or crash your main process.
+
+```python title="error_wrapping.py"
+from botocore.exceptions import BotoCoreError, ClientError
+
+from app.errors import ExternalServiceError
+
+
+async def upload_avatar(s3, user_id: str, bucket: str, key: str, body: bytes) -> None:
+    try:
+        await s3.put_object(Bucket=bucket, Key=key, Body=body)    # aioboto3 client
+    except (BotoCoreError, ClientError) as cause:
+        # "from cause" keeps the original as __cause__, and the traceback shows both
+        raise ExternalServiceError("avatar upload failed", context={"user_id": user_id, "key": key}) from cause
+```
+
+🔧 In Python, uncontrolled propagation has two concrete failure modes. An exception that escapes the main thread **terminates the process** (and every in-flight request with it). An exception inside an `asyncio` task that nobody awaits does the opposite: it is **stored on the task and silently dropped**, reported only by the event loop's exception handler ("Task exception was never retrieved"), often much later when the task is garbage-collected. Always `await` tasks or run them in an `asyncio.TaskGroup`, and install a loop exception handler (`loop.set_exception_handler`) plus `sys.excepthook` to **log and exit cleanly**, letting the platform restart you, rather than continuing in an unknown state.
+
+### 3.7 Process-level crash policy in Python ➕
+
+"Log and exit cleanly" is the right instinct; doing it well means knowing what Python does by default, what a crash handler may and may not do, and which errors never reach any handler at all. (Draining in-flight requests on shutdown is the graceful shutdown lesson's topic.)
+
+#### What Python does by default, and why you shouldn't fight it
+**Problem:** a team wraps its worker loop in `except BaseException: logger.error(...)` and installs a loop exception handler that only logs, so "the server never crashes". Weeks later it's serving wrong data: a task crashed halfway through updating an in-memory cache, and the process kept going with it half-updated.
+
+**Why it happens:** an exception that unwinds past a block skips the rest of it; unless every step sits in a `try/finally` or a `with` block, locks may be held, connections half-used, in-memory state half-mutated. Python's defaults differ by where the error happens: an uncaught exception in the main thread goes to `sys.excepthook`, prints the traceback and exits with status 1; one in another thread goes to `threading.excepthook` and kills only that thread; one in an asyncio task that nobody awaits is only reported through the loop's exception handler, and the process keeps running. A catch-all `except BaseException` is worse still: it also swallows `KeyboardInterrupt`, `SystemExit` and the `CancelledError` asyncio uses for timeouts and shutdown. An error that reached the top means some operation stopped partway, and nothing can tell you it left its state consistent.
+
+**Mechanism:** treat unhandled errors outside the request path as **fatal**: record what happened, stop taking traffic, give in-flight work a short, bounded chance to finish, and exit non-zero so the orchestrator starts a clean process. Several replicas behind a load balancer make one crash invisible to users; continuing in a corrupt state is visible to all of them.
+
+#### A crash handler that exits well
+```python title="crash_handler.py"
+import asyncio
+import logging
+import os
+import sys
+import threading
+
+import uvicorn
+
+from app.main import app, set_readiness
+
+log = logging.getLogger("fatal")
+server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=8000))
+fatal = False
+
+
+def on_fatal(kind: str, exc: BaseException | None) -> None:
+    global fatal
+    log.critical("fatal error, shutting down", exc_info=exc, extra={"ctx": {"kind": kind}})
+    for h in logging.getLogger().handlers:
+        h.flush()                                    # make sure the last log line is written before we exit
+    if fatal:
+        return                                       # a second fatal during shutdown: already on our way out
+    fatal = True
+
+    hard_kill = threading.Timer(10, os._exit, args=(1,))   # never hang: 10 s maximum
+    hard_kill.daemon = True
+    hard_kill.start()
+
+    set_readiness(False)                             # readiness probe now fails → no new traffic
+    server.should_exit = True                        # stop accepting, let in-flight requests finish
+
+
+def loop_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    exc = context.get("exception")
+    if exc is None:
+        loop.default_exception_handler(context)      # warnings without an exception: just log them
+    else:
+        on_fatal("asyncio", exc)
+
+
+sys.excepthook = lambda exc_type, exc, tb: on_fatal("uncaught", exc)
+threading.excepthook = lambda args: on_fatal("thread", args.exc_value)
+
+
+async def main() -> None:
+    asyncio.get_running_loop().set_exception_handler(loop_exception_handler)
+    await server.serve()
+    if fatal:
+        sys.exit(1)                                  # non-zero, so the platform sees a crash
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+**Edge cases:**
+- **Keep the handler tiny and defensive.** Code that raises inside the handler, or makes a slow network call (sending to an error tracker without a timeout), can hang the exit. The hard-kill timer is the backstop.
+- **Monitoring without changing behaviour:** a hook can log or report the error and then call the original (`sys.__excepthook__`, `threading.__excepthook__`), so telemetry sees it while Python's default behaviour stays in place. The Sentry Python SDK installs exactly such hooks.
+- **Exit codes matter:** a non-zero code lets the platform count crash loops and alert on them; exiting with 0 after a fatal error hides it.
+
+#### Errors that never reach a handler
+**Problem:** a background task fails, nothing is logged, and the work is silently skipped, or it fails in a place no try/except around the request could reach.
+
+**Why it happens:** the global error handler (section 4) only sees errors raised **inside a request's call chain**. Three common paths bypass it:
+- **Dangling tasks:** `asyncio.create_task(send_analytics(event))` without keeping a reference or awaiting it. If it raises, the error is reported late or never, and because the event loop keeps only a weak reference to tasks, the task can even be garbage-collected before it finishes.
+- **Callbacks and threads:** exceptions in `loop.call_soon` callbacks or `add_done_callback` functions go to the loop's exception handler, and exceptions in threads you start go to `threading.excepthook`, never to your request handlers.
+- **Work outside a request**: timers, queue consumers, cron handlers and message listeners. FastAPI exception handlers, for example, apply to the request pipeline, not to an arbitrary background loop.
+
+**Mechanism:** make "fire and forget" explicit with a helper that always keeps a reference and attaches a handler, and let the linter forbid the accidental kind (Ruff's `RUF006`, asyncio-dangling-task).
+
+```python title="background.py"
+import asyncio
+import logging
+from collections.abc import Coroutine
+from typing import Any
+
+logger = logging.getLogger(__name__)
+_background: set[asyncio.Task] = set()
+
+
+def run_in_background(name: str, coro: Coroutine[Any, Any, object]) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background.add(task)                            # strong reference until it finishes
+    task.add_done_callback(_on_done)
+    return task
+
+
+def _on_done(task: asyncio.Task) -> None:
+    _background.discard(task)
+    if task.cancelled():
+        return
+    if (exc := task.exception()) is not None:
+        logger.error("background task failed", exc_info=exc, extra={"ctx": {"task": task.get_name()}})
+        app_errors.labels(error_class="internal", code="BACKGROUND_TASK", route=task.get_name()).inc()
+
+
+# instead of:  asyncio.create_task(send_analytics(event))   ← dangling; a failure is reported late or never
+run_in_background("analytics", send_analytics(event))
+
+
+def upload_worker(path: str) -> None:               # every thread you start: catch and log at the top
+    try:
+        upload_file(path)
+    except Exception:
+        logger.exception("upload thread failed")
+```
+
+**Edge cases:** anything important enough to need a retry belongs in a job queue, not in `run_in_background`; the helper is for work you're genuinely willing to lose.
+
+### 3.8 Error boundaries
+**Error boundaries** are where errors are **stopped**, so a failure in one service **doesn't take down others**. Mechanisms the lesson names:
+- **Separate processes**, so one crash doesn't kill everything.
+- **Timeouts** at service boundaries.
+- **Message queues** (such as RabbitMQ) for **asynchronous** communication, so a bug in one service doesn't directly break another.
+
+<Mermaid chart={`flowchart LR
+  subgraph Sync["Synchronous coupling"]
+    A1["Order API"] -->|"HTTP, waits"| B1["Email service down"]
+    B1 -.->|"timeout spreads"| A1
+  end
+  subgraph Async["Queue as a boundary"]
+    A2["Order API"] -->|"enqueue, returns"| Q[["Queue"]]
+    Q --> B2["Email service down:<br/>jobs wait, retried later"]
+  end`} />
+
+🔧 A related mechanism is the **bulkhead**: give each dependency its **own limited pool** (connections, concurrency slots), so a slow dependency can only exhaust its own share instead of every worker in the process.
+
+### 3.9 Timeout budgets and deadline propagation ➕
+
+"Timeouts at service boundaries" works only if the timeouts **fit together**: each one chosen in isolation either fires too late to matter or lets work continue long after the user has given up.
+
+#### The timeout budget across hops
+**Problem:** the load balancer gives up after 30 s. Your API calls an inventory service with a 10 s timeout and retries twice, then a pricing service with another 10 s. Worst case: 40 s of work for a request the load balancer abandoned at 30 s. The user saw an error, and your servers kept working for nobody.
+
+**Why it happens:** each timeout was set for its own call, not as a share of the **whole request's** time. Retries multiply each share.
+
+**Mechanism:** treat the request's total time as a **budget**: set it at the edge, below the outermost timeout (load balancer, client), and give each downstream call **the smaller of its own limit and what's left**. The outer layer must always time out **after** the inner ones, never before.
+
+| Layer | Timeout |
+|---|---|
+| Client / load balancer | 30 s |
+| API request budget | 10 s |
+| Each downstream call (incl. retries) | `min(3 s, remaining budget)` |
+| Database statement | `min(2 s, remaining budget)` |
+
+**Edge cases:** leave a margin (100–200 ms) for the work **after** the last call, such as serialising the response; a budget spent to zero leaves no time to send even an error.
+
+#### Propagating a deadline inside the process
+**Mechanism:** create one **deadline** per request, store it in a `ContextVar` so every coroutine in that request can read it without passing it around, and run the handler under `asyncio.timeout(budget)`, which cancels whatever the request is awaiting when the budget runs out. Nested `asyncio.timeout` blocks combine naturally: an inner call is cancelled by whichever deadline comes first. (Starlette doesn't cancel a handler when the client disconnects; a long handler can check `await request.is_disconnected()` between steps.)
+
+```python title="deadline.py"
+import asyncio
+import math
+from contextvars import ContextVar
+
+import httpx
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from app.errors import AppError
+
+_deadline: ContextVar[float] = ContextVar("deadline", default=math.inf)
+
+
+def remaining() -> float:
+    """Seconds left in the current request's budget."""
+    return max(0.0, _deadline.get() - asyncio.get_running_loop().time())
+
+
+class DeadlineMiddleware:
+    def __init__(self, app: ASGIApp, budget: float = 10.0) -> None:
+        self.app = app
+        self.budget = budget
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def send_tracking(message: Message) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        token = _deadline.set(asyncio.get_running_loop().time() + self.budget)
+        try:
+            async with asyncio.timeout(self.budget):          # cancels the handler when the budget is spent
+                await self.app(scope, receive, send_tracking)
+        except TimeoutError:
+            if not started:
+                body = {"code": "DEADLINE_EXCEEDED", "message": "Request took too long"}
+                await JSONResponse(body, status_code=504)(scope, receive, send)
+        finally:
+            _deadline.reset(token)
+
+
+# in a service: each call gets min(own limit, what's left), and stops if the request is already dead
+async def get_price(client: httpx.AsyncClient, sku: str) -> httpx.Response:
+    if remaining() < 0.05:
+        raise AppError(504, "DEADLINE_EXCEEDED", "Request took too long")
+    async with asyncio.timeout(min(3.0, remaining())):
+        return await client.get(f"{PRICING_URL}/prices/{sku}")
+```
+
+**Edge cases:** cancellation only interrupts code at an `await`. A long CPU-bound loop in your own code never yields, so it keeps running past the deadline; check `remaining()` between steps, otherwise the request "times out" while the CPU keeps working on it.
+
+#### Across services and into the database
+**Problem:** the API stops waiting after 10 s, but the inventory service it called doesn't know that and finishes a 25 s query anyway.
+
+**Mechanism:** send the **remaining budget** downstream with every call, and have each service use it as its own deadline (the SRE book's example: a 30 s deadline with 7 s already spent gives the next hop 23 s). gRPC does this natively with deadlines; over HTTP, use a header. Send **relative** milliseconds rather than an absolute timestamp, so clock differences between machines don't matter. In Postgres, apply it to the transaction with `SET LOCAL statement_timeout` (or its bind-parameter form, `set_config('statement_timeout', ..., true)`).
+
+```python title="propagate.py"
+import math
+
+import httpx
+from fastapi import Request
+from sqlalchemy import text
+
+from app.db import engine
+from app.deadline import remaining
+
+MAX_BUDGET = 10.0  # seconds
+
+
+# caller: the request's asyncio.timeout already covers this await
+async def reserve(client: httpx.AsyncClient, body: dict) -> httpx.Response:
+    budget_ms = int(min(remaining(), MAX_BUDGET) * 1000) - 100       # keep a margin for our own work
+    return await client.post(f"{INVENTORY_URL}/reserve", json=body,
+                             headers={"x-request-timeout-ms": str(budget_ms)})
+
+
+# callee middleware: never trust more than our own maximum (the header could come from anywhere)
+def budget_from(request: Request) -> float:
+    try:
+        from_header = float(request.headers.get("x-request-timeout-ms", "")) / 1000
+    except ValueError:
+        return MAX_BUDGET
+    return min(from_header, MAX_BUDGET) if math.isfinite(from_header) and from_header > 0 else MAX_BUDGET
+
+
+# database: bound the statement by what's left of the request
+async def reserve_stock(sku: str, qty: int) -> None:
+    timeout_ms = int(max(100, min(2_000, remaining() * 1000)))
+    async with engine.begin() as conn:
+        # set_config(..., true) is SET LOCAL with a bind parameter: it lasts until COMMIT/ROLLBACK
+        await conn.execute(text("SELECT set_config('statement_timeout', :ms, true)"), {"ms": str(timeout_ms)})
+        await conn.execute(text("UPDATE stock SET reserved = reserved + :qty WHERE sku = :sku"), {"qty": qty, "sku": sku})
+```
+
+**Edge cases:**
+- **Accept the header only from internal callers** and cap it, as above; a public client could otherwise ask for a 10-minute budget.
+- **`SET LOCAL` lasts only for the transaction**, which is what you want with a connection pool: a plain `SET` would leak the timeout to the next request that reuses the connection.
+
+### 3.10 Bulkheads in practice ➕
+
+The bulkhead idea above is one sentence; making it real means deciding **what** gets its own compartment, **how big** each is, and what happens when one is full.
+
+#### A concurrency limit per dependency
+**Problem:** the recommendations service slows from 50 ms to 5 s. Each of its calls now holds a request open 100 times longer; within a minute every in-flight slot in your API is waiting on recommendations, and checkout, which never calls recommendations, stops responding too.
+
+**Why it happens:** all requests share the same pools (event loop capacity, sockets, memory, the admission limit from section 3.3). Without a boundary, the slowest dependency decides how many of them are tied up.
+
+**Mechanism:** wrap each dependency in its own **semaphore**: a maximum number of concurrent calls, a small waiting line, and a maximum wait. When it's full, fail **immediately** (and use the fallback), so the slow dependency can only ever occupy its own slots.
+
+```python title="bulkhead.py"
+import asyncio
+from collections.abc import Awaitable, Callable
+
+
+class BulkheadFullError(Exception):
+    pass
+
+
+class Bulkhead:
+    def __init__(self, name: str, max_concurrent: int, max_waiting: int, max_wait: float) -> None:
+        self.name = name
+        self._slots = asyncio.Semaphore(max_concurrent)
+        self.max_waiting = max_waiting
+        self.max_wait = max_wait            # seconds
+        self.waiting = 0
+
+    async def run[T](self, fn: Callable[[], Awaitable[T]]) -> T:
+        if self._slots.locked() and self.waiting >= self.max_waiting:
+            raise BulkheadFullError(self.name)
+        self.waiting += 1
+        try:
+            async with asyncio.timeout(self.max_wait):
+                await self._slots.acquire()      # returns at once if a slot is free
+        except TimeoutError:
+            raise BulkheadFullError(self.name) from None
+        finally:
+            self.waiting -= 1
+        try:
+            return await fn()
+        finally:
+            self._slots.release()                # the semaphore hands our slot to the next waiter
+
+
+recs_bulkhead = Bulkhead("recommendations", 20, 10, 0.1)
+
+
+async def recommendations_for(user_id: str) -> list[dict]:
+    try:
+        return await recs_bulkhead.run(lambda: fetch_recs(user_id))
+    except Exception:
+        return []                                # full or failing → empty widget
+```
+
+**Edge cases:** the bulkhead limits **concurrency**, not duration; pair it with a timeout (section 3.9) so slots are released, and a circuit breaker (section 1.3) so a dead dependency isn't tried at all.
+
+#### Separate pools for separate workloads
+**Problem:** a monthly report runs ten heavy queries at once on the same SQLAlchemy engine (and connection pool) as the API. All 20 connections are busy for a minute, and every API request waits for a connection.
+
+**Mechanism:** give different **workloads** different pools with their own limits and timeouts, so the expensive one can't drain the shared one. The same applies to outbound HTTP: a dedicated `httpx.AsyncClient` per provider with its own connection limit.
+
+```python title="pools.py"
+import httpx
+from sqlalchemy.ext.asyncio import create_async_engine
+
+oltp_engine = create_async_engine(
+    DATABASE_URL, pool_size=20, max_overflow=0,
+    connect_args={"options": "-c statement_timeout=2000"},
+)
+reports_engine = create_async_engine(                       # small, slow, isolated
+    REPLICA_URL, pool_size=3, max_overflow=0,
+    connect_args={"options": "-c statement_timeout=60000"},
+)
+
+# connection cap per provider; each client keeps its own keep-alive pool
+payments_client = httpx.AsyncClient(base_url=PAYMENTS_URL, limits=httpx.Limits(max_connections=50))
+email_client = httpx.AsyncClient(base_url=EMAIL_URL, limits=httpx.Limits(max_connections=10))
+```
+
+**Edge cases:** the sum of all pools across all replicas must still fit Postgres `max_connections` (section 1.2). Point heavy read workloads at a read replica when you can, which also isolates the primary.
+
+#### Sizing compartments
+**Problem:** a bulkhead that's too small rejects healthy traffic; one that's too big doesn't protect anything.
+
+**Mechanism:** size from normal behaviour with Little's law: `concurrent calls ≈ calls per second × typical latency`. 200 calls/s × 50 ms ≈ 10 concurrent; allow 2–3× that for bursts (20–30). If the dependency slows to 5 s, the bulkhead caps it at 30 slots instead of the 1,000 it would otherwise take. Export `active`, `waiting` and rejections per bulkhead and revisit the numbers after load tests.
+
+**Edge cases:** compartments per **dependency** are the usual starting point; split further (per tenant, per endpoint) only when one caller of a shared dependency has repeatedly starved the others.
+
+---
+
+## 4. The final safety net: a global error handler 🎓
+
+The lesson author's favourite mechanism, and in their view **the most important** error-handling piece in a backend: most of the effort goes in once, at the start, and after that you only add conditions now and then.
+
+### The architecture it sits in
+
+<Mermaid chart={`flowchart TD
+  REQ["HTTP request"] --> RT["Routing layer<br/>picks the handler"]
+  RT --> H["Handler<br/>deserialize, validate, bind"]
+  H --> S["Service<br/>orchestrates repositories"]
+  S --> R1["Repository: getUserById"]
+  S --> R2["Repository: getPostsByUser"]
+  R1 --> DB[(Database)]
+  R2 --> DB
+  H -. "ValidationError" .-> G["Global error middleware"]
+  S -. "business errors" .-> G
+  R1 -. "DB errors" .-> G
+  G --> RES["Consistent HTTP error response"]`} />
+
+- **Handler:** extracts data from the request, **deserialises**, **validates**, **binds**, then calls a service.
+- **Service:** an **orchestrator** that can call several repository methods (e.g. get a user, then get that user's posts).
+- **Repository:** **leaf functions** that do one thing, usually one database query (`getUserById`).
+
+**The pattern:** wherever an error occurs, **let it bubble up** to one **middleware** that sees every request and response. In JavaScript or Python you **throw** and the middleware catches; in **Go** you **return** the error from repository → service → handler until it reaches the middleware. Every language lets you define **custom error types**, and the middleware **inspects the type** and decides the response.
+
+### The lesson's examples (a book-management API, like Goodreads)
+
+| Where | What happens | Error the middleware sees | Response |
+|---|---|---|---|
+| Handler | `POST /books` with a 700-character name; the rule is ≤ 500 | Validation error | **400**, with the field errors so the user can fix them |
+| Repository | `INSERT` fails: a book with that name already exists | Unique-constraint violation | **400** "Book already exists" (🔧 **409 Conflict** is the more specific code many APIs use) |
+| Repository | `GET /books/123`: `SELECT ... WHERE id = 123` finds nothing (a malformed link, or a scam link someone sent) | "No rows" error from the driver | **404** "Book with id 123 does not exist" |
+| Repository | `POST /books` with an `authorId` that doesn't exist | Foreign-key violation | **404** "Author does not exist" (🔧 some APIs prefer **422**, since the URL itself was found) |
+| Anywhere | Anything not recognised | Unknown | **500** with a **generic** message (section 5) |
+
+An error response usually has a structure like: `code` (the HTTP status), `message`, and an array of field-level errors.
+
+### Why it's worth it
+1. **More robust:** no matter which layer fails, the error goes through one gateway. Without it, each repository has to remember to translate its own errors; forget once and a "book already exists" becomes a confusing **500 "something went wrong"**.
+2. **Less redundancy:** without a central handler, every repository method needs the same "is it a unique violation? a foreign-key violation?" checks copied in. More copies mean more bugs.
+
+### 🔧 Implementation: error types + one set of exception handlers (FastAPI)
+
+```python title="errors.py"
+class AppError(Exception):
+    def __init__(self, status: int, code: str, message: str, details: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.details = details or []
+
+
+class ValidationError(AppError):
+    def __init__(self, details: list[dict]) -> None:
+        super().__init__(400, "VALIDATION_FAILED", "Invalid input", details)
+
+
+class NotFoundError(AppError):
+    def __init__(self, what: str) -> None:
+        super().__init__(404, "NOT_FOUND", f"{what} does not exist")
+
+
+class ConflictError(AppError):
+    def __init__(self, message: str) -> None:
+        super().__init__(409, "CONFLICT", message)
+
+
+class ExternalServiceError(AppError):
+    def __init__(self, message: str, context: dict | None = None) -> None:
+        super().__init__(502, "EXTERNAL_SERVICE", message)
+        self.context = context or {}   # for the logs, never for the response
+
+# the original low-level error travels as __cause__ when raised with "raise ... from e"
+```
+
+```python title="books_repository.py"
+from sqlalchemy import RowMapping, text
+from sqlalchemy.ext.asyncio import AsyncConnection
+
+from app.errors import NotFoundError
+
+
+async def get_book_by_id(conn: AsyncConnection, book_id: str) -> RowMapping:
+    result = await conn.execute(text("SELECT * FROM books WHERE id = :id"), {"id": book_id})
+    row = result.mappings().first()
+    if row is None:
+        raise NotFoundError(f"Book with id {book_id}")   # the driver returns no row, so we raise it
+    return row
+
+# note: no try/except for 23505 or 23503 here. They bubble up untouched.
+```
+
+```python title="error_handlers.py"
+import logging
+from collections.abc import Callable
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
+
+from app.errors import AppError, ConflictError, NotFoundError, ValidationError
+
+log = logging.getLogger("errors")
+
+
+def sqlstate(e: DBAPIError) -> str | None:
+    return getattr(e.orig, "sqlstate", None)            # psycopg 3
+
+
+def column_of(e: DBAPIError) -> str | None:
+    diag = getattr(e.orig, "diag", None)
+    return getattr(diag, "column_name", None)
+
+
+# translate driver errors into domain errors in ONE place
+PG_MAP: dict[str, Callable[[DBAPIError], AppError]] = {
+    "23505": lambda e: ConflictError("A record with these details already exists"),
+    "23503": lambda e: NotFoundError("A referenced record"),
+    "23502": lambda e: ValidationError([{"field": column_of(e) or "unknown", "message": "is required"}]),
+}
+
+
+def error_body(err: AppError) -> dict:
+    return {"code": err.code, "message": err.message, "errors": err.details}
+
+
+def register_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AppError)
+    async def app_error(request: Request, err: AppError) -> JSONResponse:
+        if err.status >= 500:
+            log.error(err.message, exc_info=err)
+        else:
+            log.warning(err.message, extra={"ctx": {"code": err.code, "path": request.url.path}})
+        return JSONResponse(error_body(err), status_code=err.status)
+
+    @app.exception_handler(RequestValidationError)      # FastAPI's own body/query validation (default 422)
+    async def invalid_request(request: Request, err: RequestValidationError) -> JSONResponse:
+        details = [{"field": ".".join(map(str, e["loc"])), "message": e["msg"]} for e in err.errors()]
+        return await app_error(request, ValidationError(details))
+
+    @app.exception_handler(DBAPIError)
+    async def db_error(request: Request, err: DBAPIError) -> JSONResponse:
+        if mapper := PG_MAP.get(sqlstate(err) or ""):
+            return await app_error(request, mapper(err))
+        return await unhandled(request, err)
+
+    @app.exception_handler(Exception)
+    async def unhandled(request: Request, err: Exception) -> JSONResponse:
+        # unknown → full detail in the logs, nothing internal in the response
+        request_id = getattr(request.state, "request_id", None)
+        log.error("unhandled error", exc_info=err, extra={"ctx": {"request_id": request_id}})
+        return JSONResponse(
+            {"code": "INTERNAL", "message": "Something went wrong", "request_id": request_id},
+            status_code=500,
+        )
+
+# main.py: register_error_handlers(app) once, when the app is created
+```
+
+Edge cases:
+- **The constraint name tells you which rule fired.** If a table has two unique constraints (email and username), use `err.orig.diag.constraint_name` (e.g. `users_email_key`) to choose the message, and map it to a **user-facing** field name; don't echo the constraint name itself.
+- **The `Exception` handler is special.** Starlette runs it in its outermost middleware: it sends your 500 response and then re-raises the exception so the server logs the traceback too. Handlers for specific classes (`AppError`, `DBAPIError`) run closer to your routes and fully handle the error.
+- **Response already started:** if a `StreamingResponse` has begun sending, you can't send a JSON error anymore; the connection is just closed, so log enough to diagnose it.
+
+🔧 **Framework errors too:** FastAPI and Starlette raise their own `HTTPException` (an unknown route gives 404, a wrong method 405, and your code may raise one directly). Register a handler for Starlette's class so those responses use the same body shape:
+
+```python title="http_errors.py"
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
+@app.exception_handler(StarletteHTTPException)          # also catches fastapi.HTTPException, a subclass
+async def http_error(request: Request, err: StarletteHTTPException) -> JSONResponse:
+    return JSONResponse(
+        {"code": f"HTTP_{err.status_code}", "message": err.detail, "errors": []},
+        status_code=err.status_code,
+        headers=err.headers,
+    )
+```
+
+---
+
+## 5. Security in error handling 🎓
+
+### 5.1 Don't leak internals in error messages
+**Problem:** a raw database error contains **table names, index names, constraint names** and other internals. If the global handler copies `err.message` into the response, a malicious user learns your schema and can craft more advanced attacks (more targeted SQL injection, for one), and your platform becomes a target. Leaking **users'** data is even worse than leaking yours, because it destroys trust.
+
+**Mechanism:** control every message. By the time an error reaches the **default 500 branch**, you've already ruled out validation, constraint and business errors, so you **don't know** what it is, and it may contain internals. Return only **"Something went wrong"** (or the library default, "Internal Server Error"). Full detail goes to the **logs**, linked by a request ID.
+
+### 5.2 Don't help attackers enumerate accounts
+**Problem:** a login endpoint that says "**no user with this email**" for one input and "**incorrect password**" for another leaks which emails are registered.
+
+**The attack, step by step:**
+1. Try many emails with one password. Most get "user does not exist".
+2. One gets "**password incorrect**", so that email **definitely has an account**.
+3. Now try **common passwords** against just that email, with much better odds.
+
+The error messages alone made the attack possible.
+
+**Mechanism:** return **one generic message** for every failure: "**Invalid email or password**". The lesson points to the **OWASP Cheat Sheet Series** for authentication best practices (it gives the same advice, and similar wording for password reset: "If that email address is in our database, we will send you an email").
+
+🔧 **Same message isn't enough if timing differs.** If "user not found" returns in 2 ms but "wrong password" takes 80 ms (because bcrypt or argon2 ran), the attacker can tell them apart by timing. Run the hash comparison **either way**:
+
+```python title="login_service.py"
+import asyncio
+
+from argon2 import PasswordHasher
+from argon2.exceptions import VerificationError
+
+from app.errors import AppError
+
+ph = PasswordHasher()
+DUMMY_HASH = ph.hash("not-a-real-password")      # computed once at startup
+
+
+def verify(password_hash: str, password: str) -> bool:
+    try:
+        return ph.verify(password_hash, password)
+    except VerificationError:                    # wrong password raises instead of returning False
+        return False
+
+
+async def login(email: str, password: str) -> Session:
+    user = await users.find_by_email(email.lower())
+    password_hash = user.password_hash if user else DUMMY_HASH
+    # same work for both cases; run the slow hash in a thread so it doesn't block the event loop
+    ok = await asyncio.to_thread(verify, password_hash, password)
+    if user is None or not ok:
+        raise AppError(401, "INVALID_CREDENTIALS", "Invalid email or password")
+    return await create_session(user.id)
+```
+
+Pair this with **rate limiting** per account and per IP on the login route (see the caching lesson's Redis rate limiter).
+
+### 5.3 Don't put sensitive data in logs
+**Problem:** logs feel internal, but companies with real traffic produce **hundreds of GB of logs a day** and ship them to **several external services** (storage, analytics, observability). In many big **data breaches**, it was the **logs** that leaked, and with them any emails, passwords, API keys or card numbers written into them.
+
+**Mechanism:** never log passwords, API keys, tokens, card numbers or emails. **Log the user's ID and a correlation (request) ID** instead: enough context to trace a problem without exposing anyone.
+
+🔧 Make it automatic rather than relying on discipline: a request-ID middleware plus a redacting logger (the `JsonFormatter` with `redact` in section 2.2), so that even an accidental `logger.info("payload", extra={"ctx": {"body": body}})` comes out with the secrets censored.
+
+```python title="request_id.py"
+import logging
+import uuid
+from contextvars import ContextVar
+
+from fastapi import Request
+
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+user_id_var: ContextVar[str | None] = ContextVar("user_id", default=None)   # set by the auth dependency
+
+
+@app.middleware("http")
+async def request_id(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or str(uuid.uuid4())   # accept the gateway's ID or create one
+    request.state.request_id = rid
+    token = request_id_var.set(rid)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["x-request-id"] = rid                           # the user can quote it to support
+    return response
+
+
+class RequestContextFilter(logging.Filter):
+    """Adds the request and user IDs to every log record: the ID, never the email."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.ctx = {**getattr(record, "ctx", {}), "request_id": request_id_var.get(), "user_id": user_id_var.get()}
+        return True
+
+
+handler.addFilter(RequestContextFilter())                            # the JSON handler from section 2.2
+```
+
+---
+
+## 6. Recap 🎓
+
+- Errors are **normal**. A backend engineer needs a **fault-tolerant mindset**: expect them, detect them, handle them.
+- **Five types:** logic (silent and dangerous), database (connection, constraint, query, deadlock), external services (network, auth, rate limit, outage), input validation (easiest, so be thorough), configuration (validate at startup).
+- **The best error handling starts before the error:** health checks for the server, the database, external services and core functionality, plus monitoring of errors, **performance** and **business metrics**, and structured logs.
+- **Respond by type:** recoverable → retry with backoff, gently; non-recoverable → contain and degrade gracefully.
+- **Recover:** automate what's safe, document and rehearse the manual parts, and **protect data above everything**.
+- **Control propagation** and build **boundaries** (processes, timeouts, queues).
+- **A global error handler** is the final safety net: one place that maps every error to the right response.
+- **Security:** generic messages for unknown errors, no account enumeration, no sensitive data in logs.
+- ➕ **Classify errors:** client vs dependency vs internal, so only real failures page someone; group by fingerprint and alert on new ones after a deploy.
+- ➕ **Retry budgets:** cap retries at a fraction of traffic (about 10%), throttle adaptively on the client, and signal "overloaded, don't retry" upstream.
+- ➕ **Load shedding:** reject early with 503 + Retry-After using a concurrency limit with a bounded wait, event-loop lag, and priorities.
+- ➕ **Sagas:** cross-service operations become local steps with idempotent compensations, checkpointed so a crash resumes; irreversible steps go last.
+- ➕ **Python crash policy:** unhandled exceptions in the main thread, other threads and the asyncio loop are fatal; log and flush, drain briefly, exit non-zero; keep references to background tasks and log their failures explicitly.
+- ➕ **Deadlines:** one request budget, shrinking at each hop, propagated as a `ContextVar` deadline enforced with `asyncio.timeout`, a relative-timeout header and `SET LOCAL statement_timeout`.
+- ➕ **Bulkheads:** a semaphore per dependency, separate pools per workload, sized with Little's law.
+
+---
+
+## Interview questions
+
+1. **Why are logic errors the most dangerous kind?** **Nothing crashes and nothing alerts; the system quietly does the wrong thing (like a double discount) until someone notices the damage.**
+2. **How do you detect logic errors in production?** **Invariant checks that throw, structural guarantees (e.g. a unique constraint per order and discount), property-based tests, and monitoring business metrics.**
+3. **Why can't validation alone prevent unique-email errors?** **Two concurrent requests can both pass an "email not taken" check; only the database constraint is authoritative, so catch 23505 and translate it.**
+4. **What causes a deadlock and how do you handle it?** **Two transactions waiting on locks the other holds; lock rows in a consistent order, keep transactions short, and retry the transaction on 40P01.**
+5. **What's the single most important protection when calling an external API?** **A timeout, so a hung dependency can't hold your requests, connections and memory indefinitely.**
+6. **How should you handle a 429?** **Back off exponentially with jitter, honour Retry-After, retry in only one layer, and move long waits into background jobs.**
+7. **What is a circuit breaker?** **A wrapper that stops calling a failing dependency after a threshold, fails fast or uses a fallback while open, then lets a trial call through to test recovery.**
+8. **Why validate configuration at startup?** **So a missing setting stops the new deploy (and blue-green keeps the old version serving) instead of causing 500s for real users later.**
+9. **Liveness vs readiness checks?** **Liveness says whether to restart the process (keep it trivial); readiness says whether to send it traffic (include dependency checks).**
+10. **Recoverable vs non-recoverable errors: what's the response to each?** **Recoverable: retry with backoff without overloading the stressed system. Non-recoverable: contain and degrade gracefully with cached data or disabled features.**
+11. **What are the benefits of a global error handler?** **Every error is mapped consistently in one place, so no layer can forget a case, and the mapping logic isn't duplicated across repositories.**
+12. **Why must a login endpoint return the same error for unknown email and wrong password?** **Different messages (or timings) let attackers enumerate registered emails and then focus password guessing on real accounts.**
+13. **What should and shouldn't go into logs?** **User IDs and correlation IDs, yes; passwords, tokens, API keys, card numbers and emails, no, because logs flow through many third-party systems and are a common breach source.**
+14. ➕ **Why shouldn't 404s and validation errors page anyone?** **They're the API correctly refusing a request; count them separately from dependency and internal failures, and alert only on sudden changes in their rate.**
+15. ➕ **What is a retry storm and how does a retry budget prevent it?** **Failures cause retries, retries add load, load causes more failures; a budget allows retries only while they're a small fraction (about 10%) of normal requests, so broad failure makes clients fail fast.**
+16. ➕ **Why does a server at 120% load often serve almost nothing?** **Excess requests queue, wait past client timeouts, get retried, and the server spends its capacity on abandoned work; rejecting early with 503 keeps goodput up.**
+17. ➕ **How do you detect overload in an asyncio process?** **Event-loop lag (a coroutine measuring how late its sleeps wake up) plus an in-flight request limit; shed best-effort traffic first and exempt health checks.**
+18. ➕ **What is a saga and what is a compensating action?** **A sequence of local transactions across services; each undoable step has a business-level undo (refund, release) run in reverse order when a later step fails.**
+19. ➕ **Is it safe to keep running after an unhandled exception outside the request path?** **No; the operation stopped partway and may have left locks, connections or in-memory state inconsistent, so log, flush, exit non-zero and let the platform restart a clean process.**
+20. ➕ **What is deadline propagation?** **Setting one time budget for a request and passing the remaining time to every downstream call and query, so no layer keeps working after the caller has given up.**
+21. ➕ **How does a bulkhead differ from a circuit breaker?** **A bulkhead caps how many concurrent calls a dependency may occupy; a circuit breaker stops calling it after repeated failures. They're used together with timeouts.**
+
+## Sources
+
+- [Lesson video: Error Handling and Building Fault Tolerant Systems (Sriniously)](https://youtu.be/8NaM_9aKS24)
+- [PostgreSQL: Error codes (SQLSTATE)](https://www.postgresql.org/docs/current/errcodes-appendix.html)
+- [PostgreSQL: Explicit locking and deadlocks](https://www.postgresql.org/docs/current/explicit-locking.html)
+- [SQLAlchemy: Connection pooling](https://docs.sqlalchemy.org/en/20/core/pooling.html)
+- [OWASP: Authentication Cheat Sheet (generic error messages)](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP: Logging Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+- [AWS Builders' Library: Timeouts, retries and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)
+- [Martin Fowler: Circuit Breaker](https://martinfowler.com/bliki/CircuitBreaker.html)
+- [MDN: Retry-After header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After)
+- [Kubernetes: Liveness, readiness and startup probes](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/)
+- [FastAPI: Handling errors](https://fastapi.tiangolo.com/tutorial/handling-errors/)
+- [Starlette: Exceptions](https://www.starlette.io/exceptions/)
+- [Python: Logging cookbook](https://docs.python.org/3/howto/logging-cookbook.html)
+- [Google SRE book: Handling overload (retry budgets, adaptive throttling)](https://sre.google/sre-book/handling-overload/)
+- [Google SRE book: Addressing cascading failures (deadlines, load shedding)](https://sre.google/sre-book/addressing-cascading-failures/)
+- [microservices.io: Saga pattern](https://microservices.io/patterns/data/saga.html)
+- [Python: asyncio event loop error handling](https://docs.python.org/3/library/asyncio-eventloop.html#error-handling-api)
+- [Python: sys.excepthook and threading.excepthook](https://docs.python.org/3/library/sys.html#sys.excepthook)
+- [Python: asyncio.timeout()](https://docs.python.org/3/library/asyncio-task.html#timeouts)
+- [PostgreSQL: SET (SET LOCAL scope)](https://www.postgresql.org/docs/current/sql-set.html)
+- [Ruff: asyncio-dangling-task (RUF006)](https://docs.astral.sh/ruff/rules/asyncio-dangling-task/)
+- [Uvicorn: Settings (limit-concurrency)](https://www.uvicorn.org/settings/)

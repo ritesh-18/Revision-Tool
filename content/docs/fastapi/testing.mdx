@@ -1,0 +1,674 @@
+---
+title: "Testing"
+description: "Testing FastAPI apps from first principles: how TestClient runs the ASGI app in-process, pytest fixtures, dependency_overrides for a test database and a fake user, a rolled-back transaction per test, async tests with httpx.AsyncClient and ASGITransport, the lifespan in tests, mocking outgoing HTTP, and testing WebSockets."
+---
+
+A FastAPI app is an ASGI callable: `await app(scope, receive, send)`. That one fact makes testing simple. You don't need to start a server, bind a port or wait for it to boot. A test client builds the `scope` dict, feeds the request body through `receive`, collects what the app passes to `send`, and turns that into a response object. The whole request runs **in the test process**, through all your middleware, dependencies, validation and serialization, in a few milliseconds.
+
+This chapter builds a small app and a full test suite for it, then runs it. All outputs come from CPython 3.14.6, FastAPI 0.143.0, Starlette 1.8.0, httpx 0.28.1, pytest 9.1.1, pytest-asyncio 1.4.0 and SQLAlchemy 2.1.4. For the general theory (the test pyramid, what to mock, test doubles) see [Testing](/docs/backend-first-principles/27-testing).
+
+## How `TestClient` works
+
+```python
+import threading
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+@app.get("/where")
+async def where(request: Request):
+    return {
+        "thread": threading.current_thread().name,
+        "client": request.client.host,
+        "server": request.scope["server"],
+        "http_version": request.scope["http_version"],
+    }
+
+client = TestClient(app)
+print([f"{c.__module__}.{c.__name__}" for c in type(client).__mro__[:3]])
+print(type(client._transport).__name__)
+print("test thread:", threading.current_thread().name)
+print(client.get("/where").json())
+print(client.base_url)
+```
+
+```text title="Output"
+['starlette.testclient.TestClient', 'httpx2.Client', 'httpx2._client.BaseClient']
+_TestClientTransport
+test thread: MainThread
+{'thread': 'asyncio-portal-3bc42831390', 'client': 'testclient', 'server': ['testserver', 80], 'http_version': '1.1'}
+http://testserver
+```
+
+Reading that output from top to bottom explains the whole mechanism:
+
+1. **`TestClient` is an HTTP client class.** It subclasses an httpx-style `Client`, so you get the familiar `.get()`, `.post(json=...)`, `.headers`, `.cookies` API. (Starlette 1.8 builds it on `httpx2`, the maintained successor of httpx, and falls back to plain `httpx` with a deprecation warning. The API is the same.)
+2. **The transport is the trick.** A normal httpx client has a transport that opens TCP connections. `TestClient` plugs in `_TestClientTransport`, whose `handle_request` converts the `httpx.Request` into an ASGI `scope` and calls your app directly. No socket is ever opened, and the host is the fake `testserver`.
+3. **Your sync test calls an async app.** The test function is synchronous, but the app is a coroutine function. `TestClient` uses an **anyio blocking portal**: a background thread running its own event loop (that's the `asyncio-portal-...` thread name). Each request is submitted to the portal, the main thread blocks until the response is ready, and the result comes back.
+
+<Mermaid chart={`sequenceDiagram
+  participant T as test function (main thread)
+  participant C as TestClient
+  participant P as portal thread with event loop
+  participant A as FastAPI app
+  T->>C: client.get("/where")
+  C->>C: build ASGI scope from the request
+  C->>P: portal.call(app, scope, receive, send)
+  P->>A: await app(scope, receive, send)
+  A-->>P: send(http.response.start), send(http.response.body)
+  P-->>C: collected status, headers, body
+  C-->>T: Response object`} />
+
+Two consequences matter in practice:
+
+- **Exceptions surface in the test.** By default (`raise_server_exceptions=True`), an unhandled exception in the app is re-raised in your test instead of becoming a 500. That gives you the real traceback. Pass `raise_server_exceptions=False` when you want to assert on the 500 response itself.
+- **The event loop belongs to the portal, not to your test.** Without a `with` block, each request may run on a fresh portal and loop. Async objects (a DB connection, an `httpx.AsyncClient`) created on one loop can't be safely used on another. Keep that in mind when mixing `TestClient` with async fixtures.
+
+```python
+boom = FastAPI()
+
+@boom.get("/boom")
+async def explode():
+    raise RuntimeError("database exploded")
+
+try:
+    TestClient(boom).get("/boom")
+except RuntimeError as e:
+    print("raised in test:", e)
+
+r = TestClient(boom, raise_server_exceptions=False).get("/boom")
+print(r.status_code, r.text)
+```
+
+```text title="Output"
+raised in test: database exploded
+500 Internal Server Error
+```
+
+## The app under test
+
+A notes service with the usual moving parts: a lifespan that creates a shared HTTP client, an async SQLAlchemy session dependency, an auth dependency, an endpoint that calls a third-party API, and a WebSocket.
+
+```python title="app/db.py"
+from collections.abc import AsyncIterator
+from sqlalchemy import String
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+engine = create_async_engine("sqlite+aiosqlite:///./app.db")
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Note(Base):
+    __tablename__ = "notes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner: Mapped[str] = mapped_column(String(50))
+    text: Mapped[str] = mapped_column(String(200))
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session
+```
+
+```python title="app/main.py"
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+import httpx
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import Note, get_session
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(base_url="https://api.weather.example")
+    app.state.ready = True
+    yield
+    await app.state.http.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+def get_current_user(authorization: Annotated[str | None, Header()] = None) -> str:
+    # Real apps decode a JWT here (see the security chapter).
+    if authorization != "Bearer real-token":
+        raise HTTPException(401, "not authenticated")
+    return "alice"
+
+
+UserDep = Annotated[str, Depends(get_current_user)]
+
+
+def get_http(request: Request) -> httpx.AsyncClient:
+    return request.app.state.http
+
+
+HttpDep = Annotated[httpx.AsyncClient, Depends(get_http)]
+
+
+class NoteIn(BaseModel):
+    text: str
+
+
+class NoteOut(BaseModel):
+    id: int
+    owner: str
+    text: str
+
+
+@app.get("/health")
+async def health(request: Request):
+    return {"ready": getattr(request.app.state, "ready", False)}
+
+
+@app.post("/notes", status_code=201)
+async def create_note(data: NoteIn, user: UserDep, session: SessionDep) -> NoteOut:
+    note = Note(owner=user, text=data.text)
+    session.add(note)
+    await session.commit()
+    return NoteOut(id=note.id, owner=note.owner, text=note.text)
+
+
+@app.get("/notes")
+async def list_notes(user: UserDep, session: SessionDep) -> list[NoteOut]:
+    rows = await session.scalars(select(Note).where(Note.owner == user).order_by(Note.id))
+    return [NoteOut(id=n.id, owner=n.owner, text=n.text) for n in rows]
+
+
+@app.get("/weather/{city}")
+async def weather(city: str, http: HttpDep):
+    try:
+        r = await http.get("/current", params={"city": city}, timeout=2.0)
+        r.raise_for_status()
+    except httpx.HTTPError:
+        raise HTTPException(502, "weather provider unavailable")
+    return {"city": city, "temp_c": r.json()["temp"]}
+
+
+@app.websocket("/ws/echo")
+async def echo(ws: WebSocket, token: str | None = None):
+    if token != "secret":
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            await ws.send_json({"echo": msg, "len": len(msg)})
+    except WebSocketDisconnect:
+        pass
+```
+
+Notice the design choice that makes this testable: **every external resource reaches the endpoints through `Depends`**. The session comes from `get_session`, the user from `get_current_user`, the HTTP client from `get_http`. Each of those is a seam where a test can plug in something else.
+
+## `dependency_overrides`: swapping a dependency
+
+`app.dependency_overrides` is a plain dict on the app: `{original_callable: replacement_callable}`. When FastAPI resolves dependencies for a request, it looks up each dependency callable in this dict first. If there's an entry, it calls the replacement instead, **with the replacement's own signature**. So the replacement can have different parameters (or none), and FastAPI injects whatever it asks for.
+
+```python
+app.dependency_overrides[get_current_user] = lambda: "alice"   # no header needed any more
+```
+
+The key is the **function object**, not its name. Three rules follow:
+
+- Override the exact function that routes use in `Depends(...)`. If routes depend on `get_current_active_user`, which depends on `get_current_user`, overriding `get_current_user` works for both, because overrides apply at every level of the dependency tree.
+- The override applies to every route of that app, including routes in included routers.
+- The dict lives on the app object and survives between tests. **Always clear it** in fixture teardown, or one test's fake user leaks into the next.
+
+<Callout type="warn">
+Overrides don't apply to things that aren't resolved through `Depends`. If an endpoint calls `get_settings()` directly, or a module imported `SessionLocal` and uses it by hand, `dependency_overrides` can't reach it. That is the practical argument for routing every resource through a dependency.
+</Callout>
+
+## pytest fixtures and configuration
+
+pytest **fixtures** are functions that set something up, `yield` it to the test, and tear it down afterwards. A test asks for a fixture by naming it as a parameter. Fixtures can depend on other fixtures, and their `scope` (`function`, `module`, `session`) controls how often they are rebuilt. Shared fixtures go in `tests/conftest.py`, which pytest loads automatically.
+
+For async fixtures and tests we use pytest-asyncio. Version 1.x is configured in `pyproject.toml`:
+
+```toml title="pyproject.toml"
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+```
+
+- `asyncio_mode = "auto"` treats every `async def` test and fixture as asyncio, so you don't need `@pytest.mark.asyncio` on each one.
+- The two loop-scope settings run all async fixtures and tests on **one event loop for the whole session**. That matters because the engine fixture below is session-scoped: an async connection pool created on one loop must not be used from another loop. Mismatched loop scopes are the most common source of "attached to a different loop" errors in async test suites.
+
+## A rolled-back transaction per test
+
+Tests must not see each other's data. There are three common strategies:
+
+| Strategy | Speed | Isolation | Notes |
+|---|---|---|---|
+| Recreate the schema per test | slow | perfect | fine for a handful of tests |
+| Truncate all tables after each test | medium | good | simple, works with any code path |
+| Wrap each test in a transaction and roll it back | fast | good | needs care when the app calls `commit()` |
+
+The third one is the standard for SQLAlchemy apps. The trick is that the app **commits**, and a commit would normally make the data permanent. SQLAlchemy's `join_transaction_mode="create_savepoint"` solves this: when a session is bound to a connection that already has a transaction open, the session's "transaction" becomes a `SAVEPOINT` inside it. The app's `commit()` only releases the savepoint. At the end of the test, rolling back the outer transaction discards everything.
+
+<Mermaid chart={`sequenceDiagram
+  participant F as session fixture
+  participant DB as database connection
+  participant A as endpoint code
+  F->>DB: BEGIN (outer transaction)
+  F->>A: yield AsyncSession bound to this connection
+  A->>DB: SAVEPOINT sa_savepoint_1
+  A->>DB: INSERT INTO notes ...
+  A->>DB: RELEASE SAVEPOINT (session.commit)
+  Note over A,DB: data visible inside this test only
+  F->>DB: ROLLBACK (outer transaction)
+  Note over DB: table is empty again`} />
+
+```python title="tests/conftest.py"
+from collections.abc import AsyncIterator
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.pool import StaticPool
+
+from app.db import Base, get_session
+from app.main import app, get_current_user
+
+
+@pytest.fixture(scope="session")
+async def engine() -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+
+    # SQLite drivers manage transactions themselves and skip BEGIN, which
+    # breaks rollback-per-test. Take control of BEGIN (not needed on Postgres).
+    @event.listens_for(engine.sync_engine, "connect")
+    def _no_driver_tx(dbapi_conn, _record):
+        dbapi_conn.isolation_level = None
+
+    @event.listens_for(engine.sync_engine, "begin")
+    def _emit_begin(conn):
+        conn.exec_driver_sql("BEGIN")
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    async with engine.connect() as conn:
+        outer = await conn.begin()                       # 1. open a transaction
+        session = AsyncSession(
+            bind=conn,
+            join_transaction_mode="create_savepoint",    # 2. app commits become SAVEPOINTs
+            expire_on_commit=False,
+        )
+        try:
+            yield session
+        finally:
+            await session.close()
+            await outer.rollback()                       # 3. throw everything away
+
+
+@pytest.fixture
+async def client(session: AsyncSession) -> AsyncIterator[AsyncClient]:
+    async def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_current_user] = lambda: "alice"
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    app.dependency_overrides.clear()
+```
+
+Walking through the fixtures:
+
+- **`engine`** (session scope): one in-memory SQLite database for the whole run. `StaticPool` makes every checkout return the same connection, which is required for `:memory:` (each new SQLite connection to `:memory:` would be a brand-new, empty database). Tables are created once.
+- **`session`** (function scope, the default): opens a connection, begins the outer transaction, and binds an `AsyncSession` to it in savepoint mode. The `finally` block guarantees the rollback even when the test fails.
+- **`client`**: overrides `get_session` to yield the test's session, and `get_current_user` to return a fake user. The override for a generator dependency is itself a generator (`yield session`), so FastAPI treats it the same way. Teardown clears the overrides.
+
+<Callout type="warn" title="The SQLite gotcha, observed">
+The first version of this conftest didn't have the two event listeners. The suite failed like this:
+
+```text title="Output"
+tests\test_notes.py:14: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_notes.py::test_each_test_starts_empty - AssertionError: ass...
+1 failed, 2 passed in 0.12s
+```
+
+The row from `test_create_note` was still there in the next test. Python's `sqlite3` module (and `aiosqlite`, which wraps it) decides on its own when to emit `BEGIN`, so SQLAlchemy's "begin" was a no-op and the final rollback had nothing to roll back. Setting `isolation_level = None` turns off the driver's transaction handling, and the `begin` listener emits a real `BEGIN`. PostgreSQL drivers (asyncpg, psycopg) don't have this problem. Ideally, run your tests against the same database engine as production, for example Postgres in Docker or Testcontainers.
+</Callout>
+
+### The tests
+
+```python title="tests/test_notes.py"
+from sqlalchemy import func, select
+from app.db import Note
+
+
+async def test_create_note(client, session):
+    r = await client.post("/notes", json={"text": "buy milk"})
+    assert r.status_code == 201
+    assert r.json() == {"id": 1, "owner": "alice", "text": "buy milk"}
+    assert await session.scalar(select(func.count()).select_from(Note)) == 1
+
+
+async def test_each_test_starts_empty(client):
+    r = await client.get("/notes")
+    assert r.json() == []
+
+
+async def test_validation_error(client):
+    r = await client.post("/notes", json={})
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"] == ["body", "text"]
+
+
+import pytest
+
+
+@pytest.mark.parametrize("text", ["first run", "second run"])
+async def test_rollback_resets_ids(client, text):
+    r = await client.post("/notes", json={"text": text})
+    assert r.json()["id"] == 1          # the previous run's row was rolled back
+
+
+async def test_asgitransport_skips_lifespan(client):
+    r = await client.get("/health")
+    assert r.json() == {"ready": False}
+```
+
+`test_create_note` asks for both `client` and `session`. pytest builds each fixture once per test, so the test and the endpoint share the **same session**, and the test can query the database directly to check what the endpoint wrote. Asserting on the database, not only on the response, catches endpoints that return the right JSON but forget to persist it.
+
+## Async tests: `httpx.AsyncClient` with `ASGITransport`
+
+The `client` fixture above isn't a `TestClient`. It is a regular `httpx.AsyncClient` with `ASGITransport(app=app)`. It does the same job as `TestClient` (build a scope, call the app, collect the response) but **on the test's own event loop**, with no portal thread.
+
+Use it when:
+
+- the test itself needs to `await` things: query the DB, call a service, check a queue;
+- your fixtures are async (an async engine, an async Redis client), so everything must share one loop;
+- you want to test concurrency, for example fire 20 requests with `asyncio.gather` and check that a lock held.
+
+Use `TestClient` when the test is plain synchronous code and you want the simplest possible setup, or for WebSockets (covered below).
+
+<Callout type="warn">
+`ASGITransport` does **not** run the app's lifespan. That's what `test_asgitransport_skips_lifespan` documents: `app.state.ready` was never set. If your endpoints need resources created in the lifespan, run it yourself, as shown in the next section.
+</Callout>
+
+### pytest-asyncio or anyio?
+
+FastAPI is built on anyio, and anyio ships its own pytest plugin. Either works. With the anyio plugin you mark tests with `@pytest.mark.anyio` and choose the backend with an `anyio_backend` fixture:
+
+```python title="tests/test_anyio_style.py"
+import pytest
+from httpx import ASGITransport, AsyncClient
+from fastapi import FastAPI
+
+mini = FastAPI()
+
+
+@mini.get("/ping")
+async def ping():
+    return {"pong": True}
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_ping_with_anyio_marker():
+    async with AsyncClient(transport=ASGITransport(app=mini), base_url="http://t") as c:
+        r = await c.get("/ping")
+    assert r.json() == {"pong": True}
+```
+
+Pick one plugin per project and stick to it. pytest-asyncio is more common in app code. The anyio plugin is handy if you also want to run the same tests on trio.
+
+## The lifespan in tests
+
+The lifespan (startup and shutdown, see [middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks)) is triggered by the ASGI `lifespan` protocol: the server sends `lifespan.startup` before any request and `lifespan.shutdown` at the end. In tests, someone has to send those messages.
+
+- `TestClient(app)` used **without** `with` sends no lifespan events.
+- `with TestClient(app) as client:` sends startup on `__enter__` and shutdown on `__exit__`, and keeps **one portal and one event loop** for the whole block.
+- `httpx.AsyncClient(transport=ASGITransport(app))` never sends them.
+
+```python title="tests/test_sync.py (excerpt)"
+def test_lifespan_only_runs_inside_with():
+    assert TestClient(app).get("/health").json() == {"ready": False}
+    with TestClient(app) as client:
+        assert client.get("/health").json() == {"ready": True}
+```
+
+For async tests, the lifespan function is just an async context manager, so you can enter it directly:
+
+```python
+import asyncio
+from httpx import ASGITransport, AsyncClient
+from app.main import app, lifespan
+
+async def main():
+    async with lifespan(app):          # run startup and shutdown yourself
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            print((await c.get("/health")).json())
+
+asyncio.run(main())
+```
+
+```text title="Output"
+{'ready': True}
+```
+
+The `asgi-lifespan` package (`LifespanManager(app)`) does the same thing through the real ASGI messages, which also works when the lifespan is assembled from several routers.
+
+You can see the event-loop difference directly:
+
+```python
+import asyncio
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+@app.get("/")
+async def r():
+    return id(asyncio.get_running_loop())
+
+c = TestClient(app)
+print(c.get("/").json() == c.get("/").json())
+with TestClient(app) as c:
+    print(c.get("/").json() == c.get("/").json())
+```
+
+```text title="Output"
+False
+True
+```
+
+Without `with`, two requests ran on two different event loops. Inside `with`, they shared one.
+
+<Callout title="Use the with-block by default">
+Prefer `with TestClient(app) as client` inside a fixture. Besides running startup and shutdown, it keeps one event loop for all requests in the test. Without it, objects created in one request (an async client, a cached connection) may be used later on a different loop.
+</Callout>
+
+## Mocking outgoing HTTP calls
+
+Your tests should never call the real weather API: it's slow, flaky, costs money and can't produce the error cases you need. There are three levels where you can cut the call:
+
+1. **Replace the client with a fake transport.** httpx has `httpx.MockTransport(handler)`: every request goes to your `handler` function instead of the network. The real client code (URL building, params, `raise_for_status`) still runs.
+2. **Patch at the library level** with `respx` (for httpx) or `responses` (for requests). These intercept requests globally by URL pattern.
+3. **Replace your own wrapper.** If your code calls `WeatherClient.current(city)`, override the dependency that provides `WeatherClient` with a fake class. Simplest, but it doesn't test your HTTP code.
+
+Because our app gets its client through `get_http`, level 1 is a one-line override:
+
+```python title="tests/test_sync.py (excerpt)"
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from app.main import app, get_http
+
+
+@pytest.fixture
+def weather_client():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.params["city"] == "atlantis":
+            return httpx.Response(503)
+        return httpx.Response(200, json={"temp": 21.5})
+
+    fake = httpx.AsyncClient(
+        base_url="https://api.weather.example", transport=httpx.MockTransport(handler)
+    )
+    app.dependency_overrides[get_http] = lambda: fake
+    with TestClient(app) as client:
+        yield client, calls
+    app.dependency_overrides.clear()
+
+
+def test_weather_ok(weather_client):
+    client, calls = weather_client
+    r = client.get("/weather/paris")
+    assert r.json() == {"city": "paris", "temp_c": 21.5}
+    assert calls == ["https://api.weather.example/current?city=paris"]
+
+
+def test_weather_provider_down(weather_client):
+    client, _ = weather_client
+    r = client.get("/weather/atlantis")
+    assert r.status_code == 502
+```
+
+The handler records each URL, so the test can assert on **what was sent** (the query string), not only on what came back. And it can return any failure you want to test: a 503, a malformed body, or `raise httpx.ConnectTimeout(...)` to exercise your timeout path. The same idea applies to LLM SDKs, which are built on httpx and accept an `http_client=` argument (see [calling LLM APIs](/docs/fastapi/calling-llm-apis)).
+
+## Testing WebSockets
+
+`TestClient.websocket_connect(path)` opens a WebSocket session against the app, again in-process. It returns a context manager with `send_text`, `send_json`, `send_bytes`, `receive_text`, `receive_json`, `receive_bytes` and `close`.
+
+```python title="tests/test_sync.py (excerpt)"
+def test_websocket_echo():
+    client = TestClient(app)
+    with client.websocket_connect("/ws/echo?token=secret") as ws:
+        ws.send_text("hello")
+        assert ws.receive_json() == {"echo": "hello", "len": 5}
+        ws.send_text("again")
+        assert ws.receive_json()["echo"] == "again"
+
+
+def test_websocket_rejects_bad_token():
+    from starlette.websockets import WebSocketDisconnect
+    client = TestClient(app)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws/echo?token=nope"):
+            pass
+    assert exc.value.code == 1008
+```
+
+When the app closes the connection before accepting it, `websocket_connect` raises `WebSocketDisconnect` carrying the close code. 1008 is "policy violation", the conventional code for an auth failure. `receive_*` calls block until the app sends something, so a test that waits for a message the app never sends will hang. Keep WebSocket tests short and deterministic. Leaving the `with` block sends a disconnect, which your endpoint sees as `WebSocketDisconnect`.
+
+`httpx.AsyncClient` has no WebSocket support, so WebSocket tests use `TestClient` (or a real server plus the `websockets` client library for end-to-end tests). More on WebSockets in [WebSockets and streaming](/docs/fastapi/websockets-and-streaming).
+
+## Running the suite
+
+```python title="tests/test_sync.py (the remaining test)"
+def test_requires_auth():
+    client = TestClient(app)
+    r = client.get("/notes")
+    assert r.status_code == 401
+    assert r.json() == {"detail": "not authenticated"}
+```
+
+```bash
+python -m pytest -v
+```
+
+```text title="Output (header trimmed)"
+plugins: anyio-4.15.1, asyncio-1.4.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=session, asyncio_default_test_loop_scope=session
+collecting ... collected 13 items
+
+tests/test_anyio_style.py::test_ping_with_anyio_marker PASSED            [  7%]
+tests/test_notes.py::test_create_note PASSED                             [ 15%]
+tests/test_notes.py::test_each_test_starts_empty PASSED                  [ 23%]
+tests/test_notes.py::test_validation_error PASSED                        [ 30%]
+tests/test_notes.py::test_rollback_resets_ids[first run] PASSED          [ 38%]
+tests/test_notes.py::test_rollback_resets_ids[second run] PASSED         [ 46%]
+tests/test_notes.py::test_asgitransport_skips_lifespan PASSED            [ 53%]
+tests/test_sync.py::test_requires_auth PASSED                            [ 61%]
+tests/test_sync.py::test_lifespan_only_runs_inside_with PASSED           [ 69%]
+tests/test_sync.py::test_weather_ok PASSED                               [ 76%]
+tests/test_sync.py::test_weather_provider_down PASSED                    [ 84%]
+tests/test_sync.py::test_websocket_echo PASSED                           [ 92%]
+tests/test_sync.py::test_websocket_rejects_bad_token PASSED              [100%]
+
+============================= 13 passed in 0.21s ==============================
+```
+
+Thirteen tests, including database writes, auth, an outgoing HTTP call and a WebSocket session, in about a fifth of a second. That speed is the payoff of in-process ASGI testing plus rollback isolation: you can afford to run the whole suite on every save.
+
+Note that `test_requires_auth` uses the **real** `get_current_user`: overrides are only active inside the `client` fixture, and they are cleared afterwards. Test your auth dependency directly in a few tests like this one, then override it everywhere else.
+
+## What to test where
+
+<Mermaid chart={`flowchart TB
+  U["Unit tests: services and pure functions<br/>no FastAPI, no DB, fakes for repositories<br/>milliseconds, the majority of tests"]
+  I["API tests: TestClient or AsyncClient<br/>real routing, validation, dependencies,<br/>real DB in a rolled-back transaction"]
+  E["End-to-end: real server, real Postgres,<br/>real network, a few smoke tests"]
+  U --> I --> E`} />
+
+- **Services** (business rules) are plain Python. Test them with a fake repository and no HTTP at all. If you followed the routers, services, repositories split from [project structure](/docs/fastapi/project-structure-and-settings), these tests need no FastAPI imports.
+- **API tests** check the contract: status codes, validation errors, response shapes, auth, and that the data actually landed in the database.
+- **End-to-end tests** run the built container against real dependencies. Keep them few. They catch configuration and wiring mistakes that in-process tests can't (wrong env vars, missing migrations, proxy headers).
+
+A few habits that pay off:
+
+- **Factories over fixtures for data.** A `make_user(**overrides)` helper (or `factory_boy`/`polyfactory`) keeps each test explicit about the data it needs.
+- **Freeze time** for anything with expiry (JWTs, rate limits) instead of sleeping.
+- **Test the error paths**: 401, 403, 404, 409, 422, provider timeouts. They're where real bugs live.
+- **Settings in tests**: set env vars with `monkeypatch.setenv`, then call `get_settings.cache_clear()`, or override `get_settings` with a `Settings(...)` instance.
+- **Coverage**: `pytest --cov=app --cov-branch` (with `pytest-cov`) tells you which branches never ran.
+
+## Traps
+
+- **Forgetting to clear `dependency_overrides`.** The dict lives on the app object and leaks across tests. Clear it in fixture teardown.
+- **Overriding the wrong function.** The key is the exact callable used in `Depends`. A different function with the same name in another module doesn't match.
+- **Calling a dependency directly** (`get_settings()` inside an endpoint) bypasses overrides.
+- **`TestClient(app)` without `with`** doesn't run the lifespan, so `app.state` attributes set at startup are missing.
+- **`ASGITransport` never runs the lifespan.** Enter the lifespan context yourself or use `asgi-lifespan`.
+- **Mixing event loops.** An async engine or client created in a fixture on one loop and used from `TestClient`'s portal loop (or from a test on a different loop scope) fails with "attached to a different loop" errors, or hangs. Align pytest-asyncio loop scopes, and use `AsyncClient` when fixtures are async.
+- **Rollback isolation on SQLite** needs the `BEGIN` workaround. Without it, data silently leaks between tests.
+- **`:memory:` SQLite without `StaticPool`** gives each connection its own empty database, so the tables you created "disappear".
+- **Hitting real third-party APIs** in tests. Inject the HTTP client and give it a `MockTransport`.
+- **Hanging WebSocket tests.** `receive_*` blocks forever if the app never sends. Test one exchange at a time. And open several WebSocket sessions from inside `with TestClient(app) as client:`: a broadcast test with two sessions from a bare `TestClient` hung when one client left (see [WebSockets and streaming](/docs/fastapi/websockets-and-streaming)).
+- **Testing only the happy path.** Validation, auth and upstream failures are the interesting cases.
+
+## Key points
+
+- An ASGI app is a function, so tests call it in-process. No server, no port.
+- `TestClient` is an httpx-style client with a transport that calls the app through an anyio portal thread. Server exceptions are re-raised in the test by default.
+- `app.dependency_overrides` maps a dependency callable to a replacement. It is how you inject a test DB session, a fake user or a fake HTTP client. Clear it after each test.
+- Wrap each test in an outer transaction and bind the session with `join_transaction_mode="create_savepoint"`. App commits become savepoints, and the final rollback restores a clean database.
+- Use `httpx.AsyncClient(transport=ASGITransport(app=app))` for async tests on the test's own loop. Configure pytest-asyncio loop scopes to match fixture scopes.
+- The lifespan runs only with `with TestClient(app)` or when you enter it yourself.
+- Mock outgoing HTTP at the transport level with `httpx.MockTransport`, so your request-building code is still tested.
+- Test WebSockets with `client.websocket_connect(...)`. Rejections surface as `WebSocketDisconnect` with the close code.

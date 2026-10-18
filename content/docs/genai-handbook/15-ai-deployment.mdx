@@ -1,0 +1,1057 @@
+---
+title: "15. AI Deployment"
+description: "Deployment is where AI systems meet reality. Models that work in notebooks fail in production for reasons that have nothing to do with the model: container..."
+---
+
+<Callout type="info">
+  How to read this chapter:
+  - 📘 **Handbook**: the original handbook text, left as it was (only the ASCII diagrams were redrawn as Mermaid).
+  - 🔧 **Going deeper**: code, config and extra depth on topics the handbook already covers.
+  - ➕ **Beyond the handbook**: topics the handbook does not cover at all, added because a GenAI engineer should know them.
+
+  Generic DevOps (Dockerfiles, CI/CD, Kubernetes rollouts, GitOps, Terraform) is covered in depth in [DevOps for Backend Engineers](/docs/backend-first-principles/31-devops). The additions here stay GPU- and LLM-specific.
+</Callout>
+
+## 15.1 Concept Explanation
+
+Deployment is where AI systems meet reality. Models that work in notebooks fail in production for reasons that have nothing to do with the model: container size, networking, autoscaling, secrets, ingress, observability. This chapter is the deepest in the book because deployment is where the most engineering hours and the most production failures live.
+
+We will move from the bottom up: containers, orchestration, GPU specialization, scaling, traffic management, networking, deployment strategies, multi-cloud, CI/CD, and observability hooks. By the end, you should be able to design a production-grade AI deployment from scratch and explain every layer.
+
+## 15.2 Docker
+
+Docker packages an application and its dependencies into a portable container image. For AI, this is essential: model weights, Python versions, CUDA libraries, system libraries, and inference servers all need to be consistent across environments.
+
+Key practices:
+- **Multi-stage builds.** Separate build environment (with compilers) from runtime environment (lean image).
+- **CUDA base images.** Start from NVIDIA's CUDA images that include the right toolkit versions.
+- **Image size discipline.** A 20 GB image takes minutes to pull and inflates registry costs. Strip caches, use slim bases, avoid bundling model weights in the image (mount them at runtime).
+- **Pinned versions.** Pin every dependency; "latest" is how stable deployments break.
+- **Health checks.** Both readiness (ready to serve traffic) and liveness (still alive).
+
+For inference servers, vendor-published images (vLLM, TGI, Triton) are usually the right starting point — they bake in CUDA, the inference engine, and reasonable defaults.
+
+### 15.2.1 Building GPU inference images 🔧
+
+The practices above apply to any image. GPU images add one contract that ordinary images do not have: the split between the host driver and the CUDA libraries in the image.
+
+#### The problem
+
+An image that works on a developer's GPU box fails on a cluster node with `CUDA driver version is insufficient for CUDA runtime version`, or the container starts but PyTorch reports `torch.cuda.is_available() == False`.
+
+#### Why it happens: driver on the host, runtime in the image
+
+The **kernel driver** (`nvidia.ko` and `libcuda.so`) lives on the host and is mounted into the container by the NVIDIA Container Toolkit at start-up. The **CUDA runtime and libraries** (cuBLAS, cuDNN, NCCL, the CUDA version PyTorch was built against) live in the image. A driver supports CUDA runtimes up to a maximum version, which is the "CUDA Version" printed in the top right of `nvidia-smi` on the host. The rule is:
+
+```text
+CUDA version the image was built for  ≤  max CUDA version the host driver supports
+```
+
+Newer drivers run older runtimes. Older drivers cannot run newer runtimes, except through NVIDIA's forward-compatibility packages on datacenter GPUs. When you upgrade vLLM, check which CUDA version its wheels target and whether your node image's driver is new enough.
+
+#### Implementation: extend the vendor image, keep weights out
+
+```dockerfile
+# Pin the exact tag (better still, the digest). Never use :latest for GPU serving.
+FROM vllm/vllm-openai:v0.11.0
+
+# Add only what your deployment needs on top of the vendor image.
+RUN pip install --no-cache-dir "vllm[runai]"   # S3 weight streaming, see 15.8a
+
+# No model weights in the image: they are streamed or mounted at runtime.
+ENV HF_HOME=/models/hf-cache \
+    VLLM_NO_USAGE_STATS=1
+
+# The base image's entrypoint is the OpenAI-compatible server, so arguments go in the pod spec.
+```
+
+Check the vLLM release notes for the current tag before you copy this. The tag above is the one used in vLLM's own Docker docs as of 2026.
+
+#### Edge cases and failure modes
+
+- **Image size.** The vLLM image is many gigabytes because it bundles CUDA libraries and PyTorch. Pull time is a large part of cold start (15.8a). Pre-pull it onto node images, or use a registry mirror in the same region.
+- **Shared memory.** Tensor-parallel workers communicate through `/dev/shm`, and Docker's default 64 MB is far too small. Use `--ipc=host` locally and an in-memory `emptyDir` on Kubernetes (15.6.1).
+- **Architecture.** Grace Hopper and Grace Blackwell nodes (GH200, GB200) are arm64. An amd64-only image will not start there, so build multi-arch images or keep those nodes in a separate pool.
+- **Health checks.** vLLM exposes `/health`, which returns 200 once the engine is up. Weight loading can take minutes, so use a generous `startupProbe` and keep the `livenessProbe` from killing a pod that is still loading.
+
+## 15.3 Docker Compose
+
+Docker Compose orchestrates multiple containers on a single host. For AI, it is useful in development (model + vector DB + redis on a laptop) and in small single-node deployments. For production multi-node systems, you want Kubernetes.
+
+## 15.4 Kubernetes — The Orchestration Layer
+
+Kubernetes is the de facto orchestration system for containerized workloads. It manages container lifecycle, scaling, networking, secrets, storage, and health across many nodes.
+
+Key concepts for AI deployments:
+
+- **Pod** — the smallest deployable unit, usually one or more containers running together.
+- **Deployment** — declarative spec for stateless workloads, manages replica count and rolling updates.
+- **StatefulSet** — for stateful workloads (databases, some vector DBs).
+- **Service** — stable network endpoint for a set of pods.
+- **Ingress** — HTTP routing into the cluster.
+- **ConfigMap / Secret** — non-sensitive and sensitive configuration.
+- **PersistentVolume / PersistentVolumeClaim** — storage abstractions.
+- **HorizontalPodAutoscaler (HPA)** — scales replicas based on metrics.
+- **Node** — a machine in the cluster.
+- **Namespace** — logical isolation within a cluster.
+
+Kubernetes is complex. The reward for learning it is operational uniformity across cloud providers and on-premises.
+
+## 15.5 Helm and Kustomize
+
+Raw manifest files become unwieldy fast. Two tools dominate:
+
+**Helm** is a package manager. Helm charts are reusable templates with values you override per environment. Most popular software (Postgres, Redis, Kafka, vLLM) ships official Helm charts. Strength: powerful templating, broad ecosystem. Weakness: templates can become hard to read.
+
+**Kustomize** layers patches on a base manifest. Strength: simple, no templates. Weakness: less flexible for complex deployments.
+
+Many teams use both: Helm for third-party software, Kustomize for in-house services.
+
+## 15.6 GPU Operators and Device Plugins
+
+Kubernetes does not know about GPUs by default. The NVIDIA GPU Operator (a collection of Kubernetes operators) installs drivers, the device plugin, DCGM exporter, MIG manager, and the container runtime configuration needed to schedule GPU workloads.
+
+The GPU Operator handles the awkward parts: matching driver versions, exposing GPUs to pods, managing MIG partitions. On managed Kubernetes (EKS, GKE, AKS), the cloud provider often pre-installs much of this.
+
+Workloads request GPUs in their pod spec; the scheduler places them on nodes with available GPUs.
+
+### 15.6.1 GPU node pools: taints, tolerations and a vLLM Deployment 🔧
+
+Requesting a GPU in a pod spec is the easy part. Keeping GPU nodes for GPU work, and making the pod survive minutes of model loading, takes a few more fields.
+
+#### The problem
+
+Two failures show up in every new GPU cluster. Ordinary CPU pods (log shippers, small APIs) get scheduled onto expensive GPU nodes and keep the autoscaler from removing them. And GPU pods are killed in a restart loop because their liveness probe fails while the model is still loading.
+
+#### Mechanism
+
+- The device plugin advertises GPUs as the **extended resource** `nvidia.com/gpu`. Extended resources are integers, cannot be overcommitted, and the request must equal the limit (so you normally set only the limit).
+- A **taint** on GPU nodes (for example `nvidia.com/gpu=true:NoSchedule`) repels every pod that does not carry a matching **toleration**. Only GPU workloads tolerate it.
+- A **node selector** or node affinity then pins a workload to the GPU class it was sized for, since an L4 and an H100 both advertise `nvidia.com/gpu: 1`.
+
+#### Implementation: a vLLM Deployment
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-8b
+  namespace: inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: llama-8b }
+  template:
+    metadata:
+      labels: { app: llama-8b }
+    spec:
+      nodeSelector:
+        karpenter.k8s.aws/instance-family: g6e      # L40S nodes, the class this model was sized for
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 110            # see spot handling in 15.8b
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.11.0
+          args:
+            - --model=meta-llama/Llama-3.1-8B-Instruct
+            - --max-model-len=8192
+            - --gpu-memory-utilization=0.90
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              memory: 48Gi
+            requests:
+              cpu: "4"
+              memory: 48Gi
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token, key: token }
+          startupProbe:                              # allow up to 20 minutes to load weights
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 15
+            failureThreshold: 4
+          volumeMounts:
+            - { name: dshm, mountPath: /dev/shm }
+            - { name: model-cache, mountPath: /root/.cache/huggingface }
+      volumes:
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+        - name: model-cache
+          emptyDir: {}                               # node-local NVMe if the node class provides it
+```
+
+And the Karpenter NodePool that provides those nodes, tainted so nothing else lands on them:
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-l40s
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu                                    # an EC2NodeClass using a GPU-enabled AMI
+      requirements:
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["g6e"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+      taints:
+        - key: nvidia.com/gpu
+          value: "true"
+          effect: NoSchedule
+  limits:
+    nvidia.com/gpu: 16                               # hard cap on GPUs this pool may launch
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 15m
+```
+
+#### Edge cases and failure modes
+
+- **DaemonSets need the toleration too.** The DCGM exporter, the device plugin and your log agent must tolerate the GPU taint, or GPU nodes run unmonitored. The GPU Operator's own DaemonSets already do this.
+- **Pods pending on a fresh node.** A new node joins before the device plugin has advertised its GPUs, so for a minute or two it reports zero `nvidia.com/gpu`. That is normal. A node that stays at zero usually has a driver or toolkit mismatch, which you can confirm in the device-plugin pod logs.
+- **Memory limits.** Loading safetensors uses page cache and pinned host memory. A container memory limit far below the weight size can OOM-kill the pod during loading, even though the weights end up on the GPU.
+- **Consolidation churn.** `WhenEmptyOrUnderutilized` consolidation can move GPU pods to save money, which costs a cold start each time. For serving pools, `WhenEmpty` plus a delay is usually the safer choice.
+
+## 15.7 Autoscaling
+
+Three levels of autoscaling in Kubernetes:
+
+**Horizontal Pod Autoscaler (HPA)** — scales pod replicas based on metrics (CPU, memory, custom). For AI, scale on GPU utilization, queue depth, or tokens-per-second, not raw CPU.
+
+**Vertical Pod Autoscaler (VPA)** — adjusts pod resource requests. Less common for AI because GPU allocation is integer-sized.
+
+**Cluster Autoscaler** — adds or removes nodes when pods cannot be scheduled or nodes are underutilized. Critical for GPU workloads because GPU nodes are expensive.
+
+**Karpenter** (AWS) and similar provisioners offer more flexible node provisioning, often faster than the classic cluster autoscaler.
+
+## 15.8 Inference Autoscaling
+
+LLM inference autoscaling has unique challenges:
+
+- Cold start is slow (model load takes minutes).
+- Replicas are expensive (GPUs cost dollars per hour, not cents).
+- Traffic is bursty.
+- Right metrics are non-obvious.
+
+Patterns:
+- **Always-warm replicas.** Keep a minimum number running even at low traffic.
+- **Predictive scaling.** Scale based on historical patterns, not just current load.
+- **Tiered model serving.** Cheap models for small loads, expensive models for surges.
+- **Queue-based autoscaling.** Scale on queue depth, not CPU.
+- **KEDA** — Kubernetes event-driven autoscaler, supports many event sources (Redis queues, Kafka, custom).
+- **Knative Serving** — scale-to-zero for spiky workloads (acceptable when cold starts are tolerable).
+
+### 15.8.1 Autoscaling on queue depth and KV-cache usage 🔧
+
+The patterns above say "scale on queue depth, not CPU". This section turns that into numbers and a working KEDA config.
+
+#### Why CPU and GPU utilisation are the wrong signals
+
+An inference pod's CPU is mostly idle, because the work happens on the GPU. GPU utilisation from `nvidia-smi` reads close to 100% as soon as any decode loop is running ([GPU Systems, 14.8a](/docs/genai-handbook/14-gpu-systems)), so an HPA on it scales up at the first request and never scales down. What actually measures saturation of an LLM server is:
+
+- **Requests waiting** (`vllm:num_requests_waiting`): requests admitted to the server but not yet scheduled, because the batch or the KV cache is full. Any sustained value above zero means users are queueing.
+- **KV-cache usage** (`vllm:kv_cache_usage_perc`, 0 to 1): how full the pre-allocated KV pool is. Near 1, the scheduler starts preempting sequences.
+
+#### Sizing from first principles: Little's law
+
+The number of requests in a system equals arrival rate times time in system:
+
+```text
+concurrent requests = arrival rate (req/s) × mean request duration (s)
+```
+
+At 20 requests/s, with a mean generation time of 12 s, you have 240 requests in flight. If benchmarking shows one replica handles 48 concurrent sequences within your latency SLO, you need `240 / 48 = 5` replicas, plus headroom.
+
+#### Headroom must cover provisioning lag
+
+A new GPU replica is not available for minutes (15.8a). If traffic can grow by `g` requests/s per minute and a new replica takes `T` minutes to become ready, the existing fleet must absorb `g × T` extra requests/s on its own:
+
+```text
+headroom (req/s) ≥ traffic growth per minute × minutes to ready
+```
+
+With 10-minute cold starts and traffic that grows by 1 req/s per minute at the morning ramp, the running fleet needs about 10 req/s of spare capacity at all times. That is why minimum replicas and predictive pre-scaling matter more for GPUs than for web services.
+
+#### Implementation: KEDA on vLLM metrics
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: llama-8b
+  namespace: inference
+spec:
+  scaleTargetRef:
+    name: llama-8b                 # the Deployment from 15.6.1
+  minReplicaCount: 2               # always-warm floor
+  maxReplicaCount: 12
+  pollingInterval: 15
+  cooldownPeriod: 600
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies: [{ type: Pods, value: 4, periodSeconds: 60 }]
+        scaleDown:
+          stabilizationWindowSeconds: 900      # GPUs are slow to bring back, so shrink slowly
+          policies: [{ type: Pods, value: 1, periodSeconds: 300 }]
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: sum(vllm:num_requests_waiting{model_name="meta-llama/Llama-3.1-8B-Instruct"})
+        threshold: "4"             # target: about 4 waiting requests per replica
+    - type: prometheus
+      metricType: Value            # compare the average directly, not per replica
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: avg(vllm:kv_cache_usage_perc{model_name="meta-llama/Llama-3.1-8B-Instruct"}) * 100
+        threshold: "75"
+```
+
+How KEDA reads this: the Prometheus trigger defaults to `AverageValue`, so desired replicas is roughly `ceil(query result / threshold)`. With 20 requests waiting in total and a threshold of 4, it asks for 5 replicas. The KV-cache trigger uses `Value`, so it scales up whenever the fleet-wide average exceeds 75%. With several triggers the HPA takes the largest proposal.
+
+#### Edge cases and failure modes
+
+- **Long contexts fill the KV cache without queueing.** A few 100K-token conversations can push KV usage to 95% while `num_requests_waiting` stays at 0, then the next request waits. That is why the config above scales on both signals.
+- **Scaling up does not help a stuck replica.** Requests already waiting on one pod do not move to the new pod. Use a load balancer that routes on queue length (15.12a), or new capacity only helps future requests.
+- **Scale-to-zero.** KEDA can scale to zero with an `activationThreshold`, but the first request then waits for a full cold start. Only do it for internal or batch models.
+- **Metric staleness.** Polling, scrape interval and the HPA sync period add up to 30-60 s before KEDA acts. Combined with cold start, that is another reason to keep headroom.
+
+## 15.8a Cold starts and model-weight loading ➕
+
+The handbook says cold starts take minutes. This section breaks the minutes down so you can remove them stage by stage. [GPU Systems](/docs/genai-handbook/14-gpu-systems) and [Production Failures](/docs/genai-handbook/24-production-failures) mention cold starts briefly. The mechanics are here.
+
+### The problem
+
+A traffic spike triggers a scale-up, and the new replica serves its first request 10-15 minutes later, by which time the spike has passed and users have seen errors. Without measuring each stage, teams can't tell which one to fix.
+
+### Where the time goes
+
+<Mermaid chart={`flowchart LR
+  A["Stage 1: node provisioning<br/>launch, boot, driver,<br/>device plugin ready"] --> B["Stage 2: image pull<br/>multi-GB vLLM image"]
+  B --> C["Stage 3: weight download<br/>object store or hub<br/>to node disk or RAM"]
+  C --> D["Stage 4: load to HBM<br/>host to GPU over PCIe"]
+  D --> E["Stage 5: warm-up<br/>memory profiling,<br/>CUDA graph capture"]
+  E --> F["Ready: readiness probe passes"]`} />
+
+Illustrative orders of magnitude for a 70B BF16 model (141 GB) on an 8-GPU node, assuming no caching:
+
+| Stage | Rough time | What sets it |
+|---|---|---|
+| Node provisioning | 2-6 min | Cloud capacity, AMI boot, driver and device plugin start |
+| Image pull | 0.5-3 min | Image size, registry location, layer cache on the node |
+| Weight download | 1-25 min | Source throughput (see the maths below) |
+| Load to HBM | seconds to 1 min | PCIe bandwidth, file format, parallelism |
+| Warm-up | 0.5-3 min | Profiling run, CUDA graph capture, compile caches |
+
+### First-principles maths for weight download
+
+```text
+download time = weight bytes / effective throughput
+141 GB at 100 MB/s (one HTTP stream)            ≈ 23.5 min
+141 GB at 2 GB/s (many parallel ranged GETs)    ≈ 70 s
+141 GB at 12.5 GB/s (100 Gbps NIC, line rate)   ≈ 11 s, the physical floor for that NIC
+```
+
+A single HTTP stream from object storage is limited per connection. Throughput comes from many concurrent ranged GETs, and is then capped by the node's NIC and by how fast the destination (disk or RAM) can absorb it. That is the whole idea behind the streaming loaders below.
+
+### Mechanism 1: safetensors
+
+Older checkpoints were pickled PyTorch files (`.bin`, `.pt`). Unpickling is slow, single-threaded, and can execute arbitrary code embedded in the file, so loading an untrusted checkpoint is a remote-code-execution risk. A **safetensors** file is a small JSON header (names, dtypes, shapes, byte offsets) followed by raw tensor bytes. The loader can memory-map the file and copy each tensor straight to the GPU with no deserialisation step and no code execution. vLLM's default `--load-format auto` prefers safetensors when the checkpoint has them.
+
+### Mechanism 2: stream weights from object storage straight into GPU memory
+
+Instead of "download everything to disk, then load", a streaming loader reads many tensors concurrently from S3 into a CPU buffer and pushes them to the GPU while later tensors are still downloading, overlapping stages 3 and 4. vLLM supports the Run:ai Model Streamer for this:
+
+```bash
+pip install "vllm[runai]"
+
+vllm serve s3://my-models/llama-3.1-70b-instruct/ \
+  --load-format runai_streamer \
+  --model-loader-extra-config '{"concurrency": 32}' \
+  --tensor-parallel-size 4
+```
+
+`concurrency` sets the number of parallel S3 readers. There is also a `memory_limit` option to cap the CPU staging buffer. Credentials come from the standard AWS chain, so on EKS give the pod an IAM role through IRSA or Pod Identity rather than keys (see [Cloud for GenAI, 16.11](/docs/genai-handbook/16-cloud-for-genai)).
+
+### Mechanism 3: keep a node-local copy
+
+When the same model is loaded often, put the weights on local NVMe once per node and let every later pod on that node read them from disk at several GB/s. An init container is the simplest way to do this:
+
+```yaml
+initContainers:
+  - name: fetch-weights
+    image: peakcom/s5cmd:v2.3.0
+    args: ["--numworkers", "64", "sync", "s3://my-models/llama-3.1-8b-instruct/*", "/models/llama-3.1-8b-instruct/"]
+    volumeMounts:
+      - { name: models, mountPath: /models }
+volumes:
+  - name: models
+    hostPath: { path: /mnt/nvme/models, type: DirectoryOrCreate }   # instance-store NVMe
+```
+
+`sync` skips files that are already present, so the second pod on the node starts almost immediately. Point vLLM at `/models/llama-3.1-8b-instruct`.
+
+### Cutting the other stages
+
+- **Provisioning**: keep warm spare nodes (a low-priority placeholder Deployment that real pods preempt), or keep the minimum replica count above zero.
+- **Image pull**: bake the inference image into the node AMI, or use a pull-through cache in the same region. On EKS, a Bottlerocket data volume snapshot with pre-pulled images is another option.
+- **Warm-up**: vLLM caches `torch.compile` artifacts on disk. Persist that cache directory across restarts on the same node so later starts skip recompilation.
+
+### Edge cases and failure modes
+
+- **Hub rate limits and outages.** Pulling from the Hugging Face Hub at scale-up time ties your availability to a third party and to its rate limits. Mirror approved models into your own bucket.
+- **NAT gateway bills.** Downloading 141 GB per pod start through a NAT gateway is charged per GB. Use an S3 gateway endpoint ([Cloud for GenAI, 16.12](/docs/genai-handbook/16-cloud-for-genai)).
+- **Readiness too early.** If readiness passes before warm-up finishes, the first real requests pay for CUDA graph capture. Rely on the server's own `/health`, which reports ready only once the engine is ready.
+- **Disk full on hostPath caches.** Node-local caches need eviction, or nodes that rotate through many models fill their NVMe and new pods fail with confusing I/O errors.
+
+## 15.8b Spot GPUs and interruption handling ➕
+
+Spot capacity is the biggest discount on GPUs, and autoscaling on it only works if interruptions are handled deliberately. [Cost Optimization](/docs/genai-handbook/25-cost-optimization) explains when spot is worth it. This section is about surviving the interruption.
+
+### The problem
+
+The cloud reclaims a spot GPU node with very little notice. Every in-flight stream on it dies mid-sentence, and its replacement takes a full cold start. Without handling, users see truncated answers and a capacity hole lasting minutes.
+
+### The notice windows
+
+- **AWS EC2 Spot**: a two-minute interruption notice, published as an EventBridge event and in instance metadata at `/latest/meta-data/spot/instance-action`.
+- **Google Cloud Spot VMs**: about 30 seconds of preemption notice.
+- **Azure Spot VMs**: about 30 seconds, through Scheduled Events.
+
+Compare that with request duration. A long answer at 30 tokens/s for 2,000 tokens takes about 67 s, which fits inside AWS's two minutes if new requests stop at once, but not inside 30 seconds.
+
+### Mechanism: drain fast, replace in parallel
+
+1. The node gets the notice. On EKS, Karpenter watches an SQS interruption queue (configured with `--interruption-queue`, wired to EventBridge rules). It cordons and drains the node and **at the same time** launches a replacement.
+2. Draining deletes the pods. Kubernetes removes them from Service endpoints, so no new requests arrive, and runs each pod's `preStop` hook.
+3. The `preStop` sleep gives in-flight streams time to finish, then the container gets SIGTERM.
+4. The gateway retries failed requests on another replica, but only if no tokens were sent yet.
+
+### Implementation: pod side
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 110     # must stay under the 120 s AWS notice
+  containers:
+    - name: vllm
+      lifecycle:
+        preStop:
+          exec:
+            command: ["sh", "-c", "sleep 90"]   # let in-flight generations finish
+```
+
+And a NodePool that allows both capacity types, so Karpenter prefers spot but falls back to on-demand when spot is unavailable, across several GPU families to reduce correlated interruptions:
+
+```yaml
+requirements:
+  - key: karpenter.sh/capacity-type
+    operator: In
+    values: ["spot", "on-demand"]
+  - key: karpenter.k8s.aws/instance-family
+    operator: In
+    values: ["g6e", "g6", "g5"]
+```
+
+### Implementation: gateway side (Python)
+
+```python
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+import httpx
+
+Write = Callable[[bytes], Awaitable[None]]
+
+
+async def stream_with_failover(
+    client: httpx.AsyncClient,  # configured with a long read timeout
+    body: dict[str, Any],
+    write: Write,
+    pools: list[str],
+) -> None:
+    """Retry on another pool only if the user has not seen any tokens yet."""
+    last_error: Exception | None = None
+    for base in pools:
+        sent_any = False
+        try:
+            async with client.stream(
+                "POST", f"{base}/v1/chat/completions", json={**body, "stream": True}
+            ) as res:
+                res.raise_for_status()
+                async for chunk in res.aiter_bytes():
+                    sent_any = True
+                    await write(chunk)
+            return
+        except httpx.HTTPError as err:
+            if sent_any:
+                raise  # a half-streamed answer cannot be silently restarted
+            last_error = err
+    raise last_error or RuntimeError("no pools configured")
+```
+
+When a stream breaks after tokens were sent, tell the client explicitly (an SSE error event) and let the UI offer "regenerate". Restarting silently would show the user a different answer that is glued onto the old one.
+
+### Edge cases and failure modes
+
+- **Replacement slower than the notice.** The replacement node needs a full cold start (15.8a), so for several minutes capacity is lower. Keep on-demand replicas as the floor and use spot only for the burst above it.
+- **Correlated interruptions.** Spot reclaims often hit many instances of one type in one zone at once. Spread across instance families and availability zones, and never put all replicas of a model on spot.
+- **Grace periods cannot exceed the notice.** A `terminationGracePeriodSeconds` of 300 does not buy 300 seconds, because the instance is gone after two minutes.
+- **Batch jobs.** Offline batch inference and fine-tuning should checkpoint progress (per shard of input, or per N training steps) so an interruption costs minutes, not the whole job.
+
+## 15.9 Serverless AI
+
+Serverless platforms (AWS Lambda, GCP Cloud Run, Azure Functions, Modal, Replicate, RunPod Serverless, Banana) handle scaling and idle-cost automatically. You pay per invocation.
+
+Suitable for: spiky traffic, low-traffic features, prototypes, batch jobs.
+
+Unsuitable for: latency-critical chat (cold starts), high-volume continuous traffic (per-invocation pricing exceeds reserved capacity).
+
+Modal and Replicate are notable for GPU-aware serverless with reasonable cold-start mitigation.
+
+## 15.10 Edge AI Deployment
+
+Edge AI runs models on or near the user — on the device (phone, laptop), on a regional edge node (Cloudflare Workers AI, AWS Wavelength), or in retail/industrial appliances.
+
+Drivers: latency, offline operation, privacy, cost (no per-token bill).
+
+Constraints: limited memory, no GPU or weak GPU, intermittent connectivity. Models are heavily quantized (INT4, INT8) and often pruned or distilled.
+
+The trend: more and more inference moves to the edge as model efficiency improves. A 1-3B model running locally can handle a large share of consumer AI workloads.
+
+## 15.11 Deployment Strategies
+
+**Rolling deployment.** Replace old pods with new ones gradually. Default in Kubernetes. Risk: bad versions reach users during the rollout.
+
+**Blue-green deployment.** Run old (blue) and new (green) in parallel; switch traffic atomically. Fast rollback. Cost: double capacity during the switch.
+
+**Canary deployment.** Send a small fraction of traffic to the new version; expand if metrics hold; roll back if not. Industry standard for risky changes. Tools: Argo Rollouts, Flagger.
+
+**Shadow deployment.** Send a copy of production traffic to the new version without serving its responses to users. Compare outputs offline. Excellent for testing model changes before user exposure.
+
+**Feature flags.** Toggle behavior without redeployment. Essential for AI because prompt and model changes carry quality risk.
+
+For AI, blue-green or canary with shadow traffic is the gold standard. Roll forward with shadow first, canary with small percentage, then full.
+
+### 15.11.1 Shadow traffic and canaries for model changes 🔧
+
+The strategies themselves are generic (see [zero-downtime deployment strategies](/docs/backend-first-principles/31-devops)). What changes for models is how you decide whether the new version is better, and what shadowing costs on GPUs.
+
+#### Why model rollouts need different checks
+
+A code change is usually right or wrong, and error rates show it. A model or prompt change can return HTTP 200 on every request and still be worse: more hallucinations, more refusals, a different tone. Outputs are not deterministic, so "same output as before" cannot be the test. You need two kinds of signal:
+
+- **Operational**: error rate, TTFT and inter-token latency, tokens per response (a change in length is often the first sign of a behaviour change), cost per request.
+- **Quality**: an offline evaluation score on shadow outputs (LLM-as-judge or task metrics, see [Monitoring and Observability](/docs/genai-handbook/19-monitoring-observability)), and online signals such as thumbs-down rate and regeneration rate for the canary cohort.
+
+#### Shadow, option 1: mirror at the mesh
+
+Istio can copy a percentage of requests to a second service and drop its responses:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: llm
+  namespace: inference
+spec:
+  hosts: ["llm.inference.svc.cluster.local"]
+  http:
+    - route:
+        - destination: { host: llm-stable }
+      mirror: { host: llm-candidate }
+      mirrorPercentage: { value: 10.0 }
+```
+
+That is cheap to set up, but the mirrored responses are discarded, so you only learn about latency and errors, not quality.
+
+#### Shadow, option 2: shadow in the gateway, and keep both outputs
+
+For quality comparison, shadow in your own LLM gateway, so you can store the pair and score it later:
+
+```python
+import asyncio
+import os
+import random
+
+import structlog
+
+log = structlog.get_logger()
+SHADOW_RATE = float(os.environ.get("SHADOW_RATE", "0.05"))
+_background: set[asyncio.Task[None]] = set()  # keep references so tasks are not garbage-collected
+
+
+async def chat(req: ChatRequest) -> ChatResponse:
+    primary = await call_model(PRIMARY_URL, req)
+
+    # Never shadow requests that can trigger tools: the shadow would act for real.
+    if not req.tools and random.random() < SHADOW_RATE:
+        task = asyncio.create_task(_shadow(req, primary))  # fire and forget
+        _background.add(task)
+        task.add_done_callback(_background.discard)
+    return primary
+
+
+async def _shadow(req: ChatRequest, primary: ChatResponse) -> None:
+    try:
+        shadow = await call_model(CANDIDATE_URL, req)
+        await eval_queue.publish(
+            {"request_id": req.id, "input": req.messages, "primary": primary, "shadow": shadow}
+        )
+    except Exception:
+        log.warning("shadow call failed", request_id=req.id, exc_info=True)
+```
+
+A worker (an arq or Celery task) drains `eval_queue`, runs pairwise judging, and publishes a win rate for the candidate. The rollout proceeds only if the win rate (or the "not worse" rate) clears a threshold you set in advance.
+
+#### What shadowing costs
+
+Shadowing a fraction `s` of traffic adds `s` times the GPU load of the candidate model. At 10% shadow on a fleet of 10 GPUs, that is one extra GPU's worth of work for as long as the shadow runs. Keep shadow windows short, sample by request type so rare cases are represented, and run the shadow pool on spot capacity, since dropped shadow requests cost nothing.
+
+#### Canary with automatic analysis
+
+Argo Rollouts can pause at each traffic step and query Prometheus, rolling back automatically when a metric fails:
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: llm-canary-health
+spec:
+  metrics:
+    - name: ttft-p95-seconds
+      interval: 2m
+      count: 5
+      failureLimit: 1
+      successCondition: result[0] < 1.5
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring:9090
+          query: |
+            histogram_quantile(0.95, sum by (le) (
+              rate(vllm:time_to_first_token_seconds_bucket{track="canary"}[5m])))
+```
+
+Reference it from the Rollout's canary steps (for example `setWeight: 5`, run the analysis, `setWeight: 25`, run it again). The `track="canary"` label is assumed to come from your Prometheus relabelling of pod labels.
+
+#### Edge cases and failure modes
+
+- **Coarse weights on GPU fleets.** Without mesh or gateway traffic routing, a canary's weight is set by replica count. One canary pod next to four stable pods is 20%, not 5%. Use traffic routing for fine-grained steps.
+- **Conversation stickiness.** Switching models mid-conversation produces jarring changes in style. Route by a hash of the conversation or user ID so a conversation stays on one version.
+- **Agent side effects.** A shadowed agent request that calls tools will send the email or write the record a second time. Shadow only tool-free requests, or point the shadow at stubbed tools.
+- **Prefix-cache skew.** A fresh canary has a cold prefix cache, so its TTFT looks worse than the stable version's for the first minutes. Give the analysis a warm-up period before it counts.
+- **Quality lags.** Thumbs-down rates need hours of traffic to become significant. Gate fast on operational metrics, and gate the final step on the offline evaluation.
+
+## 15.12 Ingress, Load Balancers, and API Gateways
+
+Traffic from the internet to your cluster passes through:
+
+1. **CDN / DNS** — global routing, caching.
+2. **Cloud load balancer** — regional entry point, TLS termination.
+3. **Ingress controller** — Kubernetes-level HTTP routing (nginx, Traefik, Istio Gateway, Contour).
+4. **API gateway** — auth, rate limiting, transformation (Kong, Tyk, cloud-managed gateways).
+5. **Service** — Kubernetes service routes to pods.
+
+For AI specifically, an **LLM gateway** (Chapter 6) often sits between the API gateway and the inference pods to handle model routing, caching, and provider failover.
+
+Timeouts at each layer must accommodate long LLM responses. The default 30-60 second timeout on load balancers kills long completions. Audit timeouts top to bottom.
+
+### 15.12.1 Timeouts, buffering and disconnects for streamed responses 🔧
+
+The audit the handbook recommends has three parts: idle timeouts that kill quiet streams, proxies that buffer the stream, and client disconnects that never reach the GPU.
+
+#### The problem, layer by layer
+
+Most proxies apply an **idle** timeout: the connection is closed if no bytes flow for N seconds. A streaming response is only at risk before the first token (queueing plus prefill for a long prompt) and during long pauses, for example while an agent runs a tool. Non-streaming requests are at risk for their whole duration.
+
+| Layer | Default to check | What to set |
+|---|---|---|
+| AWS ALB | Idle timeout 60 s | Raise it (up to 4,000 s) via the load balancer attribute |
+| Ingress or Gateway proxy | Often 60 s read timeout | Raise the upstream read timeout, turn off response buffering |
+| Service mesh sidecar | Route timeouts if configured | Set explicit long timeouts on LLM routes |
+| Your FastAPI gateway | Uvicorn and httpx client timeouts | Match the longest generation you allow |
+| Browser or SDK client | Library defaults | Configure per call |
+
+#### Implementation: proxy settings
+
+With the AWS Load Balancer Controller, and an NGINX-based Ingress:
+
+```yaml
+metadata:
+  annotations:
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=600
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+```
+
+Note that the community ingress-nginx controller was retired in March 2026, with no further releases or security fixes. The Kubernetes project recommends moving to Gateway API, where the equivalent settings are the timeouts on an `HTTPRoute` rule plus implementation-specific policies.
+
+#### Implementation: a streaming proxy that propagates disconnects
+
+When a user closes the tab, the GPU keeps generating tokens nobody will read unless the disconnect is passed upstream. vLLM aborts a streaming request when its client connection closes, so the gateway only has to close its own upstream request. In FastAPI, a disconnected client stops the `StreamingResponse` generator, and leaving its `async with` block closes the upstream httpx stream:
+
+```python
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
+
+import httpx
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+UPSTREAM = "http://llm-gateway.inference:8000/v1/chat/completions"
+HEARTBEAT_SECONDS = 15
+
+app = FastAPI()
+# httpx defaults to a 5 s timeout; allow a long wait for the first token.
+upstream = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=600.0))
+
+
+async def relay(body: dict[str, Any]) -> AsyncIterator[bytes]:
+    try:
+        async with upstream.stream("POST", UPSTREAM, json={**body, "stream": True}) as r:
+            r.raise_for_status()
+            chunks = r.aiter_bytes()
+            first = asyncio.ensure_future(anext(chunks))
+            try:
+                # SSE comments keep idle timeouts at bay while the request queues and prefills.
+                while not first.done():
+                    await asyncio.wait({first}, timeout=HEARTBEAT_SECONDS)
+                    if not first.done():
+                        yield b": waiting\n\n"
+            finally:
+                first.cancel()  # no-op if it already finished
+            try:
+                yield first.result()  # stop pings once real events flow
+            except StopAsyncIteration:
+                return
+            async for chunk in chunks:
+                yield chunk
+    except httpx.HTTPError:
+        # A client disconnect arrives as cancellation (or generator close), not HTTPError,
+        # so this only reports genuine upstream failures.
+        yield b'event: error\ndata: "upstream failed"\n\n'
+
+
+@app.post("/chat")
+async def chat(body: dict[str, Any]) -> StreamingResponse:
+    # When the user goes away, Starlette stops the generator; leaving the
+    # `async with` block closes the upstream request, and vLLM aborts the GPU work.
+    return StreamingResponse(
+        relay(body),
+        media_type="text/event-stream",
+        headers={
+            "cache-control": "no-cache",
+            "x-accel-buffering": "no",  # ask NGINX-style proxies not to buffer
+        },
+    )
+```
+
+The heartbeat stops at the first upstream chunk, because upstream chunks do not always end on SSE event boundaries, and a ping inserted mid-event would corrupt it.
+
+#### Edge cases and failure modes
+
+- **Compression buffers streams.** gzip middleware holds bytes until it has a full block. Exclude `text/event-stream` from compression.
+- **CDNs in front of the API.** Some CDN origin timeouts are short and hard to raise. Route streaming API paths around the CDN, or confirm the CDN supports streaming for that path.
+- **Upstream client defaults.** httpx has its own connect, read, write and pool timeouts, five seconds each by default. A long queue plus a 100K-token prefill can take minutes before the first byte, so give the upstream `AsyncClient` an explicit `httpx.Timeout` with a long read timeout.
+- **Disconnects you cannot see.** Behind some proxies, the server only notices a closed client on the next write. The heartbeat doubles as a disconnect detector.
+
+## 15.12a LLM-aware load balancing with the Gateway API Inference Extension ➕
+
+The traffic chain above ends with a Kubernetes Service, which spreads requests across pods without knowing anything about LLMs. For GPU-backed model servers that is a real cost.
+
+### The problem
+
+Round-robin assumes requests cost about the same. LLM requests vary by orders of magnitude (a 50-token question vs a 100K-token document), so one replica can be saturated with a full KV cache and a queue while its neighbour is idle. Round-robin also ignores **prefix-cache locality**: a follow-up turn of a conversation is much cheaper on the replica that already holds its prefix in KV cache, and **LoRA residency**: a request for an adapter is cheaper on a replica that already has it loaded.
+
+### Mechanism
+
+The Gateway API Inference Extension, an official Kubernetes SIG project, turns a Gateway API implementation (Envoy Gateway, kgateway, GKE Gateway and others) into an inference gateway. It adds an `InferencePool` resource: a set of model-server pods plus an **Endpoint Picker** (EPP). For each request, the gateway asks the EPP which pod to use. The EPP scrapes each pod's metrics (queue length, KV-cache usage, loaded LoRA adapters, prefix-cache state) and chooses the pod most likely to meet the objective.
+
+### Implementation
+
+```yaml
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: llama-8b
+  namespace: inference
+spec:
+  selector:
+    matchLabels: { app: llama-8b }
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    name: llama-8b-epp
+    port: { number: 9002 }
+    failureMode: FailOpen
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm
+  namespace: inference
+spec:
+  parentRefs:
+    - name: inference-gateway
+  rules:
+    - backendRefs:
+        - group: inference.networking.k8s.io
+          kind: InferencePool
+          name: llama-8b
+      timeouts:
+        request: 600s
+```
+
+The EPP itself is deployed as a normal Deployment and Service, usually from the project's Helm chart.
+
+### Edge cases and failure modes
+
+- **The EPP is on the request path.** If it is down, `FailOpen` falls back to ordinary load balancing, while `FailClose` rejects requests. Run several EPP replicas either way.
+- **Implementation support varies.** Not every Gateway API implementation supports InferencePool backends, and feature levels differ. Check your gateway's conformance before you depend on it.
+- **It does not replace your LLM gateway.** The inference extension routes inside one cluster's model pools. Provider failover, per-tenant budgets and semantic caching still belong in the application-level LLM gateway ([Backend for GenAI](/docs/genai-handbook/06-backend-for-genai)).
+
+## 15.13 Service Mesh
+
+A service mesh handles service-to-service communication: mTLS, retries, timeouts, circuit breakers, observability, traffic shifting. Two dominate:
+
+**Istio** — feature-rich, complex, the enterprise default.
+
+**Linkerd** — simpler, lightweight, built in Rust.
+
+For AI deployments, service meshes are valuable when you have many internal services (vector DB, embedding server, reranker, LLM router, tool services). They enforce zero-trust networking and give consistent observability without per-service code.
+
+Cost: meshes add latency (small but real) and complexity. Adopt when the service count justifies it.
+
+## 15.14 CI/CD for GenAI
+
+The pipeline for AI deployments has extra stages versus typical web apps:
+
+- **Source.** Code, prompts, model config, tool definitions.
+- **Build.** Container images, model artifacts.
+- **Eval.** Run regression evals against the new prompts and models.
+- **Test.** Standard unit/integration tests, plus AI-specific safety tests.
+- **Staging deploy.** Canary or shadow traffic.
+- **Production deploy.** Progressive rollout with auto-rollback on metric regression.
+
+Eval gates between build and deploy are essential. A PR that worsens eval scores by 5% should fail the build, not be reviewed in PR comments.
+
+## 15.15 CI/CD Tools
+
+- **GitHub Actions** — broadly used, simple, integrates with GitHub.
+- **GitLab CI** — full DevOps platform.
+- **Jenkins** — legacy but ubiquitous.
+- **CircleCI, Buildkite, Drone, Tekton** — alternatives.
+- **ArgoCD** — GitOps continuous delivery for Kubernetes. Cluster state matches Git state.
+- **FluxCD** — alternative GitOps tool.
+
+ArgoCD or Flux is the modern default for Kubernetes deployments — declare desired state in Git, the controller reconciles.
+
+## 15.16 Multi-Cloud Deployment
+
+Reasons to deploy across clouds: disaster recovery, vendor leverage, regional GPU availability, regulatory residency.
+
+Patterns:
+- **Active-active.** Traffic served from multiple clouds simultaneously, routed by GeoDNS.
+- **Active-passive.** One cloud serves; the other is warm standby.
+- **Per-region selection.** Choose the cheapest GPU provider in each region.
+
+Tools:
+- **Crossplane** — Kubernetes-native multi-cloud infrastructure.
+- **Terraform** — declarative infrastructure across providers.
+- **Pulumi** — Terraform alternative in mainstream languages.
+
+The hidden cost of multi-cloud is operational. Each cloud has its own quirks. Most teams should master one cloud first.
+
+## 15.17 EKS, GKE, AKS Deployment
+
+Managed Kubernetes services from AWS, Google, and Azure respectively. All three offer GPU node pools, integrated monitoring, and IAM integration. Choice typically follows your broader cloud commitment.
+
+EKS strengths: largest ecosystem, deep AWS integration, Karpenter for fast autoscaling. GKE strengths: best-of-breed Kubernetes, strong networking, TPU support. AKS strengths: tight Azure integration, OpenAI proximity.
+
+## 15.18 On-Prem Deployment
+
+Reasons: data residency, regulatory, cost at scale, control over hardware. Stacks:
+- **OpenShift** — Red Hat's enterprise Kubernetes.
+- **Rancher** — Kubernetes management.
+- **Vanilla Kubernetes** — kubeadm or kops on your own hardware.
+- **VMware Tanzu** — for vSphere-based environments.
+
+On-prem AI requires owning the full stack: physical GPUs, networking, cooling, storage, identity, observability. The total cost of ownership is rarely better than cloud at small scale; it becomes competitive at large, steady-state scale.
+
+## 15.19 Networking — DNS, SSL, CDN, WAF
+
+- **DNS.** Route 53, Cloudflare, NS1, GCP Cloud DNS. Use health checks and weighted routing for failover.
+- **SSL/TLS.** Use Let's Encrypt or your cloud's certificate manager. Terminate TLS at the load balancer or ingress; mTLS internally via service mesh.
+- **CDN.** Cloudflare, Fastly, CloudFront, Akamai. For chat APIs, CDN benefit is mostly in static asset delivery and DDoS protection.
+- **WAF (Web Application Firewall).** Blocks common attack patterns. Cloudflare WAF, AWS WAF, GCP Cloud Armor. For AI APIs, add custom rules around prompt injection patterns and abusive token-volume requests.
+
+## 15.20 Zero Trust Architecture
+
+Zero trust assumes no implicit trust based on network location. Every service-to-service call is authenticated and authorized.
+
+For AI: identity-aware proxies (Cloudflare Access, Pomerium), mTLS via service mesh, short-lived service tokens, OIDC for human users, fine-grained RBAC for tools. Especially important for agent systems with many tool integrations — the agent should never have ambient privileges.
+
+## 15.21 Full Production Architecture
+
+<Mermaid chart={`flowchart TD
+  NET["Internet"] --> DNS["DNS (geo + health checks)"]
+  DNS --> CDN["CDN + WAF"]
+  CDN --> LB["Cloud LB (TLS termination)"]
+  LB --> ING["Ingress (nginx / Istio gateway)"]
+  ING --> APIGW["API gateway (auth, rate limit, routing)"]
+  APIGW --> LLMGW["LLM gateway (model routing, cache, observability)"]
+  subgraph Apps["Application services"]
+    CHAT["Chat service (FastAPI, SSE)"]
+    SEARCH["Search service"]
+    AGENT["Agent service"]
+  end
+  LLMGW --> CHAT
+  LLMGW --> SEARCH
+  LLMGW --> AGENT
+  Apps --> MESH["Service mesh (mTLS, retries, observability)"]
+  subgraph Backends["Model and data backends"]
+    VL1["vLLM cluster (large model, H100 nodes)"]
+    VL2["vLLM cluster (small model, A10G nodes)"]
+    EMB["Embedding server"]
+    RR["Reranker"]
+    VDB["Vector DB"]
+    PG["Postgres / Redis"]
+    KAFKA["Kafka"]
+  end
+  MESH --> VL1
+  MESH --> VL2
+  MESH --> EMB
+  MESH --> RR
+  MESH --> VDB
+  MESH --> PG
+  MESH --> KAFKA
+  Backends --> OBS["Observability (Prometheus, Grafana, Loki, Tempo, OTEL)"]
+  OBS --> SEC["Secrets (Vault, cloud Secrets Manager)"]
+  SEC --> CICD["CI/CD (GitHub Actions, ArgoCD)"]
+  CICD --> IAC["Infra as Code (Terraform)"]`} />
+
+This is roughly the shape of a serious GenAI deployment. The pieces vary by company; the layering does not.
+
+## 15.22 Tradeoffs
+
+| Choice | Win | Cost |
+|---|---|---|
+| Managed Kubernetes | Operational simplicity | Cloud bill |
+| Self-managed Kubernetes | Control, cost | Ops burden |
+| Serverless inference | Idle cost zero | Cold starts, per-call cost |
+| Always-on replicas | Low latency | Idle cost |
+| Multi-cloud | Resilience, leverage | Complexity |
+| Service mesh | Uniform networking | Latency, complexity |
+
+## 15.23 Scaling Challenges
+
+- **GPU node pools** are slow to scale; pre-provision warm capacity.
+- **Image pull time** can dominate cold start; bake images into node AMIs or use registry caches.
+- **Model weights** must be loaded into GPU memory; mount from a fast, shared storage layer.
+- **Network egress** out of cloud regions is expensive; route traffic regionally.
+- **Burst capacity** sometimes requires reserved instances months in advance for top GPUs.
+
+## 15.24 Security Concerns
+
+- Secrets management — never bake keys into images, use Vault or cloud Secrets Manager with workload identity.
+- mTLS internally — every service authenticates every other service.
+- Image signing and SBOMs — supply chain attacks are real.
+- Network policies — restrict pod-to-pod traffic to what is needed.
+- Audit logging — every model call, every config change, every secret access.
+
+## 15.25 Monitoring Strategy
+
+Beyond app-level metrics (Chapter 19), deployment-level metrics include:
+- Pod restart counts and reasons.
+- Image pull duration.
+- Autoscaler events.
+- GPU utilization per node and per pod.
+- Network throughput and latency between services.
+- Ingress error rates.
+- Time-to-ready for new pods.
+
+## 15.26 Cost Optimization
+
+- Right-size GPU nodes per workload.
+- Use spot/preemptible for stateless workloads.
+- Set up autoscaler aggressively but with sane minimums for latency.
+- Use reserved or committed-use discounts for steady state.
+- Bin-pack many small models on shared GPUs via MIG.
+- Audit egress traffic monthly.
+
+## 15.27 Interview Questions
+
+- Walk through a request from internet to GPU.
+- Compare rolling, blue-green, canary, and shadow deployments. When is each right?
+- Design an autoscaling strategy for bursty LLM traffic with cold-start sensitivity.
+- How do you handle GPU node pool scaling?
+- Describe the security boundaries from edge to model.
+- ➕ Which metrics should drive autoscaling for a vLLM fleet, and why not GPU utilisation? **Requests waiting and KV-cache usage. GPU utilisation reads near 100% under almost any load, so it cannot tell saturated from busy.**
+- ➕ Where do the minutes of a GPU cold start go, and how do you cut each one? **Node provisioning (warm spare nodes), image pull (pre-baked AMIs or regional cache), weight download (parallel streaming from S3, node-local NVMe), load to HBM (safetensors) and warm-up (persisted compile caches).**
+- ➕ A spot GPU node gets a two-minute notice. What happens to in-flight streams? **Karpenter drains the node and launches a replacement in parallel. The pod leaves Service endpoints, a `preStop` sleep lets streams finish inside the grace period, and the gateway retries only requests that have not sent any tokens yet.**
+- ➕ Why is a mesh-level mirror not enough to evaluate a new model? **Mirrored responses are discarded, so you learn about latency and errors but not quality. Shadow in the gateway and keep both outputs for pairwise evaluation.**
+- ➕ Why can round-robin load balancing be wasteful for LLM servers? **Request cost varies hugely and replicas differ in queue, KV-cache usage, cached prefixes and loaded adapters. An endpoint picker that reads those metrics (Gateway API Inference Extension) routes much better.**
+
+## 15.28 Hands-on Exercises
+
+1. Sketch a Kubernetes deployment for a chat product, identifying every layer in 15.21 for your case.
+2. Plan a canary rollout for a new prompt that you suspect may regress quality.
+3. Design a multi-region failover where the primary region runs frontier models and the failover runs smaller ones.
+
+## 15.29 Common Mistakes
+
+- 30-second timeouts somewhere in the stack truncating long LLM streams.
+- Autoscaling on CPU when the bottleneck is GPU memory or KV cache.
+- Mounting model weights from slow storage, blowing up cold start.
+- Service mesh adopted prematurely — adds complexity without payback at low service count.
+- Secrets baked into images.
+
+## 15.30 Enterprise Best Practices
+
+GitOps for everything. Eval gates in CI. Progressive rollouts by default. Standardize on one Kubernetes platform. Multi-region from day one if you serve global users. Capacity planning quarterly for GPUs. Document every layer's owner and on-call rotation. Treat the deployment platform as a product with its own SLOs.
+
+## Sources
+
+- [vLLM: using Docker](https://docs.vllm.ai/en/latest/deployment/docker/)
+- [vLLM engine arguments](https://docs.vllm.ai/en/latest/configuration/engine_args/)
+- [vLLM metrics design (num_requests_waiting, kv_cache_usage_perc, time_to_first_token_seconds)](https://docs.vllm.ai/en/latest/design/metrics.html)
+- [vLLM: loading models with the Run:ai Model Streamer](https://docs.vllm.ai/en/latest/models/extensions/runai_model_streamer.html)
+- [Hugging Face safetensors](https://huggingface.co/docs/safetensors/index)
+- [NVIDIA CUDA compatibility (driver vs runtime, forward compatibility)](https://docs.nvidia.com/deploy/cuda-compatibility/)
+- [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html)
+- [Kubernetes: schedule GPUs](https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/)
+- [Kubernetes: taints and tolerations](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+- [KEDA Prometheus scaler](https://keda.sh/docs/latest/scalers/prometheus/)
+- [Karpenter: disruption and interruption handling](https://karpenter.sh/docs/concepts/disruption/)
+- [Karpenter: NodePools](https://karpenter.sh/docs/concepts/nodepools/)
+- [AWS: Spot Instance interruption notices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/spot-instance-termination-notices.html)
+- [Google Cloud: Spot VMs (preemption notice)](https://cloud.google.com/compute/docs/instances/spot)
+- [Istio: traffic mirroring](https://istio.io/latest/docs/tasks/traffic-management/mirroring/)
+- [Argo Rollouts: analysis and progressive delivery](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/)
+- [AWS Load Balancer Controller: Ingress annotations](https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/guide/ingress/annotations/)
+- [Kubernetes blog: Ingress NGINX retirement](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/)
+- [Gateway API Inference Extension: InferencePool](https://gateway-api-inference-extension.sigs.k8s.io/api-types/inferencepool/)

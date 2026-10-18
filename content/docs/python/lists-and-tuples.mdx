@@ -1,0 +1,764 @@
+---
+title: "Lists and Tuples"
+description: How CPython stores lists as over-allocated arrays of pointers, what slicing and sorting really do, and why tuples are the immutable, hashable sibling.
+---
+
+Lists and tuples are Python's two built-in **sequences of arbitrary objects**. On the surface a list looks like a JavaScript array and a tuple looks like a frozen array, and that intuition gets you 70% of the way. The remaining 30% (what is actually stored, what each operation costs, why `t[0] += [1]` both fails *and* succeeds) is what this page is about.
+
+<Callout type="info">
+All snippets were run on **CPython 3.14.6**. Anything marked *CPython detail* (byte sizes, growth pattern, constant folding) is an implementation choice, not a language guarantee, and can differ on PyPy or future versions.
+</Callout>
+
+## 1. What a list really is
+
+A `list` is a **dynamic array of pointers**. The list object itself does not hold your values; it holds a contiguous block of `PyObject*` references, each pointing at some object living elsewhere on the heap.
+
+In CPython the struct looks roughly like this (simplified from `Include/cpython/listobject.h`):
+
+```c
+typedef struct {
+    PyObject_VAR_HEAD        // refcount, type pointer, ob_size (= len)
+    PyObject **ob_item;      // pointer to a C array of object pointers
+    Py_ssize_t allocated;    // how many slots that array has room for
+} PyListObject;
+```
+
+Three things follow directly from that layout:
+
+1. **Any mix of types is fine**, because every slot is the same size: one pointer (8 bytes on 64-bit).
+2. **Indexing is O(1)**: `lst[i]` is "read `ob_item[i]`", plain pointer arithmetic.
+3. **The same object can appear in many slots**, because slots hold references, not copies.
+
+```python
+a = [1, "two", 3.0, None]
+print([type(x).__name__ for x in a])
+b = [object()] * 3
+print(b[0] is b[1] is b[2])
+```
+
+```text title="Output"
+['int', 'str', 'float', 'NoneType']
+True
+```
+
+<Mermaid chart={`flowchart LR
+  L["list object<br/>ob_size = 4<br/>allocated = 4"] --> A["ob_item array"]
+  A --> S0["slot 0"]
+  A --> S1["slot 1"]
+  A --> S2["slot 2"]
+  A --> S3["slot 3"]
+  S0 --> I1["int 1"]
+  S1 --> STR["str two"]
+  S2 --> F["float 3.0"]
+  S3 --> N["None singleton"]
+`} />
+
+<Callout title="Coming from JS">
+V8 has several internal representations for arrays (packed SMI, packed doubles, holey, dictionary mode) and silently switches between them. CPython has exactly one: a contiguous array of pointers. There are no "holes", no sparse arrays, and `lst[1000] = x` on a short list raises `IndexError` instead of growing the list. Assigning past the end is simply not a thing.
+</Callout>
+
+### Over-allocation and amortised O(1) append
+
+If the pointer array were sized exactly to `len`, every `append` would need a `realloc` and potentially a full copy, making a loop of n appends O(n²). Instead, when the array is full, CPython grows it by **roughly 1/8 extra plus a small constant** (the formula in `list_resize` is about `newsize + (newsize >> 3) + 6`, rounded down to a multiple of 4). You can watch this with `sys.getsizeof`, which reports the list header plus the pointer array (not the elements):
+
+```python
+import sys
+lst = []
+last = sys.getsizeof(lst)
+print(f"len=0  bytes={last}")
+for i in range(20):
+    lst.append(i)
+    size = sys.getsizeof(lst)
+    if size != last:
+        print(f"len={len(lst):<2} bytes={size}  (room for {(size - sys.getsizeof([])) // 8} pointers)")
+        last = size
+```
+
+```text title="Output"
+len=0  bytes=56
+len=1  bytes=88  (room for 4 pointers)
+len=5  bytes=120  (room for 8 pointers)
+len=9  bytes=184  (room for 16 pointers)
+len=17 bytes=248  (room for 24 pointers)
+```
+
+*CPython detail:* the exact steps (4, 8, 16, 24, 32, 40, 52, ...) are not guaranteed. The *idea* is: resizes happen rarely and each one copies at most n pointers, so the **total** work for n appends is O(n), i.e. **amortised O(1) per append**. The occasional append that triggers a resize is O(n) on its own; that is why we say "amortised".
+
+Growing at the front is a different story. `insert(0, x)` has to shift every existing pointer one slot to the right:
+
+```python
+import timeit
+n = 100_000
+print("append  ", round(timeit.timeit("l.append(1)", "l=[]", number=n), 4))
+print("insert0 ", round(timeit.timeit("l.insert(0, 1)", "l=[]", number=n), 4))
+```
+
+```text title="Output"
+append   0.0039
+insert0  0.9258
+```
+
+(Timings are from one machine; the ratio is what matters.) If you need a queue, use `collections.deque`, covered on the [collections page](/docs/python/collections-module).
+
+### Cost of list operations
+
+| Operation | Average cost | Why |
+|---|---|---|
+| `lst[i]`, `lst[i] = x` | O(1) | pointer arithmetic |
+| `len(lst)` | O(1) | `ob_size` is stored |
+| `append(x)` | O(1) amortised | over-allocation |
+| `pop()` (last) | O(1) | just decrement size |
+| `pop(0)`, `insert(0, x)` | O(n) | shift every pointer |
+| `insert(i, x)`, `pop(i)`, `del lst[i]` | O(n - i) | shift the tail |
+| `x in lst`, `index(x)`, `count(x)`, `remove(x)` | O(n) | linear scan with `==` |
+| `extend(it)`, `lst += it` | O(k) amortised | k = items added |
+| `lst[a:b]` | O(b - a) | copies that many pointers |
+| `lst + other` | O(n + m) | builds a new list |
+| `lst * k` | O(n k) | builds a new list |
+| `sort()`, `sorted()` | O(n log n) | Timsort, O(n) if already sorted |
+| `reverse()` | O(n) | in place swap |
+| `min`, `max`, `sum` | O(n) | full scan |
+| `copy()`, `lst[:]` | O(n) | shallow copy of pointers |
+
+Remember that "O(1)" here counts pointer moves. A comparison like `x in lst` calls `__eq__` on each element, which can be arbitrarily expensive for custom objects.
+
+## 2. Indexing and slicing
+
+Negative indices count from the end: `-1` is the last element. Out-of-range **indexing** raises, but out-of-range **slicing** silently clamps.
+
+```python
+nums = [10, 20, 30, 40, 50]
+print(nums[0], nums[-1], nums[-2])
+try:
+    nums[10]
+except IndexError as e:
+    print("IndexError:", e)
+```
+
+```text title="Output"
+10 50 40
+IndexError: list index out of range
+```
+
+A slice is `seq[start:stop:step]`. `stop` is exclusive, any part can be omitted, and the result is always a **new list** (a shallow copy of that range of pointers).
+
+```python
+s = list(range(10))
+print(s[2:5])
+print(s[:3], s[7:])
+print(s[::2])
+print(s[::-1])
+print(s[-3:])
+print(s[5:100])
+print(s[8:2])
+c = s[:]
+print(c == s, c is s)
+```
+
+```text title="Output"
+[2, 3, 4]
+[0, 1, 2] [7, 8, 9]
+[0, 2, 4, 6, 8]
+[9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+[7, 8, 9]
+[5, 6, 7, 8, 9]
+[]
+True False
+```
+
+Under the hood `s[2:5]` calls `s.__getitem__(slice(2, 5, None))`. Slice objects are first-class, so you can name them, which reads nicely for pagination or fixed-width parsing:
+
+```python
+page = slice(20, 30)
+items = list(range(100))
+print(items[page])
+print(page.indices(25))
+```
+
+```text title="Output"
+[20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+(20, 25, 1)
+```
+
+`slice.indices(length)` shows how the slice is clamped against a sequence of that length.
+
+<Callout title="Coming from JS">
+`lst[a:b]` is `arr.slice(a, b)`, `lst[::-1]` is `[...arr].reverse()`, and `lst[-1]` is `arr.at(-1)`. In JS, `arr[-1]` is just a property lookup for the key `"-1"` and gives `undefined`; in Python negative indices are real.
+</Callout>
+
+### Slice assignment
+
+Slices can appear on the **left** of `=`. This replaces a range in place and the replacement can have a different length, so the list grows or shrinks. It is the Python equivalent of `Array.prototype.splice`.
+
+```python
+a = [0, 1, 2, 3, 4, 5]
+a[1:3] = ["x", "y", "z"]
+print(a)
+a[1:4] = []
+print(a)
+a[0:0] = ["start"]
+print(a)
+a[::2] = ["E0", "E1", "E2"]
+print(a)
+try:
+    a[::2] = [1]
+except ValueError as e:
+    print("ValueError:", e)
+del a[::2]
+print(a)
+```
+
+```text title="Output"
+[0, 'x', 'y', 'z', 3, 4, 5]
+[0, 3, 4, 5]
+['start', 0, 3, 4, 5]
+['E0', 0, 'E1', 4, 'E2']
+ValueError: attempt to assign sequence of size 1 to extended slice of size 3
+[0, 4]
+```
+
+Rules: a simple slice (`step` of 1) accepts any length; an **extended** slice (any other step) must receive exactly as many items as it selects.
+
+The most useful practical form is `lst[:] = new_items`. It mutates the **existing** list object, so every other reference sees the change. Plain `lst = new_items` just rebinds one name.
+
+```python
+data = [1, 2, 3]
+alias = data
+data[:] = [9, 9]
+print(alias)
+data = []
+print(alias)
+```
+
+```text title="Output"
+[9, 9]
+[9, 9]
+```
+
+This matters when a list is shared, for example a module-level registry that other modules imported by reference.
+
+## 3. Sorting: `sort` vs `sorted`
+
+- `lst.sort()` sorts **in place** and returns `None` (a deliberate signal that it mutated).
+- `sorted(iterable)` accepts **any iterable** and always returns a **new list**.
+
+```python
+nums = [3, 1, 2]
+print(nums.sort())
+print(nums)
+t = (3, 1, 2)
+print(sorted(t), t)
+print(sorted("banana"))
+print(sorted({"b": 1, "a": 2}))
+```
+
+```text title="Output"
+None
+[1, 2, 3]
+[1, 2, 3] (3, 1, 2)
+['a', 'a', 'a', 'b', 'n', 'n']
+['a', 'b']
+```
+
+The classic bug is `nums = nums.sort()`, which leaves `nums` as `None`.
+
+### Timsort, and why "already sorted" is fast
+
+CPython's sort is **Timsort**, invented by Tim Peters for Python in 2002: a hybrid of merge sort and insertion sort that looks for existing ordered **runs** in the data (ascending, or strictly descending, which it reverses) and merges them. Real-world data (logs by timestamp, records appended in order with a few out-of-place items) is often partially sorted, so Timsort frequently beats its O(n log n) worst case and is **O(n) on already-sorted input**. Since 3.11 (bpo-34561) the order in which runs are merged follows Munro and Wild's "powersort" policy, which is provably near-optimal; the overall algorithm and its guarantees are unchanged. Java (for objects), V8 and Android all adopted Timsort later.
+
+Guarantees you can rely on:
+
+- **O(n log n)** worst case, O(n) best case.
+- **Stable**: elements that compare equal keep their original relative order. This is guaranteed by the language, not just CPython.
+- Uses only `<` (the `__lt__` method) to compare.
+
+### `key` and `reverse`
+
+`key` is a function called **once per element**; Timsort then sorts by those precomputed keys (a "decorate, sort, undecorate" built in). This is very different from a JS comparator, which is called O(n log n) times with pairs.
+
+```python
+users = [
+    {"name": "zoe", "age": 31},
+    {"name": "Maya", "age": 25},
+    {"name": "arun", "age": 31},
+]
+print([u["name"] for u in sorted(users, key=lambda u: u["name"])])
+print([u["name"] for u in sorted(users, key=lambda u: u["name"].lower())])
+print([u["name"] for u in sorted(users, key=lambda u: (-u["age"], u["name"]))])
+users.sort(key=lambda u: u["age"], reverse=True)
+print([u["name"] for u in users])
+```
+
+```text title="Output"
+['Maya', 'arun', 'zoe']
+['arun', 'Maya', 'zoe']
+['arun', 'zoe', 'Maya']
+['zoe', 'arun', 'Maya']
+```
+
+Notes on that output:
+
+- Plain string comparison is by code point, so uppercase sorts before lowercase. Use `str.lower` (or `str.casefold` for proper Unicode) as a key for human ordering.
+- Returning a **tuple** from `key` gives a multi-level sort, because tuples compare element by element. Negating a number flips just that level.
+- With `reverse=True`, equal elements **still keep their original order** (`zoe` before `arun` because that was their order in the list). `reverse` is not the same as reversing the result afterwards:
+
+```python
+pairs = [(1, "a"), (0, "b"), (1, "c")]
+print(sorted(pairs, key=lambda p: p[0], reverse=True))
+print(list(reversed(sorted(pairs, key=lambda p: p[0]))))
+```
+
+```text title="Output"
+[(1, 'a'), (1, 'c'), (0, 'b')]
+[(1, 'c'), (1, 'a'), (0, 'b')]
+```
+
+### Multi-pass sorts thanks to stability
+
+Because the sort is stable, you can sort by the secondary key first and the primary key second. This is handy when one key is descending and the other is a string you cannot negate:
+
+```python
+from operator import itemgetter
+rows = [("b", 2), ("a", 2), ("c", 1), ("a", 1)]
+step1 = sorted(rows, key=itemgetter(0))
+step2 = sorted(step1, key=itemgetter(1), reverse=True)
+print(step1)
+print(step2)
+```
+
+```text title="Output"
+[('a', 2), ('a', 1), ('b', 2), ('c', 1)]
+[('a', 2), ('b', 2), ('a', 1), ('c', 1)]
+```
+
+`operator.itemgetter` and `operator.attrgetter` are faster than equivalent lambdas (implemented in C) and accept several fields:
+
+```python
+from operator import attrgetter
+from collections import namedtuple
+Job = namedtuple("Job", "id priority created")
+jobs = [Job(1, 2, 300), Job(2, 1, 100), Job(3, 2, 200)]
+print([j.id for j in sorted(jobs, key=attrgetter("priority", "created"))])
+print(max(jobs, key=attrgetter("created")).id)
+```
+
+```text title="Output"
+[2, 3, 1]
+1
+```
+
+`min`, `max`, `heapq.nlargest` and `itertools.groupby` all take the same `key=` convention.
+
+### Traps
+
+Python 3 refuses to compare unrelated types, so a mixed list fails loudly instead of sorting by some arbitrary rule:
+
+```python
+try:
+    sorted([3, "a", 1])
+except TypeError as e:
+    print("TypeError:", e)
+print(sorted([3, 1.5, True]))
+```
+
+```text title="Output"
+TypeError: '<' not supported between instances of 'str' and 'int'
+[True, 1.5, 3]
+```
+
+(`bool` is a subclass of `int`, so `True` is `1` for comparison.) Also watch out for `None` in data from a database: `sorted(rows, key=lambda r: r.score)` blows up if any score is `None`. A common fix is a tuple key such as `(r.score is None, r.score or 0)` to push `None` to the end.
+
+<Callout title="Coming from JS">
+- JS `arr.sort()` with no comparator converts elements to **strings**, so `[10, 9, 1].sort()` gives `[1, 10, 9]`. Python compares the actual values: `[1, 9, 10]`.
+- JS `sort` mutates and returns the same array; Python's `list.sort` mutates and returns `None`. The closest match to `sorted` in JS is the ES2023 `arr.toSorted()`.
+- JS takes a two-argument comparator returning a number; Python takes a one-argument `key`. If you have an old comparator, wrap it with `functools.cmp_to_key`.
+</Callout>
+
+## 4. Other list methods worth knowing
+
+```python
+l = [3, 1, 4, 1, 5]
+l.extend([9, 2])
+print(l)
+print(l.pop(), l.pop(0), l)
+l.remove(1)
+print(l)
+print(l.index(5), l.count(4))
+l.reverse()
+print(l)
+try:
+    l.remove(42)
+except ValueError as e:
+    print("ValueError:", e)
+```
+
+```text title="Output"
+[3, 1, 4, 1, 5, 9, 2]
+2 3 [1, 4, 1, 5, 9]
+[4, 1, 5, 9]
+2 1
+[9, 5, 1, 4]
+ValueError: list.remove(x): x not in list
+```
+
+- `remove(x)` deletes the **first** match by value and raises if absent. `del l[i]` and `pop(i)` work by index.
+- `index(x)` raises `ValueError` when missing (no `-1` like JS `indexOf`). Check with `in` first, or catch the error.
+- There is no `l.length`, `l.map` or `l.filter`. Use `len(l)` and comprehensions (`[f(x) for x in l if cond]`).
+
+### `+=` mutates, `+` creates
+
+```python
+a = [1, 2]
+b = a
+a += [3]
+print(b)
+a = a + [4]
+print(b, a)
+try:
+    a += 5
+except TypeError as e:
+    print("TypeError:", e)
+a += "hi"
+print(a)
+```
+
+```text title="Output"
+[1, 2, 3]
+[1, 2, 3] [1, 2, 3, 4]
+TypeError: 'int' object is not iterable
+[1, 2, 3, 4, 'h', 'i']
+```
+
+`a += x` calls `list.__iadd__`, which is `extend` in place, so it accepts **any iterable** (a string is an iterable of characters, hence `'h', 'i'`). `a + x` calls `__add__`, which builds a new list and only accepts another list.
+
+### Two classic traps
+
+**`*` repeats references, not values.** Multiplying a list of lists copies the pointer to the same inner list:
+
+```python
+grid = [[0] * 3] * 3
+grid[0][0] = 1
+print(grid)
+grid = [[0] * 3 for _ in range(3)]
+grid[0][0] = 1
+print(grid)
+```
+
+```text title="Output"
+[[1, 0, 0], [1, 0, 0], [1, 0, 0]]
+[[1, 0, 0], [0, 0, 0], [0, 0, 0]]
+```
+
+This is explored in depth on [Copying, mutability and identity](/docs/python/copying-mutability-and-identity).
+
+**Removing while iterating skips elements.** The `for` loop walks an internal index; removing an element shifts the rest left, so the next one is jumped over:
+
+```python
+nums = [1, 2, 2, 3, 4]
+for n in nums:
+    if n % 2 == 0:
+        nums.remove(n)
+print(nums)
+nums = [1, 2, 2, 3, 4]
+nums = [n for n in nums if n % 2]
+print(nums)
+```
+
+```text title="Output"
+[1, 2, 3]
+[1, 3]
+```
+
+Unlike dicts, lists do **not** raise on mutation during iteration; they just silently give the wrong answer. Build a new list (comprehension) or iterate over a copy (`for n in nums[:]`).
+
+## 5. Tuples
+
+A `tuple` is an **immutable sequence**. In CPython it is a single allocation: header plus a fixed-size inline array of pointers (no separate `ob_item` buffer, no spare capacity).
+
+```python
+t = (1, 2, 3)
+single = (1,)
+not_tuple = (1)
+empty = ()
+print(type(single).__name__, type(not_tuple).__name__, len(empty))
+packed = 1, "a", None
+print(packed)
+try:
+    t[0] = 99
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+tuple int 0
+(1, 'a', None)
+TypeError: 'tuple' object does not support item assignment
+```
+
+The **comma** makes a tuple, not the parentheses. Parentheses are only needed for the empty tuple and to disambiguate (e.g. inside a function call). A stray trailing comma in `x = compute(),` silently gives you a 1-tuple, a common bug.
+
+### Immutable container, possibly mutable contents
+
+Immutability is **shallow**: the tuple's slots can never be repointed, but the objects they point to can change if they are themselves mutable.
+
+```python
+t = (1, [2, 3])
+t[1].append(4)
+print(t)
+try:
+    t[1] += [5]
+except TypeError as e:
+    print("TypeError:", e)
+print(t)
+```
+
+```text title="Output"
+(1, [2, 3, 4])
+TypeError: 'tuple' object does not support item assignment
+(1, [2, 3, 4, 5])
+```
+
+The second part is a famous puzzle. `t[1] += [5]` expands to two steps: `tmp = t[1].__iadd__([5])` (which **succeeds** and extends the list in place), then `t[1] = tmp` (which **fails** because tuples reject item assignment). So you get both an exception and a mutation.
+
+<Mermaid chart={`flowchart LR
+  T["tuple (fixed slots)"] --> A["int 1"]
+  T --> B["list object (mutable)"]
+  B --> C["2"]
+  B --> D["3"]
+  B --> E["4 appended later"]
+`} />
+
+### Why tuples are hashable (when their contents are)
+
+A dict key or set member must have a hash that never changes (see [Dicts and sets](/docs/python/dicts-and-sets)). Because a tuple's slots can't change, a tuple's hash is computed from its elements' hashes, and it stays stable **as long as every element is itself hashable**. A tuple holding a list is not hashable, and the error only shows up when you try to hash it:
+
+```python
+print(hash((1, 2, "x")) == hash((1, 2, "x")))
+cache = {(40.7, -74.0): "NYC"}
+print(cache[(40.7, -74.0)])
+try:
+    hash((1, [2]))
+except TypeError as e:
+    print("TypeError:", e)
+try:
+    {(1, [2]): "nope"}
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+True
+NYC
+TypeError: unhashable type: 'list'
+TypeError: cannot use 'tuple' as a dict key (unhashable type: 'list')
+```
+
+Composite keys like `(tenant_id, user_id)` or `(lat, lng)` are the everyday use: a cache keyed by a tuple is the idiomatic replacement for gluing a string key together with a template literal in JS (and it can't collide the way `"a:b" + ":c"` vs `"a" + ":b:c"` can).
+
+### Packing and unpacking
+
+Any iterable can be unpacked into names, as long as the counts match. This is how Python does swaps, multiple return values and destructuring.
+
+```python
+x, y = 10, 20
+x, y = y, x
+print(x, y)
+host, port = "db.internal:5432".split(":")
+print(host, int(port))
+(a, b), c = (1, 2), 3
+print(a, b, c)
+try:
+    p, q = [1, 2, 3]
+except ValueError as e:
+    print("ValueError:", e)
+```
+
+```text title="Output"
+20 10
+db.internal 5432
+1 2 3
+ValueError: too many values to unpack (expected 2, got 3)
+```
+
+`x, y = y, x` works because the right side is fully evaluated into a tuple **before** any assignment happens. A function that "returns two values" (`return user, token`) is returning one tuple.
+
+### Star-unpacking
+
+A single starred name collects "everything else" into a **list** (always a list, even when the source is a tuple or string):
+
+```python
+first, *rest = [1, 2, 3, 4]
+print(first, rest)
+*init, last = "abc"
+print(init, last)
+head, *middle, tail = (1, 2)
+print(head, middle, tail)
+merged = [*range(3), *"ab", 9]
+print(merged)
+cfg = (*[1, 2], 3)
+print(cfg)
+```
+
+```text title="Output"
+1 [2, 3, 4]
+['a', 'b'] c
+1 [] 2
+[0, 1, 2, 'a', 'b', 9]
+(1, 2, 3)
+```
+
+Unpacking also works in `for` loops, and `_` is the conventional "I don't care" name:
+
+```python
+rows = [("alice", 30, "admin"), ("bob", 25, "viewer")]
+for name, _, role in rows:
+    print(name, role)
+for i, (name, *_ ) in enumerate(rows, start=1):
+    print(i, name)
+```
+
+```text title="Output"
+alice admin
+bob viewer
+1 alice
+2 bob
+```
+
+<Callout title="Coming from JS">
+- `const [a, b] = arr` silently gives `undefined` for missing items and ignores extras. Python's `a, b = seq` raises `ValueError` on any count mismatch. That strictness catches real bugs (e.g. a CSV row with an extra column).
+- JS rest `[first, ...rest]` must be last; Python's `*rest` can sit anywhere (`head, *mid, tail`), but only one per pattern.
+- JS spread `[...a, ...b]` maps to `[*a, *b]`. Object spread `{...a, ...b}` maps to `{**a, **b}` for dicts.
+- There is no default value syntax in Python destructuring like `[a = 1] = []`.
+</Callout>
+
+### Tuples are a little cheaper
+
+```python
+import sys
+print(sys.getsizeof([1, 2, 3]), sys.getsizeof((1, 2, 3)))
+import timeit
+print(round(timeit.timeit("[1, 2, 3]", number=1_000_000), 3), round(timeit.timeit("(1, 2, 3)", number=1_000_000), 3))
+import dis
+dis.dis(compile("(1, 2, 3)", "", "eval"))
+```
+
+```text title="Output"
+88 72
+0.063 0.025
+  0           RESUME                   0
+
+  1           LOAD_CONST               1 ((1, 2, 3))
+              RETURN_VALUE
+```
+
+*CPython details:* a tuple has no spare capacity and no separate buffer, so it's smaller. A tuple literal made only of constants is **folded at compile time** into a single constant (see `LOAD_CONST` above), so "creating" it costs nothing, while a list literal must be built fresh every time because it is mutable. CPython also keeps free lists of small tuples to recycle allocations. These are micro-optimisations; choose based on meaning, not speed.
+
+### Named tuples
+
+Positional access like `row[2]` is unreadable. A **named tuple** is a tuple subclass whose fields also have names, with zero per-instance memory overhead beyond the tuple itself:
+
+```python
+from collections import namedtuple
+Point = namedtuple("Point", "x y")
+p = Point(3, 4)
+print(p, p.x, p[1], p == (3, 4))
+```
+
+```text title="Output"
+Point(x=3, y=4) 3 4 True
+```
+
+`collections.namedtuple` vs `typing.NamedTuple`, `_replace`, `_asdict` and when to prefer a dataclass are covered on the [collections module page](/docs/python/collections-module).
+
+## 6. List vs tuple vs `array.array`
+
+There is a third built-in-ish sequence: `array.array` stores **raw C values** (not pointers to Python objects) in a contiguous buffer, all of one declared type.
+
+```python
+import sys
+from array import array
+nums_list = list(range(1000))
+nums_arr = array("i", range(1000))
+print(sys.getsizeof(nums_list), sys.getsizeof(nums_arr))
+print(nums_arr[:5], nums_arr.itemsize)
+try:
+    nums_arr.append(1.5)
+except TypeError as e:
+    print("TypeError:", e)
+try:
+    array("b", [200])
+except OverflowError as e:
+    print("OverflowError:", e)
+```
+
+```text title="Output"
+8056 4200
+array('i', [0, 1, 2, 3, 4]) 4
+TypeError: 'float' object cannot be interpreted as an integer
+OverflowError: signed char is greater than maximum
+```
+
+And the `getsizeof` of the list *understates* its true cost: it counts 8 bytes per pointer but not the int objects themselves (about 28 bytes each for ints outside the small-int cache). The array stores 4 bytes per value, total.
+
+| | `list` | `tuple` | `array.array` |
+|---|---|---|---|
+| Mutable | yes | no | yes |
+| Element types | any, mixed | any, mixed | one C type (`"i"`, `"d"`, `"b"`...) |
+| Stores | pointers to objects | pointers to objects | raw values |
+| Hashable | never | if all items are | never |
+| Typical use | growing collection of things | fixed record, dict key, return value | compact numeric buffers, binary IO |
+| JS analogue | `Array` | frozen array / tuple type | `Int32Array`, `Float64Array` |
+
+When to use which:
+
+- **list**: a homogeneous collection whose size changes (rows from a query, items in a cart).
+- **tuple**: a fixed-shape record where *position means something* (`(host, port)`, `(lat, lng)`), function return values, dict keys, and anything you want to signal "don't mutate this".
+- **array.array**: large numeric sequences where memory matters and you don't need NumPy. For real numeric or AI work you will use NumPy arrays, which follow the same "raw typed buffer" idea plus vectorised math.
+
+<Callout title="Coming from JS">
+A TypeScript tuple type `[string, number]` is a compile-time label on an ordinary mutable array. A Python tuple is a different runtime type that really can't be modified. The closest JS runtime equivalent is `Object.freeze([...])`, but even that isn't usable as a `Map` key by value: two frozen arrays with the same contents are different keys, whereas two equal Python tuples are the same dict key.
+</Callout>
+
+## Interview questions
+
+1. **Why is `list.append` O(1) but `list.insert(0, x)` O(n)?**
+   **The list is a contiguous array of pointers with spare capacity; append writes into the next free slot (resizing occasionally, so amortised O(1)), while inserting at the front must shift every existing pointer.**
+
+2. **What does `sys.getsizeof(my_list)` measure?**
+   **Only the list object and its pointer array (including over-allocated slots), not the objects the list refers to.**
+
+3. **Difference between `lst.sort()` and `sorted(lst)`?**
+   **`sort` is an in-place list method that returns `None`; `sorted` takes any iterable and returns a new list. Both use the same stable Timsort.**
+
+4. **What does "stable sort" mean and why is it useful?**
+   **Equal elements keep their original relative order, which lets you sort by multiple keys in successive passes (secondary key first, primary key last).**
+
+5. **Explain `t = (1, [2]); t[1] += [3]`.**
+   **It raises `TypeError`, but the list is still extended: `+=` first calls `list.__iadd__` (which mutates in place) and then tries to assign the result back into the tuple slot, which fails.**
+
+6. **When is a tuple hashable?**
+   **Only when every element is hashable, because its hash is derived from the elements' hashes. `(1, "a")` is hashable, `(1, [2])` is not.**
+
+7. **What is the difference between `a = b[:]` and `b[:] = a`?**
+   **The first creates a new list (shallow copy) bound to `a`; the second replaces the contents of the existing list `b` in place, so every reference to `b` sees the change.**
+
+8. **Why does `[[0] * 3] * 3` behave strangely?**
+   **`*` repeats references, so all three rows are the same inner list object; mutate one row and all "change". Use a comprehension to create independent rows.**
+
+## Recap
+
+- A list is a **dynamic array of pointers** with over-allocation: O(1) indexing and amortised O(1) append, O(n) at the front and for membership tests.
+- Slicing **copies** (shallowly) and clamps out-of-range bounds; **slice assignment** replaces a range in place and can resize the list.
+- `sort()` mutates and returns `None`; `sorted()` returns a new list. Both are **stable Timsort**, keyed by a one-argument `key` function, with `reverse` keeping equal items in order.
+- `+=` on a list is in-place `extend`; `+` creates a new list. `*` and loop-removal are classic reference/iteration traps.
+- Tuples are **shallowly immutable**, slightly smaller, constant-foldable, and **hashable when their contents are**, which makes them ideal composite dict keys.
+- Unpacking is strict about counts; `*name` collects the rest into a list and can appear anywhere once.
+- Pick **list** for changing collections, **tuple** for fixed records and keys, **array.array** (or NumPy) for compact numeric data.
+
+## Sources
+
+- [CPython changelog for 3.11.0a1, bpo-34561 (list sorting switches to the powersort merge strategy)](https://docs.python.org/3.11/whatsnew/changelog.html)
+- [`Objects/listsort.txt` in the CPython repository (Timsort design notes, powersort)](https://github.com/python/cpython/blob/main/Objects/listsort.txt)
+- [`Objects/listobject.c` in the CPython repository (`list_resize` over-allocation)](https://github.com/python/cpython/blob/main/Objects/listobject.c)
+- [Sorting techniques HOWTO](https://docs.python.org/3/howto/sorting.html)
+- [`array` module documentation](https://docs.python.org/3/library/array.html)

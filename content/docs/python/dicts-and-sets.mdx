@@ -1,0 +1,802 @@
+---
+title: "Dicts and Sets"
+description: How CPython's compact hash tables power dicts and sets, what makes a key hashable, the full method toolkit, and the security story behind hash randomisation.
+---
+
+The `dict` is the most important data structure in Python. It's not just something you use: the language is built on it. Module globals, class attributes, instance attributes (mostly), keyword arguments and `**kwargs` are all dicts or dict-like hash tables. Sets are the same machinery with keys and no values. Understanding the hash table underneath explains every rule on this page: why keys must be hashable, why mutation during iteration raises, why lookups are O(1) on average, and why there was once a denial-of-service bug in every major web language.
+
+<Callout type="info">
+All snippets were run on **CPython 3.14.6**. Byte sizes, probe formulas and table layouts are *CPython details*. Insertion order of dicts is a **language guarantee** (since 3.7).
+</Callout>
+
+## 1. Dict basics in 30 seconds
+
+```python
+user = {"id": 7, "name": "Asha", "roles": ["admin"]}
+print(user["name"], len(user), "id" in user, "Asha" in user)
+try:
+    user["email"]
+except KeyError as e:
+    print("KeyError:", e)
+```
+
+```text title="Output"
+Asha 3 True False
+KeyError: 'email'
+```
+
+`in` checks **keys**, not values. A missing key raises `KeyError` rather than returning `undefined`.
+
+<Callout title="Coming from JS">
+A Python dict is much closer to a JS **`Map`** than to a plain object:
+- Keys can be any **hashable** object (ints, tuples, frozensets, `None`, your own classes), not just strings and symbols. `{1: "a"}` keeps the key as the int `1`; a JS object would coerce it to `"1"`.
+- There is no prototype chain, so no `"toString" in obj` surprises and no need for `Object.create(null)` or `hasOwnProperty`.
+- `d.key` does **not** work; attribute access and item access are separate (`d["key"]`).
+- Order is pure insertion order for every key type. JS objects put integer-like keys first in numeric order; Python never reorders.
+- Missing keys raise `KeyError`. Use `d.get(k)` for JS-style "give me nothing if absent".
+</Callout>
+
+Any hashable object can be a key, and keys that are *equal* collapse into one entry, even across types:
+
+```python
+d = {1: "int", 1.5: "float", (0, 0): "tuple", None: "none", True: "bool?"}
+print(d)
+print(d[1])
+```
+
+```text title="Output"
+{1: 'bool?', 1.5: 'float', (0, 0): 'tuple', None: 'none'}
+bool?
+```
+
+`True == 1` and `hash(True) == hash(1)`, so `True` found the existing key `1` and overwrote its value. The **first** key object inserted is kept; only the value is replaced.
+
+## 2. How a dict works underneath
+
+### Hash table fundamentals
+
+A hash table stores entries in an array of **slots**. To find a key you:
+
+1. compute `hash(key)`, a fixed-size integer,
+2. map it to a slot index, e.g. `hash & (table_size - 1)` (table sizes are powers of two, so this is a cheap modulo),
+3. look at that slot: if empty, the key is absent; if it holds an entry whose hash matches **and** whose key `==` yours (or `is` yours), you found it; otherwise it's a **collision**, so try another slot.
+
+CPython uses **open addressing**: on collision it probes other slots in the *same* array instead of hanging a linked list off each slot (chaining). The probe sequence is pseudo-random and mixes in the higher bits of the hash, roughly:
+
+```c
+perturb = hash;
+i = hash & mask;
+while (slot i is occupied by a different key) {
+    perturb >>= 5;
+    i = (i * 5 + perturb + 1) & mask;
+}
+```
+
+The `perturb` term means two keys that land in the same first slot (same low bits) quickly diverge if their full hashes differ. With int keys you can see a first-slot collision deterministically, because `hash(n) == n` for small ints:
+
+```python
+for k in [10, 18, 3]:
+    print(k, hash(k), hash(k) & 7)
+```
+
+```text title="Output"
+10 10 2
+18 18 2
+3 3 3
+```
+
+In an 8-slot table, `10` and `18` both want slot 2. Whichever is inserted second probes onward.
+
+The table is kept **at most two-thirds full**. Past that, collisions get expensive, so CPython allocates a bigger table and reinserts everything (O(n), but rare, so inserts are **amortised O(1)**, the same trick as list over-allocation).
+
+### The compact dict (CPython 3.6+)
+
+Before 3.6, each slot held a full `(hash, key, value)` triple, so a table that was one-third empty wasted a third of 24-byte slots. Since 3.6, CPython splits the table in two:
+
+- an **indices** array: the sparse hash table proper. Each slot holds only a small integer (1, 2, 4 or 8 bytes depending on table size) pointing into...
+- an **entries** array: a dense array of `(hash, key, value)` records, **appended in insertion order**.
+
+<Mermaid chart={`flowchart LR
+  subgraph IDX["indices (sparse, 8 slots)"]
+    I0["0: empty"]
+    I1["1: entry 2"]
+    I2["2: entry 0"]
+    I3["3: empty"]
+    I4["4: entry 1"]
+    I5["5: empty"]
+    I6["6: empty"]
+    I7["7: empty"]
+  end
+  subgraph ENT["entries (dense, insertion order)"]
+    E0["0: hash, 'name', 'Asha'"]
+    E1["1: hash, 'id', 7"]
+    E2["2: hash, 'roles', list"]
+  end
+  I2 --> E0
+  I4 --> E1
+  I1 --> E2
+`} />
+
+Two big wins:
+
+1. **Memory**: the sparse part is tiny integers, the dense part has no holes (until deletions). The 3.6 release notes report 20% to 25% less memory than in 3.5.
+2. **Order for free**: iterating means walking the dense entries array front to back, which *is* insertion order. Iteration is also faster because it touches contiguous memory.
+
+Insertion order became a CPython detail in 3.6 and an official **language guarantee in 3.7**.
+
+On deletion, the index slot is marked as a "dummy" (so probe chains that passed through it still work) and the entry becomes a hole. Holes are compacted away at the next resize.
+
+You can watch the resizes. An empty dict shares a static empty table; the first insert allocates an 8-slot table with room for 5 entries (two-thirds of 8), then 16 slots / 10 entries, 32 / 21:
+
+```python
+import sys
+d = {}
+last = sys.getsizeof(d)
+print("len=0 ", last)
+for i in range(25):
+    d[i] = i
+    s = sys.getsizeof(d)
+    if s != last:
+        print(f"len={len(d):<3}", s)
+        last = s
+```
+
+```text title="Output"
+len=0  64
+len=1   224
+len=6   352
+len=11  632
+len=22  1168
+```
+
+*CPython detail:* there are further optimisations, e.g. tables whose keys are all strings skip storing the hash per entry (strings cache their hash), and instances of the same class can share one keys table ("key-sharing dicts", PEP 412), but the model above is the one to reason with.
+
+### Order semantics
+
+```python
+d = {}
+d["b"] = 1
+d["a"] = 2
+d["c"] = 3
+print(list(d))
+d["b"] = 99
+print(list(d))
+del d["b"]
+d["b"] = 1
+print(list(d))
+print({"a": 1, "b": 2} == {"b": 2, "a": 1})
+```
+
+```text title="Output"
+['b', 'a', 'c']
+['b', 'a', 'c']
+['a', 'c', 'b']
+True
+```
+
+- Updating an existing key keeps its position.
+- Deleting and reinserting moves it to the end.
+- **Equality ignores order** for `dict` (but not for `OrderedDict`, see the [collections page](/docs/python/collections-module)).
+- Dicts are reversible since 3.8: `reversed(d)` walks keys newest first.
+
+## 3. What makes a key hashable
+
+`hash(obj)` calls `type(obj).__hash__`. For an object to work as a dict key or set member it must obey the **hash contract**:
+
+1. **If `a == b` then `hash(a) == hash(b)`.** Otherwise the table would look in the wrong slot and never find the equal key.
+2. **The hash must never change while the object is in a table.** Otherwise the entry is stranded in a slot that no longer matches its hash.
+
+(The reverse of rule 1 is *not* required: unequal objects may share a hash; that's just a collision.)
+
+```python
+print(hash(1), hash(1.0), hash(True))
+print(hash(-1), hash(-2))
+print(hash("a") == hash("a"))
+print(hash((1, 2)) == hash((1, 2)))
+```
+
+```text title="Output"
+1 1 1
+-2 -2
+True
+True
+```
+
+Numeric types are designed so equal numbers hash equally across `int`, `float`, `Decimal` and `Fraction`. The odd one: `hash(-1)` is `-2`, because in CPython's C API `-1` is the "an error occurred" return value, so it is never used as a real hash.
+
+```python
+d = {1: "one"}
+d[1.0] = "float one"
+d[True] = "true"
+print(d)
+```
+
+```text title="Output"
+{1: 'true'}
+```
+
+### Why mutable built-ins aren't hashable
+
+A list's natural hash would be derived from its contents. If you append to it after using it as a key, its hash changes and rule 2 breaks. Rather than allow subtle corruption, Python sets `__hash__ = None` on `list`, `dict` and `set`:
+
+```python
+for obj in ([1], {"a": 1}, {1, 2}):
+    try:
+        hash(obj)
+    except TypeError as e:
+        print("TypeError:", e)
+print(hash(frozenset({1, 2})) == hash(frozenset({2, 1})))
+```
+
+```text title="Output"
+TypeError: unhashable type: 'list'
+TypeError: unhashable type: 'dict'
+TypeError: unhashable type: 'set'
+True
+```
+
+Use the immutable counterparts as keys: `tuple` for a list, `frozenset` for a set, and for a dict either `frozenset(d.items())` or a tuple of sorted items.
+
+### Your own classes
+
+By default, user-defined objects hash by **identity** and compare by identity, which is consistent and safe, but means two "equal-looking" objects are different keys:
+
+```python
+class Session:
+    def __init__(self, sid):
+        self.sid = sid
+a, b = Session("x"), Session("x")
+print(a == b, len({a, b}))
+```
+
+```text title="Output"
+False 2
+```
+
+If you define `__eq__` without `__hash__`, Python **sets `__hash__` to `None`** for you, making instances unhashable. That's deliberate: the inherited identity hash would violate rule 1.
+
+```python
+class Money:
+    def __init__(self, amount, cur):
+        self.amount, self.cur = amount, cur
+    def __eq__(self, other):
+        return (self.amount, self.cur) == (other.amount, other.cur)
+print(Money.__hash__)
+try:
+    {Money(1, "USD")}
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+None
+TypeError: cannot use 'Money' as a set element (unhashable type: 'Money')
+```
+
+The correct pattern: hash a tuple of exactly the fields that `__eq__` compares, and make those fields immutable.
+
+```python
+class Money:
+    __slots__ = ("_amount", "_cur")
+    def __init__(self, amount, cur):
+        object.__setattr__(self, "_amount", amount)
+        object.__setattr__(self, "_cur", cur)
+    def __setattr__(self, name, value):
+        raise AttributeError("Money is immutable")
+    def __eq__(self, other):
+        if not isinstance(other, Money):
+            return NotImplemented
+        return (self._amount, self._cur) == (other._amount, other._cur)
+    def __hash__(self):
+        return hash((self._amount, self._cur))
+prices = {Money(10, "USD"): "basic", Money(25, "USD"): "pro"}
+print(prices[Money(10, "USD")])
+```
+
+```text title="Output"
+basic
+```
+
+In practice you rarely hand-write that; a frozen dataclass generates `__eq__` and `__hash__` correctly:
+
+```python
+from dataclasses import dataclass
+@dataclass(frozen=True)
+class Key:
+    tenant: str
+    user_id: int
+cache = {Key("acme", 1): "hit"}
+print(cache[Key("acme", 1)])
+```
+
+```text title="Output"
+hit
+```
+
+### What happens when you break the contract
+
+Here a mutable object hashes on a field that later changes:
+
+```python
+class User:
+    def __init__(self, email):
+        self.email = email
+    def __eq__(self, other):
+        return self.email == other.email
+    def __hash__(self):
+        return hash(self.email)
+u = User("a@x.io")
+seen = {u}
+u.email = "b@x.io"
+print(u in seen)
+print(User("a@x.io") in seen)
+print(len(seen), [x.email for x in seen])
+```
+
+```text title="Output"
+False
+False
+1 ['b@x.io']
+```
+
+The object is *in* the set (iteration finds it) but no lookup can reach it: searching for the new email probes the wrong slot, and searching for the old email finds the slot but `==` fails. No error, just a silently corrupted cache. This is the real reason mutable things are unhashable.
+
+A related edge case: `float("nan")` is not equal to itself, yet `nan in {nan: 1}` is `True` because lookups check **identity first** (`is`), then `==`. A *different* NaN object won't be found.
+
+## 4. Dict methods you will use daily
+
+### `get` and `setdefault`
+
+```python
+cfg = {"host": "localhost"}
+print(cfg.get("port"), cfg.get("port", 5432))
+groups = {}
+for name, team in [("a", "api"), ("b", "web"), ("c", "api")]:
+    groups.setdefault(team, []).append(name)
+print(groups)
+```
+
+```text title="Output"
+None 5432
+{'api': ['a', 'c'], 'web': ['b']}
+```
+
+`setdefault(k, default)` returns `d[k]` if present, otherwise inserts `default` and returns it, in one hash lookup. Trap: the default argument is **evaluated every time**, even when unused:
+
+```python
+calls = 0
+def expensive():
+    global calls
+    calls += 1
+    return []
+d = {"k": [1]}
+d.setdefault("k", expensive())
+print(calls)
+```
+
+```text title="Output"
+1
+```
+
+For "group into lists" patterns, `collections.defaultdict(list)` is cleaner and only builds the default when needed.
+
+### `pop` and `popitem`
+
+```python
+d = {"a": 1, "b": 2, "c": 3}
+print(d.pop("a"), d.pop("zzz", None))
+try:
+    d.pop("zzz")
+except KeyError as e:
+    print("KeyError:", e)
+print(d.popitem(), d)
+```
+
+```text title="Output"
+1 None
+KeyError: 'zzz'
+('c', 3) {'b': 2}
+```
+
+`pop(k, default)` never raises when a default is given. `popitem()` removes the **last inserted** item (LIFO), guaranteed since 3.7.
+
+### `update`, merge and in-place merge
+
+Python 3.9 (PEP 584) added the merge operator (a pipe, `d1 | d2`) which returns a new dict, and the in-place form `d1 |= d2`. The right-hand side wins on conflicts.
+
+```python
+defaults = {"timeout": 30, "retries": 3, "debug": False}
+overrides = {"debug": True, "region": "eu"}
+merged = defaults | overrides
+print(merged)
+print(defaults)
+defaults |= overrides
+print(defaults)
+d = {"a": 1}
+d.update([("b", 2)], c=3)
+print(d)
+print({**{"x": 1}, **{"x": 2, "y": 3}})
+```
+
+```text title="Output"
+{'timeout': 30, 'retries': 3, 'debug': True, 'region': 'eu'}
+{'timeout': 30, 'retries': 3, 'debug': False}
+{'timeout': 30, 'retries': 3, 'debug': True, 'region': 'eu'}
+{'a': 1, 'b': 2, 'c': 3}
+{'x': 2, 'y': 3}
+```
+
+- `update` accepts a mapping, an iterable of pairs, and/or keyword arguments, and mutates.
+- `{**a, **b}` is the older idiom and also works with any mapping on either side; the pipe operator requires dicts (or dict subclasses) on the left.
+- All of these are **shallow** merges: nested dicts are replaced, not deep-merged.
+
+<Callout title="Coming from JS">
+`{ ...defaults, ...overrides }` becomes `defaults | overrides` or `{**defaults, **overrides}`. `Object.assign(target, src)` becomes `target.update(src)` or `target |= src`. Same shallow semantics, same "last one wins" rule.
+</Callout>
+
+### `fromkeys` trap
+
+```python
+d = dict.fromkeys(["a", "b"], [])
+d["a"].append(1)
+print(d)
+```
+
+```text title="Output"
+{'a': [1], 'b': [1]}
+```
+
+Every key shares the **same** list object. Use a comprehension (`{k: [] for k in keys}`) for mutable defaults.
+
+### Handling missing keys in subclasses
+
+`dict.__getitem__` calls `self.__missing__(key)` on a miss, if the subclass defines it. This is exactly how `defaultdict` and `Counter` work. Note that `get` does not trigger it:
+
+```python
+class Defaulting(dict):
+    def __missing__(self, key):
+        return f"<{key}?>"
+d = Defaulting(a=1)
+print(d["a"], d["zzz"], d.get("zzz"))
+```
+
+```text title="Output"
+1 <zzz?> None
+```
+
+## 5. Dict views
+
+`keys()`, `values()` and `items()` return **views**: lightweight, live windows onto the dict, not copies.
+
+```python
+stock = {"apple": 3, "pear": 0}
+keys = stock.keys()
+items = stock.items()
+stock["fig"] = 7
+print(keys)
+print(items)
+print(keys & {"fig", "kiwi"})
+print(type(stock.values()).__name__)
+```
+
+```text title="Output"
+dict_keys(['apple', 'pear', 'fig'])
+dict_items([('apple', 3), ('pear', 0), ('fig', 7)])
+{'fig'}
+dict_values
+```
+
+- Views reflect later changes (`fig` appeared without re-calling `keys()`).
+- `keys()` views are **set-like**: they support `&`, `-`, `^` and comparisons with any set. `items()` views are set-like too when the values are hashable. `values()` is not set-like (values can repeat and needn't be hashable).
+- Need a snapshot or indexing? Wrap in `list(...)`.
+
+```python
+stock = {"apple": 3, "pear": 0, "fig": 7}
+print(sorted(stock.keys() - {"pear"}))
+print(stock.items() >= {("fig", 7)})
+```
+
+```text title="Output"
+['apple', 'fig']
+True
+```
+
+<Callout title="Coming from JS">
+`Object.keys(obj)` returns a fresh array snapshot. `map.keys()` returns a one-shot iterator. Python's `d.keys()` is neither: it's a re-iterable, live, set-like view. That's why `list(d.keys())[0]` is needed for indexing, and why set algebra on keys "just works".
+</Callout>
+
+## 6. Mutating while iterating
+
+Iterating a dict walks its entries array. If you add or remove keys mid-loop the table may resize or compact, so CPython detects size changes and raises instead of giving garbage:
+
+```python
+d = {"a": 1, "b": 0, "c": 0}
+try:
+    for k, v in d.items():
+        if v == 0:
+            del d[k]
+except RuntimeError as e:
+    print("RuntimeError:", e)
+d = {"a": 1, "b": 0, "c": 0}
+for k in list(d):
+    if d[k] == 0:
+        del d[k]
+print(d)
+d = {"a": 1, "b": 0, "c": 0}
+d = {k: v for k, v in d.items() if v}
+print(d)
+```
+
+```text title="Output"
+RuntimeError: dictionary changed size during iteration
+{'a': 1}
+{'a': 1}
+```
+
+There's also a check for "same size, different keys":
+
+```python
+d = {"a": 1, "b": 2}
+try:
+    for k in d:
+        del d[k]
+        d[k + "_new"] = 0
+except RuntimeError as e:
+    print("RuntimeError:", e)
+```
+
+```text title="Output"
+RuntimeError: dictionary keys changed during iteration
+```
+
+**Changing values** of existing keys is fine, because the structure doesn't change:
+
+```python
+d = {"a": 1, "b": 2}
+for k in d:
+    d[k] *= 10
+print(d)
+```
+
+```text title="Output"
+{'a': 10, 'b': 20}
+```
+
+Sets behave the same (`RuntimeError: Set changed size during iteration`). Fixes: iterate over a snapshot (`list(d)`), or build a new dict with a comprehension. In async code this bites when one coroutine iterates a shared dict, awaits, and another coroutine modifies it in the meantime.
+
+## 7. Dict comprehensions
+
+```python
+prices = {"apple": 1.2, "pear": 0.8, "fig": 2.5}
+print({k: round(v * 1.1, 2) for k, v in prices.items() if v > 1})
+print({v: k for k, v in {"a": 1, "b": 2}.items()})
+print(dict(zip(["id", "name"], [1, "Asha"])))
+```
+
+```text title="Output"
+{'apple': 1.32, 'fig': 2.75}
+{1: 'a', 2: 'b'}
+{'id': 1, 'name': 'Asha'}
+```
+
+The JS equivalent is `Object.fromEntries(Object.entries(obj).filter(...).map(...))`. When inverting a dict, duplicate values collapse: the last key wins.
+
+## 8. Sets and frozensets
+
+A `set` is a hash table of keys only: unordered, unique, hashable members, O(1) average membership.
+
+```python
+tags = {"python", "backend", "python"}
+print(len(tags), "python" in tags)
+empty = set()
+print(type({}).__name__, type(empty).__name__)
+print(set("hello") == {"h", "e", "l", "o"})
+```
+
+```text title="Output"
+2 True
+dict set
+True
+```
+
+`{}` is an empty **dict**; the empty set is `set()`.
+
+*CPython detail:* sets use their own implementation (`Objects/setobject.c`), not the compact dict. It probes a few adjacent slots linearly before jumping (better cache behaviour), and it is **not** insertion-ordered. Iteration order of a set depends on hashes and history; for strings it even changes between runs (see hash randomisation below). Never rely on it; sort for output.
+
+### Set algebra
+
+```python
+a = {"read", "write", "admin"}
+b = {"read", "comment"}
+print(sorted(a | b))
+print(sorted(a & b))
+print(sorted(a - b))
+print(sorted(a ^ b))
+print({"read"} <= a, a.isdisjoint({"x"}))
+print(sorted(a.union(["delete"])))
+try:
+    a | ["delete"]
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+['admin', 'comment', 'read', 'write']
+['read']
+['admin', 'write']
+['admin', 'comment', 'write']
+True True
+['admin', 'delete', 'read', 'write']
+TypeError: unsupported operand type(s) for |: 'set' and 'list'
+```
+
+| Operation | Operator | Method | Meaning |
+|---|---|---|---|
+| union | pipe | `union` | in either |
+| intersection | `&` | `intersection` | in both |
+| difference | `-` | `difference` | in left, not right |
+| symmetric difference | `^` | `symmetric_difference` | in exactly one |
+| subset | `<=` | `issubset` | every left item is in right |
+| superset | `>=` | `issuperset` | every right item is in left |
+
+Operators require both sides to be sets; the named methods accept **any iterable**. In-place variants (`|=`, `&=`, `-=`, `^=`, `update`, `intersection_update`...) mutate.
+
+Backend uses: permission checks (`required <= user_perms`), diffing two lists of IDs (`to_add = new - old`, `to_remove = old - new`), and fast "have I seen this?" deduplication.
+
+### Deduplicating while keeping order
+
+`set` loses order. Since dicts keep insertion order, `dict.fromkeys` is the idiomatic order-preserving dedupe:
+
+```python
+emails = ["b@x.io", "a@x.io", "b@x.io", "c@x.io"]
+print(sorted(set(emails)))
+print(list(dict.fromkeys(emails)))
+```
+
+```text title="Output"
+['a@x.io', 'b@x.io', 'c@x.io']
+['b@x.io', 'a@x.io', 'c@x.io']
+```
+
+### frozenset
+
+An immutable, hashable set. Use it as a dict key, as a member of another set, or for constants.
+
+```python
+fs = frozenset({"read", "write"})
+perms = {fs: "editor"}
+print(perms[frozenset({"write", "read"})])
+try:
+    fs.add("x")
+except AttributeError as e:
+    print("AttributeError:", e)
+print({frozenset({1}), frozenset({1})})
+```
+
+```text title="Output"
+editor
+AttributeError: 'frozenset' object has no attribute 'add'
+{frozenset({1})}
+```
+
+<Callout title="Coming from JS">
+JS `Set` compares members with SameValueZero, i.e. by **reference** for objects: `new Set([[1], [1]]).size` is 2, and you can't look up an array by contents. Python sets compare by **value** (`__hash__` + `__eq__`), which is why members must be hashable. Also, JS `Set` is insertion-ordered; Python `set` is not. JS only gained `union`, `intersection` and friends as methods in 2024; Python has had operators for decades.
+</Callout>
+
+## 9. Complexity
+
+Average case assumes a decent hash function; worst case is when every key collides.
+
+| Operation | dict average | set average | Worst case |
+|---|---|---|---|
+| lookup `d[k]`, `k in d` | O(1) | O(1) | O(n) |
+| insert / update | O(1) amortised | O(1) amortised | O(n) |
+| delete | O(1) | O(1) | O(n) |
+| `len` | O(1) | O(1) | O(1) |
+| iteration | O(n) | O(n) | O(n) |
+| copy | O(n) | O(n) | O(n) |
+| merge / union with size m | O(m) | O(len(a) + len(b)) | |
+| intersection | | O(min(len(a), len(b))) | |
+| difference `a - b` | | O(len(a)) | |
+
+The practical difference between O(1) and O(n) membership is dramatic:
+
+```python
+import timeit
+setup = "data = list(range(100_000)); s = set(data); target = 99_999"
+print("list", round(timeit.timeit("target in data", setup, number=1000), 4))
+print("set ", round(timeit.timeit("target in s", setup, number=1000), 6))
+```
+
+```text title="Output"
+list 0.7603
+set  6.8e-05
+```
+
+If you check membership in a loop, convert the haystack to a set once, outside the loop.
+
+## 10. Hash-collision DoS and hash randomisation
+
+The worst case above is not theoretical. At the 28C3 conference in December 2011, researchers showed that PHP, Java, ASP.NET, Ruby, V8 and Python could be knocked over with a single HTTP request: web frameworks parse form fields, query strings or JSON into a hash table, and if an attacker sends thousands of keys **crafted to have the same hash**, every insert probes the whole collision chain. n inserts become O(n²); a POST of a couple of megabytes could pin a CPU core for minutes.
+
+Python's string hash was deterministic back then, so collisions could be precomputed offline. The fix:
+
+- **Hash randomisation**: string and bytes hashes are keyed with a random secret chosen at interpreter start-up. First shipped as an opt-in (the `-R` flag or `PYTHONHASHSEED`) in the 2012 security releases (2.6.8 and 2.7.3 on Python 2, 3.2.3 on Python 3), and **on by default since 3.3**.
+- **A keyed cryptographic-style hash**: PEP 456 (3.4) replaced the old FNV-based string hash with SipHash (the SipHash-2-4 variant), so the secret can't be recovered from observed hashes. Since 3.11 the default for `str` and `bytes` is SipHash-1-3, which has similar security properties and is a little faster on long inputs.
+
+The environment variable `PYTHONHASHSEED` controls the secret: unset or `random` means random per process, an integer fixes the seed (reproducible), and `0` disables randomisation entirely.
+
+```python
+import subprocess, sys, os
+for seed in ["0", "0", "1"]:
+    out = subprocess.run([sys.executable, "-c", "print(hash('user:42'))"],
+                         env={"PYTHONHASHSEED": seed, "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")},
+                         capture_output=True, text=True).stdout.strip()
+    print(seed, out)
+print(sys.hash_info.algorithm)
+```
+
+```text title="Output"
+0 2467364908147093645
+0 2467364908147093645
+1 -4383336205329456031
+siphash13
+```
+
+(`SYSTEMROOT` is only there so the child process starts on Windows.) Consequences for you:
+
+- **Never persist or share `hash()` values** for strings (cache keys in Redis, sharding, file names). They differ between processes and between worker restarts. Use `hashlib` (e.g. `hashlib.sha256` or `blake2b`) for stable hashes.
+- **Set iteration order of strings changes run to run.** Tests that compare `str(some_set)` will flake. Sort before comparing or printing.
+- Ints are **not** randomised (`hash(n)` is `n` reduced modulo the Mersenne prime 2 to the power 61 minus 1), so exposing int-keyed hash tables to untrusted input is less protected. In practice, still cap request sizes, the number of form fields and JSON nesting at the edge.
+
+<Callout title="Coming from JS">
+V8 also randomises its string hash seed per isolate for the same reason, and Node had its own hash-flooding CVEs. The difference is visibility: JS never exposes the hash, while Python's `hash()` is a public builtin, which is exactly why you must not treat its output as stable.
+</Callout>
+
+## Interview questions
+
+1. **Why are dict lookups O(1) on average and O(n) in the worst case?**
+   **The key's hash picks a slot directly; only collisions require probing. If many keys collide (bad hash or an attack), each lookup degenerates into a scan of the probe chain.**
+
+2. **How does a dict preserve insertion order?**
+   **Since 3.6 CPython's compact dict stores entries in a dense array in insertion order, with a separate sparse index table for hashing; iteration walks the dense array. Ordering is a language guarantee since 3.7.**
+
+3. **What is the `__hash__`/`__eq__` contract?**
+   **Objects that compare equal must have equal hashes, and an object's hash must not change while it is stored in a hash table. Defining `__eq__` alone sets `__hash__` to `None`.**
+
+4. **Why can't a list be a dict key?**
+   **Its contents (and therefore any content-based hash) can change after insertion, which would strand the entry in the wrong slot. Use a tuple instead.**
+
+5. **What happens if you add keys to a dict while looping over it?**
+   **CPython raises `RuntimeError: dictionary changed size during iteration`. Iterate over `list(d)` or build a new dict instead. Modifying values of existing keys is fine.**
+
+6. **What is the difference between `d1 | d2` and `d1.update(d2)`?**
+   **The pipe returns a new merged dict (Python 3.9+); `update` mutates `d1` in place and returns `None`. Both are shallow and right-hand values win.**
+
+7. **Why does `hash("abc")` differ between runs, and what does `PYTHONHASHSEED` do?**
+   **String hashing is keyed by a per-process random secret to prevent hash-flooding DoS attacks; `PYTHONHASHSEED` fixes or disables that seed.**
+
+8. **How would you dedupe a list but keep order?**
+   **`list(dict.fromkeys(items))`, relying on dict insertion order; a plain `set` loses order.**
+
+## Recap
+
+- Dicts and sets are **open-addressing hash tables**: hash, mask to a slot, probe on collision, resize at two-thirds full.
+- CPython's **compact dict** separates a sparse index array from a dense entries array, giving smaller dicts and **guaranteed insertion order** (3.7+).
+- Keys must be **hashable**: equal objects need equal hashes and hashes must be stable. Mutable built-ins opt out; use tuples, frozensets or frozen dataclasses.
+- Know the toolkit: `get`, `setdefault`, `pop`, `popitem`, `update`, the merge operators (3.9+), `fromkeys` (with its shared-default trap), and `__missing__`.
+- Views are **live and set-like**; structural mutation during iteration raises `RuntimeError`.
+- Sets give O(1) membership and real set algebra but **no ordering**; `frozenset` is the hashable variant.
+- String hashes are **randomised per process** (SipHash-1-3) to defeat collision attacks: never persist `hash()` output.
+
+## Sources
+
+- [What's New in Python 3.6: the compact dict, 20% to 25% less memory](https://docs.python.org/3/whatsnew/3.6.html)
+- [`collections` documentation: dict insertion order guaranteed since 3.7](https://docs.python.org/3/library/collections.html)
+- [PEP 584: the dict merge and update operators (3.9)](https://peps.python.org/pep-0584/)
+- [What's New in Python 3.3: hash randomisation on by default](https://docs.python.org/3/whatsnew/3.3.html)
+- [Command line and environment: `-R` and `PYTHONHASHSEED`](https://docs.python.org/3/using/cmdline.html)
+- [PEP 456: secure and interchangeable hash algorithm (SipHash, 3.4)](https://peps.python.org/pep-0456/)
+- [What's New in Python 3.11: `siphash13` becomes the default](https://docs.python.org/3/whatsnew/3.11.html)
+- [oCERT-2011-003 advisory on hash-collision denial of service](https://ocert.org/advisories/ocert-2011-003.html)
+- [`Objects/dictobject.c` in the CPython repository (compact layout, probing)](https://github.com/python/cpython/blob/main/Objects/dictobject.c)

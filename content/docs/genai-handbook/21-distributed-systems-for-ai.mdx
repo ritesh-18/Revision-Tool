@@ -1,0 +1,953 @@
+---
+title: "21. Distributed Systems for AI"
+description: "A distributed system is one in which components running on networked computers coordinate to achieve a goal. AI systems are distributed by default: the..."
+---
+
+<Callout type="info">
+**How to read this chapter.** 📘 **Handbook**: the original chapter text. 🔧 **Going deeper**: code and extra depth on topics the chapter already covers. ➕ **Beyond the handbook**: new topics the original chapter did not cover.
+</Callout>
+
+## 21.1 Concept Explanation
+
+A distributed system is one in which components running on networked computers coordinate to achieve a goal. AI systems are distributed by default: the model runs on one set of nodes, the vector DB on another, the application on a third, the message bus on a fourth. All the classical distributed-systems problems — consistency, ordering, failure handling, latency — apply.
+
+This chapter applies distributed systems fundamentals to AI-specific architectures. Many design choices in earlier chapters trace back to these principles.
+
+## 21.2 CAP Theorem
+
+The CAP theorem states that a distributed system can guarantee at most two of:
+- **Consistency.** Every read sees the most recent write.
+- **Availability.** Every request gets a response (possibly stale).
+- **Partition tolerance.** The system continues to operate despite network partitions.
+
+In practice, partitions happen, so the choice is between consistency and availability during a partition.
+
+For AI:
+- Vector DBs typically choose availability — eventually consistent inserts are fine; the index lag is measured in seconds.
+- Session state typically chooses consistency — losing chat history is worse than a brief unavailability.
+- Caches typically choose availability — stale data is acceptable for a few seconds.
+
+Knowing which side each component is on prevents surprises during failures.
+
+## 21.3 PACELC
+
+Refinement of CAP: even when there is no partition, systems trade Latency for Consistency. PACELC: if Partition, choose Availability or Consistency; Else, choose Latency or Consistency.
+
+Production systems care about the "else" branch as much as the "P" branch. Strong-consistency reads are slower; eventual-consistency reads are faster. Pick deliberately.
+
+## 21.4 Distributed Queues
+
+Queues decouple producers and consumers, smooth bursts, and enable retries.
+
+For AI:
+- **Embedding jobs** in a queue, workers pull and process.
+- **Agent steps** in a queue if long-running.
+- **Eval runs** in a queue.
+- **Inference requests** in a queue if traffic is bursty and latency tolerates queuing.
+
+Properties to consider: ordering (FIFO?), at-least-once vs exactly-once delivery, durability, throughput.
+
+## 21.4a Queue-Based Load Levelling for LLM Traffic 🔧
+
+The list above names "inference requests in a queue" as an option; this section works out when that queue actually protects your GPUs and how to build it.
+
+### The problem: bursty demand meets a hard GPU ceiling
+
+A GPU replica pool has a fixed number of generation slots, set by how much KV cache fits in memory. Take an example pool: 4 replicas, each serving 16 concurrent streams at an acceptable inter-token latency, so 64 slots. A typical request produces 500 output tokens at about 80 tokens per second per stream, so it holds a slot for roughly 6 seconds. Little's law gives the pool's ceiling:
+
+```text
+throughput = slots / time_in_system = 64 / 6 s ≈ 10.7 requests/s
+```
+
+Now a product email goes out and traffic jumps to 40 requests/s for 2 minutes. The excess is `(40 - 10.7) × 120 ≈ 3,500` requests. Without a queue, the inference server either rejects them, preempts running sequences (vLLM evicts KV blocks and recomputes them later, which slows everyone), or runs out of memory. With a queue, the excess waits. When traffic returns to a baseline of 6 requests/s, the spare capacity is about 4.7 requests/s, so the backlog takes `3,500 / 4.7 ≈ 750 s`, about 12 minutes, to drain.
+
+That number is the key lesson. A queue levels load only for work that can wait minutes: embeddings, batch evals, document processing, async summaries. An interactive chat user will not wait 12 minutes, so interactive traffic needs fast rejection or degradation (a smaller model, a "busy" message) rather than a deep queue.
+
+### Admit by tokens, not by request count
+
+The scarce resource on an LLM server is KV-cache memory, and a request's cost scales with `prompt_tokens + max_tokens`. A worker that allows "64 concurrent jobs" lets 64 long-context jobs in at once and evicts everything. A token budget admits many short jobs or a few long ones, which matches what the GPU can hold.
+
+Two more rules make the queue useful:
+
+- **Deadlines.** Every job carries the time after which its result is worthless. The worker checks it before spending GPU time, so a backlog never burns capacity on answers nobody will read.
+- **Priority lanes.** Paid or interactive-async work goes ahead of bulk jobs, but with a reserved share for low priority so it cannot starve.
+
+### Implementation with arq
+
+arq has no per-job priority, so the priority lanes are two queues with their own worker pools: the urgent lane gets more workers, and the bulk lane keeps its own, which is the reserved share that stops it from starving. arq retries a job only when it raises `Retry`, so any other exception is a final failure.
+
+```python
+import asyncio
+import json
+import math
+import time
+from contextlib import asynccontextmanager
+from typing import Any, Literal
+
+import httpx
+from arq import Retry
+from arq.connections import ArqRedis, RedisSettings
+from arq.worker import func
+from pydantic import BaseModel
+
+URGENT_QUEUE = "llm-batch:urgent"
+BULK_QUEUE = "llm-batch:bulk"
+
+
+class Message(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class LlmJob(BaseModel):
+    tenant_id: str
+    messages: list[Message]
+    max_tokens: int
+    deadline: float  # epoch seconds after which the result is useless
+
+
+async def enqueue(pool: ArqRedis, job: LlmJob, *, request_id: str, urgent: bool) -> None:
+    await pool.enqueue_job(
+        "generate",
+        job.model_dump(),
+        _job_id=request_id,  # same id twice = one job (idempotent enqueue)
+        _queue_name=URGENT_QUEUE if urgent else BULK_QUEUE,
+    )
+
+
+# Token budget for the replica this worker feeds. KV cache is the real limit.
+TOKEN_BUDGET = 64 * 4_096
+_tokens_in_flight = 0
+_budget = asyncio.Condition()
+
+
+@asynccontextmanager
+async def token_budget(tokens: int):
+    global _tokens_in_flight
+    async with _budget:
+        await _budget.wait_for(lambda: _tokens_in_flight + tokens <= TOKEN_BUDGET)
+        _tokens_in_flight += tokens
+    try:
+        yield
+    finally:
+        async with _budget:
+            _tokens_in_flight -= tokens
+            _budget.notify_all()  # waiters re-check the budget
+
+
+def backoff(job_try: int) -> float:
+    return 2.0 * 2 ** (job_try - 1)  # 2 s, 4 s, 8 s ...
+
+
+async def generate(ctx: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    job = LlmJob.model_validate(payload)
+    if time.time() > job.deadline:
+        raise TimeoutError("deadline passed")  # a plain exception: arq never retries it
+
+    messages = [m.model_dump() for m in job.messages]
+    cost = math.ceil(len(json.dumps(messages)) / 4) + job.max_tokens  # rough token estimate
+    async with token_budget(cost):
+        try:
+            res = await ctx["http"].post(
+                "http://vllm:8000/v1/chat/completions",
+                json={"model": "llama-3.1-8b-instruct", "messages": messages, "max_tokens": job.max_tokens},
+                timeout=max(1.0, job.deadline - time.time()),
+            )
+        except httpx.TransportError as exc:  # connection errors and timeouts
+            raise Retry(defer=backoff(ctx["job_try"])) from exc
+        if res.status_code == 429 or res.status_code >= 500:
+            raise Retry(defer=backoff(ctx["job_try"]))  # retried
+        res.raise_for_status()  # a 4xx will not fix itself: fails without a retry
+        return res.json()
+
+
+async def startup(ctx: dict[str, Any]) -> None:
+    ctx["http"] = httpx.AsyncClient()
+
+
+async def shutdown(ctx: dict[str, Any]) -> None:
+    await ctx["http"].aclose()
+
+
+class UrgentWorker:  # run with: arq app.llm_queue.UrgentWorker
+    functions = [func(generate, max_tries=3)]
+    queue_name = URGENT_QUEUE
+    redis_settings = RedisSettings(host="localhost", port=6379)
+    on_startup = startup
+    on_shutdown = shutdown
+    max_jobs = 64  # upper bound; the token budget is the real gate
+
+
+class BulkWorker(UrgentWorker):  # fewer replicas of this one, but never zero
+    queue_name = BULK_QUEUE
+```
+
+### Autoscale on queue age, not on CPU
+
+GPU servers show low CPU use even when saturated, so CPU-based autoscaling never fires. The useful signal is how long the backlog will take to drain:
+
+```text
+drain_time = queue_depth / (pool_throughput - arrival_rate)
+scale up when drain_time > replica_cold_start_time   (often 2 to 10 minutes for a large model)
+```
+
+If the backlog will clear before a new replica is even ready, adding one only costs money. Expose the oldest job's age and the queue depth as metrics (an arq queue is a Redis sorted set scored by enqueue time, so `ZCARD` gives the depth and the lowest score gives the oldest job) and feed them to KEDA or a custom autoscaler.
+
+### Edge cases and failure modes
+
+- **Retry amplification.** With 3 attempts and a 30% failure rate, each job makes on average `1 + 0.3 + 0.09 ≈ 1.39` calls. During an outage the failure rate approaches 100% and load triples, exactly when the upstream is weakest. Pair retries with the circuit breaker in 21.16.
+- **Head-of-line blocking.** One 100k-token job takes a large share of the budget and stalls many small jobs behind it. Give long-context jobs their own queue and replica pool.
+- **Stalled jobs.** If a worker process dies mid-generation, arq's pessimistic execution leaves the job in the queue, and another worker runs it once the job's in-progress marker expires. The job runs twice, so any side effect after the LLM call must be idempotent (21.14).
+- **Estimate drift.** The `length / 4` estimate is poor for code and non-English text. Use the model's tokenizer if budgets are tight, or leave 20% headroom.
+
+Generic load-shedding and admission-control patterns are covered in depth in [Scaling and Performance, part 2](/docs/backend-first-principles/22-scaling-performance-part-2).
+
+## 21.5 Kafka — Streaming and Event Log
+
+Kafka (Chapter 18) is more than a queue. It is a durable, ordered, partitioned log.
+
+For AI specifically:
+- **Event sourcing** of conversations — the conversation history is a log; the current state is derived.
+- **Replayable streams** for backtesting new prompts against old data.
+- **Audit trail** for compliance.
+
+## 21.6 RabbitMQ
+
+RabbitMQ is a mature broker with rich routing semantics — direct, topic, fanout, headers exchanges. Strong for task queues where Kafka's log-and-replay model is overkill.
+
+For AI: task queues for embedding workers, agent step dispatch, batch eval jobs.
+
+## 21.7 NATS
+
+NATS is a lightweight, high-performance pub/sub messaging system. JetStream adds persistence. Lower operational footprint than Kafka.
+
+For AI: low-latency inter-service eventing, especially in microservice architectures with many small messages.
+
+## 21.8 Redis Streams
+
+Redis with stream semantics. Simple, fast, suitable for small to medium scale. Limits show up at large persistent log scale; Kafka or Redpanda takes over.
+
+## 21.9 Event Sourcing
+
+Store every state-changing event as an immutable record. Current state is derived by replaying events.
+
+For AI:
+- Conversation history as event log.
+- Agent step traces as event log.
+- Eval result history as event log.
+
+Benefits: full audit trail, replay for debugging, time-travel for state at any point.
+
+Costs: storage, query complexity (snapshots help), schema evolution discipline.
+
+## 21.10 CQRS — Command Query Responsibility Segregation
+
+Separate the write path (commands that change state) from the read path (queries that read state). The two can have different models and scale independently.
+
+For AI:
+- Writes: ingestion pipeline updates documents.
+- Reads: retrieval queries the vector DB.
+- The vector DB is essentially a materialized read view of the document corpus.
+
+Most production RAG systems implicitly use CQRS. Naming it clarifies design.
+
+## 21.11 Eventual Consistency
+
+In a distributed system without synchronous coordination, reads may temporarily see stale data. Eventual consistency means the system converges given enough time without new writes.
+
+For AI:
+- New documents may take seconds to appear in the vector index.
+- New prompts may take minutes to propagate across all replicas.
+- New cache entries may not be visible to all readers immediately.
+
+Design with the staleness in mind. UIs can show "still indexing" states. Caches should have TTLs. Index refresh schedules should be documented.
+
+## 21.12 Distributed Consensus
+
+When multiple nodes must agree on something (leader election, configuration changes, transaction order), consensus protocols are used. Raft and Paxos are the foundational algorithms.
+
+For AI infrastructure:
+- Kubernetes uses etcd (Raft).
+- Some vector DBs use Raft for replication.
+- Service discovery often uses Raft-based stores.
+
+You usually consume consensus as a feature, not implement it.
+
+## 21.13 Distributed Tracing
+
+Covered in Chapter 19. The fundamental tool for understanding distributed systems. Every request gets a trace ID; every span links into the trace. Without this, debugging multi-service flows is guesswork.
+
+## 21.14 Idempotency
+
+An idempotent operation produces the same result whether executed once or many times. Critical for retries, which are mandatory in any distributed system.
+
+For AI:
+- Embedding a document with a deterministic ID — idempotent.
+- Posting a chat message with a client-provided ID — idempotent.
+- Calling a "send email" tool — NOT idempotent without an idempotency key.
+
+Design idempotent operations wherever possible. Where impossible, use explicit idempotency keys.
+
+### Idempotency keys for agent tool calls 🔧
+
+The "send email" example above is the common case in agent systems, so here is the full pattern in Python and Postgres.
+
+**Problem.** An agent step calls a tool, the call times out after 30 seconds, and the workflow engine retries the step. The customer gets two emails, or two refunds.
+
+**Why it happens.** A timeout is ambiguous. The caller cannot tell "the request never arrived" from "it ran, but the response was lost". Retries are required (21.16), so the tool must be safe to call twice.
+
+**Mechanism.** Derive a key from what makes the call unique in the workflow: run id, step number, tool name and arguments. Claim the key with a unique constraint before running the tool, store the result after, and return the stored result on any repeat. Pass the same key to the downstream provider when it supports one (most payment and email APIs do), which also covers a crash between "tool ran" and "result stored".
+
+```python
+import hashlib
+import json
+import os
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+engine = create_async_engine(os.environ["DATABASE_URL"])  # e.g. postgresql+asyncpg://...
+# CREATE TABLE tool_calls (
+#   idem_key   text PRIMARY KEY,
+#   status     text NOT NULL,          -- 'pending' | 'done' | 'failed'
+#   result     jsonb,
+#   created_at timestamptz NOT NULL DEFAULT now()
+# );
+
+
+def idem_key(run_id: str, step: int, tool: str, args: Any) -> str:
+    # LLM-generated arguments may come back with keys in a different order, so sort them first
+    # (sort_keys canonicalises nested dicts too).
+    payload = json.dumps([run_id, step, tool, args], sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+async def run_tool_once[T](
+    run_id: str, step: int, tool: str, args: Any,
+    exec_tool: Callable[[str], Awaitable[T]],
+) -> T:
+    key = idem_key(run_id, step, tool, args)
+
+    async with engine.begin() as conn:
+        claim = await conn.execute(
+            text("INSERT INTO tool_calls (idem_key, status) VALUES (:key, 'pending') ON CONFLICT DO NOTHING"),
+            {"key": key},
+        )
+    if claim.rowcount == 0:
+        async with engine.connect() as conn:
+            row = (await conn.execute(
+                text("SELECT status, result FROM tool_calls WHERE idem_key = :key"), {"key": key}
+            )).one()
+        if row.status == "done":
+            return row.result  # replay: return the first result
+        raise RuntimeError(f"tool call {key} is {row.status}; needs reconciliation")
+
+    try:
+        result = await exec_tool(key)  # forward key to the provider
+    except Exception:
+        async with engine.begin() as conn:
+            await conn.execute(text("UPDATE tool_calls SET status = 'failed' WHERE idem_key = :key"), {"key": key})
+        raise
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE tool_calls SET status = 'done', result = CAST(:result AS jsonb) WHERE idem_key = :key"),
+            {"key": key, "result": json.dumps(result)},
+        )
+    return result
+```
+
+**Edge cases.**
+
+- **Why the step number is in the key.** Hashing only the arguments would block a legitimate second, identical email later in the same run.
+- **Stuck `pending` rows.** A crash after the claim leaves the row pending forever. A reconciler asks the provider (by the same key) whether the action happened, then marks the row done or failed.
+- **Failed is not retry-safe by default.** A `failed` row means "we saw an error", not "nothing happened". Only clear it when the provider confirms nothing ran.
+
+## 21.15 Backpressure
+
+When a consumer cannot keep up with a producer, backpressure signals the producer to slow down. Without it, queues grow until something breaks.
+
+For AI:
+- Inference servers signal "queue full, reject" instead of accepting infinite requests.
+- Embedding workers signal "behind" so ingestion slows.
+- Streaming responses pause when client cannot consume tokens.
+
+## 21.16 Circuit Breakers and Retries
+
+A circuit breaker stops calling a downstream service after a threshold of failures. Better to fail fast than pile up timeouts.
+
+Retries with exponential backoff and jitter handle transient failures without amplifying load.
+
+For AI: LLM provider failures and rate limits are real. Wrap every external call with retries (idempotent-aware) and circuit breakers.
+
+### Retries and breakers for LLM calls 🔧
+
+The advice above is easy to state and easy to get wrong for LLM traffic, so here is a concrete version.
+
+**Why plain retries hurt.** Suppose 1,000 clients hit a provider rate limit at the same moment and all retry after exactly 1 second. The provider sees the same 1,000-request spike again one second later. Exponential backoff spreads retries over time, and random jitter stops clients that failed together from retrying together. With "full jitter" each client sleeps a random time between 0 and the backoff cap, which spreads the spike evenly.
+
+**What is retryable.** `429` (rate limited), `5xx`, and provider-specific overload codes (Anthropic uses `529` for "overloaded") are worth retrying. A `400` (bad schema, prompt too long) will fail the same way every time. When the provider sends a `retry-after` header, use it instead of guessing.
+
+```python
+import asyncio
+import itertools
+import random
+import time
+from collections.abc import Awaitable, Callable
+
+import httpx
+
+
+async def call_with_retry(
+    do_request: Callable[[], Awaitable[httpx.Response]], max_attempts: int = 4
+) -> httpx.Response:
+    for attempt in itertools.count(1):
+        res = await do_request()
+        retryable = res.status_code in (429, 529) or res.status_code >= 500
+        if not retryable or attempt == max_attempts:
+            return res
+
+        try:
+            retry_after = float(res.headers.get("retry-after", ""))
+        except ValueError:
+            retry_after = 0.0  # absent, or an HTTP date we do not parse here
+        backoff = random.uniform(0, min(8.0, 0.5 * 2 ** attempt))  # full jitter
+        await asyncio.sleep(retry_after if retry_after > 0 else backoff)
+    raise AssertionError("unreachable")
+
+
+class CircuitOpenError(Exception):
+    pass
+
+
+class CircuitBreaker:
+    """Minimal breaker: after `threshold` consecutive failures, fail fast for `cool_down`
+    seconds, then let calls through again. Production breakers add a half-open state
+    that admits one probe."""
+
+    def __init__(self, threshold: int = 5, cool_down: float = 30.0) -> None:
+        self.threshold = threshold
+        self.cool_down = cool_down
+        self.failures = 0
+        self.opened_at = 0.0
+
+    async def call[T](self, fn: Callable[[], Awaitable[T]]) -> T:
+        if self.failures >= self.threshold and time.monotonic() - self.opened_at < self.cool_down:
+            raise CircuitOpenError()  # caller routes to a fallback provider or a smaller model
+        try:
+            out = await fn()
+        except Exception:
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.opened_at = time.monotonic()
+            raise
+        self.failures = 0
+        return out
+```
+
+**LLM-specific edge cases.**
+
+- **Mid-stream failure.** Once tokens have been streamed to the user, a silent retry produces a different answer that gets glued onto the first. Either retry only before the first token, or tell the client to discard and restart the message.
+- **Two timeouts, not one.** Set a time-to-first-token timeout (for example 10 s) and a separate total timeout (for example 120 s). A single 30 s timeout kills long but healthy generations.
+- **What trips the breaker.** Count `429`, `5xx` and timeouts. Do not count `400` caused by your own bad request, or one buggy prompt will open the breaker for every user.
+- **Retry budget.** Cap retries to a share of traffic (for example 10% extra calls per minute). This stops the 3× amplification described in 21.4a during a full outage.
+
+## 21.17 Bulkheads
+
+Isolate resources so failure in one part of the system does not cascade. Separate thread pools per dependency, separate worker pools per priority class.
+
+For AI: separate inference pools for free vs paid users so a free-tier surge does not impact paid customers.
+
+## 21.18 Workflow Engines
+
+For long-running, multi-step processes (agents, document ingestion, batch evals), workflow engines provide durability, retries, and visibility.
+
+- **Temporal.** Durable workflows in mainstream languages. Strong for agentic systems.
+- **Restate.** Newer alternative with similar guarantees and lower operational footprint.
+- **Inngest.** Event-driven workflow platform, serverless.
+- **AWS Step Functions, GCP Workflows, Azure Logic Apps.** Cloud-managed workflows.
+
+Workflow engines often replace ad-hoc orchestration in agentic systems, turning fragile loops into durable resumable processes.
+
+## 21.19 Microservices for AI
+
+The decomposition for a typical AI system:
+- Auth service.
+- Chat service (handles SSE, conversation state).
+- Retrieval service.
+- LLM gateway.
+- Tool services (one per major tool category).
+- Embedding service.
+- Eval service.
+- Observability service.
+
+Each scales independently, deploys independently, can be written in the most appropriate language.
+
+The cost is operational: more services means more deployments, more on-call rotations, more inter-service contracts. Match decomposition to team size.
+
+## 21.20 Scaling Inference Systems
+
+Patterns for scaling inference horizontally:
+- **Replica pools** per model, autoscaling on queue depth.
+- **Tiered pools** — large model for hard queries, small model for easy ones.
+- **Sharded by tenant or workload class.**
+- **Regional clusters** to keep latency low.
+- **Hot standby** for failover.
+
+The hidden cost: cold starts on big models are slow. Always-on warm capacity is often necessary even at low traffic.
+
+## 21.20a Prefix-Aware Routing to GPU Replicas ➕
+
+Replica pools from the list above need a load balancer, and for LLMs the choice of balancer changes throughput, because each replica holds a different set of cached prompt prefixes.
+
+### The problem: round-robin throws away the prefix cache
+
+Inference engines such as vLLM cache the KV tensors of prompt prefixes they have already processed (prefix caching is explained in [Chapter 13](/docs/genai-handbook/13-ai-inference-systems)). A request whose first 3,000 tokens match a cached prefix skips that prefill. The cache is local to one replica, though, and a round-robin balancer sends the same tenant to a different replica each time.
+
+### Why it matters, in numbers
+
+Take Llama 3.1 8B (32 layers, 8 KV heads, head size 128, bf16). The KV cache per token is:
+
+```text
+2 (K and V) × 32 layers × 8 heads × 128 dims × 2 bytes = 131,072 bytes = 128 KiB per token
+one 3,000-token tenant prefix (system prompt + tool schemas + pinned docs) ≈ 375 MiB
+```
+
+With 2,000 tenants, the prefixes add up to about 730 GiB. Eight replicas with about 40 GiB of free KV memory each have 320 GiB in total.
+
+- **Round-robin:** every replica sees every tenant, so each 40 GiB cache competes for all 730 GiB of prefixes. Only about 5% fit, and most requests pay the full prefill.
+- **Prefix-affine routing:** each tenant goes to one replica, so each cache only has to hold about 91 GiB of prefixes. Over 40% fit, and hot tenants stay cached. The pool's effective cache becomes 8 times larger without new hardware.
+
+Prefill for 3,000 tokens on an 8B model is about `2 × 8e9 × 3,000 ≈ 48 TFLOP`, roughly 50 to 100 ms on an H100. A cache hit removes that from time-to-first-token and frees the GPU for other work.
+
+### Mechanism: hash the stable prefix, then bound the load
+
+1. Build the prompt so that the stable part comes first (system prompt, tool definitions, tenant documents) and the variable part (the user's message) comes last.
+2. Hash the stable part, or the tenant id plus the prompt version.
+3. Use rendezvous (highest-random-weight) hashing to rank replicas for that hash. When a replica joins or leaves, only about `1/N` of keys move.
+4. Skip any replica whose in-flight count is above `loadFactor × average`. A single hot tenant then spills onto its second-ranked replica instead of overloading the first. This is the "consistent hashing with bounded loads" idea.
+
+### Implementation in Python
+
+```python
+import hashlib
+import math
+from dataclasses import dataclass
+
+
+@dataclass
+class Replica:
+    url: str
+    in_flight: int
+    healthy: bool
+
+
+def _rank(key: str, r: Replica) -> int:
+    return int.from_bytes(hashlib.sha1(f"{key}|{r.url}".encode()).digest()[:4], "big")
+
+
+def pick_replica(stable_prefix: str, replicas: list[Replica], load_factor: float = 1.25) -> Replica:
+    live = [r for r in replicas if r.healthy]
+    if not live:
+        raise RuntimeError("no healthy replicas")
+
+    key = hashlib.sha256(stable_prefix.encode()).hexdigest()
+    avg = sum(r.in_flight for r in live) / len(live)
+    cap = max(1, math.ceil(avg * load_factor))
+
+    ranked = sorted(live, key=lambda r: _rank(key, r), reverse=True)  # stable per key
+    under_cap = next((r for r in ranked if r.in_flight < cap), None)  # best replica under the cap
+    return under_cap or min(ranked, key=lambda r: r.in_flight)        # everyone busy: least loaded
+```
+
+On Kubernetes you rarely write this yourself today. The Gateway API Inference Extension and llm-d's inference scheduler score vLLM pods on prefix-cache hits, queue length and KV-cache use, and the SGLang router has a cache-aware mode (as of late 2026). The hand-rolled version is still useful behind a plain FastAPI gateway or with a hosted provider that offers several deployments.
+
+### Edge cases and failure modes
+
+- **The prefix must be byte-identical.** A timestamp or request id near the top of the system prompt makes every prefix unique and the hit rate drops to zero. Put dynamic values after the stable block.
+- **Multi-turn chats.** The prefix grows each turn. Route by conversation id, so turn 5 lands where turns 1 to 4 are cached.
+- **Scale events.** Adding a replica moves about `1/N` of keys, and their first request after the move is a cold prefill. Expect a short TTFT bump after autoscaling.
+- **Stale load data.** Routers that poll replica load every few seconds can send a burst to a replica that just filled up. Count in-flight requests at the router itself, as above, rather than relying only on polled metrics.
+
+Generic consistent hashing is covered in depth in [Scaling and Performance, part 2](/docs/backend-first-principles/22-scaling-performance-part-2).
+
+## 21.20b Disaggregated Prefill and Decode Serving ➕
+
+Routing decides which replica gets a request; disaggregation goes further and splits the two phases of one request across different replicas.
+
+### The problem: two phases with opposite needs share one GPU
+
+An LLM request has a prefill phase (process the whole prompt in one pass) and a decode phase (produce one token per step). They stress different hardware limits:
+
+- **Prefill is compute-bound.** A 4,096-token prompt on a 70B model costs about `2 × 70e9 × 4,096 ≈ 573 TFLOP`. Spread over 8 H100s at about 50% use (about 4,000 TFLOP/s in total), that is roughly 150 ms of solid compute.
+- **Decode is memory-bandwidth-bound.** Each decode step reads all 140 GB of bf16 weights. Across 8 H100s with 3.35 TB/s each, that is at least about 5 ms per step, whether the batch holds 1 sequence or 64.
+
+When both run on the same replica, a new 150 ms prefill joins the running batch, and every user who is mid-answer sees their stream pause for that long. This is the inter-token latency (ITL) spike that hurts voice agents and streaming chat the most.
+
+### Mechanism
+
+Run two pools. Prefill workers process prompts and produce the KV cache. A connector ships that KV cache over a fast network to a decode worker, which streams the tokens. Each pool can then use its own parallelism and batch size: large batches of prompts on the prefill side, many concurrent streams on the decode side.
+
+<Mermaid chart={`sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant P as Prefill pool
+    participant D as Decode pool
+    C->>R: prompt
+    R->>P: run prefill
+    P->>D: transfer KV cache over RDMA or NVLink
+    P-->>R: first token
+    R-->>C: first token (TTFT)
+    loop until EOS or max tokens
+        D-->>C: next token (ITL)
+    end`} />
+
+### The cost: moving the KV cache
+
+```python
+def kv_bytes_per_token(layers: int, kv_heads: int, head_dim: int, bytes_per_val: int = 2) -> int:
+    return 2 * layers * kv_heads * head_dim * bytes_per_val  # K and V
+
+# Llama 3.1 70B: 80 layers, 8 KV heads (GQA), head_dim 128, bf16
+per_tok = kv_bytes_per_token(80, 8, 128)        # 327,680 bytes = 320 KiB
+prompt = 4_096
+total = per_tok * prompt                         # about 1.34 GB
+
+for name, gbytes_per_s in [("400 Gb/s InfiniBand", 50), ("100 Gb/s Ethernet", 12.5)]:
+    print(f"{name}: {total / (gbytes_per_s * 1e9) * 1e3:.0f} ms")
+# 400 Gb/s InfiniBand: 27 ms
+# 100 Gb/s Ethernet: 107 ms
+```
+
+On a fast fabric the transfer (about 27 ms) is small next to the 150 ms of prefill it moves off the decode GPUs. On ordinary Ethernet it eats much of the gain. This is why disaggregation is mostly deployed inside a single rack or cluster with RDMA.
+
+### When it is worth it
+
+- **Worth it:** long prompts (RAG, agents with large tool schemas), strict ITL targets, and enough traffic to keep two separate pools busy.
+- **Not worth it:** short prompts, small fleets, or when chunked prefill (splitting a long prefill into slices mixed with decode steps) already keeps ITL within target. Chunked prefill is a single flag and needs no extra network.
+
+vLLM documents its disaggregated prefill as experimental and states plainly that it does not improve throughput; the gain is control over TTFT and tail ITL (as of the October 2026 docs). The DistServe paper is the reference design, and llm-d packages the same idea for Kubernetes.
+
+### Failure modes
+
+- **Wrong pool ratio.** The right number of prefill workers per decode worker depends on prompt and output lengths. If your traffic mix shifts (for example, longer RAG contexts), one pool queues while the other idles. Autoscale each pool on its own queue.
+- **Transfer failure.** If the KV transfer fails or times out, the decode worker must redo the prefill locally rather than fail the request.
+- **Debugging gets harder.** One request now spans three processes. Trace ids must flow through the router, the prefill worker and the decode worker.
+
+## 21.21 Distributed Memory Systems
+
+Agent memory at scale becomes a distributed memory system. Properties needed:
+- Low-latency reads (memory lookup is on the request critical path).
+- Eventual consistency tolerated.
+- Per-user partitioning.
+- Multi-region replication for global users.
+
+Implementations: Redis or DynamoDB for hot memory, vector DB for semantic memory, Postgres for structured profile data.
+
+## 21.21a Distributed Training: Collectives, Sharding and Fault Tolerance ➕
+
+Everything above concerns serving; the other large distributed workload in AI is training, where the thing being coordinated is gradients, not requests. Chapter 23 names the libraries (DeepSpeed, FSDP); this section explains the mechanics underneath them.
+
+### Collective operations and what they cost ➕
+
+**Problem.** In data-parallel training every GPU computes gradients on its own slice of the batch, and all GPUs must end each step with the same averaged gradient. That exchange happens every step and can dominate step time.
+
+**The operations.**
+
+| Collective | What each GPU ends with | Used for |
+|---|---|---|
+| all-reduce | the sum (or mean) of every GPU's tensor | gradient sync in plain data parallel (DDP) |
+| reduce-scatter | one shard of the summed tensor | gradient sync in ZeRO-2/3 and FSDP |
+| all-gather | the full tensor assembled from every GPU's shard | rebuilding sharded weights before a layer runs |
+| broadcast | rank 0's tensor | initial weights, config |
+
+**Cost from first principles.** NCCL's ring all-reduce is a reduce-scatter followed by an all-gather. Each moves `(N-1)/N × S` bytes per GPU, so the total traffic per GPU is:
+
+```text
+all-reduce bytes per GPU = 2 × (N - 1) / N × S        (S = tensor size, N = GPUs)
+```
+
+For an 8B model with bf16 gradients (S = 16 GB) on 8 GPUs, each GPU sends and receives `2 × 7/8 × 16 = 28 GB` per step. Over NVLink inside one H100 node (about 450 GB/s per direction) that takes about 60 ms. Across nodes at 400 Gb/s (50 GB/s) per GPU it takes about 560 ms. That gap is why training clusters pay for InfiniBand and why frameworks overlap communication with the backward pass: gradients are grouped into buckets and each bucket is reduced as soon as its layers finish, while earlier layers are still computing.
+
+**Measure it on your cluster.**
+
+```python
+# torchrun --nproc_per_node=8 allreduce_bench.py
+import os, time, torch
+import torch.distributed as dist
+
+dist.init_process_group("nccl")
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+x = torch.zeros(256 * 1024 * 1024, dtype=torch.bfloat16, device="cuda")  # 512 MB
+
+for _ in range(5):          # warm up NCCL communicators
+    dist.all_reduce(x)
+torch.cuda.synchronize()
+
+iters = 20
+t0 = time.perf_counter()
+for _ in range(iters):
+    dist.all_reduce(x)
+torch.cuda.synchronize()
+dt = (time.perf_counter() - t0) / iters
+
+n, size = dist.get_world_size(), x.numel() * x.element_size()
+bus_bw = 2 * (n - 1) / n * size / dt / 1e9   # the "bus bandwidth" figure nccl-tests reports
+if dist.get_rank() == 0:
+    print(f"{size / 1e6:.0f} MB all-reduce: {dt * 1e3:.1f} ms, bus bandwidth {bus_bw:.0f} GB/s")
+dist.destroy_process_group()
+```
+
+**Failure modes.**
+
+- **Hangs, not errors.** A collective blocks until every rank joins it. If one rank skips it (for example, an `if rank == 0:` branch that runs an extra forward pass), the whole job hangs until the NCCL timeout fires. Every rank must issue the same collectives in the same order.
+- **Stragglers.** Step time is set by the slowest GPU. One GPU running hot and throttling slows all of them. Track per-rank step time, not only the average.
+
+### ZeRO stages and FSDP: memory maths ➕
+
+**Problem.** Data parallelism copies the full training state onto every GPU. For mixed-precision Adam, the state per parameter is:
+
+```text
+bf16 weights 2 B + bf16 gradients 2 B + fp32 master weights 4 B + Adam m 4 B + Adam v 4 B = 16 bytes/param
+```
+
+An 8B model therefore needs 128 GB per GPU before any activations, which does not fit on an 80 GB H100.
+
+**Mechanism.** ZeRO (from the DeepSpeed paper) removes the duplication in stages. With `P` parameters and `N` GPUs:
+
+| Stage | What is sharded | Bytes per GPU | 8B on 8 GPUs | 70B on 64 GPUs |
+|---|---|---|---|---|
+| DDP (none) | nothing | `16P` | 128 GB | 1,120 GB |
+| ZeRO-1 | optimizer state | `4P + 12P/N` | 44 GB | 293 GB |
+| ZeRO-2 | + gradients | `2P + 14P/N` | 30 GB | 155 GB |
+| ZeRO-3 / FSDP full shard | + weights | `16P/N` | 16 GB | 17.5 GB |
+
+These figures exclude activations, which the gradient checkpointing sub-section below covers. ZeRO-1 and ZeRO-2 send the same bytes as DDP. ZeRO-3 adds an all-gather of each layer's weights in the forward and again in the backward pass, about 1.5 times the traffic of DDP, in exchange for memory that falls linearly with GPU count. PyTorch FSDP's full-shard mode is the same idea as ZeRO-3.
+
+```python
+def bytes_per_gpu(params: float, n_gpus: int, stage: int) -> float:
+    if stage == 0:
+        return 16 * params
+    if stage == 1:
+        return 4 * params + 12 * params / n_gpus
+    if stage == 2:
+        return 2 * params + 14 * params / n_gpus
+    return 16 * params / n_gpus
+
+for stage in range(4):
+    print(stage, round(bytes_per_gpu(8e9, 8, stage) / 1e9), "GB")   # 128, 44, 30, 16
+```
+
+**Implementation with FSDP2.** In current PyTorch (FSDP2, `fully_shard`), you shard each transformer block, then the root module:
+
+```python
+# torchrun --nproc_per_node=8 train_fsdp.py
+import os, torch
+import torch.distributed as dist
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from transformers import AutoConfig, AutoModelForCausalLM
+
+dist.init_process_group("nccl")
+torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+config = AutoConfig.from_pretrained("meta-llama/Llama-3.1-8B")
+with torch.device("meta"):                      # build the model without allocating memory
+    model = AutoModelForCausalLM.from_config(config)
+
+mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+for block in model.model.layers:                # one all-gather per block, not per tensor
+    fully_shard(block, mp_policy=mp)
+fully_shard(model, mp_policy=mp)                # root picks up embeddings and lm_head
+
+model.to_empty(device="cuda")                   # allocate only this rank's shard
+# Next: load weights shard by shard with torch.distributed.checkpoint, or call
+# set_model_state_dict(..., options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True)).
+# Also re-create non-persistent buffers (e.g. rotary inv_freq), which to_empty leaves uninitialised.
+
+optim = torch.optim.AdamW(model.parameters(), lr=1e-5)
+for batch in loader:
+    loss = model(**batch).loss
+    loss.backward()        # gradients are reduce-scattered here, overlapped with compute
+    optim.step()
+    optim.zero_grad()
+```
+
+**Edge cases.**
+
+- **CPU memory blow-up.** Loading the full fp32 checkpoint on each of 8 ranks needs `8 × 32 GB` of host RAM before sharding begins. Building on the meta device and loading shard-wise avoids it.
+- **Wrap granularity.** Wrapping only the root makes FSDP gather the whole model at once, so you lose the memory benefit. Wrapping every linear layer creates thousands of tiny collectives. Per-transformer-block is the usual middle ground.
+- **When sharding is not enough.** Past roughly 70B parameters, or with very long sequences, teams add tensor parallelism inside a node and pipeline parallelism across nodes (Megatron-style). Tensor parallelism is introduced in [Chapter 13](/docs/genai-handbook/13-ai-inference-systems).
+
+### Gradient (activation) checkpointing ➕
+
+**Problem.** After sharding, activations are often the largest memory item, and they grow with sequence length and batch size.
+
+**Why, in numbers.** The Megatron activation-recomputation paper estimates the stored activations of one transformer layer at about `s × b × h × (34 + 5 × a × s / h)` bytes in 16-bit precision, where `s` is the sequence length, `b` the micro-batch, `h` the hidden size and `a` the number of attention heads. FlashAttention avoids storing the `s × s` attention matrix, which removes the second term and leaves about `34 × s × b × h`. For an 8B-class model (`h = 4096`, 32 layers) with `s = 8192` and `b = 1`:
+
+```text
+34 × 8192 × 1 × 4096 ≈ 1.14 GB per layer × 32 layers ≈ 36.5 GB of activations
+```
+
+**Mechanism.** Checkpointing keeps only each block's input (`2 × s × b × h ≈ 64 MB` per layer, about 2 GB in total) and recomputes the block's internals during the backward pass. Memory drops from 36.5 GB to about 2 GB plus one block's working set. The price is roughly one extra forward pass, which is about 30% more compute per step (forward is about a third of forward plus backward).
+
+```python
+# Hugging Face models
+model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+# Plain PyTorch: wrap a block's forward
+from torch.utils.checkpoint import checkpoint
+
+def forward(self, x):
+    for block in self.blocks:
+        x = checkpoint(block, x, use_reentrant=False)
+    return x
+```
+
+**Edge cases.**
+
+- **Frozen base plus LoRA.** With the older reentrant implementation, a checkpointed block whose inputs do not require grad produces no gradients for the adapters inside it. Use `use_reentrant=False` (TRL's `SFTConfig` turns checkpointing on by default).
+- **Selective checkpointing.** Recomputing everything wastes compute on cheap operations. Checkpointing every second block, or only the attention and MLP internals, trades a little memory back for speed.
+
+### Fault tolerance and checkpoint cadence ➕
+
+Chapter 23.13 says to checkpoint "every N steps"; this section works out what N should be.
+
+**Problem.** Large jobs fail often. During Llama 3 405B pre-training, Meta recorded 419 unexpected interruptions in 54 days on 16,384 H100s, about one every 3 hours, and more than half were GPU or HBM faults. Every failure loses all work since the last checkpoint, plus the restart time.
+
+**Why there is an optimum.** Checkpointing often wastes time writing; checkpointing rarely wastes time redoing work. With `C` the time a checkpoint blocks training and `M` the mean time between failures, the Young/Daly approximation gives:
+
+```text
+optimal interval  τ ≈ sqrt(2 × C × M)
+wasted fraction   ≈ C / τ + τ / (2 × M)
+```
+
+| Setup | C | M | τ | Waste (excluding restart) |
+|---|---|---|---|---|
+| Blocking save to shared storage | 60 s | 3 h | about 19 min | about 10.5% |
+| Async save (only a GPU-to-CPU copy blocks) | 5 s | 3 h | about 5.5 min | about 3% |
+
+The second row shows why large jobs use asynchronous checkpointing: training continues while a background thread writes to storage.
+
+```python
+import math
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict
+
+def optimal_interval_s(ckpt_block_s: float, mtbf_s: float) -> float:
+    return math.sqrt(2 * ckpt_block_s * mtbf_s)
+
+pending = None
+def maybe_checkpoint(step: int, model, optim, every_steps: int):
+    global pending
+    if step % every_steps:
+        return
+    if pending is not None:
+        pending.result()                      # never start a new save before the last one finishes
+    model_sd, optim_sd = get_state_dict(model, optim)
+    pending = dcp.async_save(
+        {"model": model_sd, "optim": optim_sd},
+        checkpoint_id=f"/mnt/ckpt/step-{step:08d}",   # each rank writes only its own shards
+    )
+```
+
+**Edge cases.**
+
+- **Save more than weights.** Optimizer state, LR scheduler, data-loader position and RNG state all belong in the checkpoint. Without the loader position, a resumed job trains on the same data twice.
+- **Torn checkpoints.** A crash during a write leaves a half-written directory. Write to a temporary name, then mark it complete, and resume only from complete checkpoints.
+- **Untested restores.** Restore a checkpoint in a test job regularly. A checkpoint that cannot be loaded is worse than none, because it gives false confidence.
+- **Automatic restart.** `torchrun --max-restarts` (or a Kubernetes job controller) restarts failed ranks. On spot or preemptible GPUs, a 2-minute preemption notice (AWS) is just enough to trigger one last async save.
+
+## 21.22 Real-World Architecture
+
+<Mermaid chart={`flowchart TD
+    EDGE["Edge (CDN, WAF)"] --> APIGW[API gateway]
+    APIGW --> AUTH["Auth (JWT, OAuth)"]
+    AUTH --> CHAT[Chat service]
+    AUTH --> SEARCH[Search service]
+    AUTH --> AGENT[Agent service]
+    CHAT & SEARCH & AGENT --> LLMGW[LLM gateway]
+    subgraph PLATFORM[Shared platform]
+        VDB["Vector DB cluster (sharded, replicated)"]
+        INF["Inference pools (large H100, small A10G, batch spot)"]
+        TOOLS[Tool microservices]
+        WF["Workflow engine (Temporal) for long agents"]
+        BUS["Event bus (Kafka)"]
+        PERSIST["Persistence (Postgres, Redis, object store)"]
+    end
+    LLMGW --> PLATFORM
+    CHAT & SEARCH & AGENT --> PLATFORM
+    PLATFORM --> OBS["Observability mesh (OpenTelemetry, Prometheus, Tempo, Loki)"]
+    OBS --> SECRETS["Secrets (Vault)"]
+    SECRETS --> CICD["CI/CD + IaC"]`} />
+
+## 21.23 Tradeoffs
+
+| Choice | Win | Cost |
+|---|---|---|
+| Microservices | Independent scale, language choice | Operational complexity |
+| Monolith | Simpler ops | Coupled deployments |
+| Strong consistency | Predictable | Latency, availability |
+| Eventual consistency | Available, fast | Stale reads |
+| Sync orchestration | Simple flow | Tight coupling |
+| Event-driven | Decoupled, scalable | Eventual, harder debug |
+
+## 21.24 Failure Modes
+
+In any distributed AI system, plan for:
+- LLM provider outage.
+- Vector DB partition.
+- Network slowness between services.
+- Cascading retries amplifying load.
+- Cold-start delays during scale events.
+- Cross-region replication lag.
+
+Defenses: timeouts, retries, circuit breakers, bulkheads, graceful degradation (fallback to a smaller model, fallback to keyword search if vector down, fallback to "service degraded" message).
+
+## 21.25 Interview Questions
+
+- Explain CAP and PACELC. Where does each AI component live?
+- When would you use a workflow engine instead of a synchronous loop?
+- Walk through retries, idempotency, and backpressure for an embedding pipeline.
+- Design a multi-region AI service with regional failover.
+- Compare microservices and monolithic architectures for a small AI team.
+- ➕ Why does round-robin load balancing waste GPU capacity for LLM serving? **Each replica's prefix cache is local, so spreading one tenant across all replicas makes every cache hold every prefix. Prefix-affine routing with a load cap multiplies the effective cache size by the replica count.**
+- ➕ What does ZeRO-3 / FSDP full sharding save, and what does it cost? **Training state drops from 16 bytes per parameter per GPU to `16/N`. The cost is an extra all-gather of weights in forward and backward, about 1.5 times the communication of plain data parallel.**
+- ➕ How often should a 1,000-GPU job checkpoint? **Use Young/Daly: `sqrt(2 × C × M)`. With a 60 s blocking save and a 3-hour mean time between failures that is about 19 minutes. Async saves cut `C` and allow much shorter intervals.**
+- ➕ When does disaggregated prefill/decode help? **When long prompts cause inter-token latency spikes for streaming users and there is a fast RDMA fabric to move the KV cache. It improves tail latency control, not raw throughput.**
+- ➕ Why is a queue the wrong tool for an interactive chat burst? **The backlog drains only at the spare capacity rate, which can mean minutes of waiting. Interactive traffic needs fast rejection or a cheaper fallback model, and queues suit work that can wait.**
+
+## 21.26 Hands-on Exercises
+
+1. Map your design from Chapter 1 to distributed components. Identify failure modes per component.
+2. Design retry and timeout policies for every external call in that system.
+3. Plan graceful degradation paths when each major dependency fails.
+
+## 21.27 Common Mistakes
+
+- No timeouts; piling threads on slow dependencies.
+- Retries without idempotency, causing duplicate actions.
+- Tight coupling between services; one team blocks another constantly.
+- Treating eventual consistency as a bug instead of designing for it.
+- Skipping circuit breakers, suffering cascading failures.
+
+## 21.28 Enterprise Best Practices
+
+OpenTelemetry tracing across every service. Documented SLOs and SLIs per component. Failure scenarios documented and rehearsed. Workflow engine for any process with more than a handful of steps or any retry needs. Regular dependency review for unnecessary coupling.
+
+## Sources
+
+Checked October 2026. Throughput, bandwidth and failure-rate figures are examples or published measurements; measure your own hardware.
+
+- Rajbhandari et al., [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054) (2019): the 16 bytes/parameter breakdown, the three stages and the 1.5× communication of stage 3.
+- PyTorch, [Getting Started with Fully Sharded Data Parallel (FSDP2)](https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html) and [Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html): `fully_shard`, `MixedPrecisionPolicy`, `get_state_dict`, `async_save`.
+- NVIDIA, [nccl-tests performance notes](https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md): the bus-bandwidth formula for all-reduce.
+- Korthikanti et al., [Reducing Activation Recomputation in Large Transformer Models](https://arxiv.org/abs/2205.05198) (2022): the per-layer activation memory estimate.
+- Llama Team, Meta, [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783) (2024): 419 unexpected interruptions in 54 days on 16,384 H100 GPUs.
+- J. T. Daly, "A higher order estimate of the optimum checkpoint interval for restart dumps", Future Generation Computer Systems 22 (2006): the Young/Daly checkpoint interval.
+- Zhong et al., [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving](https://arxiv.org/abs/2401.09670) (OSDI 2024).
+- vLLM docs, [Disaggregated Prefilling (experimental)](https://docs.vllm.ai/en/latest/features/disagg_prefill.html) and [Automatic Prefix Caching](https://docs.vllm.ai/en/latest/design/prefix_caching.html).
+- [Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/) and [llm-d inference scheduler](https://llm-d.ai/docs/architecture/Components/inf-scheduler): prefix-cache-aware routing on Kubernetes.
+- [arq documentation](https://arq-docs.helpmanual.io/): job uniqueness with `_job_id`, `Retry` with `defer`, `max_tries`, pessimistic execution.
+- AWS Architecture Blog, [Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/): the "full jitter" strategy.
+- Anthropic, [API errors](https://docs.anthropic.com/en/api/errors): `429` rate limit and `529` overloaded.

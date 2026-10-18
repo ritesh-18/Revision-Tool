@@ -1,0 +1,807 @@
+---
+title: "Agents and Long-Running Jobs"
+description: "Why agent runs don't fit in a request, and the job pattern that replaces it: 202 plus a job id, a worker that runs the agent loop, progress by polling, SSE or WebSocket, persisted steps, idempotency keys, cancellation, timeouts and step budgets, human approval, crash recovery with leases, and production queues (arq, Celery, Dramatiq, durable execution)."
+---
+
+An **agent** is a loop: the model looks at the conversation, asks to call a tool, your code runs the tool, the result goes back to the model, and this repeats until the model says it's done. A single run can make dozens of LLM calls and tool calls and take minutes. Some runs pause for a human to approve an action.
+
+HTTP request/response was not designed for that. This chapter replaces "do the work in the request" with a **job**: the request creates a record and returns at once, a worker runs the loop, and the client follows progress through a separate channel.
+
+All runnable snippets were run on **CPython 3.14.6** with FastAPI 0.143.0. The agent's model is a scripted fake, because there's no API key here. The real Claude loop is shown and marked **not run**. The arq examples need a Redis server, which isn't running in this environment, so they are also marked **not run**.
+
+## Why an agent doesn't fit in a request
+
+A request handler that runs the whole agent fails in several ways at once:
+
+| Problem | What happens |
+| --- | --- |
+| **Timeouts** | Load balancers, API gateways and browsers cut idle or long requests, often at 30 to 120 seconds. The agent keeps running (and spending) with nobody to receive the answer. |
+| **Retries duplicate work** | The client times out and retries. Now two agents run the same task, and both may send the email. |
+| **Deploys kill runs** | A rolling deploy stops the process. Every in-flight run dies halfway, with no record of what it already did. |
+| **No progress** | The user sees a spinner for four minutes. |
+| **No human in the loop** | You can't pause a request for an hour while someone approves a refund. |
+| **Capacity** | Each run holds a worker slot and a connection for minutes. Your API's capacity becomes "number of concurrent agents". |
+
+The fix is the same one used for any slow work (see [Task queues and background jobs](/docs/backend-first-principles/14-task-queues-background-jobs)): split **accepting** the work from **doing** it.
+
+## The job pattern
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant API as FastAPI
+  participant DB as Job store
+  participant Q as Queue
+  participant W as Worker
+  participant LLM as LLM and tools
+  C->>API: POST /jobs (Idempotency-Key)
+  API->>DB: insert job (queued)
+  API->>Q: enqueue job id
+  API-->>C: 202 Accepted, Location header
+  W->>Q: take job id
+  W->>DB: status = running
+  loop each step
+    W->>LLM: model call / tool call
+    W->>DB: append step (checkpoint)
+  end
+  C->>API: GET /jobs/id (poll) or GET /jobs/id/events (SSE)
+  API->>DB: read status and steps
+  API-->>C: progress
+  W->>DB: status = succeeded, result
+`} />
+
+The job record is the contract between the API and the workers. A job moves through a small state machine:
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> queued
+  queued --> running: worker picks it up
+  queued --> cancelled: cancel
+  running --> waiting_approval: risky tool call
+  waiting_approval --> running: approve or reject
+  running --> succeeded
+  running --> failed: error, timeout, budget
+  running --> cancelled: cancel
+  waiting_approval --> cancelled: cancel
+  running --> queued: worker crashed, lease expired
+  succeeded --> [*]
+  failed --> [*]
+  cancelled --> [*]`} />
+
+Three of these states are **terminal**: once a job is `succeeded`, `failed` or `cancelled`, nothing changes it again. Every endpoint below checks the state before acting.
+
+## A runnable version: in-process queue and workers
+
+Start with everything in one process: an `asyncio.Queue`, two worker tasks started in the [lifespan](/docs/fastapi/middleware-lifespan-and-background-tasks), and dicts as the job store. It's not production-ready (a restart loses everything), but every production concern has a place in it, and it runs.
+
+The fake model plays the role of a tool-use response. Given the transcript so far, it returns either a tool call or a final answer:
+
+```python
+import asyncio
+import json
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, Literal
+
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+JobStatus = Literal["queued", "running", "waiting_approval",
+                    "succeeded", "failed", "cancelled"]
+TERMINAL = {"succeeded", "failed", "cancelled"}
+
+
+class Step(BaseModel):
+    n: int
+    kind: Literal["llm", "tool", "approval"]
+    detail: str
+    at: float = Field(default_factory=time.monotonic)
+
+
+class Job(BaseModel):
+    id: str
+    task: str
+    status: JobStatus = "queued"
+    steps: list[Step] = []
+    result: str | None = None
+    error: str | None = None
+    max_steps: int = 10
+    timeout_s: float = 5.0
+    pending_tool: dict[str, Any] | None = None   # tool call awaiting human approval
+    approved: bool | None = None
+
+
+class CreateJob(BaseModel):
+    task: str
+    max_steps: int = Field(10, ge=1, le=50)
+    timeout_s: float = Field(5.0, gt=0, le=600)
+
+
+# ---------- a scripted stand-in for the model ----------
+class FakeAgentLLM:
+    """Returns the next action given the transcript, like a tool-use response would."""
+
+    PLAN = [
+        {"tool": "search_orders", "input": {"customer": "acme"}},
+        {"tool": "read_order", "input": {"order_id": "A-17"}},
+        {"tool": "send_email", "input": {"to": "ops@acme.test", "body": "Refund approved"}},
+    ]
+
+    async def next_action(self, transcript: list[dict]) -> dict:
+        await asyncio.sleep(0.02)                    # network latency of one LLM call
+        tool_results = sum(1 for m in transcript if m["role"] == "tool")
+        if "loop forever" in transcript[0]["content"]:
+            return {"tool": "search_orders", "input": {"customer": "acme"}}
+        if tool_results < len(self.PLAN):
+            return self.PLAN[tool_results]
+        return {"final": "Refund for order A-17 approved and customer notified."}
+
+
+TOOLS_NEEDING_APPROVAL = {"send_email"}
+
+
+async def run_tool(name: str, args: dict) -> str:
+    await asyncio.sleep(0.01)
+    return {"search_orders": "found A-17, A-18", "read_order": "A-17: damaged, $40",
+            "send_email": "sent"}[name]
+```
+
+The prompt "loop forever" makes the fake keep calling tools, which is how the demo triggers the budget and timeout guards. Real agents loop for subtler reasons: a tool keeps returning an error the model can't fix, or the model keeps "double-checking".
+
+### The agent loop
+
+```python
+async def run_agent(app: FastAPI, job: Job) -> None:
+    llm: FakeAgentLLM = app.state.llm
+    transcript = [{"role": "user", "content": job.task}]
+    async with asyncio.timeout(job.timeout_s):
+        while True:
+            if len(job.steps) >= job.max_steps:
+                raise RuntimeError(f"step budget of {job.max_steps} exhausted")
+            action = await llm.next_action(transcript)
+            if "final" in action:
+                job.result = action["final"]
+                return
+            job.steps.append(Step(n=len(job.steps) + 1, kind="llm",
+                                  detail=f"wants {action['tool']}({action['input']})"))
+
+            if action["tool"] in TOOLS_NEEDING_APPROVAL:
+                job.pending_tool, job.status = action, "waiting_approval"
+                job.steps.append(Step(n=len(job.steps) + 1, kind="approval",
+                                      detail=f"waiting for approval of {action['tool']}"))
+                event = app.state.approvals.setdefault(job.id, asyncio.Event())
+                await event.wait()                    # parked; no CPU, no LLM spend
+                job.status, job.pending_tool = "running", None
+                if not job.approved:
+                    transcript.append({"role": "tool", "content": "rejected by human"})
+                    job.result = "Stopped: a human rejected the email."
+                    return
+
+            output = await run_tool(action["tool"], action["input"])
+            transcript.append({"role": "tool", "content": output})
+            job.steps.append(Step(n=len(job.steps) + 1, kind="tool",
+                                  detail=f"{action['tool']} -> {output}"))
+```
+
+Four guards are built into the loop:
+
+- **Step budget.** `max_steps` caps how many steps one run may take. Without it, a confused agent loops until something else breaks, and every iteration is a paid LLM call. Count steps, and also track tokens or dollars (see [Production AI concerns](/docs/fastapi/production-ai-concerns)).
+- **Wall-clock timeout.** `asyncio.timeout` cancels whatever is being awaited when the deadline passes and raises `TimeoutError` at the `async with` (see [asyncio](/docs/python/asyncio) for how cancellation works).
+- **Approval gate.** Tools with side effects that are hard to undo (sending email, issuing refunds, deleting data) don't run until a human says so. The worker parks on an `asyncio.Event` and uses no CPU and no tokens while waiting.
+- **A step record per action.** Every decision and every tool result is appended to `job.steps`. That's the progress feed, the audit log, and (once it's in a database) the checkpoint for resuming after a crash.
+
+### Workers
+
+```python
+async def worker(app: FastAPI, name: str) -> None:
+    queue: asyncio.Queue[str] = app.state.queue
+    while True:
+        job_id = await queue.get()
+        job: Job = app.state.jobs[job_id]
+        if job.status == "cancelled":                 # cancelled while still queued
+            queue.task_done()
+            continue
+        job.status = "running"
+        task = asyncio.current_task()
+        app.state.running[job_id] = task
+        try:
+            await run_agent(app, job)
+            job.status = "succeeded"
+        except asyncio.CancelledError:
+            if task.cancelling() and job.status != "cancelled":
+                raise                                  # the worker itself is shutting down
+            job.status = "cancelled"
+            task.uncancel()                            # we handled it; keep the worker alive
+        except TimeoutError:
+            job.status, job.error = "failed", f"timed out after {job.timeout_s}s"
+        except Exception as exc:
+            job.status, job.error = "failed", str(exc)
+        finally:
+            app.state.running.pop(job_id, None)
+            queue.task_done()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.jobs = {}              # job_id -> Job      (Postgres in production)
+    app.state.idempotency = {}       # key -> job_id      (unique index in production)
+    app.state.approvals = {}         # job_id -> asyncio.Event
+    app.state.running = {}           # job_id -> worker Task
+    app.state.queue = asyncio.Queue()
+    app.state.llm = FakeAgentLLM()
+    workers = [asyncio.create_task(worker(app, f"w{i}")) for i in range(2)]
+    yield
+    for w in workers:
+        w.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+
+
+app = FastAPI(lifespan=lifespan)
+```
+
+The worker turns every outcome into a terminal state, so no job is ever stuck in `running` because of an exception. The cancellation branch needs care. The cancel endpoint below cancels the worker *task*, and the same `CancelledError` also arrives when the app shuts down. The worker tells them apart by checking whether the job was marked `cancelled` first. For a user cancel, it calls `task.uncancel()` so the task's pending-cancellation count goes back to zero, and keeps serving the queue. For a shutdown, it re-raises.
+
+### Endpoints
+
+```python
+@app.post("/jobs", status_code=status.HTTP_202_ACCEPTED, response_model=Job)
+async def create_job(body: CreateJob, request: Request, response: Response,
+                     idempotency_key: str | None = Header(default=None)):
+    state = request.app.state
+    if idempotency_key and idempotency_key in state.idempotency:
+        job = state.jobs[state.idempotency[idempotency_key]]
+        response.headers["Location"] = f"/jobs/{job.id}"
+        return job                                    # same job, no second agent run
+    job = Job(id=uuid.uuid4().hex[:8], task=body.task,
+              max_steps=body.max_steps, timeout_s=body.timeout_s)
+    state.jobs[job.id] = job
+    if idempotency_key:
+        state.idempotency[idempotency_key] = job.id
+    await state.queue.put(job.id)
+    response.headers["Location"] = f"/jobs/{job.id}"
+    return job
+
+
+def get_job_or_404(request: Request, job_id: str) -> Job:
+    job = request.app.state.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    return job
+
+
+@app.get("/jobs/{job_id}", response_model=Job)
+async def get_job(job_id: str, request: Request):
+    return get_job_or_404(request, job_id)
+
+
+@app.get("/jobs/{job_id}/events")
+async def job_events(job_id: str, request: Request):
+    job = get_job_or_404(request, job_id)
+
+    async def stream():
+        sent = 0
+        while True:
+            for step in job.steps[sent:]:
+                yield f"event: step\ndata: {step.model_dump_json()}\n\n"
+            sent = len(job.steps)
+            if job.status in TERMINAL:
+                payload = json.dumps({"status": job.status, "result": job.result,
+                                      "error": job.error})
+                yield f"event: end\ndata: {payload}\n\n"
+                return
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(0.02)                 # production: Redis pub/sub instead
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+class Decision(BaseModel):
+    approve: bool
+
+
+@app.post("/jobs/{job_id}/approval", response_model=Job)
+async def decide(job_id: str, decision: Decision, request: Request):
+    job = get_job_or_404(request, job_id)
+    if job.status != "waiting_approval":
+        raise HTTPException(409, f"job is {job.status}, not waiting_approval")
+    job.approved = decision.approve
+    request.app.state.approvals[job_id].set()
+    return job
+
+
+@app.post("/jobs/{job_id}/cancel", response_model=Job)
+async def cancel(job_id: str, request: Request):
+    job = get_job_or_404(request, job_id)
+    if job.status in TERMINAL:
+        raise HTTPException(409, f"job already {job.status}")
+    job.status = "cancelled"
+    task = request.app.state.running.get(job_id)
+    if task is not None:
+        task.cancel()                                 # interrupts the in-flight await
+    return job
+```
+
+- `POST /jobs` returns **202 Accepted** with a `Location` header: "I took it; here's where to look". Status codes are covered in [Responses, errors and status codes](/docs/fastapi/responses-errors-and-status-codes).
+- The **events** endpoint replays every step from the start, then streams new ones, and ends with an `end` event. A client that reconnects gets the full history again. A production version reads from a Redis Stream or pub/sub channel instead of polling memory, and supports the SSE `Last-Event-ID` header so a reconnecting client resumes where it left off.
+- **409 Conflict** answers actions that don't fit the current state: approving a job that isn't waiting, or cancelling one that already finished.
+
+### Driving it
+
+```python
+import json
+import time
+
+from fastapi.testclient import TestClient
+
+from jobs_app import app
+
+
+def wait_for(client, job_id, statuses):
+    while (job := client.get(f"/jobs/{job_id}").json())["status"] not in statuses:
+        time.sleep(0.01)
+    return job
+
+
+with TestClient(app) as client:
+    # 1. submit, retry with the same Idempotency-Key
+    headers = {"Idempotency-Key": "refund-acme-A17"}
+    r1 = client.post("/jobs", json={"task": "Handle refund for acme"}, headers=headers)
+    r2 = client.post("/jobs", json={"task": "Handle refund for acme"}, headers=headers)
+    print(r1.status_code, r1.headers["location"], r1.json()["status"])
+    print("retry returns same job:", r1.json()["id"] == r2.json()["id"],
+          "| jobs stored:", len(app.state.jobs))
+    job_id = r1.json()["id"]
+
+    # 2. the agent parks on the email tool until a human decides
+    job = wait_for(client, job_id, {"waiting_approval"})
+    print("status:", job["status"], "| pending:", job["pending_tool"]["tool"])
+    print(client.post(f"/jobs/{job_id}/approval", json={"approve": True}).json()["status"])
+
+    # 3. follow progress over SSE until the end event
+    with client.stream("GET", f"/jobs/{job_id}/events") as resp:
+        event = None
+        for line in resp.iter_lines():
+            if line.startswith("event: "):
+                event = line[7:]
+            elif line.startswith("data: "):
+                data = json.loads(line[6:])
+                if event == "step":
+                    print(f"  step {data['n']} [{data['kind']}] {data['detail']}")
+                else:
+                    print("  end:", data)
+
+    # 4. step budget
+    r = client.post("/jobs", json={"task": "loop forever please", "max_steps": 4})
+    print("budget job:", wait_for(client, r.json()["id"], {"failed", "succeeded"})["error"])
+
+    # 5. timeout
+    r = client.post("/jobs", json={"task": "loop forever please", "max_steps": 50,
+                                   "timeout_s": 0.1})
+    print("timeout job:", wait_for(client, r.json()["id"], {"failed", "succeeded"})["error"])
+
+    # 6. cancel a running job
+    r = client.post("/jobs", json={"task": "loop forever please", "max_steps": 50})
+    cid = r.json()["id"]
+    wait_for(client, cid, {"running"})
+    time.sleep(0.05)
+    print("cancel:", client.post(f"/jobs/{cid}/cancel").json()["status"])
+    time.sleep(0.05)
+    job = client.get(f"/jobs/{cid}").json()
+    print("after cancel:", job["status"], "| steps recorded:", len(job["steps"]))
+    print("cancel again:", client.post(f"/jobs/{cid}/cancel").status_code)
+```
+
+```text title="Output (job ids are random; the cancelled job's step count depends on timing)"
+202 /jobs/6c94f780 queued
+retry returns same job: True | jobs stored: 1
+status: waiting_approval | pending: send_email
+waiting_approval
+  step 1 [llm] wants search_orders({'customer': 'acme'})
+  step 2 [tool] search_orders -> found A-17, A-18
+  step 3 [llm] wants read_order({'order_id': 'A-17'})
+  step 4 [tool] read_order -> A-17: damaged, $40
+  step 5 [llm] wants send_email({'to': 'ops@acme.test', 'body': 'Refund approved'})
+  step 6 [approval] waiting for approval of send_email
+  step 7 [tool] send_email -> sent
+  end: {'status': 'succeeded', 'result': 'Refund for order A-17 approved and customer notified.', 'error': None}
+budget job: step budget of 4 exhausted
+timeout job: timed out after 0.1s
+cancel: cancelled
+after cancel: cancelled | steps recorded: 2
+cancel again: 409
+```
+
+Walking through it:
+
+1. The retry with the same `Idempotency-Key` returned the **same** job, and only one job exists. Without the key, a client that retried after a network blip would start a second agent.
+2. The agent stopped at `send_email` and waited. The approval endpoint returned `waiting_approval` because it only *signals* the worker. The worker resumes a moment later, on its own task, which is why the step log shows the email being sent afterwards.
+3. The SSE stream replayed all seven steps and ended with the result.
+4. The looping job hit the 4-step budget; the next one hit the 0.1 s timeout. Both ended in `failed` with a reason instead of running forever.
+5. Cancel stopped a running job mid-loop, and cancelling again was a 409.
+
+## The real agent loop with Claude
+
+With the Anthropic SDK, "next action" is a Messages API call with `tools`, and the loop runs while `stop_reason == "tool_use"`. This version is **not run** (no API key). The call shapes were checked against the installed `anthropic` 1.13.0 SDK:
+
+```python
+# Not run: needs ANTHROPIC_API_KEY. Shapes verified against anthropic 1.13.0.
+import anthropic
+
+client = anthropic.AsyncAnthropic()      # one client per worker process
+
+TOOLS = [
+    {
+        "name": "search_orders",
+        "description": "Find a customer's recent orders. Returns order ids and states.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"customer": {"type": "string"}},
+            "required": ["customer"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    # ... read_order, send_email
+]
+
+
+async def agent_loop(job, store, emit) -> str:
+    messages = await store.load_messages(job.id) or [{"role": "user", "content": job.task}]
+    while True:
+        if await store.step_count(job.id) >= job.max_steps:
+            raise BudgetExceeded("step budget exhausted")
+
+        response = await client.messages.create(
+            model="claude-opus-5-5",
+            max_tokens=16000,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        )
+        # Store the assistant turn verbatim, including any thinking blocks:
+        # they must be sent back unchanged on the next request.
+        messages.append({"role": "assistant",
+                         "content": [b.model_dump(exclude_none=True) for b in response.content]})
+        await store.save_step(job.id, messages, response.usage)     # checkpoint
+        await emit({"type": "llm", "stop_reason": response.stop_reason})
+
+        if response.stop_reason == "end_turn":
+            return "".join(b.text for b in response.content if b.type == "text")
+        if response.stop_reason in ("refusal", "max_tokens"):
+            raise AgentStopped(response.stop_reason)
+
+        results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            if block.name in TOOLS_NEEDING_APPROVAL and not await store.is_approved(job.id, block.id):
+                await store.park_for_approval(job.id, block)      # worker exits; resumes later
+                raise ParkedForApproval
+            output = await run_tool(block.name, block.input, idempotency_key=f"{job.id}:{block.id}")
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        # All results for one assistant turn go back in ONE user message.
+        messages.append({"role": "user", "content": results})
+        await store.save_step(job.id, messages, None)
+        await emit({"type": "tool", "count": len(results)})
+```
+
+How this maps onto the fake:
+
+- `response.stop_reason == "tool_use"` means "run these tools and call me again". Claude may request several tools in one turn. Run them (concurrently if they're independent) and return all the `tool_result` blocks in a single user message.
+- **Persist after every turn.** The checkpoint is the `messages` list itself. A worker that resumes the job loads it and continues with the next call.
+- **Keep content blocks verbatim.** Current Claude models return thinking blocks alongside text and tool calls, and the API expects you to send earlier assistant turns back unchanged. `model_dump(exclude_none=True)` stores them as plain JSON-ready dicts without unset optional fields.
+- **The tool's idempotency key is derived from the `tool_use` block id**, which is stable for that call even if the worker crashes and the turn is replayed from the checkpoint.
+- **`strict: True`** makes the tool input conform to the schema. Tool definitions and structured outputs are covered in [Structured outputs and tool calling](/docs/fastapi/structured-outputs-and-tool-calling).
+- **Approval parks the job and ends the worker's run** instead of holding a coroutine open. The approval endpoint marks the tool call approved and re-enqueues the job, and the next run picks up from the checkpoint. In-process `asyncio.Event` waiting (as in the demo) can't survive a restart and holds a worker slot for as long as the human takes.
+
+The SDK also has a **tool runner** (`client.beta.messages.tool_runner`) that drives this loop for you, with per-turn hooks. A hand-written loop is shown here because a job system needs to checkpoint and park between turns. Anthropic also offers **Managed Agents**, which runs the loop and the tool sandbox on Anthropic's side and streams session events. That's worth evaluating when you don't want to own the worker fleet at all.
+
+## Idempotency keys
+
+A client can't tell "the request failed" from "the response got lost". So clients retry, and the server must make a retry harmless. The convention (used by Stripe and others): the client generates a unique `Idempotency-Key` per logical operation and sends it on every retry. The server stores `key -> job id` and returns the existing job when it sees the key again.
+
+In a database, do it with a **unique constraint**, not a read-then-insert. Two concurrent retries can both read "not found" and both insert:
+
+```sql
+-- Not run: illustrative schema
+CREATE TABLE jobs (
+  id               text PRIMARY KEY,
+  tenant_id        text NOT NULL,
+  idempotency_key  text,
+  request_sha256   text NOT NULL,
+  status           text NOT NULL,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, idempotency_key)
+);
+-- INSERT ... ON CONFLICT (tenant_id, idempotency_key) DO NOTHING RETURNING id;
+-- If nothing came back, SELECT the existing row and return it.
+```
+
+Scope keys per tenant, so one customer's key can't collide with another's. Store a hash of the request body too: if the same key arrives with a *different* body, that's a client bug, and the right answer is **422**, not the old job. Expire keys after a day or so.
+
+Idempotency also applies **inside** the job. A worker that crashes after a tool call but before the checkpoint will repeat that call on resume. Every tool with side effects needs its own idempotency key (the job id plus the tool call id), passed through to the downstream API or checked against your own table before acting.
+
+## Crash recovery: leases and checkpoints
+
+A worker can die without running any cleanup code: an OOM kill, `kill -9`, a node disappearing. Its job stays `running` forever unless something notices. The usual mechanism is a **lease**: the worker keeps extending a `lease_until` timestamp while it works (a heartbeat), and a **reaper** re-queues `running` jobs whose lease has expired. The next worker resumes from the last checkpoint.
+
+This simulation runs that sequence in plain asyncio. Worker A crashes after the side effect of step 3 but **before** step 3's checkpoint, which is the worst case:
+
+```python
+import asyncio
+import time
+
+LEASE_S = 0.2
+
+# What a jobs table + steps table would hold. Every write here is a committed DB row.
+db = {"job-1": {"status": "queued", "attempt": 0, "lease_until": 0.0,
+                "steps": [], "plan": ["search", "read", "draft", "send"]}}
+side_effects: list[str] = []          # what the outside world saw
+
+
+class WorkerCrashed(Exception):
+    """Stands in for kill -9, an OOM kill or a lost node."""
+
+
+async def run_tool(job_id: str, step_no: int, name: str) -> None:
+    # Idempotent by construction: the effect is keyed by (job, step).
+    key = f"{job_id}:{step_no}:{name}"
+    if key in side_effects:
+        print(f"  tool: {key} already applied, skipping")
+    else:
+        side_effects.append(key)
+    await asyncio.sleep(0.01)
+
+
+async def heartbeat(job_id: str) -> None:
+    while True:
+        db[job_id]["lease_until"] = time.monotonic() + LEASE_S
+        await asyncio.sleep(LEASE_S / 3)
+
+
+async def work(job_id: str, worker: str, crash_after: int | None) -> None:
+    job = db[job_id]
+    job["status"], job["attempt"] = "running", job["attempt"] + 1
+    hb = asyncio.create_task(heartbeat(job_id))
+    try:
+        done = len(job["steps"])                       # resume point = last checkpoint
+        print(f"{worker}: attempt {job['attempt']} resuming at step {done + 1}")
+        for step_no, name in enumerate(job["plan"][done:], start=done + 1):
+            await run_tool(job_id, step_no, name)
+            if crash_after is not None and step_no > crash_after:
+                raise WorkerCrashed                    # effect happened, checkpoint did not
+            job["steps"].append(name)                  # checkpoint after each step
+            print(f"{worker}: step {step_no} {name} committed")
+        job["status"] = "succeeded"
+    except WorkerCrashed:
+        print(f"{worker}: crashed (no status update, no cleanup)")
+        hb.cancel()
+        return                                         # dead process: lease simply stops renewing
+    hb.cancel()
+
+
+async def reaper() -> None:
+    """Runs on a timer: any 'running' job whose lease expired goes back to the queue."""
+    while True:
+        await asyncio.sleep(LEASE_S / 2)
+        for job_id, job in db.items():
+            if job["status"] == "running" and job["lease_until"] < time.monotonic():
+                if job["attempt"] >= 3:
+                    job["status"] = "failed"
+                    print(f"reaper: {job_id} exceeded max attempts, marking failed")
+                else:
+                    job["status"] = "queued"
+                    print(f"reaper: lease on {job_id} expired, re-queued")
+                    asyncio.create_task(work(job_id, "worker-B", crash_after=None))
+
+
+async def main():
+    r = asyncio.create_task(reaper())
+    await work("job-1", "worker-A", crash_after=2)
+    while db["job-1"]["status"] not in ("succeeded", "failed"):
+        await asyncio.sleep(0.05)
+    r.cancel()
+    print("final:", db["job-1"]["status"], db["job-1"]["steps"])
+    print("side effects:", side_effects)
+
+
+asyncio.run(main())
+```
+
+```text title="Output"
+worker-A: attempt 1 resuming at step 1
+worker-A: step 1 search committed
+worker-A: step 2 read committed
+worker-A: crashed (no status update, no cleanup)
+reaper: lease on job-1 expired, re-queued
+worker-B: attempt 2 resuming at step 3
+  tool: job-1:3:draft already applied, skipping
+worker-B: step 3 draft committed
+worker-B: step 4 send committed
+final: succeeded ['search', 'read', 'draft', 'send']
+side effects: ['job-1:1:search', 'job-1:2:read', 'job-1:3:draft', 'job-1:4:send']
+```
+
+Worker B didn't redo steps 1 and 2, because they were checkpointed. It did re-run step 3, because the crash happened between the effect and the checkpoint, and the tool's idempotency key turned that re-run into a no-op. Every side effect happened exactly once.
+
+This is the general truth about job systems: **delivery is at-least-once**. There's always a window between "did the thing" and "recorded that I did it". You can't close that window. You can only make repeats harmless. The attempt counter bounds the retries, so a job that crashes its worker every time (a poison job) eventually fails instead of looping forever.
+
+In Postgres, the reaper is a periodic query like `UPDATE jobs SET status='queued' WHERE status='running' AND lease_until < now() RETURNING id`. Workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`, so two workers never take the same row.
+
+## Polling, SSE or WebSocket
+
+All three read the same job record; they differ in how updates reach the client.
+
+| | Polling `GET /jobs/id` | SSE `GET /jobs/id/events` | WebSocket |
+| --- | --- | --- | --- |
+| Direction | client pulls | server pushes | both ways |
+| Latency | up to the poll interval | immediate | immediate |
+| Infrastructure | any HTTP | long-lived HTTP; proxies must not buffer | upgrade support, sticky sessions |
+| Reconnect | trivial | built into `EventSource` with `Last-Event-ID` | you write it |
+| Good for | scripts, webhooks, batch clients | progress feeds, token streams | interactive agents where the user steers mid-run |
+
+A sensible default: always offer polling (it's what scripts and other services use), add SSE for UIs, and use a [WebSocket](/docs/fastapi/websockets-and-streaming) only when the client needs to send messages into a running job, such as "stop" or "also check order A-18". For server-to-server clients, a **webhook** callback on completion avoids polling entirely.
+
+## Production: a real queue
+
+The in-process version breaks as soon as you have more than one process, or restart. The production split is: API processes accept jobs and serve status; separate **worker processes** run agents; a **queue** connects them; **Postgres** holds the durable job and step records. The queue only carries job ids; the truth lives in the database.
+
+<Mermaid chart={`flowchart LR
+  C["Clients"] --> LB["Load balancer"]
+  LB --> A1["API process"]
+  LB --> A2["API process"]
+  A1 & A2 -->|insert job| PG[("Postgres<br/>jobs, steps")]
+  A1 & A2 -->|enqueue id| R[("Redis<br/>queue + event streams")]
+  R --> W1["worker process<br/>many async jobs"]
+  R --> W2["worker process"]
+  W1 & W2 -->|checkpoints| PG
+  W1 & W2 -->|progress events| R
+  W1 & W2 --> LLM["LLM API and tools"]
+  R -->|SSE fan-out| A1 & A2`} />
+
+### arq
+
+**arq** is an asyncio-native job queue on Redis. Agent jobs spend nearly all their time awaiting network calls, so one async worker process can run many of them concurrently, which is a good fit. The worker below is **not run** (it needs a Redis server). Its settings were checked by constructing an `arq.worker.Worker` with them against the installed arq 0.28.0:
+
+```python
+# worker.py   (start with:  arq worker.WorkerSettings)   Not run: needs Redis.
+import json
+
+from arq import Retry
+from arq.connections import RedisSettings
+from arq.worker import func
+
+REDIS = RedisSettings(host="localhost", port=6379)
+
+
+async def run_agent_job(ctx: dict, job_id: str) -> str:
+    redis = ctx["redis"]                     # arq gives every job the pool
+    attempt = ctx["job_try"]                 # 1 on the first run, 2 on the first retry...
+    db = ctx["db"]                           # whatever on_startup put there
+
+    job = await db.load_job(job_id)          # steps already done are in Postgres
+    if job.status in ("succeeded", "cancelled"):
+        return job.status                    # duplicate delivery: nothing to do
+    await db.mark_running(job_id, attempt)
+
+    async def emit(event: dict) -> None:     # progress for SSE/WebSocket listeners
+        await redis.xadd(f"job:{job_id}:events", {"data": json.dumps(event)}, maxlen=1000)
+
+    try:
+        result = await agent_loop(job, db, emit)  # checkpoints every step
+    except TransientLLMError:
+        raise Retry(defer=attempt * 10)      # back off 10 s, 20 s, ... then re-run the job
+    await db.finish(job_id, result)
+    await emit({"type": "end", "status": "succeeded"})
+    return "succeeded"
+
+
+async def startup(ctx: dict) -> None:
+    ctx["db"] = await connect_db()           # one pool per worker process, not per job
+    ctx["llm"] = make_anthropic_client()
+
+
+async def shutdown(ctx: dict) -> None:
+    await ctx["db"].close()
+
+
+class WorkerSettings:
+    functions = [func(run_agent_job, timeout=900, max_tries=3)]
+    redis_settings = REDIS
+    on_startup = startup
+    on_shutdown = shutdown
+    max_jobs = 20                # concurrent jobs per worker process (all I/O-bound)
+    allow_abort_jobs = True      # lets the API cancel a running job
+    keep_result = 3600
+```
+
+The API side (**not run**):
+
+```python
+# Not run: needs Redis.
+from arq import create_pool
+from arq.jobs import Job as ArqJob
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.arq = await create_pool(REDIS)
+    yield
+    await app.state.arq.aclose()
+
+
+@app.post("/jobs", status_code=202)
+async def create_job(body: CreateJob, request: Request, tenant=Depends(current_tenant),
+                     idempotency_key: str | None = Header(default=None)):
+    job = await jobs_repo.create_or_get(tenant.id, idempotency_key, body)   # unique constraint
+    if job.created:
+        # _job_id makes arq refuse a second enqueue of the same id while it exists
+        await request.app.state.arq.enqueue_job("run_agent_job", job.id, _job_id=job.id)
+    return job
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel(job_id: str, request: Request):
+    await jobs_repo.mark_cancelled(job_id)                 # the worker also checks this flag
+    await ArqJob(job_id, request.app.state.arq).abort(timeout=5)
+    return {"status": "cancelled"}
+
+
+@app.get("/jobs/{job_id}/events")
+async def events(job_id: str, request: Request, last_event_id: str = Header("0")):
+    redis = request.app.state.arq
+
+    async def stream():
+        last = last_event_id
+        while not await request.is_disconnected():
+            batch = await redis.xread({f"job:{job_id}:events": last}, block=15000, count=100)
+            if not batch:
+                yield ": keep-alive\n\n"                   # comment line keeps proxies happy
+                continue
+            for _stream, entries in batch:
+                for entry_id, fields in entries:
+                    last = entry_id.decode()
+                    yield f"id: {last}\ndata: {fields[b'data'].decode()}\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+```
+
+Notes on the arq version:
+
+- `func(..., timeout=900, max_tries=3)` sets a per-job wall-clock limit and a retry cap. `raise Retry(defer=...)` asks arq to run the job again later; on the retry, `ctx["job_try"]` is incremented and the job resumes from its Postgres checkpoint.
+- `_job_id=job.id` gives arq-level deduplication on top of your database's unique constraint.
+- `Job(...).abort()` requires `allow_abort_jobs = True` on the worker. It cancels the job's task in the worker, which raises `CancelledError` inside your loop; mark the job `cancelled` in Postgres too, because the database is what clients read.
+- **Redis Streams** (`XADD` and `XREAD`) give each event an id, which maps directly to SSE's `id:` field and `Last-Event-ID` reconnects. Plain pub/sub drops anything sent while a subscriber was disconnected.
+- arq delivers **at least once**: a job interrupted by a worker shutdown or crash can run again. Everything from the leases section still applies.
+
+### Other options
+
+- **Celery** is the long-standing Python task queue (Redis or RabbitMQ brokers, huge ecosystem, `acks_late` for at-least-once). Its workers are synchronous by default, so each agent run occupies a worker process or thread for minutes. That's fine at small scale and wasteful at large scale, where an async worker can multiplex dozens of I/O-bound runs.
+- **Dramatiq** is a simpler Celery alternative with good defaults (retries with backoff, acks after completion). Also sync-first.
+- **Durable execution engines** (Temporal, and similar products like Restate, DBOS or Inngest) go further. You write the agent as ordinary code ("workflow"), and every LLM call and tool call is an "activity" whose result the engine records. After a crash, the engine replays the workflow and feeds back recorded results instead of re-executing them. Retries, timeouts, human signals ("approved"), and runs lasting days come built in. The cost is a new piece of infrastructure and a determinism discipline: workflow code must not read the clock or do I/O directly. For long, expensive, multi-step agents with approvals, this is often a better fit than hand-rolled leases.
+
+## Traps
+
+- **Running the agent in the request**, or in FastAPI's `BackgroundTasks`. Background tasks run in the same process after the response; they die on deploy and have no retries, status or cancellation. Fine for sending a log line, wrong for a five-minute agent.
+- **No step or token budget.** A looping agent is an unbounded bill.
+- **Holding a worker while waiting for a human.** Park the job and end the run; resume on approval.
+- **Assuming exactly-once.** Workers crash between the effect and the checkpoint. Make tools idempotent with per-call keys.
+- **Read-then-insert idempotency.** Two concurrent retries both see "no job". Use a unique constraint.
+- **Cancel that only flips a flag.** If the worker never checks it between steps, or you don't cancel the in-flight call, the agent keeps spending. Do both.
+- **Swallowing `CancelledError`.** Catching it with a bare `except BaseException` and carrying on breaks shutdown and timeouts. Handle it deliberately, as the worker above does.
+- **Progress only in memory.** Events kept in one process's memory are invisible to the API process serving the SSE connection. Use Redis Streams or the database.
+- **Storing only the final text of each turn.** You lose tool calls and thinking blocks, and a resumed run can't continue the conversation correctly. Store content blocks verbatim.
+- **No terminal state on error.** Any exception path that leaves a job `running` produces a zombie job the user polls forever.
+
+## Key points
+
+- Agent runs are long, many-step and expensive, so they run as jobs: `POST /jobs` returns 202 and an id, a worker runs the loop, and clients follow along by polling, SSE or WebSocket.
+- Persist the job and every step. That record is your status API, your audit log and your resume point.
+- Guard every run with a step budget, a token or cost budget, a wall-clock timeout and cancellation.
+- Gate irreversible tools behind human approval, and park the job while waiting.
+- Idempotency keys make client retries harmless; per-tool-call keys make worker retries harmless. Delivery is at-least-once.
+- Leases plus a reaper recover jobs from crashed workers; checkpoints let the next worker resume instead of restarting.
+- In production: Postgres for truth, a queue (arq for async workers; Celery or Dramatiq for sync) for dispatch, Redis Streams for progress, or a durable execution engine such as Temporal when runs are long and complex.
+
+Next: [Serving your own models](/docs/fastapi/serving-your-own-models), for when the model runs on your hardware instead of behind an API.

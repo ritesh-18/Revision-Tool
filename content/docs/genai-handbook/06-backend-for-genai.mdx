@@ -1,0 +1,1050 @@
+---
+title: "6. Backend for GenAI"
+description: "A GenAI backend is a distributed system whose hottest dependency happens to be an LLM. Everything else — auth, rate limiting, queueing, retries,..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth added to a topic the chapter already covers.
+  - ➕ **Beyond the handbook**: a topic the chapter does not cover, added because a GenAI engineer should know it.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams. Code is Python 3.14 with FastAPI, Pydantic, Postgres and Redis (async SQLAlchemy, redis-py and arq for queues). General backend topics link to [Backend From First Principles](/docs/backend-first-principles).
+</Callout>
+
+## 6.1 Concept Explanation
+
+A GenAI backend is a distributed system whose hottest dependency happens to be an LLM. Everything else — auth, rate limiting, queueing, retries, persistence, observability — is conventional backend engineering. The novelty is the *shape* of the LLM call: long-tailed latency, streaming, expensive failures, non-deterministic outputs. The backend's job is to absorb that novelty and present a stable contract to clients.
+
+## 6.2 The Anatomy of a GenAI Backend
+
+<Mermaid chart={`flowchart TD
+  C["Client"] --> G["API Gateway / Edge"]
+  G --> A["Authentication & Rate Limiting"]
+  A --> B["Business Logic Service"]
+  B --> R["Retrieval (vector DB)"]
+  B --> L["LLM Inference (provider or self-hosted)"]
+  B --> T["Tool services (internal APIs)"]
+  B --> P["Persistence (Postgres, object store)"]
+  B --> E["Event bus (Kafka, NATS)"]
+  B --> O["Observability (traces, metrics, logs)"]
+`} />
+
+Each layer is independently scalable, replaceable, and monitorable. The discipline of separating these concerns is what distinguishes a maintainable AI backend from a Jupyter-notebook-turned-deployment.
+
+## 6.3 FastAPI in Production — Beyond Hello World
+
+FastAPI dominates Python AI backends, covered in Chapter 5. Production-grade usage involves:
+- Dependency injection for shared resources (DB pool, LLM client, cache).
+- Background tasks for fire-and-forget work (logging, analytics).
+- Middleware for tracing, authentication, and request logging.
+- Lifespan events for startup and shutdown (warm caches, drain in-flight requests).
+- Graceful handling of disconnect mid-stream.
+
+The framework is small; the discipline around it is what makes the system reliable.
+
+## 6.4 Node.js Overview
+
+Node.js is the second major backend for GenAI, dominant in JavaScript-first organizations and in Next.js full-stack apps where the same language serves frontend and backend. Its event-driven I/O model maps naturally to streaming LLM responses.
+
+Strengths: shared language with the frontend, fast cold starts, a huge ecosystem, first-class support from most LLM SDKs (OpenAI, Anthropic publish official Node libraries). Weaknesses: weaker ecosystem for scientific computing, weaker support in some Python-first tools (LangChain has a JS port but Python remains primary).
+
+For pure LLM proxying, Node.js is competitive. For anything involving local model loading, embedding generation, or heavy data preprocessing, Python is still preferred.
+
+## 6.5 NestJS Overview
+
+NestJS is a TypeScript framework that imposes structure (modules, controllers, providers) on Node.js backends. It is to Node what Spring is to Java — opinionated, batteries-included, enterprise-friendly.
+
+When to use it: large teams, complex domains, the value of structure exceeds the cost of ceremony. When to skip it: small teams shipping fast, where structure is overhead.
+
+NestJS pairs naturally with TypeORM or Prisma for data access and with the official OpenAI/Anthropic SDKs for LLM calls. It supports SSE and WebSocket out of the box.
+
+## 6.5a Streaming an LLM Response Through FastAPI 🔧
+
+"Graceful handling of disconnect mid-stream" (6.3) is one line in a list, and it hides the parts that decide whether a production stream works: the provider stream has to reach the browser token by token, slow down when the browser is slow, and stop when the browser leaves.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser (fetch)
+  participant N as FastAPI endpoint
+  participant P as LLM provider
+  B->>N: POST /chat/stream (body + JWT)
+  N-->>B: 200, text/event-stream headers sent
+  N->>P: messages.stream (async with)
+  loop each text delta
+    P-->>N: content_block_delta
+    N-->>B: event token
+    Note over N: await send waits while the socket buffer is full
+  end
+  P-->>N: message_stop
+  N-->>B: event done (usage)
+  B--xN: user closes tab
+  N->>P: generator cancelled, async with closes the provider request
+`} />
+
+### Why a POST with `EventSourceResponse`
+
+A chat request carries a large body (history, attachments), so it belongs in a POST, and the browser reads it with `fetch` rather than `EventSource` (which can only GET). FastAPI's `EventSourceResponse` (from `fastapi.sse`) works with any HTTP method. The path operation is an async generator, each `ServerSentEvent` it yields is encoded in the SSE wire format, and FastAPI sets `Cache-Control: no-cache` and `X-Accel-Buffering: no` (so nginx does not buffer) and sends a `: ping` comment whenever the generator has been silent for 15 seconds. Underneath it is a Starlette `StreamingResponse`, which gives you the two controls you need: the generator cannot run far ahead of what the server has handed to the socket (backpressure), and it is cancelled when the client disconnects (cancellation). On FastAPI versions without `fastapi.sse`, the `sse-starlette` package or a plain `StreamingResponse(..., media_type="text/event-stream")` that yields hand-formatted `event:` and `data:` lines does the same job.
+
+### Implementation
+
+```python
+# chat.py
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+import anthropic
+from fastapi import Depends, FastAPI, Request
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # One client (one connection pool) per process, closed cleanly on shutdown
+    async with anthropic.AsyncAnthropic() as client:
+        app.state.anthropic = client
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_anthropic(request: Request) -> anthropic.AsyncAnthropic:
+    return request.app.state.anthropic
+
+
+class ChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+
+
+@app.post("/chat/stream", response_class=EventSourceResponse)
+async def chat_stream(
+    body: ChatIn,
+    request: Request,
+    client: Annotated[anthropic.AsyncAnthropic, Depends(get_anthropic)],
+) -> AsyncIterator[ServerSentEvent]:
+    context = await retrieve_context(body.message)  # a slow step before the paid call
+    if await request.is_disconnected():
+        return  # the user left during retrieval: do not start a generation
+
+    streamed_chars = 0
+    try:
+        async with client.messages.stream(
+            model="claude-sonnet-5-5",
+            max_tokens=1024,
+            system=context,
+            messages=[{"role": "user", "content": body.message}],
+        ) as stream:
+            async for text in stream.text_stream:
+                streamed_chars += len(text)
+                # Suspends here while the client is slower than the model (backpressure)
+                yield ServerSentEvent(event="token", data={"t": text})
+            final = await stream.get_final_message()
+        yield ServerSentEvent(
+            event="done",
+            data={"stopReason": final.stop_reason, "outputTokens": final.usage.output_tokens},
+        )
+    except asyncio.CancelledError:
+        # The client disconnected. Leaving the `async with` closed the provider request.
+        log.info("client left after %d streamed chars", streamed_chars)
+        raise  # never swallow cancellation
+    except anthropic.APIError:
+        log.exception("generation failed")
+        yield ServerSentEvent(event="error", data={"message": "generation failed"})
+```
+
+### Backpressure
+
+**Problem.** A client on a slow network reads 1 KB per second while the provider sends 5 KB per second. If nothing pushes back, the extra bytes pile up in the server's memory, and a few thousand slow clients can exhaust it.
+
+**Why it happens.** In ASGI, writing is `await send(message)`, and that await can wait. Uvicorn hands the bytes to the asyncio transport, and while the transport's write buffer is above its high-water mark (64 KiB by default) the next `send` waits until the kernel has drained it. TCP flow control makes that happen exactly when the client stops reading. So the waiting is built in: you get it simply by awaiting, and you lose it by putting an unbounded buffer between the provider and the response, such as an `asyncio.Queue()` without `maxsize` that another task fills from the provider stream. That is a common Python streaming bug.
+
+**Mechanism.** Read from the provider inside the response generator and yield each event. While `send` waits, Starlette stops pulling from your generator, the generator stays suspended at its `yield`, and it stops reading the provider's stream. The provider connection's own TCP window then fills, so the slowdown travels upstream. FastAPI's SSE layer adds only two one-slot buffers between the generator and `send`. In a local test against Uvicorn, a generator producing 1 KB events for a client that read nothing stalled after about 200 events (the socket buffers on both ends) instead of running ahead.
+
+### Cancellation
+
+**Problem.** The user presses stop or closes the tab, but the provider keeps generating and billing.
+
+**Why it happens.** Nothing tells the provider request to stop unless the code reading it is stopped. One trap: Uvicorn implements ASGI spec 2.3, in which a `send` after the client has gone returns silently instead of raising, so a loop that only writes would never notice. Starlette's `StreamingResponse` covers this by listening for the ASGI `http.disconnect` message in a parallel task and cancelling the response when it arrives. (On servers that implement ASGI spec 2.4, `send` raises `OSError` instead, which Starlette turns into `ClientDisconnect`.)
+
+**Mechanism.** When the client leaves, the generator receives `asyncio.CancelledError` at whatever `await` it is suspended on. Leaving the `async with client.messages.stream(...)` block closes the provider HTTP response, which stops generation. Catch `CancelledError` only to log or record usage, then re-raise it: swallowing it breaks the task group that is cancelling you. `await request.is_disconnected()` covers the other case, work that is not waiting on the client, such as the retrieval step before the model call. Check it before you start anything expensive. In a local test, a client that read a dozen events and closed the connection produced a `CancelledError` in the generator, the provider stream was closed, and `request.is_disconnected()` returned `True` from inside the handler.
+
+### Edge cases and failure modes
+
+- **Compression middleware.** Compression buffers output to compress it, which turns a stream into one late burst. Starlette's `GZipMiddleware` skips `text/event-stream` by default, but other compression middleware and compressing proxies may not. Exclude `text/event-stream` everywhere along the path.
+- **Idle timeouts.** Load balancers commonly drop connections idle for about 60 seconds. FastAPI's 15-second `: ping` comment keeps the connection alive while a tool call or retrieval step runs.
+- **Usage accounting on disconnect.** A cancelled stream never reaches `get_final_message()`. Record the tokens you streamed (or an estimate) in the `except asyncio.CancelledError` block (or a `finally`), because the provider bills them.
+- **Errors after the 200.** The status is already sent, so failures travel as an `error` event. The client must handle it (see 7.4a in [Frontend for GenAI](/docs/genai-handbook/07-frontend-for-genai)). 5.8a in [Python for AI Engineers](/docs/genai-handbook/05-python-for-ai-engineers) builds a similar endpoint from the async-generator side, and general SSE and WebSocket mechanics are in [Real-time Backends](/docs/backend-first-principles/26-real-time-backends).
+
+### The same endpoint in Node.js
+
+If your backend is Node.js or NestJS (6.4, 6.5), the ideas are identical but nothing is automatic. NestJS's `@Sse()` decorator serves a GET route from an RxJS Observable, so a POST chat stream usually writes to the Express response directly. `res.write` never waits: it returns `false` when its buffer is full, and the code must stop until the `drain` event. Disconnect detection uses the response's `close` event, not the request's (in current Node versions the request emits `close` once a POST body has been read), wired to an `AbortController` whose signal is passed to the SDK. Python's `await send` and task cancellation give you the same two controls as part of the language.
+
+## 6.6 API Gateways
+
+An API gateway sits in front of your backend services and handles concerns that should not live in every microservice: authentication, rate limiting, request routing, TLS termination, logging, and increasingly, prompt routing and LLM-specific concerns.
+
+Common choices:
+- **Kong, Tyk, Apigee** — general-purpose API gateways.
+- **Envoy** — high-performance proxy used inside service meshes.
+- **AWS API Gateway, GCP API Gateway, Azure APIM** — managed cloud options.
+- **LiteLLM proxy, Portkey, Helicone** — LLM-specific gateways that add model routing, cost tracking, caching, and provider failover.
+
+The trend is toward LLM-aware gateways because plain HTTP gateways do not understand tokens, models, or prompts. An AI gateway can re-route on model failure, enforce per-team token budgets, and standardize observability across providers.
+
+## 6.6a Provider Abstraction and Fallback in Application Code 🔧
+
+A gateway handles failover at the network edge, but your service still needs a provider-neutral interface of its own, and fallback has rules that no gateway can enforce for you.
+
+### Normalizing the contract
+
+**Problem.** Anthropic and OpenAI stream different event shapes, report usage in different fields and raise different error classes. If those shapes spread through your services, switching or adding a provider touches every file.
+
+**Why it happens.** Each SDK models its own API. The parts your product depends on are smaller and stable: messages in, text deltas out, a final stop reason and token counts.
+
+**Mechanism.** Define that small contract once and write one adapter per provider. Everything else (rate limiting, caching, tracing, fallback) is written against the interface.
+
+```python
+# llm/types.py
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Protocol
+
+
+@dataclass(frozen=True)
+class ChatRequest:
+    messages: list[dict[str, str]]  # [{"role": "user" | "assistant", "content": "..."}]
+    max_tokens: int
+    system: str | None = None
+
+
+@dataclass(frozen=True)
+class TextEvent:
+    text: str
+
+
+@dataclass(frozen=True)
+class DoneEvent:
+    stop_reason: str
+    input_tokens: int
+    output_tokens: int
+
+
+type StreamEvent = TextEvent | DoneEvent  # match on the class: case TextEvent(text=t)
+
+
+class LlmProvider(Protocol):
+    name: str
+
+    def stream(self, req: ChatRequest) -> AsyncIterator[StreamEvent]: ...
+
+
+# llm/anthropic_provider.py
+import anthropic
+
+
+class AnthropicProvider:
+    name = "anthropic"
+
+    def __init__(self, client: anthropic.AsyncAnthropic, model: str):
+        self._client = client
+        self._model = model
+
+    async def stream(self, req: ChatRequest) -> AsyncIterator[StreamEvent]:
+        extra = {"system": req.system} if req.system else {}
+        async with self._client.messages.stream(
+            model=self._model, max_tokens=req.max_tokens, messages=req.messages, **extra
+        ) as s:
+            async for text in s.text_stream:
+                yield TextEvent(text)
+            m = await s.get_final_message()
+        yield DoneEvent(m.stop_reason or "unknown", m.usage.input_tokens, m.usage.output_tokens)
+
+
+# llm/openai_provider.py
+from openai import AsyncOpenAI
+
+
+class OpenAIProvider:
+    name = "openai"
+
+    def __init__(self, client: AsyncOpenAI, model: str):
+        self._client = client
+        self._model = model
+
+    async def stream(self, req: ChatRequest) -> AsyncIterator[StreamEvent]:
+        system = [{"role": "system", "content": req.system}] if req.system else []
+        s = await self._client.chat.completions.create(
+            model=self._model,
+            max_completion_tokens=req.max_tokens,
+            messages=[*system, *req.messages],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        stop_reason = "unknown"
+        async with s:  # closes the HTTP response if the consumer stops early
+            async for chunk in s:
+                choice = chunk.choices[0] if chunk.choices else None
+                if choice and choice.delta.content:
+                    yield TextEvent(choice.delta.content)
+                if choice and choice.finish_reason:
+                    stop_reason = choice.finish_reason
+                if chunk.usage:
+                    yield DoneEvent(stop_reason, chunk.usage.prompt_tokens, chunk.usage.completion_tokens)
+```
+
+**Edge cases.** Keep features that only one provider has (prompt-cache markers, thinking settings, provider-specific tools) as optional fields that an adapter may ignore, and log when it does. Stop reasons differ (`end_turn` versus `stop`, `max_tokens` versus `length`). Map them to your own enum if code branches on them.
+
+### Fallback only before the first token
+
+**Problem.** The primary provider fails halfway through an answer, and the code retries on the secondary provider. The user sees the answer start again, or two half answers joined together.
+
+**Why it happens.** Once text has been sent to the client, it is part of the conversation. A second model will not continue the first model's sentence. It writes its own answer from the start.
+
+**Mechanism.** Fall back only if no event has been sent yet. After the first token, a failure becomes an `error` event, and the user can retry.
+
+```python
+# llm/fallback.py
+from collections.abc import AsyncIterator
+
+import anthropic
+import openai
+
+
+def is_retryable(err: Exception) -> bool:
+    # Connection reset, DNS, timeout (the SDKs' timeout errors subclass APIConnectionError)
+    if isinstance(err, (anthropic.APIConnectionError, openai.APIConnectionError)):
+        return True
+    if isinstance(err, (anthropic.APIStatusError, openai.APIStatusError)):
+        s = err.status_code
+        return s in (408, 429) or s >= 500  # 529 "overloaded" included
+    return False
+
+
+async def stream_with_fallback(
+    providers: list[LlmProvider], req: ChatRequest, breaker: CircuitBreaker
+) -> AsyncIterator[StreamEvent]:
+    last_error: Exception = RuntimeError("no provider available")
+    for p in providers:
+        if breaker.is_open(p.name):
+            continue
+        started = False
+        try:
+            async for ev in p.stream(req):
+                started = True
+                yield ev
+            breaker.record_success(p.name)
+            return
+        except Exception as err:
+            # A user cancel arrives as asyncio.CancelledError, a BaseException,
+            # so it skips this block and never triggers a fallback.
+            breaker.record_failure(p.name)
+            if started or not is_retryable(err):
+                raise  # never switch mid-answer
+            last_error = err
+    raise last_error
+```
+
+### Circuit breaking
+
+**Problem.** The primary provider is down for 10 minutes. Every request first waits for the primary to time out, then falls back, so every user pays the timeout.
+
+**Why it happens.** Fallback alone is reactive: each request discovers the outage again.
+
+**Mechanism.** A circuit breaker counts recent failures per provider. Above a threshold it "opens" and requests skip that provider for a cool-down. After the cool-down, it lets a few requests through to test whether the provider has recovered.
+
+```python
+import time
+
+
+class CircuitBreaker:
+    def __init__(self, threshold: int = 5, window_s: float = 30.0, cool_down_s: float = 30.0):
+        self._threshold = threshold
+        self._window_s = window_s
+        self._cool_down_s = cool_down_s
+        self._failures: dict[str, list[float]] = {}
+        self._open_until: dict[str, float] = {}
+
+    def is_open(self, name: str) -> bool:
+        return self._open_until.get(name, 0.0) > time.monotonic()
+
+    def record_success(self, name: str) -> None:
+        self._failures.pop(name, None)
+
+    def record_failure(self, name: str) -> None:
+        now = time.monotonic()
+        recent = [t for t in self._failures.get(name, []) if now - t < self._window_s]
+        recent.append(now)
+        self._failures[name] = recent
+        if len(recent) >= self._threshold:
+            self._open_until[name] = now + self._cool_down_s
+```
+
+**Edge cases.** This breaker lives in one process, so each pod learns about an outage on its own. That is usually acceptable. Share the state in Redis only if one pod's discovery must protect all of them. Count only retryable failures: a burst of 400s caused by your own bad request must not open the circuit.
+
+### Prompt portability and policy
+
+**Problem.** The fallback model is reached during an outage, and answer quality drops sharply, or a regulated customer's data goes to a provider their contract does not allow.
+
+**Why it happens.** Prompts are tuned against one model. Another model can read the same prompt differently, especially formatting rules and tool-use instructions. And fallback is a data-routing decision, not only a reliability one.
+
+**Mechanism.** Keep prompt variants per model family, and run your eval set against the fallback route regularly, not only the primary (see [Prompt Engineering](/docs/genai-handbook/12-prompt-engineering) and [MLOps for GenAI](/docs/genai-handbook/17-mlops-for-genai)). Build the provider list per tenant from policy (allowed providers and regions) before calling `stream_with_fallback`. Record which provider served each response in the trace.
+
+## 6.7 REST vs gRPC vs WebSocket vs SSE
+
+| Protocol | Best for | Avoid for |
+|---|---|---|
+| REST | External APIs, broad client support | Streaming, bidirectional |
+| gRPC | Internal service-to-service, structured contracts, high throughput | Browser clients (limited support) |
+| SSE | Streaming model output to browsers | Bidirectional flows |
+| WebSocket | Bidirectional realtime (voice, agent interrupts) | Simple request-response |
+
+In practice: REST or SSE for external client APIs, gRPC for internal microservice communication, WebSocket where bidirectionality is mandatory. Mixing is fine and common.
+
+## 6.7a Real-Time Voice Transport: WebSocket vs WebRTC ➕
+
+The table lists WebSocket for voice, but for browser and mobile voice agents the production answer is usually WebRTC, and the reason is in how the two move packets.
+
+### The problem: audio that stutters and lags
+
+A voice agent streamed over a WebSocket works on office Wi-Fi. On a mobile network the agent's voice stutters, then plays a burst of audio late, and turn-taking feels broken because every delay adds to the roughly 300 ms budget that natural conversation allows (7.9 in [Frontend for GenAI](/docs/genai-handbook/07-frontend-for-genai)).
+
+### Why it happens (first principles)
+
+WebSocket runs over TCP, and TCP delivers bytes in order. When one packet is lost, every packet after it waits in the receiver's buffer until the lost one is resent, which takes at least one round trip. This is head-of-line blocking. For a file, waiting is correct. For live audio, a 20 ms frame that arrives 300 ms late is worse than a missing one: you would rather skip it and keep the conversation in real time.
+
+WebRTC sends media over UDP (as SRTP), so a lost packet does not hold up later ones. Around that it adds what live audio needs: the Opus codec with forward error correction (it can rebuild a lost frame from redundancy in the next one), a jitter buffer that smooths uneven arrival, congestion control that lowers the bitrate before the network drops packets, and the browser's built-in echo cancellation, noise suppression and gain control. With WebSocket audio you would build each of these yourself.
+
+### Mechanism: an SFU with the agent as a participant
+
+In practice nobody connects a browser to an agent process with raw peer-to-peer WebRTC. A media server, usually an SFU (selective forwarding unit) such as LiveKit, sits in the middle. The user's browser and your agent worker both join the same room as participants. The SFU forwards audio tracks between them. The agent worker runs the voice pipeline: voice activity detection, streaming speech-to-text, the LLM, and streaming text-to-speech.
+
+<Mermaid chart={`flowchart LR
+  U["Browser or mobile app"] -->|"1 POST /voice/session (JWT)"| API["FastAPI backend"]
+  API -->|"2 room name + LiveKit token"| U
+  U <-->|"3 WebRTC audio (UDP, Opus)"| SFU["LiveKit SFU"]
+  API -.->|"agent dispatch"| AG["Agent worker"]
+  AG <-->|"WebRTC audio + data"| SFU
+  AG --> STT["Streaming STT"]
+  AG --> LLM["LLM (streaming)"]
+  AG --> TTS["Streaming TTS"]
+`} />
+
+Your backend's job is small but security-critical: authenticate the user, choose the room, and issue a short-lived token that lets this user join only that room.
+
+```python
+# voice.py
+import os
+import uuid
+from datetime import timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, Depends
+from livekit import api
+
+from .auth import User, get_current_user  # validates the JWT, returns the user
+
+router = APIRouter(prefix="/voice")
+
+
+@router.post("/session")
+async def create_session(user: Annotated[User, Depends(get_current_user)]) -> dict[str, str]:
+    room = f"support-{user.id}-{uuid.uuid4()}"  # the server picks the room
+    token = (
+        api.AccessToken(os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"])
+        .with_identity(user.id)
+        .with_ttl(timedelta(minutes=10))  # only needs to last until the client connects
+        .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True))
+    )
+    return {"serverUrl": os.environ["LIVEKIT_URL"], "room": room, "token": token.to_jwt()}
+```
+
+### Edge cases and failure modes
+
+- **Never let the client name the room.** If the room comes from the request body, a user can join someone else's call. Derive it on the server, as above.
+- **Firewalls.** Corporate networks often block UDP. A TURN server relays media over TCP or TLS on port 443 as a fallback, so connections succeed at the cost of some latency. Managed SFUs include TURN; self-hosted ones need it configured.
+- **WebSocket still has a place.** Server-to-server audio, such as telephony providers' media streams into your backend, often uses WebSocket because data-center links lose few packets. The head-of-line problem matters most on the last mile to a user's device.
+- **Permissions follow the user into the agent.** The agent worker acts for the user in the room. Pass the user's identity (from the token's identity) into every tool call, the same rule as 6.8.
+- **Consent and recording.** Voice is personal data, and recording laws differ by region. Decide what you store (audio, transcripts or neither) before launch.
+
+General WebSocket scaling (sticky sessions, fan-out across instances) is covered in [Real-time Backends](/docs/backend-first-principles/26-real-time-backends).
+
+## 6.8 Authentication for AI Apps
+
+Three identity layers usually coexist:
+- **End user** — the human using the chat interface.
+- **Application** — the workload calling the backend on behalf of the user.
+- **Service** — internal services calling each other.
+
+JWT is the typical user token, OAuth2 the typical authorization flow, mTLS or short-lived service tokens for internal service-to-service.
+
+A pitfall specific to agents: when an agent calls a tool, *whose* permissions apply? The user's, not the service's. Forgetting this is how an agent ends up reading someone else's files. Pass the user identity through every tool call and enforce it at the tool side.
+
+## 6.9 JWT and OAuth in Practice
+
+JWT is a signed token containing claims (user id, roles, expiry). Stateless, easy to verify, but cannot be revoked before expiry without a centralized revocation list — defeating the stateless property. Use short expiries and refresh tokens.
+
+OAuth2 is the flow for third-party authorization — "log in with Google," "let this app access your Notion." The typical AI-app pattern is OAuth for user identity (delegating to an identity provider like Auth0, Okta, Cognito), JWT as the session token, scoped tool permissions per user, refresh tokens stored server-side.
+
+## 6.10 Rate Limiting
+
+LLM calls are expensive and slow. Without rate limiting, one user with a script can drain a token budget meant for a thousand.
+
+Standard algorithms:
+- **Token bucket.** Allows bursts up to a maximum, refills at a steady rate. Used for "X requests per minute" semantics.
+- **Sliding window.** Counts requests in a moving window. More precise, slightly more storage.
+- **Concurrent in-flight cap.** Limits how many simultaneous requests one client can have open. Critical for streaming endpoints where a client can hold connections for minutes.
+
+For GenAI specifically, rate limit on *tokens* (input + output), not just requests, since a single request can be 100,000 tokens. Many providers expose token-per-minute and request-per-minute limits separately; mirror that pattern in your backend.
+
+## 6.10a Token-Based Rate Limiting with Redis 🔧
+
+Rate limiting on tokens has one hard part that request limits do not: you do not know the cost of a request until it has finished.
+
+### The problem: cost is unknown at admission time
+
+Input tokens can be counted before the call, but output tokens are only known at the end. If you charge the bucket after the call, a user can start 20 long generations at once before any of them is counted. If you charge the maximum (`max_tokens`) and never refund, short answers burn budget they did not use.
+
+### Why a reservation fixes it
+
+Treat the bucket like a card authorization: hold an estimate when the request is admitted, then settle the real amount when it ends. The estimate is the input token count plus `max_tokens`, so admission is conservative. The settlement refunds the difference between the estimate and the real usage.
+
+### Mechanism: an atomic token bucket in Lua
+
+The bucket must be shared across pods (so it lives in Redis) and updated atomically (so two pods cannot both spend the last tokens). A Lua script runs inside Redis as one atomic step. It uses Redis's own clock, so pods with skewed clocks agree.
+
+```python
+# rate_limit/token_bucket.py
+from redis.asyncio import Redis
+
+TOKEN_BUCKET = """
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_per_sec = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+local state = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(state[1]) or capacity
+local ts = tonumber(state[2]) or now
+tokens = math.min(capacity, tokens + (now - ts) * refill_per_sec)
+local allowed = 0
+if cost <= tokens then
+  tokens = math.min(capacity, tokens - cost)
+  allowed = 1
+end
+redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', key, math.ceil(capacity / refill_per_sec) + 60)
+return { allowed, math.floor(tokens) }
+"""
+
+
+class TokenBudget:
+    def __init__(self, redis: Redis):
+        # EVALSHA with an automatic fallback to EVAL if Redis lost the script cache
+        self._script = redis.register_script(TOKEN_BUCKET)
+
+    async def take(self, key: str, capacity: int, refill_per_sec: float, cost: int) -> tuple[bool, int]:
+        """cost > 0 reserves, cost < 0 refunds. Returns (allowed, remaining)."""
+        allowed, remaining = await self._script(keys=[key], args=[capacity, refill_per_sec, cost])
+        return allowed == 1, remaining
+
+
+# usage in the chat service
+CAPACITY = 200_000  # tokens per user per minute
+REFILL = CAPACITY / 60
+
+
+async def generate_within_budget(budget: TokenBudget, user_id: str, messages: list, max_tokens: int) -> Usage:
+    key = f"tpm:user:{user_id}"
+    estimate = estimate_input_tokens(messages) + max_tokens
+    allowed, _ = await budget.take(key, CAPACITY, REFILL, estimate)
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Token budget exceeded")
+    usage: Usage | None = None
+    try:
+        usage = await run_generation(messages, max_tokens)  # returns real input + output tokens
+        return usage
+    finally:
+        actual = usage.input_tokens + usage.output_tokens if usage else estimate
+        await budget.take(key, CAPACITY, REFILL, actual - estimate)  # refund (negative)
+```
+
+### Edge cases and failure modes
+
+- **Estimating input tokens.** Calling the provider's token-counting endpoint on every request adds latency. A character-based estimate (about 4 characters per token for English, fewer for code and many other languages) is enough for admission, because settlement corrects it.
+- **A reservation larger than capacity** can never succeed. Reject it with a clear error ("prompt too large for your plan") instead of a 429 the client will retry forever.
+- **Redis is down.** Decide on purpose: fail open (allow, and risk cost) for paying customers, fail closed for anonymous traffic. Do not let the error bubble up as a 500.
+- **Several limits at once.** Keep a request-per-minute bucket and a concurrent-streams cap (6.10) beside the token bucket, and per-tenant buckets above per-user ones, checked in one script call if you need them to be atomic together. A general distributed token bucket is covered in [Scaling and Performance, part 2](/docs/backend-first-principles/22-scaling-performance-part-2), and adaptive limits against external APIs in [Task Queues and Background Jobs](/docs/backend-first-principles/14-task-queues-background-jobs).
+
+## 6.10b Handling Provider 429s: Outbound Rate Limiting ➕
+
+6.10 limits what your users can send to you. The same problem exists one hop further out: your whole fleet shares one rate limit at each provider, and nothing in the chapter protects it.
+
+### The problem: 429 storms
+
+Traffic rises, the provider starts returning 429, every pod retries at once, the retries count against the same limit, and an overload of a few seconds becomes minutes of errors.
+
+### Why it happens
+
+Providers limit per organization (sometimes per workspace) and per model, in requests per minute and in input and output tokens per minute. Anthropic documents that its limits use a token bucket, that a per-minute limit may be enforced over shorter intervals so short bursts can trigger 429s, and that a sudden jump in usage can hit acceleration limits. Your pods do not see each other's traffic, so each one thinks it is well under the limit.
+
+### Mechanism
+
+1. **Honor `retry-after`.** It is the provider telling you exactly when capacity returns. Retrying earlier fails and adds load.
+2. **Back off with jitter** when there is no `retry-after`. Exponential growth spreads retries out over time. Random jitter stops all pods from retrying at the same instant.
+3. **Tell the 429s apart.** A spend-cap 429 (Anthropic includes `enforced_spend_limit_reached` in the error details and no `retry-after`) will not clear by retrying, so fail fast and alert. A 529 `overloaded_error` means the provider is overloaded, so a fallback provider (6.6a) is a better move than waiting.
+4. **Throttle before the provider does.** Run a fleet-wide outbound bucket per provider and model (the script from 6.10a works), set slightly below your provider limit, and read the `anthropic-ratelimit-*-remaining` headers to slow down early.
+5. **Separate lanes.** Give interactive chat and background jobs separate outbound budgets, so a nightly batch cannot starve live users. Work that can wait hours belongs on a batch API.
+
+```python
+# llm/provider_retry.py
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
+
+import anthropic
+
+
+def is_spend_cap(err: anthropic.APIStatusError) -> bool:
+    body = err.body if isinstance(err.body, dict) else {}
+    details = (body.get("error") or {}).get("details") or {}
+    return details.get("error_code") == "enforced_spend_limit_reached"
+
+
+async def with_provider_retry[T](fn: Callable[[], Awaitable[T]], max_attempts: int = 4) -> T:
+    attempt = 1
+    while True:
+        try:
+            return await fn()
+        except (anthropic.APIConnectionError, anthropic.APIStatusError) as err:
+            if isinstance(err, anthropic.APIStatusError):
+                retryable = not is_spend_cap(err) and (err.status_code == 429 or err.status_code >= 500)
+                retry_after = err.response.headers.get("retry-after")
+            else:
+                retryable, retry_after = True, None  # connection reset, DNS, timeout
+            if not retryable or attempt >= max_attempts:
+                raise
+
+            try:
+                retry_after_s = float(retry_after) if retry_after else 0.0
+            except ValueError:
+                retry_after_s = 0.0  # an HTTP-date instead of seconds: fall back to backoff
+            backoff_s = random.uniform(0, min(30.0, 0.5 * 2**attempt))  # full jitter
+            await asyncio.sleep(retry_after_s if retry_after_s > 0 else backoff_s)
+            attempt += 1
+
+
+# The SDK already retries twice by default. Turn that off when you own the policy,
+# or the attempts multiply (3 SDK attempts x 4 of yours = 12 calls).
+client = anthropic.AsyncAnthropic(max_retries=0)
+```
+
+### Edge cases and failure modes
+
+- **Streaming requests** can only be retried before the first token, for the same reason as fallback (6.6a).
+- **Retry budgets.** Under a long outage, even well-spaced retries multiply load. Cap retries to a share of traffic (for example, no more than 10 percent of requests may be retries) and fail the rest fast.
+- **Queue instead of failing.** For background work, put the job back on the queue with a delay (6.12a) instead of holding a worker in a sleep loop.
+- **Watch it.** Track 429s per provider and model, time spent waiting, and the remaining-tokens headers. A slow climb in waiting time is the early warning before users see errors.
+
+## 6.10c Retries and Idempotency for LLM Calls ➕
+
+Retries make a backend resilient only if repeating a request is safe, and for LLM endpoints it usually is not, by default.
+
+### The problem: one click, two answers
+
+The browser's request times out after the server started generating. The client retries. Now there are two generations (billed twice), two assistant messages saved in the conversation, and if the agent called a tool, the refund was issued twice.
+
+### Why it happens (first principles)
+
+A timeout is ambiguous. The client cannot know whether the server never got the request, is still working on it, or finished and the response was lost. An operation is idempotent when doing it twice has the same effect as doing it once. A POST that generates text, writes rows and calls tools is not.
+
+### Mechanism: idempotency keys
+
+The client generates a key (a UUID) once per user action and sends it in an `Idempotency-Key` header on every attempt. The server stores the key with a hash of the request body and the outcome. A repeated key returns the saved result. A key that is still running gets a 409 (or, for streams, attaches to the running job as in 6.12a). The same key reused with a different body is a client bug and gets a 422.
+
+```sql
+CREATE TABLE idempotency_keys (
+  tenant_id    text        NOT NULL,
+  key          text        NOT NULL,
+  request_hash text        NOT NULL,
+  status       text        NOT NULL CHECK (status IN ('in_progress', 'completed')),
+  response     jsonb,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, key)
+);
+```
+
+```python
+# idempotency.py
+import json
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from fastapi import HTTPException
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+class IdempotencyService:
+    def __init__(self, engine: AsyncEngine):
+        self._engine = engine
+
+    async def run(
+        self, tenant_id: str, key: str, request_hash: str, work: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        params = {"t": tenant_id, "k": key, "h": request_hash}
+        async with self._engine.begin() as conn:
+            claimed = await conn.execute(
+                text("""
+                    INSERT INTO idempotency_keys (tenant_id, key, request_hash, status)
+                    VALUES (:t, :k, :h, 'in_progress')
+                    ON CONFLICT (tenant_id, key) DO NOTHING
+                """),
+                params,
+            )
+            if claimed.rowcount == 0:
+                row = (await conn.execute(
+                    text("""
+                        SELECT request_hash, status, response FROM idempotency_keys
+                         WHERE tenant_id = :t AND key = :k
+                    """),
+                    params,
+                )).one()
+                if row.request_hash != request_hash:
+                    raise HTTPException(422, "Key reused with a different body")
+                if row.status == "completed":
+                    return row.response  # jsonb comes back as Python objects
+                raise HTTPException(409, "A request with this key is still running")
+
+        try:
+            result = await work()
+        except Exception:
+            # Free the key so the client can retry cleanly after a failure
+            async with self._engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM idempotency_keys WHERE tenant_id = :t AND key = :k"), params
+                )
+            raise
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text("""
+                    UPDATE idempotency_keys SET status = 'completed', response = CAST(:r AS jsonb)
+                     WHERE tenant_id = :t AND key = :k
+                """),
+                {**params, "r": json.dumps(result)},
+            )
+        return result
+```
+
+### Edge cases and failure modes
+
+- **Crashed workers.** If the process dies mid-generation, the row stays `in_progress` forever. Treat rows older than your longest generation as abandoned, and let a new attempt take them over.
+- **Tool side effects.** The idempotency key protects your endpoint, not the systems the agent calls. Give every tool call its own key derived from something stable, such as the conversation ID plus the provider's tool-call ID, and pass it to downstream APIs that accept one (payment APIs usually do). See [AI Agents](/docs/genai-handbook/11-ai-agents).
+- **Streaming.** A completed streamed answer can be replayed from the stored final text. A retry that arrives while the stream is running should reconnect to it rather than start a second one, which is easiest when generation runs as a job (6.12a).
+- **Regenerate is not a retry.** When the user presses "regenerate", they want a new answer, so the client must send a new key.
+
+General retry and fault-tolerance patterns are in [Error Handling and Fault Tolerance](/docs/backend-first-principles/16-error-handling-fault-tolerance).
+
+## 6.11 Distributed Tracing
+
+A single user request might touch eight services. Distributed tracing assigns a trace ID at the entry point and propagates it across all downstream calls so you can reconstruct the full path.
+
+OpenTelemetry is the standard. Backends include Jaeger, Tempo, Honeycomb, Datadog. Chapter 19 covers observability in depth.
+
+GenAI-specific trace attributes worth capturing: model name and version, input token count, output token count, prompt template ID, retrieval source IDs, tool call sequence, cache hit/miss, cost in USD. These let you trace cost and quality regressions to specific code paths.
+
+## 6.12 Real-World Use Cases
+
+A representative production GenAI backend:
+- REST endpoint for user-facing chat (SSE streaming).
+- WebSocket endpoint for voice and agent interrupts.
+- gRPC internal API for tool services.
+- Background workers for ingestion, embedding generation, eval runs.
+- A scheduled job system for periodic model evaluations and drift detection.
+
+## 6.12a Long-Running Generation Through Queues ➕
+
+The list above sends ingestion and evals to background workers, but user-facing generation that runs for minutes (a research report, a multi-step agent run, a long document draft) needs the same treatment, with the twist that the user still wants to watch it stream.
+
+### The problem: work tied to a connection
+
+A report takes eight minutes. During that time the user's laptop sleeps, a deploy restarts the pod, or a proxy's timeout closes the stream. With request-scoped streaming (6.5a), each of these kills the generation and the work is lost, while the tokens already generated are still billed.
+
+### Why it happens
+
+In 6.5a the work lives inside the HTTP request: when the connection ends, the work ends. That is right for a 20-second chat answer and wrong for an eight-minute job. Long work needs a lifetime that does not depend on any one connection, and the stream has to become something a client can leave and rejoin.
+
+### Mechanism: job queue plus a replayable event log
+
+1. `POST /reports` validates the request, enqueues a job and returns `202 Accepted` with a job ID.
+2. A worker takes the job and calls the LLM. As tokens arrive it appends them to a Redis Stream keyed by the job (an append-only log with IDs).
+3. `GET /reports/:id/events` is an SSE endpoint that reads the Redis Stream from a given ID. When the browser reconnects, it sends the last ID it received in the `Last-Event-ID` header, and the endpoint resumes from there.
+4. When the job finishes, the worker saves the result in Postgres and appends a `done` event.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant API as FastAPI
+  participant Q as arq queue (Redis)
+  participant W as Worker
+  participant R as Redis Stream job events
+  participant P as LLM provider
+  B->>API: POST /reports (Idempotency-Key)
+  API->>Q: enqueue_job (job id = key)
+  API-->>B: 202 jobId
+  B->>API: GET /reports/id/events (SSE)
+  W->>Q: take job
+  W->>P: stream generation
+  P-->>W: tokens
+  W->>R: XADD token events
+  API->>R: XREAD BLOCK from last id
+  API-->>B: id + event token
+  Note over B,API: laptop sleeps, connection drops
+  B->>API: GET events with Last-Event-ID
+  API->>R: XREAD from that id (replay, then live)
+  W->>R: XADD done
+  API-->>B: event done
+`} />
+
+```python
+# reports_queue.py (producer, in the API)
+import os
+
+from arq.connections import ArqRedis, RedisSettings
+
+REDIS_SETTINGS = RedisSettings(host=os.environ["REDIS_HOST"], port=6379)
+# Created once in the FastAPI lifespan: app.state.arq = await arq.create_pool(REDIS_SETTINGS)
+
+
+async def start_report(arq: ArqRedis, user_id: str, idempotency_key: str, report: ReportInput) -> dict:
+    job = await arq.enqueue_job(
+        "generate_report",
+        user_id,
+        report.model_dump(),
+        _job_id=idempotency_key,  # same key, same job: no duplicate on retry
+    )
+    # None means a job with this ID is already queued, running, or has a kept result
+    return {"jobId": idempotency_key, "duplicate": job is None}
+```
+
+```python
+# reports_worker.py (a separate process: `arq reports_worker.WorkerSettings`)
+import os
+import time
+
+import anthropic
+from arq import Retry
+from arq.connections import RedisSettings
+
+
+async def startup(ctx: dict) -> None:
+    ctx["anthropic"] = anthropic.AsyncAnthropic()
+
+
+async def shutdown(ctx: dict) -> None:
+    await ctx["anthropic"].close()
+
+
+async def generate_report(ctx: dict, user_id: str, report_input: dict) -> None:
+    redis = ctx["redis"]  # arq's ArqRedis, a redis.asyncio.Redis
+    job_id = ctx["job_id"]
+    key = f"job:{job_id}:events"
+    await redis.delete(key)  # a retried attempt starts a clean log
+    buffer = ""
+    last_flush = time.monotonic()
+
+    try:
+        async with ctx["anthropic"].messages.stream(
+            model="claude-sonnet-5-5", max_tokens=16_000, messages=build_report_prompt(report_input)
+        ) as stream:
+            async for text in stream.text_stream:
+                buffer += text
+                if time.monotonic() - last_flush > 0.1:  # batch tokens: one XADD per 100 ms, not per token
+                    await redis.xadd(key, {"type": "token", "data": buffer})
+                    buffer = ""
+                    last_flush = time.monotonic()
+            final = await stream.get_final_message()
+    except anthropic.APIError as err:
+        status = getattr(err, "status_code", None)  # None for connection errors
+        if status is None or status == 429 or status >= 500:
+            raise Retry(defer=5 * 2 ** ctx["job_try"]) from err  # exponential backoff: 10 s, 20 s
+        raise
+
+    if buffer:
+        await redis.xadd(key, {"type": "token", "data": buffer})
+    await save_report(job_id, user_id, final)  # Postgres is the source of truth
+    await redis.xadd(key, {"type": "done", "data": ""})
+    await redis.expire(key, 3600)
+
+
+class WorkerSettings:
+    functions = [generate_report]
+    on_startup = startup
+    on_shutdown = shutdown
+    redis_settings = RedisSettings(host=os.environ["REDIS_HOST"], port=6379)
+    max_jobs = 4  # concurrent jobs per worker process
+    max_tries = 3
+    keep_result = 24 * 3600  # the job ID stays taken for a day
+    job_timeout = 15 * 60  # longer than the longest report
+    job_completion_wait = 60  # on SIGTERM, stop taking jobs and let running ones finish
+```
+
+```python
+# reports_api.py (SSE relay, resumable)
+from collections.abc import AsyncIterator
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from redis.asyncio import Redis
+
+router = APIRouter(prefix="/reports")
+
+
+async def owned_job_id(job_id: str, user: Annotated[User, Depends(get_current_user)]) -> str:
+    # Runs before the response starts, so it can still return a 404
+    if not await reports.is_owner(job_id, user.id):  # never stream someone else's job
+        raise HTTPException(404, "Report not found")
+    return job_id
+
+
+@router.get("/{job_id}/events", response_class=EventSourceResponse)
+async def report_events(
+    job_id: Annotated[str, Depends(owned_job_id)],
+    request: Request,
+    redis: Annotated[Redis, Depends(get_redis)],  # a client created with decode_responses=True
+    last_event_id: Annotated[str | None, Header()] = None,  # the Last-Event-ID header
+) -> AsyncIterator[ServerSentEvent]:
+    last_id = last_event_id or "0-0"
+    key = f"job:{job_id}:events"
+    while not await request.is_disconnected():
+        # A blocking XREAD holds one pool connection for up to 15 s: size the pool for it
+        result = await redis.xread({key: last_id}, block=15_000)
+        if not result:
+            continue  # no new events; FastAPI sends a ": ping" comment after 15 s of silence
+        for _stream, entries in result:
+            for entry_id, fields in entries:
+                last_id = entry_id
+                yield ServerSentEvent(id=entry_id, event=fields["type"], data=fields["data"])
+                if fields["type"] == "done":
+                    return
+```
+
+### Edge cases and failure modes
+
+- **Retries re-run the model.** A failed attempt that is retried calls the LLM again from the start, and the user sees text restart. The worker clears the log at the start of each attempt, and the client should reset its text when it sees a new attempt. Retry only transient errors (6.10b).
+- **Job IDs as idempotency keys.** arq's `enqueue_job` returns `None` instead of enqueuing when a job with that ID is queued, running or still has a stored result, which is what makes the retry safe. Once `keep_result` expires, the same ID can run again, so keep the Postgres idempotency record (6.10c) as the long-term guard. Celery does not deduplicate on `task_id` at all, so with Celery you need that record from the start.
+- **Cancellation.** A queued job does not notice that the user lost interest. Add a cancel endpoint that sets a flag (or publishes a message) the worker checks between chunks, and leave the `async with` around the provider stream when it is set. arq can also cancel a running job through `Job.abort()` if the worker runs with `allow_abort_jobs=True`.
+- **Deploys.** Workers must finish or hand back their jobs on shutdown. arq handles SIGTERM itself: with `job_completion_wait` set, it stops taking new jobs and gives running ones that many seconds before cancelling them. Give the pod a termination grace period longer than that, or accept that long jobs get retried (see [Graceful Shutdown](/docs/backend-first-principles/19-graceful-shutdown)).
+- **Stalled jobs.** arq runs every job as a task on one event loop. Synchronous CPU work in one job freezes every other job on that worker, including their token streams. Keep CPU work off the event loop (`asyncio.to_thread` or a process pool). Set `job_timeout` above the longest job, because arq cancels jobs that run longer, and its in-progress marker expires 10 seconds after that timeout, at which point another worker can pick the job up.
+- **Memory of the log.** Redis Streams grow with every event. Batch tokens (as above), set an expiry after `done`, and keep the durable result in Postgres, not Redis.
+- **Cost lever.** If nobody watches the job live, consider a provider batch API, which trades hours of latency for a lower price (see [Cost Optimization](/docs/genai-handbook/25-cost-optimization)).
+
+Queue fundamentals (delivery guarantees, retries, dead-letter queues) are in [Task Queues and Background Jobs](/docs/backend-first-principles/14-task-queues-background-jobs).
+
+## 6.13 Production Architecture
+
+<Mermaid chart={`flowchart TD
+  I["Internet"] --> W["CDN / WAF"]
+  W --> GW["API Gateway (auth, rate limit, routing)"]
+  GW --> CS["Chat Service (FastAPI, SSE)"]
+  GW --> SS["Search Service (FastAPI)"]
+  GW --> AS["Agent Service (LangGraph or custom)"]
+  CS --> M["Service Mesh (mTLS, retries, observability)"]
+  SS --> M
+  AS --> M
+  M --> V["Vector DB"]
+  M --> LG["LLM Gateway (LiteLLM/Portkey)"]
+  LG --> PR["Multiple LLM providers"]
+  M --> TS["Tool services (Python, Go, Node)"]
+  M --> DB["Postgres / Redis / Object store"]
+  M --> K["Event bus (Kafka)"]
+  M --> OB["Observability backend"]
+`} />
+
+## 6.14 Alternatives by Stack
+
+| Stack | Strengths | Weaknesses |
+|---|---|---|
+| Python + FastAPI | Best ecosystem for AI, fast iteration | GIL, ops overhead |
+| Node.js + Express/NestJS | Shared with frontend, fast cold start | Weaker AI tooling |
+| Go | Performance, concurrency, small binaries | Weaker AI SDK coverage |
+| Rust | Maximum performance, safety | Smaller AI ecosystem, longer dev time |
+| Java/Kotlin + Spring | Enterprise integrations | Verbose, slow startup |
+
+Most teams pick Python for the AI-touching services and another stack (Go, Java) for the high-throughput infrastructure around them.
+
+## 6.15 Scaling Challenges
+
+- **Long-tail latency.** LLM responses can take 30 seconds. Standard 30-second HTTP timeouts at every layer (load balancer, gateway, ingress) will silently kill streams. Audit every timeout in the stack.
+- **Connection saturation.** Streaming endpoints hold connections. Plan for 10× the connections of a non-streaming service.
+- **Bursty cost.** One viral feature can 10× the LLM bill overnight. Per-customer budgets and circuit breakers prevent this.
+
+## 6.16 Security Concerns
+
+- Prompt injection at the API boundary — sanitize where you can, but assume injection will happen and design downstream tools to be safe even with malicious model outputs.
+- Tool call permission scoping (covered above).
+- Logging discipline — prompts and completions can contain PII, secrets, source code, customer data. Redact at the logging layer, not in application code.
+- Per-tenant isolation — multi-tenant chat apps must guarantee that one user's context never leaks into another's prompt. Audit retrieval and session code with this lens.
+
+## 6.17 Deployment Guide
+
+Standard pattern: containerize each service, deploy to Kubernetes, expose via Ingress, mesh internal traffic with Istio or Linkerd. Use Helm or Kustomize for manifest management. Roll out via blue-green or canary. Chapter 15 details this.
+
+## 6.18 Monitoring Strategy
+
+Trace every request end to end. Alert on p99 latency, p99 input tokens, error rate, cache hit rate, retry rate, queue depth. Build a dashboard per service that fits on one screen — if you cannot see the system at a glance, you will not notice it failing.
+
+## 6.19 Cost Optimization
+
+Cache aggressively. Route by difficulty. Compress prompts. Truncate retrieval to what fits in budget. Move long-context workloads to providers with better long-context pricing. Profile the top 10 most expensive endpoints monthly; you will be surprised which ones drift up.
+
+## 6.20 Interview Questions
+
+- Why use SSE over WebSocket for chat?
+- How do you rate-limit by tokens rather than requests?
+- Walk through how an LLM gateway differs from an API gateway.
+- Where do you enforce user permissions in an agent's tool call?
+- Design the backend for a chat product with 100k DAU.
+- ➕ In FastAPI, how does a streaming endpoint notice that the client left, and what should it do? **Starlette listens for the ASGI `http.disconnect` message and cancels the response, so the generator gets `asyncio.CancelledError` at its current `await`. Close the provider stream (leaving its `async with` does it), record usage, and re-raise. Use `await request.is_disconnected()` before expensive work that is not waiting on the client.**
+- ➕ How does backpressure work in an ASGI streaming response? **`await send(...)` waits while the socket's write buffer is full, so a generator that yields events directly stays suspended and stops reading from the provider. An unbounded queue between the provider and the response defeats it.**
+- ➕ When is it safe to fall back to another provider? **Only before the first token has reached the client, and only for retryable errors (connection failures, 408, 429, 5xx). After that, report an error event and let the user retry.**
+- ➕ How do you rate-limit on output tokens you do not know yet? **Reserve an estimate (input tokens plus `max_tokens`) atomically at admission, then refund the difference once real usage is known.**
+- ➕ Why is WebRTC preferred over WebSocket for browser voice agents? **WebSocket runs on TCP, where one lost packet delays all later audio (head-of-line blocking). WebRTC uses UDP with Opus error correction, jitter buffers, congestion control and built-in echo cancellation.**
+- ➕ A client retries a chat POST after a timeout. How do you avoid two generations? **An idempotency key per user action, stored with a request hash and status: completed keys return the saved result, in-progress keys return 409 or attach to the running job.**
+
+## 6.21 Hands-on Exercises
+
+1. Map a request through your previous design from Chapter 1 across the layered architecture in 6.13.
+2. For each layer, list the timeout it sets and confirm none truncates a 30-second LLM stream.
+3. Design a tenant-isolation strategy for retrieval where two users in the same org share an index but two users in different orgs do not.
+
+## 6.22 Common Mistakes
+
+- Layer-cake timeouts that silently break long requests.
+- Forgetting per-token rate limits.
+- Letting prompt injection reach a destructive tool unchecked.
+- Treating the LLM as a sync function rather than a streaming, cancellable, occasionally-failing dependency.
+
+## 6.23 Enterprise Best Practices
+
+Adopt an LLM gateway from day one — even if it is your own. Standardize on OpenTelemetry. Treat prompts and tool definitions as code, versioned in git. Build a single shared "AI client" library used across services so all teams pick up improvements to retry, cache, and observability. Run quarterly cost reviews by endpoint.
+
+## Sources
+
+- FastAPI docs, [Lifespan Events](https://fastapi.tiangolo.com/advanced/events/) and [StreamingResponse](https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse), and the [`fastapi.sse` source](https://github.com/fastapi/fastapi/blob/master/fastapi/sse.py) (`EventSourceResponse`, `ServerSentEvent`, 15-second keepalive comment).
+- Starlette docs, [StreamingResponse](https://www.starlette.io/responses/#streamingresponse), and the [ASGI HTTP spec](https://asgi.readthedocs.io/en/latest/specs/www.html) (`http.disconnect`, spec 2.4 `send` raising `OSError`).
+- Python docs, [Task cancellation](https://docs.python.org/3/library/asyncio-task.html#task-cancellation) and [`WriteTransport.set_write_buffer_limits`](https://docs.python.org/3/library/asyncio-protocol.html#asyncio.WriteTransport.set_write_buffer_limits) (write-buffer high-water mark).
+- Node.js docs, [`http.ServerResponse`](https://nodejs.org/api/http.html#class-httpserverresponse) (`write` return value, `drain`, `close`), for the Node.js comparison in 6.5a.
+- Anthropic docs, [Streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming), [Rate limits](https://platform.claude.com/docs/en/api/rate-limits) (token bucket, `retry-after` and `anthropic-ratelimit-*` headers, spend-cap 429), [Errors](https://platform.claude.com/docs/en/api/errors) (529 overloaded, default SDK retries, errors after a 200). Read in October 2026.
+- OpenAI docs, [Streaming API responses](https://developers.openai.com/api/docs/guides/streaming-responses) and the [openai-python SDK](https://github.com/openai/openai-python).
+- [anthropic-sdk-python](https://github.com/anthropics/anthropic-sdk-python) (`AsyncAnthropic`, `messages.stream`, error classes, `max_retries`).
+- LiveKit docs, [Tokens and grants](https://docs.livekit.io/frontends/authentication/tokens/) and [LiveKit Agents](https://docs.livekit.io/agents/), and the [LiveKit Python server SDK](https://github.com/livekit/python-sdks) (`livekit.api.AccessToken`).
+- WebRTC for the Curious, [Media communication](https://webrtcforthecurious.com/docs/06-media-communication/) (RTP, RTCP and congestion control).
+- Redis docs, [Scripting with Lua](https://redis.io/docs/latest/develop/programmability/eval-intro/) and [Redis Streams](https://redis.io/docs/latest/develop/data-types/streams/), and [redis-py asyncio examples](https://redis.readthedocs.io/en/stable/examples/asyncio_examples.html).
+- [arq docs](https://arq-docs.helpmanual.io/) (job IDs and uniqueness, `Retry`, `keep_result`, `job_timeout`, `job_completion_wait`, aborting jobs).
+- IETF draft, [The Idempotency-Key HTTP Header Field](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/).

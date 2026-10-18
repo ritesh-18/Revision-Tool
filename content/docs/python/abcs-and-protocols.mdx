@@ -1,0 +1,617 @@
+---
+title: "ABCs and Protocols"
+description: "How Python expresses interfaces: duck typing and EAFP by default, abc.ABC for nominal contracts enforced at instantiation, collections.abc for free mixin methods, and typing.Protocol for structural typing."
+---
+
+Python has no `interface` keyword. Instead it has three layers, from loosest to strictest:
+
+1. **Duck typing**: no declaration at all. If the object has the method, the call works.
+2. **`typing.Protocol`**: a *structural* interface checked by the type checker (mypy, pyright). Nothing has to inherit from it.
+3. **`abc.ABC`**: a *nominal* base class. Subclasses must implement the abstract methods or they cannot be instantiated.
+
+Knowing which layer to use is most of the skill.
+
+<Callout type="info">
+  Snippets were run on **CPython 3.14.6**. Static checking examples use **mypy 2.4.0**.
+</Callout>
+
+## Duck typing is the default
+
+```python
+class Duck:
+    def speak(self): return "Quack"
+class Robot:
+    def speak(self): return "Beep"
+class Rock:
+    pass
+
+def make_it_speak(thing):
+    return thing.speak()
+
+for t in (Duck(), Robot(), Rock()):
+    try:
+        print(make_it_speak(t))
+    except AttributeError as e:
+        print("AttributeError:", e)
+```
+
+```text title="Output"
+Quack
+Beep
+AttributeError: 'Rock' object has no attribute 'speak'
+```
+
+`thing.speak()` compiles to a `LOAD_ATTR` and a call. At runtime CPython looks up `speak` on the object (instance dict, then the class MRO, see [classes and instances](/docs/python/classes-and-instances)). It never asks what *type* `thing` is. The whole language is built this way: `for x in obj` only needs `__iter__` (or `__getitem__`), `len(obj)` only needs `__len__`, `with obj` only needs `__enter__` and `__exit__`. Those are the "protocols" of the [data model](/docs/python/data-model-dunder-methods), and they are duck typed.
+
+The upside: any object can participate, including ones from libraries that never heard of your code. The downside: mistakes surface late, at the call, and nothing documents what `thing` must provide. ABCs and Protocols fix the second problem without giving up the first.
+
+<Callout title="Coming from JS">
+  JavaScript works the same way at runtime: `thing.speak()` only cares that the property exists and is callable. TypeScript then adds a *structural* static layer on top. Python's equivalent of that TS layer is `typing.Protocol`, not ABCs.
+</Callout>
+
+## EAFP vs LBYL
+
+Two styles for code that might fail:
+
+- **LBYL**, "look before you leap": check first (`if key in d`, `hasattr`, `isinstance`), then act.
+- **EAFP**, "easier to ask forgiveness than permission": just do it and catch the specific exception.
+
+```python
+config = {"port": "8080"}
+# LBYL
+if "timeout" in config:
+    timeout = int(config["timeout"])
+else:
+    timeout = 30
+# EAFP
+try:
+    port = int(config["port"])
+except (KeyError, ValueError):
+    port = 8000
+print(timeout, port)
+```
+
+```text title="Output"
+30 8080
+```
+
+Python leans EAFP for three reasons:
+
+1. **It avoids race conditions.** `if os.path.exists(p): open(p)` can fail if the file is deleted between the two lines (a TOCTOU bug). `try: open(p) except FileNotFoundError:` cannot.
+2. **It fits duck typing.** You do not check *whether* an object can do something; you try, and a meaningful exception tells you it could not.
+3. **The happy path is cheap.** Since 3.11, a `try` block that does not raise costs essentially nothing ("zero-cost" exceptions). Raising and catching is what costs.
+
+Measured on 3.14.6 (2 million iterations, best of 5):
+
+```text title="Output"
+LBYL hit     52.2 ns
+EAFP hit     37.0 ns
+LBYL miss    30.7 ns
+EAFP miss   160.8 ns
+```
+
+When the key is usually present, EAFP is faster (one lookup instead of two). When it is usually missing, raising an exception is about 5 times slower. Rule of thumb: EAFP for the expected case, LBYL (or `dict.get`) when failure is common. And always catch the **narrowest** exception: a bare `except Exception` around `int(config["port"])` would also hide a typo like `confg`.
+
+<Callout title="Coming from JS">
+  JS culture is mostly LBYL (`if (obj?.prop)`, `typeof x === "function"`), partly because exceptions in JS are untyped and you cannot catch only one class without `instanceof` checks inside `catch`. Python's `except KeyError:` filters by type, which makes EAFP clean.
+</Callout>
+
+## `abc.ABC` and `@abstractmethod`
+
+### What it is
+
+An abstract base class declares methods that subclasses must implement. Unlike a TS `abstract class`, enforcement happens **at runtime, when you try to create an instance**.
+
+```python
+from abc import ABC, abstractmethod
+
+class Notifier(ABC):
+    @abstractmethod
+    def send(self, to: str, body: str) -> None: ...
+
+    @property
+    @abstractmethod
+    def channel(self) -> str: ...
+
+    def send_many(self, recipients, body):          # concrete template method
+        for r in recipients:
+            self.send(r, body)
+
+print(sorted(Notifier.__abstractmethods__))   # a frozenset; sorted for stable output
+try:
+    Notifier()
+except TypeError as e:
+    print("TypeError:", e)
+
+class HalfDone(Notifier):
+    def send(self, to, body):
+        print(f"[{self.channel}] -> {to}: {body}")
+try:
+    HalfDone()
+except TypeError as e:
+    print("TypeError:", e)
+
+class EmailNotifier(HalfDone):
+    channel = "email"     # a plain class attribute satisfies the abstract property
+
+n = EmailNotifier()
+n.send_many(["a@x.io", "b@x.io"], "hi")
+print(EmailNotifier.__abstractmethods__)
+print(type(Notifier))
+```
+
+```text title="Output"
+['channel', 'send']
+TypeError: Can't instantiate abstract class Notifier without an implementation for abstract methods 'channel', 'send'
+TypeError: Can't instantiate abstract class HalfDone without an implementation for abstract method 'channel'
+[email] -> a@x.io: hi
+[email] -> b@x.io: hi
+frozenset()
+<class 'abc.ABCMeta'>
+```
+
+### How it works underneath
+
+- `@abstractmethod` only sets `func.__isabstractmethod__ = True`. It does nothing else.
+- `ABC` is just a class whose metaclass is `ABCMeta`. When `ABCMeta` creates a class, it scans the namespace and inherited abstract names, and stores every name whose value still has `__isabstractmethod__` set into the frozenset `cls.__abstractmethods__`.
+- `object.__new__` (in C) checks that frozenset. If it is non-empty, it raises the `TypeError` you saw. That is why failure happens **at instantiation, not at class definition and not at call time**. Defining an incomplete subclass is fine; creating one is not.
+- Any object in the class namespace counts as an implementation as long as it is not marked abstract. That is why `channel = "email"` satisfies an abstract property.
+
+Because the set is computed once when the class is created, patching methods in later does not update it:
+
+```python
+from abc import ABC, abstractmethod, update_abstractmethods
+
+class Plugin(ABC):
+    @abstractmethod
+    def run(self): ...
+
+class Late(Plugin):
+    pass
+Late.run = lambda self: "patched"
+try:
+    Late()
+except TypeError as e:
+    print("TypeError:", e)
+update_abstractmethods(Late)      # 3.10+: recompute the set
+print(Late().run())
+```
+
+```text title="Output"
+TypeError: Can't instantiate abstract class Late without an implementation for abstract method 'run'
+patched
+```
+
+Abstract methods can have a body. Subclasses can call it with `super()`, which is handy for a shared default:
+
+```python
+class Partial(ABC):
+    @abstractmethod
+    def run(self):
+        return "default from the base"
+class Impl(Partial):
+    def run(self):
+        return "impl + " + super().run()
+print(Impl().run())
+```
+
+```text title="Output"
+impl + default from the base
+```
+
+Stack decorators with `@abstractmethod` **innermost**: `@property` then `@abstractmethod`, or `@classmethod` then `@abstractmethod`. The old `abstractproperty` and `abstractclassmethod` are deprecated.
+
+### Virtual subclasses with `register()`
+
+An ABC can also accept classes that never inherit from it:
+
+```python
+class Legacy:            # does not inherit from Plugin
+    def run(self): return "legacy"
+Plugin.register(Legacy)
+print(issubclass(Legacy, Plugin), isinstance(Legacy(), Plugin))
+print(Plugin in Legacy.__mro__)
+
+class NotEnforced:
+    pass
+Plugin.register(NotEnforced)
+print(isinstance(NotEnforced(), Plugin))   # register() trusts you blindly
+```
+
+```text title="Output"
+True True
+False
+True
+```
+
+`ABCMeta` overrides `__instancecheck__` and `__subclasscheck__`, so `isinstance` consults a registry (and a per-ABC cache) in addition to the real MRO. A registered class gets **no inherited methods and no enforcement**: `register()` is a promise you make, not a check Python performs.
+
+Static checkers also understand ABCs: mypy reports `Cannot instantiate abstract class "Incomplete" with abstract attribute "get"` before you run anything.
+
+<Callout title="Coming from JS">
+  TypeScript `abstract class` is checked only by the compiler; the emitted JS happily runs `new AbstractThing()` if you cast around the error. A Python ABC enforces at runtime too. Neither is like a TS `interface`, because an ABC is a real class in the MRO that can carry shared code (like `send_many` above).
+</Callout>
+
+## `collections.abc`: interfaces with free methods
+
+`collections.abc` defines the standard container interfaces. They are useful in two ways: for **checking** what something can do, and as **mixin bases** that fill in a lot of methods for you.
+
+### Checking: `__subclasshook__`
+
+```python
+from collections.abc import Iterable, Sequence, Mapping, Hashable
+
+class Countdown:
+    def __init__(self, n): self.n = n
+    def __iter__(self):
+        yield from range(self.n, 0, -1)
+
+print(isinstance(Countdown(3), Iterable))      # no inheritance, no register
+print(isinstance([], Sequence), isinstance((), Sequence), isinstance("ab", Sequence))
+print(isinstance({}, Mapping), isinstance(range(3), Sequence))
+print(isinstance(Countdown(3), Sequence))
+print(isinstance([], Hashable), isinstance((), Hashable))
+```
+
+```text title="Output"
+True
+True True True
+True True
+False
+False True
+```
+
+`Countdown` is recognised as `Iterable` without inheriting or registering. One-method ABCs like `Iterable`, `Sized`, `Container`, `Hashable` and `Callable` define a `__subclasshook__` that checks whether the method exists somewhere in the class's MRO (and is not set to `None`). That is runtime duck typing with an `isinstance` front-end. Richer ABCs such as `Sequence` and `Mapping` do **not** guess; built-in types are explicitly registered, and your own classes must inherit or call `register()`. Notice `str` is a `Sequence`, which bites code that checks `isinstance(x, Sequence)` to mean "a list of things".
+
+### Mixins: implement a few, get many
+
+| ABC | You implement | You get for free |
+|---|---|---|
+| `Iterable` | `__iter__` | (just the check) |
+| `Sequence` | `__getitem__`, `__len__` | `__contains__`, `__iter__`, `__reversed__`, `index`, `count` |
+| `MutableSequence` | the above plus `__setitem__`, `__delitem__`, `insert` | `append`, `extend`, `pop`, `remove`, `reverse`, `__iadd__` |
+| `Mapping` | `__getitem__`, `__iter__`, `__len__` | `__contains__`, `keys`, `items`, `values`, `get`, `__eq__` |
+| `MutableMapping` | the above plus `__setitem__`, `__delitem__` | `pop`, `popitem`, `clear`, `update`, `setdefault` |
+| `Set` | `__contains__`, `__iter__`, `__len__` | comparisons, `&`, `-`, `^`, `isdisjoint` |
+
+```python
+from collections.abc import Sequence
+
+class Page(Sequence):
+    def __init__(self, items): self._items = list(items)
+    def __getitem__(self, i): return self._items[i]
+    def __len__(self): return len(self._items)
+
+pg = Page(["a", "b", "c", "b"])
+print(list(pg), "b" in pg, pg.index("c"), pg.count("b"), list(reversed(pg)))
+```
+
+```text title="Output"
+['a', 'b', 'c', 'b'] True 2 2 ['b', 'c', 'b', 'a']
+```
+
+The free methods are written in terms of your primitives, so they are correct but generic (`__contains__` is a linear scan via `__iter__`). Override them when you can do better.
+
+A backend example: a case-insensitive HTTP header map. Subclassing `MutableMapping` is the right way to build a custom dict; subclassing `dict` is the classic trap:
+
+```python
+from collections.abc import MutableMapping
+
+class LowerKeyDict(MutableMapping):
+    """Case-insensitive header map: implement 5 methods, get ~10 for free."""
+    def __init__(self, *args, **kwargs):
+        self._d = {}
+        self.update(*args, **kwargs)          # update() is a free mixin
+    def __getitem__(self, k): return self._d[k.lower()]
+    def __setitem__(self, k, v): self._d[k.lower()] = v
+    def __delitem__(self, k): del self._d[k.lower()]
+    def __iter__(self): return iter(self._d)
+    def __len__(self): return len(self._d)
+
+h = LowerKeyDict({"Content-Type": "json"}, Accept="*/*")
+print(h["CONTENT-TYPE"], "accept" in h, h.get("X-Missing", "-"))
+print(dict(h.items()), h.pop("ACCEPT"), len(h))
+h.setdefault("X-Req-Id", "42")
+print(dict(h), h == {"content-type": "json", "x-req-id": "42"})
+
+class Broken(dict):
+    def __setitem__(self, k, v):
+        super().__setitem__(k.lower(), v)
+b = Broken()
+b.update({"Content-Type": "json"})     # dict.update bypasses the override
+print(b)
+```
+
+```text title="Output"
+json True -
+{'content-type': 'json', 'accept': '*/*'} */* 1
+{'content-type': 'json', 'x-req-id': '42'} True
+{'Content-Type': 'json'}
+```
+
+`dict`'s C methods (`update`, `__init__`, `setdefault`, `get`) do not call your overridden `__setitem__`/`__getitem__`; they go straight to the C hash table. The `MutableMapping` mixins are written in Python on top of your methods, so every path goes through your logic. (If you do want a real `dict` subclass, `collections.UserDict` is the other safe option.)
+
+In type hints, prefer the abstract types for parameters: accept `Iterable[str]` or `Mapping[str, int]`, return concrete `list` or `dict`. The `typing.List`/`typing.Dict` aliases are deprecated in favour of `collections.abc` and the builtins.
+
+## `typing.Protocol`: structural typing
+
+### What it is
+
+A `Protocol` describes a shape: "anything with these methods and attributes". A class satisfies it **without inheriting from it**. The check is done by the static type checker.
+
+```python
+from typing import Protocol
+
+class SupportsClose(Protocol):
+    def close(self) -> None: ...
+
+class File:
+    def close(self) -> None: ...
+
+class Weird:
+    def close(self, force: bool) -> int: return 1
+
+class Rock:
+    pass
+
+def shutdown(r: SupportsClose) -> None:
+    r.close()
+
+shutdown(File())
+shutdown(Weird())
+shutdown(Rock())
+```
+
+Running `mypy` on that file:
+
+```text title="Output"
+t1.py:19: error: Argument 1 to "shutdown" has incompatible type "Weird"; expected "SupportsClose"  [arg-type]
+t1.py:19: note: Following member(s) of "Weird" have conflicts:
+t1.py:19: note:     Expected:
+t1.py:19: note:         def close(self) -> None
+t1.py:19: note:     Got:
+t1.py:19: note:         def close(self, force: bool) -> int
+t1.py:20: error: Argument 1 to "shutdown" has incompatible type "Rock"; expected "SupportsClose"  [arg-type]
+Found 2 errors in 1 file (checked 1 source file)
+```
+
+The checker compares full signatures, so `Weird` is rejected even though it has a `close`. At **runtime** the annotation is ignored: `shutdown(Weird())` crashes with `TypeError` (missing `force`) and `shutdown(Rock())` would crash with `AttributeError`. Only the static checker catches them before deployment.
+
+### How it works underneath
+
+- `Protocol` is a special base class understood by type checkers (PEP 544). Its metaclass is a subclass of `ABCMeta`.
+- Listing `Protocol` in the bases marks the class as a protocol. A subclass that lists `Protocol` again is also a protocol; a subclass that does not is a normal class that explicitly implements it (you *may* inherit from a protocol to get its default method bodies and an early error if you miss something).
+- Protocols cannot be instantiated.
+- Without `@runtime_checkable`, `isinstance(x, SupportsClose)` raises `TypeError`, on purpose, so you do not mistake a static contract for a runtime check.
+
+### `@runtime_checkable` and its limits
+
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Closeable(Protocol):
+    def close(self) -> None: ...
+
+class File:
+    def close(self) -> None: print("file closed")
+class Liar:
+    close = 42            # not callable, wrong "signature"
+class Weird:
+    def close(self, force: bool) -> int: return 1
+
+print(isinstance(File(), Closeable), isinstance(Liar(), Closeable), isinstance(Weird(), Closeable))
+print(isinstance(object(), Closeable))
+
+@runtime_checkable
+class HasName(Protocol):
+    name: str
+class Thing:
+    def __init__(self): self.name = "x"
+print(isinstance(Thing(), HasName))
+try:
+    issubclass(Thing, HasName)
+except TypeError as e:
+    print("TypeError:", e)
+try:
+    Closeable()
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+True True True
+False
+True
+TypeError: Protocols with non-method members don't support issubclass(). Non-method members: 'name'.
+TypeError: Protocols cannot be instantiated
+```
+
+The runtime check only asks **"do attributes with these names exist?"**. It ignores signatures, return types and even whether the attribute is callable (`Liar` passes). Since 3.12 it uses `inspect.getattr_static`, so it does not trigger properties or `__getattr__`, and it is noticeably slow for protocols with many members compared to a normal `isinstance`. Use it for coarse dispatch, never as validation.
+
+<Callout title="Coming from JS">
+  A Protocol is the Python version of a TypeScript `interface`: structural, erased at runtime, checked by a tool. Differences worth knowing: TS checks object literals for excess properties and Python does not; Python protocols can declare `@property` members, class methods and `__call__`; and `@runtime_checkable` gives you a (weak) runtime check that TS interfaces never have. A TS user-defined type guard (`x is Foo`) maps to `TypeGuard`/`TypeIs` in [advanced typing](/docs/python/advanced-typing).
+</Callout>
+
+## ABC or Protocol?
+
+<Mermaid chart={`flowchart TD
+  A["Need an interface"] --> B{"Do implementers live<br/>outside your code?"}
+  B -->|yes| P["Protocol<br/>structural, no inheritance needed"]
+  B -->|no| C{"Want shared method code<br/>or runtime enforcement?"}
+  C -->|yes| ABC["abc.ABC<br/>nominal, checked at instantiation"]
+  C -->|no| D{"Only a type-checker contract?"}
+  D -->|yes| P
+  D -->|no| ABC
+`} />
+
+| Question | `abc.ABC` | `typing.Protocol` |
+|---|---|---|
+| How does a class conform? | inherits (or is registered) | just has the right members |
+| When is it checked? | at runtime, on instantiation, plus statically | statically; at runtime only names, if `@runtime_checkable` |
+| Can it carry shared implementation? | yes, a natural fit | only for classes that opt in by inheriting |
+| Works with third-party classes? | only via `register()` | yes, automatically |
+| Coupling | implementer imports the base | implementer knows nothing about it |
+
+Rules of thumb:
+
+- **Protocol** for "ports" your code *consumes*: repositories, clients, clocks, caches, anything you want to fake in tests. Define the protocol next to the consumer, with only the methods it needs (interface segregation for free).
+- **ABC** for frameworks and plugin systems where you *provide* a base class with template methods and want a clear error if a subclass forgets something.
+- Both together is fine: a Protocol as the public contract, an ABC as an optional helper base for implementers.
+- Plain duck typing for small internal helpers where neither adds clarity.
+
+## Example: a repository interface for a backend
+
+The service declares what it needs as a `Protocol`. An in-memory adapter satisfies it with no base class. A SQL adapter shares plumbing through an ABC. The service never imports either adapter.
+
+```python
+from __future__ import annotations
+
+import itertools
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
+from typing import Protocol
+
+
+@dataclass(frozen=True, slots=True)
+class User:
+    id: int | None
+    email: str
+    name: str
+
+
+class UserNotFound(LookupError):
+    pass
+
+
+# ---- the port: what the service needs, nothing more ----
+class UserRepository(Protocol):
+    async def get(self, user_id: int) -> User: ...
+    async def get_by_email(self, email: str) -> User | None: ...
+    async def add(self, user: User) -> User: ...
+
+
+# ---- adapter 1: in-memory (tests, local dev) ----
+class InMemoryUserRepository:            # note: no base class at all
+    def __init__(self) -> None:
+        self._rows: dict[int, User] = {}
+        self._ids = itertools.count(1)
+
+    async def get(self, user_id: int) -> User:
+        try:
+            return self._rows[user_id]
+        except KeyError:
+            raise UserNotFound(user_id) from None
+
+    async def get_by_email(self, email: str) -> User | None:
+        return next((u for u in self._rows.values() if u.email == email), None)
+
+    async def add(self, user: User) -> User:
+        new_id = next(self._ids)
+        saved = replace(user, id=new_id)
+        self._rows[new_id] = saved
+        return saved
+
+
+# ---- adapter 2: a SQL-backed one shares plumbing through an ABC ----
+class SqlRepositoryBase(ABC):
+    def __init__(self, dsn: str) -> None:
+        self.dsn = dsn
+
+    @abstractmethod
+    def table(self) -> str: ...
+
+    def _select(self, where: str) -> str:   # shared helper, inherited for free
+        return f"SELECT * FROM {self.table()} WHERE {where}"
+
+
+class PostgresUserRepository(SqlRepositoryBase):
+    def table(self) -> str:
+        return "users"
+
+    async def get(self, user_id: int) -> User:
+        print("SQL:", self._select("id = $1"))
+        return User(user_id, "db@example.com", "From DB")
+
+    async def get_by_email(self, email: str) -> User | None:
+        print("SQL:", self._select("email = $1"))
+        return None
+
+    async def add(self, user: User) -> User:
+        print("SQL: INSERT INTO", self.table())
+        return replace(user, id=99)
+
+
+# ---- the service depends on the Protocol, not on a concrete class ----
+class UserService:
+    def __init__(self, repo: UserRepository) -> None:
+        self.repo = repo
+
+    async def register(self, email: str, name: str) -> User:
+        if await self.repo.get_by_email(email):
+            raise ValueError(f"{email} already registered")
+        return await self.repo.add(User(None, email, name))
+
+
+async def main() -> None:
+    for repo in (InMemoryUserRepository(), PostgresUserRepository("postgres://...")):
+        svc = UserService(repo)
+        u = await svc.register("ada@example.com", "Ada")
+        print(type(repo).__name__, "->", u)
+    mem = InMemoryUserRepository()
+    svc = UserService(mem)
+    await svc.register("ada@example.com", "Ada")
+    try:
+        await svc.register("ada@example.com", "Ada again")
+    except ValueError as e:
+        print("ValueError:", e)
+    try:
+        await mem.get(42)
+    except UserNotFound as e:
+        print("UserNotFound:", e)
+
+import asyncio
+asyncio.run(main())
+```
+
+```text title="Output"
+InMemoryUserRepository -> User(id=1, email='ada@example.com', name='Ada')
+SQL: SELECT * FROM users WHERE email = $1
+SQL: INSERT INTO users
+PostgresUserRepository -> User(id=99, email='ada@example.com', name='Ada')
+ValueError: ada@example.com already registered
+UserNotFound: 42
+```
+
+`mypy --strict` reports `Success: no issues found` for this file: both adapters structurally match `UserRepository`. If you rename `get_by_email` in one adapter, the error appears at `UserService(repo)`, the place where the contract matters.
+
+Design notes:
+
+- The protocol lives with the **consumer** (the service layer), not with the database code. Adapters depend inward, never the reverse.
+- Methods are `async def` in the protocol, so an adapter with a sync `get` would be rejected by the checker (its return type is not awaitable).
+- Raising a domain error (`UserNotFound`, a `LookupError`) instead of leaking `KeyError` or a driver exception keeps the service independent of storage.
+- Wiring is plain constructor injection. FastAPI's `Depends` or a small factory function replaces NestJS's DI container.
+
+<Callout title="Coming from JS">
+  In NestJS you would write `interface UserRepository` plus an injection token (`@Inject(USER_REPO)`), because TS interfaces do not exist at runtime and the container needs something real to key on. In Python you just pass the object; the Protocol exists only for the type checker, and there is no container to satisfy.
+</Callout>
+
+## Interview questions
+
+1. **What is duck typing and how does Python implement it?** **Behaviour is decided by which attributes an object has, not its declared type. Attribute lookup happens at call time, so any object with the right method works.**
+2. **EAFP vs LBYL: which does Python prefer and why?** **EAFP. It avoids check-then-act races, fits duck typing, and a non-raising `try` is nearly free since 3.11. Use LBYL when failure is the common case, because raising is expensive.**
+3. **When exactly does an ABC with missing abstract methods fail?** **At instantiation. `ABCMeta` computes `__abstractmethods__` when the class is created, and `object.__new__` raises `TypeError` if that set is non-empty.**
+4. **What does `ABC.register()` do and not do?** **It makes `isinstance`/`issubclass` return `True` for a class that does not inherit. It adds no methods and enforces nothing.**
+5. **Why subclass `MutableMapping` instead of `dict` for a custom mapping?** **`dict`'s C methods like `update` and `get` bypass overridden `__setitem__`/`__getitem__`. `MutableMapping`'s mixins are built on your methods, so behaviour stays consistent, and you get about ten methods for free.**
+6. **How is a `Protocol` different from an ABC?** **Protocols are structural and checked statically; classes conform just by having matching members. ABCs are nominal, require inheritance or registration, and are enforced at runtime.**
+7. **What does `@runtime_checkable` actually check?** **Only that attributes with the protocol's member names exist. Not signatures, not types, not even callability. Data protocols also cannot be used with `issubclass`.**
+8. **How would you define a repository interface in a Python backend?** **A `Protocol` next to the service that uses it, listing only the needed methods. Adapters implement it without inheriting; optionally share plumbing through an ABC; inject via the constructor.**
+
+## Recap
+
+- Python is duck typed. Interfaces are documentation and tooling layered on top.
+- Prefer EAFP with narrow `except` clauses; switch to LBYL or `.get()` when misses are common.
+- `abc.ABC` plus `@abstractmethod` is nominal and runtime enforced, at instantiation time, via `__abstractmethods__`. ABCs can carry shared code.
+- `collections.abc` gives `isinstance` checks (some via `__subclasshook__`) and mixins: implement two to five primitives, get the rest. Use them instead of subclassing `dict` or `list`.
+- `typing.Protocol` is structural typing like TS interfaces, checked by mypy or pyright. `@runtime_checkable` only checks names.
+- Protocols for ports you consume, ABCs for bases you provide.

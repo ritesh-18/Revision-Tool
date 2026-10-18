@@ -1,0 +1,1922 @@
+---
+title: "Backend Scaling and Performance Engineering: Part 2"
+description: Statelessness, load balancers and health checks, read replicas and sharding, CDNs and edge computing, async processing, microservices and serverless, solved at the engineering level.
+---
+
+<Callout type="info">
+  Notes for [Backend Scaling and Performance Engineering, Part 2](https://youtu.be/sOhAopEwjH4) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, config, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+[Part 1](/docs/backend-first-principles/21-scaling-performance-part-1) ended on horizontal scaling: more identical servers instead of one bigger one, with the warning that it brings distributed-systems problems. **This part solves those problems one by one**: what makes horizontal scaling possible at all (statelessness), how traffic is split (load balancers), how the stateful part scales (databases), how geography is handled (CDNs and the edge), how to make users wait less (async work), and two architectural options that are often pitched as "the way to scale" (microservices and serverless). It ends with the lesson's rules of thumb for the whole series.
+
+<Mermaid chart={`flowchart LR
+  A["Statelessness"] --> B["Load balancers<br/>algorithms + health checks"]
+  B --> C["Database scaling<br/>replicas, sharding"]
+  C --> D["CDNs"]
+  D --> E["Edge computing"]
+  E --> F["Async processing"]
+  F --> G["Microservices"]
+  G --> H["Serverless"]
+  H --> I["Rules of thumb"]`} />
+
+---
+
+## 1. Statelessness: what makes horizontal scaling work 🎓
+
+### The problem
+Horizontal scaling runs **many copies of the same code** and spreads requests across them. That only works if **it doesn't matter which copy gets a request**. If instance D holds data that A, B and C can't see, a request landing on the wrong instance behaves differently, and you get "weird errors" across the stack.
+
+- **Stateful server:** holds information exclusive to itself (about a user, a session, a file).
+- **Stateless server:** holds nothing that other instances can't reach. Delete instance B and A + C + D behave exactly the same.
+
+**Rule:** anything that must persist lives **outside** the servers, in a shared store every instance can reach. This is why the lesson says horizontal scaling must be planned **from the ground up**: it changes code, not just infrastructure, while vertical scaling is a slider in a dashboard.
+
+<Mermaid chart={`flowchart TB
+  U["users"] --> LB["load balancer"]
+  LB --> A["instance A"]
+  LB --> B["instance B"]
+  LB --> C["instance C"]
+  A & B & C --> R[("Redis<br/>sessions, cache")]
+  A & B & C --> S[("Object storage<br/>S3, R2, MinIO")]
+  A & B & C --> P[("Postgres / RDS<br/>data")]`} />
+
+### Example 1: sessions
+1. The user logs in. The request lands on **instance A**, which creates a session, sets the session-ID cookie, and stores the session **in its own memory** (an in-process array or map).
+2. The next request lands on **instance B**. B has never heard of that session, so it returns **401: please log in**. The user just logged in. A confusing, frustrating experience.
+
+**Fix:** store sessions in a shared store such as **Redis**. A writes the session there; B looks it up there and sees the user is authenticated.
+
+(🔧 In Python this bites even on a single machine: each uvicorn or gunicorn worker is a separate process with its own memory, so a dict of sessions in worker 1 is invisible to worker 2.)
+
+### Example 2: file uploads
+A saves an uploaded file to **its own disk**; the next request lands on C, which can't find it. **Fix:** upload to **object storage** (S3, Cloudflare R2, or an on-premise MinIO) that every instance can read.
+
+### Example 3: the database
+SQLite keeps the database as a file on one server's disk. With several instances, use a **shared database server** (Postgres, or a managed one like RDS).
+
+| State | Wrong (stateful) | Right (externalized) |
+|---|---|---|
+| Sessions, cache | in-process memory | Redis / Valkey |
+| Uploaded files | local disk | S3 / R2 / MinIO |
+| Relational data | SQLite file on the box | Postgres / RDS |
+
+### 🔧 Going deeper: Redis-backed sessions in FastAPI
+
+```python title="sessions.py"
+import json
+import os
+import secrets
+import time
+from typing import Annotated
+
+import redis.asyncio as redis
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
+
+app = FastAPI()
+r = redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+TTL = 60 * 60 * 24 * 7  # 7 days
+
+
+async def login(response: Response, user_id: str) -> None:
+    sid = secrets.token_urlsafe(32)  # unguessable, 256 bits
+    await r.set(f"sess:{sid}", json.dumps({"user_id": user_id, "at": time.time()}), ex=TTL)
+    response.set_cookie("sid", sid, httponly=True, secure=True, samesite="lax", max_age=TTL)
+
+
+async def require_session(sid: Annotated[str | None, Cookie()] = None) -> dict:
+    raw = await r.get(f"sess:{sid}") if sid else None  # ANY instance (and any worker) can answer this
+    if raw is None:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+    await r.expire(f"sess:{sid}", TTL)  # sliding expiry
+    return json.loads(raw)
+
+
+async def logout(sid: str) -> None:
+    await r.delete(f"sess:{sid}")  # instant revocation everywhere
+
+
+@app.get("/me")
+async def me(session: Annotated[dict, Depends(require_session)]) -> dict:
+    return {"user_id": session["user_id"]}
+```
+
+🔧 Alternatives and edge cases:
+- **Sticky sessions** (the load balancer pins a user to one instance) hide the problem instead of fixing it. When that instance dies or scales in, its users lose their sessions, and the load becomes uneven.
+- **JWTs** avoid a session lookup entirely (the token carries the claims, signed), but you lose easy revocation. Many systems use short-lived JWTs plus a refresh token stored server-side.
+- Other hidden state to externalize: **rate-limit counters**, **WebSocket subscriptions** (use Redis pub/sub to fan out across instances), **scheduled cron jobs** (run them once, not on every instance, e.g. via a queue's repeatable jobs), and **local temp files** between requests.
+
+---
+
+## 2. Load balancers 🎓
+
+### The problem
+With several instances, **where** in the stack is the decision made about which instance gets each request? Something must sit between the internet and the servers.
+
+### The mechanism
+A **load balancer (LB)** is that middleman. All client traffic goes to the LB, never to servers directly. The LB picks an instance using its **algorithm**, forwards the request, receives the response, and sends it back on the same client connection.
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant LB as Load balancer
+  participant A as Instance A
+  participant B as Instance B
+  C->>LB: GET /profile
+  LB->>LB: algorithm picks B
+  LB->>B: forward request
+  B-->>LB: 200 JSON
+  LB-->>C: 200 JSON (same connection)`} />
+
+### 2.1 Round robin
+Send requests in rotation: A, B, C, A, B, C...
+- **Works well when** requests cost roughly the same **and** servers have the same capacity (e.g. each 4 GB RAM, 2 cores). A dumb algorithm can carry a lot of traffic in that case.
+- **Breaks when request costs differ.** The lesson's two request types:
+  - **Type 1, light:** a simple `SELECT` of the user's profile, about **200–300 ms**.
+  - **Type 2, heavy:** calls an external service (Elasticsearch, an email API), then writes to a big table with many indexes (every index must be updated on a write, as in Part 1), about **2 s**.
+- Round robin knows nothing about cost. If the arrival order happens to line up, **all the heavy requests land on one server**, which can eventually crash while the others sit idle.
+
+### 2.2 Weighted round robin
+Same rotation, with capacity weights. If A has **8 GB / 4 cores** and B and C have **4 GB / 2 cores**, give A weight 2: for every 4 requests, A gets 2, B 1, C 1. It handles **unequal servers**, but it's still blind to **unequal requests**.
+
+### 2.3 Least connections
+Send each request to the server with the **fewest active connections right now**.
+
+**Why active connections measure load:** in HTTP's request-response cycle, the connection stays open (active) while the server works on the request, through the external API call and the database write. A heavy request holds its connection for 2 s; a light one for 200 ms. So **the connection count is a live signal of how much unfinished work each server has**. (🔧 With HTTP/1.1 keep-alive and HTTP/2 multiplexing, LBs count in-flight requests or streams rather than TCP connections; the idea is the same.)
+
+The lesson's walkthrough:
+
+| Step | Arrives | Active connections A / B / C | Goes to |
+|---|---|---|---|
+| 1 | heavy (2 s) | 0 / 0 / 0 | A (tie, any) |
+| 2 | light | 1 / 0 / 0 | B |
+| 3 | light | 1 / 1 / 0 | C |
+| 4 (≈300 ms later) | any | 1 / 0 / 0 (B and C done, A still busy) | B or C, **not A** |
+
+Heavy work naturally steers new traffic away from the busy server. **Weighted least connections** combines this with capacity weights (an 8 GB server is allowed twice the connections).
+
+### 2.4 Others
+- **Least response time:** prefer servers answering fastest; a struggling server gets fewer requests.
+- **Resource-based:** prefer servers with low CPU or memory usage.
+
+The idea is always the same: some logic in the LB decides which instance gets the next request.
+
+<Mermaid chart={`flowchart TD
+  Q{"Requests similar in cost?"} -->|yes| Q2{"Servers equal?"}
+  Q2 -->|yes| RR["Round robin"]
+  Q2 -->|no| WRR["Weighted round robin"]
+  Q -->|no| Q3{"Servers equal?"}
+  Q3 -->|yes| LC["Least connections"]
+  Q3 -->|no| WLC["Weighted least connections"]
+  LC -.-> LRT["or least response time / resource-based"]`} />
+
+### 2.5 Health checks: what happens when an instance dies
+**Problem.** Instance A crashes (overload, a bad config). With round robin the LB keeps sending it every third request. Those users get **502/503**. Worse, any user's next request may land on A, so the errors hop around between users.
+
+**Mechanism.** Alongside real traffic, the LB sends its own **test request** to every instance, e.g. every second, to a cheap endpoint, expecting **200**. The endpoint does no heavy work, so the probes add no meaningful load.
+1. A probe fails (error, timeout or non-2xx): the LB marks the instance **unhealthy** and stops sending it user traffic. Traffic goes to B and C by the normal algorithm.
+2. The LB **keeps probing** the unhealthy instance; otherwise it could never find out that it recovered.
+3. When probes return 200 again, the LB puts it back into rotation.
+
+<Mermaid chart={`stateDiagram-v2
+  [*] --> Healthy
+  Healthy --> Unhealthy: probe fails (fall threshold)
+  Unhealthy --> Unhealthy: still failing, keep probing
+  Unhealthy --> Healthy: probe returns 200 (rise threshold)
+  Healthy --> Healthy: probe 200, receives user traffic`} />
+
+### 🔧 Going deeper: config and a proper health endpoint
+
+```nginx title="nginx.conf"
+upstream api {
+  least_conn;                                            # 2.3
+  server 10.0.0.11:3000 weight=2 max_fails=3 fail_timeout=10s;  # 8 GB box, weighted
+  server 10.0.0.12:3000 max_fails=3 fail_timeout=10s;
+  server 10.0.0.13:3000 max_fails=3 fail_timeout=10s;
+}
+server {
+  listen 80;
+  location / { proxy_pass http://api; proxy_next_upstream error timeout http_502 http_503; }
+}
+```
+
+Open-source NGINX does **passive** checks (it marks a server failed after real requests fail). For **active** probing like the lesson describes, use HAProxy, a cloud LB (AWS ALB target-group health checks) or Kubernetes readiness probes:
+
+```text title="haproxy.cfg"
+backend api
+  balance leastconn
+  option httpchk GET /health/ready
+  http-check expect status 200
+  # probe every 1 s, 3 failures = down, 2 successes = back up
+  server a 10.0.0.11:3000 check inter 1s fall 3 rise 2 weight 2
+  server b 10.0.0.12:3000 check inter 1s fall 3 rise 2 weight 1
+```
+
+```python title="health.py"
+import asyncio
+import signal
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Response
+from sqlalchemy import text
+
+DRAIN_SECONDS = 10
+draining = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # graceful shutdown: fail readiness first, let the LB notice, then finish in-flight requests
+    loop = asyncio.get_running_loop()
+    uvicorn_handler = signal.getsignal(signal.SIGTERM)  # uvicorn's own graceful-shutdown handler
+
+    def on_sigterm() -> None:
+        global draining
+        draining = True  # 1. readiness fails, the LB stops routing new requests here
+        if callable(uvicorn_handler):  # 2. later: uvicorn stops accepting and drains in-flight requests
+            loop.call_later(DRAIN_SECONDS, uvicorn_handler, signal.SIGTERM, None)
+
+    loop.add_signal_handler(signal.SIGTERM, on_sigterm)  # Unix only
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health/live")
+async def live() -> Response:  # process is up: don't check dependencies here
+    return Response(status_code=200)
+
+
+@app.get("/health/ready")
+async def ready() -> Response:  # can I take traffic right now?
+    if draining:
+        return Response(status_code=503)
+    try:
+        async with asyncio.timeout(0.5):
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        return Response(status_code=200)
+    except Exception:
+        return Response(status_code=503)
+```
+
+On Kubernetes, a `preStop` hook that sleeps for a few seconds gives the same "stop routing first, then shut down" delay without any code, because the pod is removed from the Service's endpoints while the hook runs.
+
+Edge cases:
+- **Thresholds (fall/rise)** stop one slow probe from flapping an instance in and out.
+- **Liveness vs readiness.** If liveness checks the DB, a DB outage makes the orchestrator **restart every instance** at once, turning one failure into a full outage. Check dependencies only in readiness.
+- **Draining.** Without the readiness-first shutdown above, a deploy drops the requests that were in flight on the old instances.
+
+---
+
+## 3. Overload protection: backpressure, load shedding and rate limiting ➕
+
+Health checks take **dead** instances out of rotation, but nothing so far protects the **live** ones from receiving more traffic than they can handle, and autoscaling (section 12) takes minutes to help.
+
+<Mermaid chart={`flowchart LR
+  C["clients"] --> E{"edge: per-IP limit<br/>nginx / CDN"}
+  E -->|"over limit: 429"| C
+  E --> RL{"per-tenant token bucket<br/>Redis"}
+  RL -->|"over quota: 429"| C
+  RL --> AC{"in-flight below cap?<br/>event loop healthy?"}
+  AC -->|"no, and request is sheddable: 503"| C
+  AC --> H["handler"]
+  H --> D["downstreams<br/>retry budget + circuit breaker"]`} />
+
+#### 3.1 Why overload collapses throughput instead of capping it ➕
+
+**Problem.** A service that handles 1,000 req/s receives 1,300 req/s during a spike. You'd expect it to serve 1,000 and fail 300. Instead, it serves almost nothing successfully.
+
+**Why it happens (first principles).**
+- Past 100% utilization the queue grows without limit (Part 1, section 4). By Little's law, if latency goes from 100 ms to 10 s, in-flight requests grow 100×, along with their memory, sockets and pool slots.
+- Clients have **timeouts**. A client gives up after 5 s, but the server still finishes the request at second 8. The CPU spent on it was wasted: it produced no **goodput** (useful, successfully delivered responses).
+- Clients then **retry**, adding more load exactly when there is the least capacity (section 3.5).
+
+So an unprotected server under overload spends more and more of its capacity on requests nobody is waiting for, and goodput falls toward zero. The fix is counter-intuitive: **reject some requests early and cheaply**, so the rest finish in time.
+
+#### 3.2 Backpressure: bounded concurrency and bounded queues ➕
+
+**Problem.** Uvicorn accepts every connection and starts every request, so there is no limit on how much work is in progress at once. (Its `--limit-concurrency` option is a blunt backstop: past N connections or tasks it answers `503` immediately, with no queue and no exceptions for health checks.)
+
+**Mechanism.** Cap in-flight requests per worker process, and let a small, bounded queue absorb short bursts. A request that can't get a slot within a short wait is rejected with `503` and `Retry-After`. Choose the cap with Little's law: if the load test shows one instance sustains 400 req/s at about 100 ms, around 40 requests are in flight at the knee, so a cap of about 60–80 per instance leaves room for normal variation while stopping a pile-up. Divide it by the number of workers per instance, because each worker process enforces its own limit.
+
+```python title="concurrency_limit.py (pure ASGI middleware)"
+import asyncio
+
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+MAX_IN_FLIGHT = 20  # from the load test: 80 per instance ÷ 4 workers
+MAX_QUEUED = 25
+MAX_WAIT_S = 0.2    # waiting longer than this is worse than failing fast
+
+
+class ConcurrencyLimit:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self.slots = asyncio.Semaphore(MAX_IN_FLIGHT)
+        self.waiting = 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope["path"].startswith(("/health", "/metrics")):
+            return await self.app(scope, receive, send)  # never limit probes and metrics
+
+        if self.slots.locked() and self.waiting >= MAX_QUEUED:
+            return await reject(scope, receive, send)    # queue full: fail fast
+        self.waiting += 1
+        try:
+            async with asyncio.timeout(MAX_WAIT_S):      # queued too long: give up cheaply
+                await self.slots.acquire()
+        except TimeoutError:
+            return await reject(scope, receive, send)
+        finally:
+            self.waiting -= 1
+
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.slots.release()  # on success, on error AND on client disconnect (cancellation)
+
+
+async def reject(scope: Scope, receive: Receive, send: Send) -> None:
+    response = JSONResponse({"error": "overloaded, retry shortly"}, status_code=503,
+                            headers={"Retry-After": "1"})
+    await response(scope, receive, send)
+
+
+# app.add_middleware(ConcurrencyLimit)
+```
+
+**Edge cases.**
+- **Don't fail readiness because of overload.** If an overloaded instance reports unready, the LB moves its traffic to the others, which then overload too, and the whole fleet drops out one by one. Readiness means "I can work", not "I'm busy".
+- **Exclude health-check and metrics routes** from the limit, or the LB will think a busy instance is dead.
+- With the **least-connections** algorithm (section 2.3), the LB already avoids busy instances; the cap protects against bursts that hit all of them at once.
+
+#### 3.3 Load shedding: dropping the right requests ➕
+
+**Problem.** When you must reject something, rejecting at random hurts checkout as much as a background analytics ping.
+
+**Mechanism: priorities plus an overload signal.**
+- **Classify requests.** Google's SRE book describes request **criticality** levels (from `CRITICAL_PLUS` down to `SHEDDABLE`). Stripe describes a fleet-usage shedder that **reserves part of capacity for critical requests**, and a last-line worker-utilization shedder that drops traffic in order: test-mode traffic first, then `GET`s, then `POST`s, critical methods last.
+- **Measure overload in-process.** In an asyncio server, **event-loop lag** is a direct signal: if the loop is 200 ms late, every request on that worker is 200 ms late. Python has no built-in gauge for it, but a background task that sleeps 20 ms and measures how late it wakes up is enough. Shed sheddable traffic first when it rises; shed everything but critical traffic when it rises further.
+- **Drop work nobody is waiting for.** Pass a deadline with the request (e.g. "the client gives up at time T"); when a request is dequeued after its deadline, skip it instead of computing an answer nobody will read.
+
+```python title="shed.py"
+import asyncio
+import time
+from collections import deque
+from typing import Literal
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from prometheus_client import Counter
+
+app = FastAPI()
+SHED = Counter("requests_shed_total", "Requests rejected by the load shedder", ["priority"])
+
+_lag_ms: deque[float] = deque(maxlen=50)  # the last second of 20 ms samples
+
+
+async def monitor_loop_lag(interval: float = 0.02) -> None:  # start it as a task in the lifespan
+    while True:
+        t0 = time.perf_counter()
+        await asyncio.sleep(interval)
+        _lag_ms.append((time.perf_counter() - t0 - interval) * 1000)  # how late the loop woke us up
+
+
+def worst_lag_ms() -> float:
+    return max(_lag_ms, default=0.0)  # with 50 samples, the max is roughly the p98 of the last second
+
+
+type Priority = Literal["critical", "normal", "sheddable"]
+
+
+def priority_of(request: Request) -> Priority:
+    path = request.url.path
+    if path.startswith(("/checkout", "/payments")):
+        return "critical"
+    if request.method == "GET" and path.startswith("/recommendations"):
+        return "sheddable"
+    return "normal"
+
+
+@app.middleware("http")
+async def load_shedder(request: Request, call_next):
+    p = priority_of(request)
+    lag = worst_lag_ms()
+    shed = (p == "sheddable" and lag > 100) or (p == "normal" and lag > 300)
+    deadline = float(request.headers.get("x-request-deadline", 0))  # epoch ms, set by the caller
+    if shed or (deadline and time.time() * 1000 > deadline):
+        SHED.labels(priority=p).inc()  # shedding must be visible
+        return JSONResponse({"error": "temporarily overloaded"}, status_code=503,
+                            headers={"Retry-After": "2"})
+    return await call_next(request)
+```
+
+In the Node world, Fastify ships a ready-made version, `@fastify/under-pressure`, which returns `503` when event-loop delay, heap, RSS or event-loop utilization cross configured limits; in Python you assemble the same thing from the pieces above.
+
+**Edge cases.**
+- **Shed as early as possible.** A rejection at the edge or in the first middleware costs microseconds; one after authentication and a database query has already spent most of the cost.
+- **Clients must treat 503 + Retry-After as "back off"**, not as "retry immediately" (section 3.5).
+- **Shedding hides real capacity problems** if nobody looks. Alert on the shed rate; sustained shedding means you need more capacity.
+
+#### 3.4 Rate limiting at scale: a distributed token bucket ➕
+
+**Problem.** The rate limiters in [Backend security](/docs/backend-first-principles/20-backend-security) and [Caching](/docs/backend-first-principles/13-caching) use fixed windows in Redis, which is right for login protection. For an API with per-customer quotas across many instances, two issues appear:
+- **In-memory limits multiply with instances.** "100 req/s per customer" enforced in each of 10 instances really means 1,000 req/s, and the number changes every time the autoscaler acts.
+- **Fixed windows allow double bursts** at the window edge.
+
+**Mechanism: a token bucket shared in Redis.** Each customer has a bucket of capacity **B** that refills at **r** tokens per second; each request takes one token. Over time a customer gets at most r per second, and can burst up to B after a quiet period. Instead of a timer refilling buckets, store `tokens` and `last refill time`, and compute the refill lazily on each request:
+
+> tokens now = min(B, tokens stored + (now − last) × r)
+
+Doing this read-compute-write in a **Lua script** makes it atomic in Redis, so two instances can't both spend the last token.
+
+```python title="token_bucket.py"
+import math
+import os
+
+import redis.asyncio as redis
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+r = redis.from_url(os.environ["REDIS_URL"])
+
+# KEYS[1] = bucket key, ARGV = capacity, refill per second, cost
+LUA = """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local cap = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or cap
+local ts = tonumber(b[2]) or now
+tokens = math.min(cap, tokens + (now - ts) * rate / 1000)
+local allowed = 0
+if tokens >= cost then tokens = tokens - cost allowed = 1 end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000) * 2)
+local waitMs = 0
+if allowed == 0 then waitMs = math.ceil((cost - tokens) / rate * 1000) end
+return { allowed, waitMs }
+"""
+take_token = r.register_script(LUA)  # EVALSHA under the hood, loading the script when needed
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    tenant_id = request.headers.get("x-tenant-id", "anonymous")
+    key = f"rl:{{{tenant_id}}}"  # rl:{tenant}: the hash tag keeps the key on one Redis Cluster slot
+    try:
+        allowed, wait_ms = await take_token(keys=[key], args=[200, 100, 1])  # burst 200, 100 req/s
+    except redis.RedisError:
+        return await call_next(request)  # Redis down: fail OPEN for quota limits
+    if allowed:
+        return await call_next(request)
+    return JSONResponse({"error": "rate limit exceeded"}, status_code=429,
+                        headers={"Retry-After": str(math.ceil(wait_ms / 1000))})
+```
+
+The script reads the clock with Redis's own `TIME`, so app servers with skewed clocks don't disagree about how many tokens exist.
+
+A cheap first layer in front, per client IP, at the edge:
+
+```nginx title="nginx.conf"
+limit_req_zone $binary_remote_addr zone=per_ip:10m rate=20r/s;   # leaky bucket per IP
+server {
+  location /api/ {
+    limit_req zone=per_ip burst=40 nodelay;    # allow short bursts, reject the rest at once
+    limit_req_status 429;
+    proxy_pass http://api;
+  }
+}
+```
+
+**Edge cases.**
+- **Fail open or closed?** Stripe recommends failing open: a Redis outage shouldn't turn into an API outage. For security limits (login brute force), failing closed may be the right call. Decide per limiter.
+- **Redis is now on every request's path**: one more round trip (usually under a millisecond in-region), and one more dependency. For very high rates, keep a small **local** bucket per instance that takes a share of the global rate and only syncs with Redis occasionally; you trade some accuracy for far fewer Redis calls.
+- **A single global key is a hot key.** "10,000 req/s across all customers" stored in one key lands on one Redis shard. Split it into N sub-keys with rate ÷ N each.
+- **Tell clients what happened.** Return `429` with `Retry-After`. Many APIs also return remaining-quota headers (the IETF `RateLimit` header fields are still a draft, so check what your clients understand).
+
+#### 3.5 Retry storms and retry budgets ➕
+
+**Problem.** A dependency has a brief slowdown. Every caller retries. The dependency now receives twice its normal traffic while it's already struggling, so it gets slower, so more calls time out and retry. The system stays broken **after the original cause is gone**, held down by its own retries.
+
+**Why it happens.** Retries multiply load, and the multiplication stacks across layers: if three layers each try 3 times, one user request can become 3 × 3 × 3 = **27** calls to the bottom service (the [error handling](/docs/backend-first-principles/16-error-handling-fault-tolerance) notes make the same point). The retries arrive exactly when capacity is lowest.
+
+**Mechanism: budgets, not just counts.** Google's SRE book describes two limits used together:
+- **Per request:** at most 3 attempts; after that, the failure bubbles up.
+- **Per client:** retries may be at most **10%** of requests. During a real outage, almost nothing gets retried, so the load stays near normal instead of doubling.
+
+It also describes **client-side adaptive throttling**: each client tracks `requests` and `accepts` over the last couple of minutes and rejects locally with probability `max(0, (requests − K × accepts) ÷ (requests + 1))`, with K typically 2. When the backend rejects most traffic, clients stop sending most of it.
+
+```python title="retry_budget.py"
+import asyncio
+import random
+import time
+
+import httpx
+
+
+class RetryBudget:
+    """Allow retries only while they stay below `ratio` of recent requests (per worker process)."""
+
+    def __init__(self, ratio: float = 0.1, window_s: float = 10.0) -> None:
+        self.ratio, self.window_s = ratio, window_s
+        self.requests = self.retries = 0
+        self.window_start = time.monotonic()
+
+    def _roll(self) -> None:  # start a fresh window every window_s seconds
+        if time.monotonic() - self.window_start >= self.window_s:
+            self.requests = self.retries = 0
+            self.window_start = time.monotonic()
+
+    def on_request(self) -> None:
+        self._roll()
+        self.requests += 1
+
+    def can_retry(self) -> bool:
+        self._roll()
+        if self.retries + 1 > self.ratio * max(self.requests, 10):
+            return False
+        self.retries += 1
+        return True
+
+
+budget = RetryBudget()
+
+
+async def call_inventory(client: httpx.AsyncClient, sku: str) -> dict:
+    attempt = 1
+    while True:
+        budget.on_request()
+        try:
+            res = await client.get(f"/stock/{sku}", timeout=0.3)
+            res.raise_for_status()
+            return res.json()
+        except httpx.HTTPError as e:
+            if attempt >= 3 or not is_retryable(e) or not budget.can_retry():
+                raise
+        await asyncio.sleep(random.uniform(0, 0.1 * 2**attempt))  # full jitter
+        attempt += 1
+```
+
+**Edge cases.**
+- **Retry in one layer only**, usually the one closest to the user or the one closest to the failing dependency, never in all of them.
+- Combine with a **circuit breaker** (covered in [Error handling](/docs/backend-first-principles/16-error-handling-fault-tolerance)): the budget limits extra load during partial failure, the breaker stops calls during a full outage.
+- Honour `Retry-After` from 429 and 503 responses; it's the server telling you how long to back off.
+
+#### 3.6 Connection storms when instances scale out or restart ➕
+
+**Problem.** A traffic spike triggers the autoscaler, which adds 20 pods at once. Each opens its database pool at startup. Or the primary database fails over, and every instance reconnects in the same second. Postgres starts a process per connection (Part 1, section 11.3), authentication and TLS cost CPU, `max_connections` is hit, connection attempts fail, and the drivers retry, which makes it worse. The database falls over **because** you scaled.
+
+**Why it happens.** Connection setup is expensive and bursty events are synchronized: every new pod starts at the same moment, every instance notices the failover at the same moment. The connection budget also scales with the **maximum** replica count, not the current one: 30 max replicas × a pool of 20 = 600 potential connections (and in Python, multiply by the worker processes per pod, since each has its own pool).
+
+**Mechanism.**
+1. **Budget for the maximum:** `maxReplicas × workers per pod × pool size` must fit under the database's (or the pooler's) limit, with room for admin and migrations.
+2. **An external pooler** (PgBouncer, RDS Proxy) absorbs the client-side burst: app connections to it are cheap, and it keeps a fixed number of real Postgres connections.
+3. **Open connections lazily**, not all at startup (SQLAlchemy's pool already does this), and **reconnect with jittered backoff** so a fleet doesn't reconnect in lockstep.
+4. **Limit how fast the autoscaler adds pods**, so new pods arrive in waves.
+
+```yaml title="hpa.yaml (scale-up behaviour)"
+spec:
+  minReplicas: 4
+  maxReplicas: 30              # 30 × pool 20 = 600: must fit the pooler's client limit
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - { type: Pods, value: 4, periodSeconds: 60 }      # at most 4 new pods per minute
+        - { type: Percent, value: 50, periodSeconds: 60 }  # or +50%, whichever is larger
+      selectPolicy: Max
+```
+
+```python title="db_connect.py"
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
+
+
+async def connect_with_backoff(connect: Callable[[], Awaitable[None]], max_s: float = 30.0) -> None:
+    """Reconnect with exponential backoff and full jitter: N instances spread their attempts out."""
+    attempt = 0
+    while True:
+        try:
+            return await connect()
+        except Exception:
+            cap = min(max_s, 0.25 * 2**attempt)
+            await asyncio.sleep(random.uniform(0, cap))
+            attempt += 1
+```
+
+**Edge cases.**
+- A new pod should report **ready** only after its essential connections work (section 2.5), or it receives traffic it can't serve yet.
+- With **transaction pooling** in PgBouncer, a connection storm becomes a queue inside PgBouncer instead of a crash in Postgres; watch PgBouncer's waiting-client count as a saturation metric.
+- **Serverless** makes this extreme: every concurrent invocation is a new instance (section 12).
+
+---
+
+## 4. Scaling the database 🎓
+
+### Why it's the hard part
+Once state is externalized, the app tier scales almost linearly: put more servers behind the LB. But all of them now hit **one database**, which is a server too (say 4 GB and 4 cores) and eventually runs out. And you **can't simply clone it** like an app server: each copy holds data on disk, and every copy must return the **same answer**. Coordinating that is what makes database scaling tricky.
+
+### 4.1 Read replicas
+
+**Mechanism.**
+- One **primary** (also called master or parent) takes **all writes**.
+- Several **replicas** (secondary, child, slave) hold copies of the data and serve **reads only**. Rule number one: never write to a replica.
+- The database's built-in **replication** streams changes from the primary to the replicas. Postgres, MySQL and others support it natively.
+- Replicas can live **near users**: primary in the US, replicas in India, Japan, China... with app servers in those regions too.
+
+<Mermaid chart={`flowchart LR
+  subgraph US["US region"]
+    APIUS["API"] --> PRI[("Primary<br/>all writes")]
+  end
+  subgraph IN["India region"]
+    APIIN["API"] -->|reads| R1[("Replica")]
+    APIIN -->|writes| PRI
+  end
+  subgraph JP["Japan region"]
+    APIJP["API"] -->|reads| R2[("Replica")]
+    APIJP -->|writes| PRI
+  end
+  PRI -. "replication stream<br/>lag ~200 ms to India" .-> R1
+  PRI -. "replication stream" .-> R2`} />
+
+**Two benefits:**
+1. **Less load on the primary.** In typical SaaS apps, about **70–90% of queries are reads**. Move them to replicas and the primary handles only the ~30% that are writes.
+2. **Lower latency** for users far from the primary, because their reads are served locally.
+
+**The trade-off: consistency (replication lag).**
+- Replication can't beat physics. Data from the US to India travels through undersea fibre; say about **200 ms**. That delay is **replication lag**.
+- The failure case, step by step:
+  1. A user in India changes their name from "A" to "AB" and clicks **Save**. It's a write, so it goes to the US primary. Success, 200.
+  2. The front end immediately (within milliseconds) issues a `GET` to refresh the form. It's a read, so it goes to the **Indian replica**.
+  3. Less than 200 ms has passed, so the replica **still has "A"**. The UI said "saved!" and then shows the old name.
+- For a profile name this is confusing. For **payments or invoices**, it can cause real damage.
+
+<Mermaid chart={`sequenceDiagram
+  participant U as User (India)
+  participant API as API
+  participant P as Primary (US)
+  participant R as Replica (India)
+  U->>API: PATCH name = AB
+  API->>P: UPDATE users
+  P-->>API: ok
+  API-->>U: 200 saved
+  U->>API: GET profile (t + 10 ms)
+  API->>R: SELECT
+  R-->>API: name = A (stale)
+  P-->>R: replication arrives (t + 200 ms)`} />
+
+**Mitigations from the lesson:**
+1. **Route reads after a write to the primary.** If this interaction just wrote to `users`, send the follow-up reads of `users` to the primary.
+2. **Track replication lag** (about 200–250 ms) and make reads **wait** until the replica has caught up before answering.
+3. **Design the front end around it**, e.g. delay the refetch by ~300 ms, or simply show the value you just saved.
+
+Which one you pick depends on the trade-off you can accept. Distributed systems always make you trade something, and usually it's consistency. Managed providers (RDS, Google Cloud SQL) make replicas a few toggles and come with tested ways to handle these problems.
+
+### 🔧 Going deeper: implementing read-your-writes
+
+**Option A: a sticky-to-primary window per user** (simple, usually enough):
+
+```python title="db_router.py"
+import os
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+primary = create_async_engine(os.environ["PRIMARY_URL"])
+replica = create_async_engine(os.environ["REPLICA_URL"])
+STICKY_MS = 2_000  # comfortably above observed lag; tune from metrics
+
+
+async def write(user_id: str, sql: str, params: dict) -> int:
+    async with primary.begin() as conn:
+        result = await conn.execute(text(sql), params)
+    await r.set(f"rw:{user_id}", "1", px=STICKY_MS)  # in Redis: shared across instances (stateless!)
+    return result.rowcount
+
+
+async def read(user_id: str, sql: str, params: dict):
+    recently_wrote = await r.exists(f"rw:{user_id}")
+    async with (primary if recently_wrote else replica).connect() as conn:
+        return (await conn.execute(text(sql), params)).all()
+```
+
+**Option B: wait until the replica has replayed your write** (exact, the lesson's mitigation 2). Postgres exposes write-ahead-log positions (LSNs):
+
+```python
+import asyncio
+import time
+
+from sqlalchemy import text
+
+
+# after the write, on the primary
+async def current_lsn() -> str:
+    async with primary.connect() as conn:
+        return (await conn.execute(text("SELECT pg_current_wal_lsn()::text"))).scalar_one()
+# return it to the client (e.g. a header) or keep it per user in Redis
+
+
+# before a read that must see it, on the replica
+async def replica_caught_up(lsn: str, timeout_s: float = 0.3) -> bool:
+    deadline = time.monotonic() + timeout_s
+    async with replica.connect() as conn:
+        while time.monotonic() < deadline:
+            ok = (await conn.execute(
+                text("SELECT pg_last_wal_replay_lsn() >= CAST(:lsn AS pg_lsn)"), {"lsn": lsn}
+            )).scalar_one()
+            if ok:
+                return True
+            await asyncio.sleep(0.02)
+    return False  # too slow: fall back to the primary
+```
+
+Monitoring lag on a replica: `SELECT now() - pg_last_xact_replay_timestamp() AS lag;` (caveat: when the primary is idle, this keeps growing even though nothing is behind, so compare LSNs for accuracy).
+
+Edge cases: a replica can fall **far** behind (long queries, network issues), so alert on lag and take lagging replicas out of rotation, exactly like an unhealthy app instance. **Never** read from a replica inside a transaction that then writes based on what it read.
+
+### 4.2 Sharding (partitioning)
+
+**Problem.** An e-commerce `orders` table reaches **billions of rows**. Two separate pains:
+1. **Query latency:** `SELECT * FROM orders WHERE user_id = 5` is slow even with an index, purely because of the volume.
+2. **Instance capacity:** one machine can only serve so many queries per second, and replicas don't help with **writes**.
+
+**Mechanism.** Split the table's rows across **several physical database instances**. Each shard holds a subset and serves only queries for that subset.
+- **The tricky decision is the shard key**: the rule that decides which rows live where.
+- The lesson's example uses **order date**: shard 1 holds January to June, shard 2 holds July to December. With more volume, **one shard per month**.
+- A **routing layer** in the backend (or in a DB proxy) decides, before each query, which shard holds the data, sends the query there, and returns the result.
+
+**Why it solves both problems:** two instances serve twice the queries per second, and each searches half the rows.
+
+<Mermaid chart={`flowchart TD
+  API["API"] --> RT{"shard router<br/>key = f(row)"}
+  RT -->|"orders Jan to Jun"| S1[("shard 1")]
+  RT -->|"orders Jul to Dec"| S2[("shard 2")]
+  RT -.->|"hash(user_id) mod N alternative"| S3[("shard N")]`} />
+
+### 🔧 Going deeper: choosing the shard key well
+The date example illustrates the idea, but it has two serious problems in practice, and they show what a good key needs:
+- **Hot shard:** every **new** order is written to the current period's shard, so one shard takes all the write load while the others idle.
+- **Wrong access pattern:** "all orders of user 5" spans **every** shard, so you fan out to all of them (and pay the tail-latency cost from Part 1).
+
+A good shard key spreads writes evenly **and** keeps each common query on one shard. For "orders by user", that's usually **`hash(user_id)`**:
+
+```python title="shard_router.py"
+import hashlib
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+shards: list[AsyncEngine] = [shard0, shard1, shard2, shard3]
+
+
+def shard_for(user_id: str) -> AsyncEngine:
+    # a stable hash: never the built-in hash(), which is randomized per process for str
+    h = int.from_bytes(hashlib.md5(user_id.encode()).digest()[:4], "big")
+    return shards[h % len(shards)]  # ⚠ changing len(shards) remaps almost every key
+
+
+async def orders_of_user(user_id: str):
+    async with shard_for(user_id).connect() as conn:
+        result = await conn.execute(
+            text("SELECT * FROM orders WHERE user_id = :u ORDER BY created_at DESC LIMIT 50"),
+            {"u": user_id},
+        )
+        return result.all()
+```
+
+- **Resharding:** with `mod N`, going from 4 to 5 shards moves most rows. Use **consistent hashing**, many virtual buckets mapped to shards, or a **directory table** (key to shard) so data can move in small pieces.
+- **Cross-shard queries, joins and transactions** become your problem (scatter-gather, two-phase commit or sagas). Keep data that's queried together on the same shard.
+- **Partitioning inside one Postgres** (declarative partitioning) gives the "fewer rows per search" benefit on a single instance, with partition pruning, and is often enough before real sharding:
+
+```sql
+CREATE TABLE orders (
+  id bigint, user_id bigint, total numeric, created_at timestamptz NOT NULL
+) PARTITION BY RANGE (created_at);
+CREATE TABLE orders_2025_h1 PARTITION OF orders FOR VALUES FROM ('2025-01-01') TO ('2025-07-01');
+CREATE TABLE orders_2025_h2 PARTITION OF orders FOR VALUES FROM ('2025-07-01') TO ('2026-01-01');
+-- WHERE created_at >= '2025-08-01' only scans orders_2025_h2; old partitions can be detached and archived
+```
+
+### 4.3 Consistent hashing and rebalancing ➕
+
+The shard router above warns that changing `len(shards)` remaps almost every key; this section explains why, and the techniques that let you add a shard (or a cache node) while moving only a small fraction of the data.
+
+<Mermaid chart={`flowchart LR
+  subgraph Mod["hash mod N: 4 to 5 shards"]
+    direction TB
+    m1["key hash 17<br/>17 mod 4 = 1<br/>17 mod 5 = 2 MOVED"]
+    m2["about 80% of keys move"]
+  end
+  subgraph Ring["consistent hashing ring"]
+    direction TB
+    r1["nodes and keys hashed<br/>onto the same circle"] --> r2["key belongs to the next<br/>node clockwise"]
+    r2 --> r3["add a node: only the keys<br/>between it and its neighbour move<br/>about 1/N of keys"]
+  end`} />
+
+#### 4.3.1 Why `hash mod N` breaks when N changes ➕
+
+**Problem.** You have 4 shards and route with `hash(key) mod 4`. You add a fifth. Now the router uses `mod 5`, and most keys point at a different shard than the one holding their data.
+
+**Why it happens (the maths).** A key stays put only if `h mod 4 = h mod 5`. Across consecutive hash values, the two agree for 4 out of every 20 values (where `h mod 20` is 0 to 3), so only **20% of keys stay** and **80% move**. In general, going from N to N + 1 buckets with `mod` keeps about 1 ÷ (N + 1) of keys in place. For a database that means migrating 80% of your rows; for a cache cluster it means an 80% miss rate at once, and a thundering herd on the database (see [Caching](/docs/backend-first-principles/13-caching)).
+
+**What we want instead:** when going from N to N + 1 nodes, only about **1 ÷ (N + 1)** of the keys should move (the new node's fair share), and all of them should move **to** the new node, not between old ones.
+
+#### 4.3.2 The hash ring and virtual nodes ➕
+
+**Mechanism.** Karger and colleagues (1997) proposed **consistent hashing**: hash both keys and nodes onto the same circular space (say 0 to 2³² − 1). A key belongs to the first node found going clockwise from the key's position. Adding a node only takes over the keys between it and its counter-clockwise neighbour; removing a node hands its keys to the next node. On average only K ÷ N keys move.
+
+**The catch: uneven arcs.** With one point per node, random positions make arcs very unequal: one node can own twice the keys of another. The fix is **virtual nodes**: each physical node is placed on the ring many times (say 100–200 points). Arcs average out, and a node with twice the capacity can simply get twice as many points.
+
+```python title="hash_ring.py"
+import bisect
+import hashlib
+
+
+def h32(s: str) -> int:
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:4], "big")
+
+
+class HashRing:
+    def __init__(self, nodes: list[str], vnodes: int = 160) -> None:
+        self.vnodes = vnodes
+        self.points: list[tuple[int, str]] = []  # (position on the ring, node), kept sorted
+        for node in nodes:
+            self.add(node)
+
+    def add(self, node: str, weight: int = 1) -> None:
+        for i in range(self.vnodes * weight):
+            bisect.insort(self.points, (h32(f"{node}#{i}"), node))
+
+    def remove(self, node: str) -> None:
+        self.points = [p for p in self.points if p[1] != node]
+
+    def node_for(self, key: str) -> str:
+        i = bisect.bisect_left(self.points, (h32(key), ""))  # binary search: first point with pos >= hash
+        return self.points[i % len(self.points)][1]           # wrap around the circle
+
+
+ring = HashRing(["shard-a", "shard-b", "shard-c", "shard-d"])
+ring.node_for("user:42")  # the same answer on every app instance, with no coordination
+ring.add("shard-e")       # about 20% of keys now map to shard-e, the rest stay put
+```
+
+**Alternatives worth knowing.**
+- **Jump consistent hash** (Lamping and Veach, Google, 2014): a few lines of arithmetic, no ring in memory, and a very even spread. Its limit: buckets must be numbered 0 to N − 1, so you can add or remove only at the end. Good for numbered shards, not for an arbitrary set of cache servers.
+- **Rendezvous (highest random weight) hashing:** for each key, score every node with `hash(key, node)` and take the highest. Simple and even; the cost is O(N) per lookup.
+
+#### 4.3.3 Fixed slots: how Redis Cluster does it ➕
+
+**Problem.** A ring computed independently on every client is fine for caches, but a **database** needs everyone to agree exactly which node owns which key, including during a move.
+
+**Mechanism: many fixed slots, and a map from slots to nodes.** Redis Cluster splits the key space into **16,384 hash slots**, with `HASH_SLOT = CRC16(key) mod 16384`. The number of slots never changes, so the key-to-slot mapping is fixed forever; only the **slot-to-node** map changes. Adding a node means moving some slots to it, one at a time. Vitess, Cassandra (token ranges) and DynamoDB (partitions) use the same idea under different names: hash into many fixed small units, and rebalance by moving units.
+- **During a move**, a client that asks the old node for a key that has already moved gets an `ASK` redirect to the new node for that one request; once the slot is fully moved, clients get `MOVED` and update their slot map.
+- **Hash tags** let you keep related keys together: only the part inside braces is hashed, so `{user1000}.following` and `{user1000}.followers` land in the same slot and can be used in one multi-key command or transaction.
+
+The same pattern works for your own Postgres shards: hash the shard key into, say, 4,096 **logical shards**, and keep a small table that maps logical shards to physical databases.
+
+```sql title="shard-map.sql (lives in a small, highly available config DB)"
+CREATE TABLE shard_map (
+  logical_shard int PRIMARY KEY,        -- 0..4095, fixed forever
+  physical_db   text NOT NULL,          -- e.g. 'orders-db-3'
+  state         text NOT NULL DEFAULT 'active'  -- 'active', 'migrating', 'read_only'
+);
+-- the router computes hash(user_id) mod 4096, then looks up physical_db (cached in each app)
+```
+
+#### 4.3.4 Rebalancing live data without downtime ➕
+
+**Problem.** Moving a logical shard from database A to database B while the application keeps writing to it.
+
+**Mechanism: copy, catch up, switch, clean up.**
+1. **Copy** the shard's rows from A to B in the background (a snapshot).
+2. **Catch up**: stream the changes made since the snapshot to B (logical replication or change data capture), until B is only seconds behind.
+3. **Switch**: briefly block writes for that shard (mark it `read_only` in the shard map), wait until B has applied the last change, update the map to point at B, and allow writes again. The write pause is seconds, and it affects only the keys in that one shard.
+4. **Clean up**: after a safety period, delete the shard's rows from A.
+
+```sql
+-- step 2 with Postgres logical replication, for the tables of one tenant range
+-- on A:
+CREATE PUBLICATION move_shard_17 FOR TABLE orders WHERE (logical_shard = 17);   -- row filters: Postgres 15+
+-- on B:
+CREATE SUBSCRIPTION move_shard_17 CONNECTION 'host=orders-db-a dbname=app' PUBLICATION move_shard_17;
+```
+
+**Edge cases.**
+- **Routers cache the shard map.** Every instance must see the change before writes resume; otherwise a stale instance writes to A after the switch. Bump a map version and have instances reject writes for a shard whose version they haven't loaded, or route all writes through a proxy that owns the map.
+- **Moves are load.** Copying a shard competes with production traffic on both databases; throttle it and run it off-peak.
+- **Rebalancing doesn't fix a hot key.** If one customer is 30% of traffic, moving shards around only moves the problem. Hot tenants need their own shard (or their own cell, section 9).
+
+### 4.4 Distributed databases and managed providers 🎓
+The current trend (the lesson was recorded in December 2025) is **distributed databases** that handle sharding, replication and distributed transactions for you:
+- **PlanetScale**: MySQL-based, built on **Vitess**.
+- **Neon**: serverless Postgres (its storage layer is written in Rust).
+- **CockroachDB** and **YugabyteDB**: distributed SQL.
+
+**The lesson's advice:** unless you have deep database-administration expertise, **don't run your own database infrastructure**. Replication, sharding and backups are each hard. Realistically you pick a provider (RDS, Neon, PlanetScale...) on features, price and team preference, get a connection URL, and plug it into the backend. You still need these concepts so you can **configure** the provider sensibly: backup frequency, which regions get replicas, how to plan sharding.
+
+---
+
+## 5. CAP and PACELC: the trade-off behind every replica ➕
+
+Replicas and shards keep forcing the same choice, stale-but-fast or fresh-but-slow; CAP and PACELC name that choice precisely, so you can decide it per feature instead of discovering it in production.
+
+<Mermaid chart={`flowchart TD
+  Q{"Is the network<br/>partitioned right now?"} -->|"yes (P)"| PA{"choose"}
+  PA -->|"A: keep answering,<br/>maybe stale or conflicting"| A1["availability"]
+  PA -->|"C: refuse or block<br/>until nodes agree"| C1["consistency"]
+  Q -->|"no, else (E)"| EL{"choose"}
+  EL -->|"L: answer from the nearest copy,<br/>replicate later"| L1["low latency"]
+  EL -->|"C: wait for other copies<br/>before answering"| C2["consistency"]`} />
+
+#### 5.1 CAP, stated correctly ➕
+
+**Problem.** "CAP says pick two of three" is the popular version, and it leads to wrong designs, such as "we chose CA".
+
+**What it actually says.** Brewer's conjecture, proved by Gilbert and Lynch in 2002: in a system whose data is replicated over a network, **when a network partition happens** (some nodes can't reach others), each node that receives a request must either
+- **stay available** and answer with what it has, which may be stale or may conflict with what the other side accepts, or
+- **stay consistent** (linearizable: every read sees the latest write) by refusing or blocking until it can reach the others.
+
+Partitions are not optional in real networks (a switch fails, a region link drops, a long GC pause looks like a partition), so "CA" isn't a real choice for a distributed system. The real question is **what each operation does during a partition**.
+
+**Example with the lesson's replicas (section 4.1).** The link between the US primary and the India replica fails.
+- **AP behaviour:** the India API keeps serving reads from its replica. Users see data that stops updating. Writes can't reach the primary, so they fail, or get queued locally and reconciled later.
+- **CP behaviour:** the India API refuses reads that must be fresh (returns an error or redirects to the primary, if reachable). Correct, but unavailable for those users.
+
+Nothing stops you choosing **per operation**: a product catalogue can be AP, an account balance CP.
+
+#### 5.2 PACELC: the trade-off you pay every day ➕
+
+**Problem.** Partitions are rare. CAP says nothing about the other 99.9% of the time, which is where the real cost is.
+
+**Mechanism.** Daniel Abadi's **PACELC** (2010, published 2012) extends it: **if** there is a Partition, choose Availability or Consistency; **Else**, even when everything works, choose **Latency** or **Consistency**. Keeping copies consistent means waiting for other copies before answering, and between regions that wait is the speed of light (section 6). The usual classification puts Cassandra, Riak and Amazon's original Dynamo in **PA/EL** (available, low latency, eventually consistent), and systems like VoltDB, HBase and Bigtable in **PC/EC**. A single Postgres server is consistent, and once you add asynchronous replicas you are choosing EL for reads that go to them.
+
+**In Postgres you choose explicitly**, with `synchronous_commit` and synchronous standbys:
+
+| `synchronous_commit` (with a synchronous standby) | Commit waits until | Trade-off |
+|---|---|---|
+| `off` | nothing is flushed, not even locally | fastest; a crash can lose the last moments of commits |
+| `local` | the primary has flushed to its own disk | standby may lag, failover can lose data |
+| `remote_write` | the standby has received and written it (not necessarily flushed) | survives a standby Postgres crash, not a standby OS crash |
+| `on` (default) | the standby has flushed it to durable storage | no committed data lost on failover |
+| `remote_apply` | the standby has **applied** it, so reads there see it | read-your-writes on the standby, much slower commits |
+
+```sql
+-- primary: one synchronous standby from this list must confirm each commit
+ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (replica_same_region, replica_other_az)';
+SELECT pg_reload_conf();
+
+-- per transaction: a money movement waits for the standby to apply it
+BEGIN;
+SET LOCAL synchronous_commit = remote_apply;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+
+-- per transaction: an analytics event takes the fast path
+BEGIN;
+SET LOCAL synchronous_commit = local;
+INSERT INTO page_views (user_id, path) VALUES (42, '/pricing');
+COMMIT;
+```
+
+**Edge cases.**
+- **A synchronous standby is a new failure mode.** If the only synchronous standby goes down, commits **block** on the primary. List several candidates (`ANY 1 (...)` or `FIRST 1 (...)`) so one failure doesn't stop writes.
+- **Synchronous replication across regions** adds a full inter-region round trip (tens to hundreds of milliseconds, section 4.1) to every commit. Keep the synchronous standby in the same region (another availability zone), and replicate asynchronously to far regions.
+
+#### 5.3 Choosing consistency per feature ➕
+
+**Problem.** Treating the whole system as "eventually consistent" or "strongly consistent" is either buggy or slow.
+
+**Mechanism: write down, per operation, what a stale or lost result costs.**
+
+| Operation | Stale read costs | Lost write costs | Choice |
+|---|---|---|---|
+| Product catalogue, blog posts | a price shown seconds late | n/a (rare admin writes) | replicas, CDN, long TTLs (PA/EL) |
+| Profile name after editing | confusion | annoyance | read-your-writes (section 4.1) |
+| Like counts, view counts | nothing | a few lost increments | async, batched, approximate |
+| Inventory at checkout, balances | overselling, money errors | money errors | primary only, synchronous standby, transactions (PC/EC) |
+| Unique usernames, idempotency keys | duplicates | duplicates | single source of truth with a unique constraint |
+
+**Edge cases.**
+- **"Eventually" needs a bound.** Measure replication lag and alert on it (section 4.1); "eventually" that means "in 40 minutes, during an incident" breaks features designed for "in 200 ms".
+- **Conflicts need a rule.** If two sides accept writes during a partition (section 8.3), decide in advance how to merge them: last-writer-wins (simple, silently loses data), per-field merges, or data types designed to merge (CRDTs, such as counters that sum per-region values).
+
+---
+
+## 6. CDNs: caching at the geographic level 🎓
+
+Everything so far happens **inside the data centre**. One layer remains: **geography**.
+
+### The problem: the speed of light
+- Light in fibre travels at about **200,000 km/s** (slower than in a vacuum). Undersea cables carry intercontinental traffic, so this is a hard cap.
+- **Tokyo to North Virginia (`us-east-1`)**, where many commercial apps are hosted: a round trip covers about **20,000 km**, so roughly **100 ms minimum**. No optimization can beat that.
+- That's only the **wire**. Then the server routes the request (fast, mostly pattern matching), **deserializes** the JSON body into language objects (cost grows with payload size), runs business logic, queries the DB (**50–100 ms** for a mid-to-complex query even in the same region), and maybe calls an external API (**~200 ms**). The Tokyo user's 100 ms quickly becomes **500–800 ms**.
+
+> 🔧 Check the floor: 20,000 km ÷ 200,000 km/s = 0.1 s = 100 ms. Real fibre paths aren't straight lines, so measured round trips are higher.
+
+After all the database and Redis work from Part 1, the remaining latency is **physical distance**. That's what a **CDN (content delivery network)** solves.
+
+### The mechanism
+Place **edge locations**, also called **PoPs (points of presence)**, near users, e.g. in Tokyo. The Tokyo user's request travels **100–200 km** instead of 20,000, and latency drops from about **100 ms to 2–3 ms** for content cached there.
+
+<Mermaid chart={`flowchart LR
+  T["User in Tokyo"] -->|"~2-3 ms"| POP["CDN PoP Tokyo"]
+  POP -->|"cache hit"| T
+  POP -->|"cache miss only, ~100 ms+"| O["Origin in us-east-1"]
+  M["User in Mumbai"] --> POP2["CDN PoP Mumbai"] -->|"miss"| O
+  S["User in Singapore"] --> POP3["CDN PoP Singapore"] -->|"miss"| O`} />
+
+### Three wins
+1. **Latency:** 100 ms becomes 2–3 ms for cached content.
+2. **Origin load:** PoPs answer most requests, so the origin sees far less traffic (the lesson's rough figure is 50% less), and you need horizontal scaling less often.
+3. **Security (DDoS):** an attacker with ~20,000 malware-infected bots floods your server. Either it crashes (hard limits), or your autoscaler keeps adding instances and you get a bill like **$50,000 for one day**. Either way, damage. Put a CDN like **Cloudflare** in front: all traffic passes through it first, it detects attack patterns (it has years of experience at this), challenges suspicious clients with **CAPTCHAs**, and spreads the flood across a network so large that even terabytes of attack traffic don't reach you.
+
+### What to put on a CDN
+- **Static content:** JS and CSS bundles, HTML, images, video, fonts. These rarely change. A React SPA build is exactly this kind of bundle: serve it from the CDN instead of the origin (or an S3 bucket behind it).
+- **Some API responses:** e.g. a product catalogue that rarely changes.
+- **Purging (CDN invalidation):** when data changes, purge it. Cloudflare lets you attach **tags** to cached content (e.g. one per user's blog posts); when the user publishes a new post, purge that tag, and the next request refetches from the origin.
+
+### 🔧 Going deeper: telling the CDN what to cache
+
+```python title="cache_headers.py"
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Response
+from fastapi.staticfiles import StaticFiles
+
+app = FastAPI()
+
+
+class ImmutableStatic(StaticFiles):
+    # fingerprinted static assets (app.3f9a1c.js): cache forever, the file name changes on deploy
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
+app.mount("/assets", ImmutableStatic(directory="dist/assets"), name="assets")
+
+
+# a catalogue API response: browsers 60 s, the CDN 10 min, serve stale for 5 min while refetching
+@app.get("/api/catalog")
+async def list_catalog(response: Response):
+    response.headers["Cache-Control"] = "public, max-age=60, s-maxage=600, stale-while-revalidate=300"
+    response.headers["Cache-Tag"] = "catalog"  # Cloudflare cache tags, comma-separated
+    return await catalog.list()
+
+
+# per-user or authenticated data: never on a shared cache
+@app.get("/api/me")
+async def me(response: Response, user: Annotated[dict, Depends(current_user)]):
+    response.headers["Cache-Control"] = "private, no-store"
+    return user
+```
+
+```bash
+# purge everything tagged "catalog" after an admin edits products
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/purge_cache" \
+  -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json" \
+  --data '{"tags":["catalog"]}'
+```
+
+Edge cases: a response that varies by header (language, auth) must say so with `Vary`, or the CDN serves one user's version to everyone. **Never** let a shared cache store a response that sets cookies or contains personal data.
+
+---
+
+## 7. Edge computing 🎓
+
+### Two meanings of "edge"
+- **Edge nodes:** CDN servers sit at the **edge of the network**, the first point your traffic touches, typically placed in cooperation with **ISPs**. That's why they're fast.
+- **Edge computing:** running **code** at those nodes. A classic CDN just looks up a file by name and returns it, with no thinking involved. Edge computing does **processing** at the PoP before responding.
+
+There are far more edge nodes than primary data centres (data centres need huge investment and planning; edge nodes piggyback on ISP infrastructure), so they're close to almost every user. The code doesn't run faster than on your server; **the round trip is shorter**.
+
+### Use case 1: authentication at the edge
+Without the edge, a Tokyo user with an invalid session pays a **~100 ms round trip** to the US just to receive a 401, and your origin wastes resources on rejections. At the edge:
+1. The request hits the edge node, which runs the same session check you'd run on the server.
+2. Invalid: return **401 in 2–3 ms**. Your server never sees it.
+3. Valid: forward to the origin. **The origin only handles legitimate traffic.**
+
+<Mermaid chart={`flowchart LR
+  U["User, Tokyo"] --> E{"Edge worker<br/>verify session/token"}
+  E -->|"invalid: 401 in ~3 ms"| U
+  E -->|"valid"| O["Origin, US<br/>legit traffic only"]
+  E -->|"Accept-Language: ja"| JP["serve Japanese variant"]`} />
+
+### Use case 2: location and preferences
+The edge knows which region it serves and can read headers. A request from Tokyo with a Japanese browser language can get the **Japanese version** directly, without a trip to the origin.
+
+Other good fits: **validation**, **customization**, **routing** (which origin a request should go to).
+
+### Why not run everything at the edge? Constraints
+1. **Resources:** edge nodes are mostly ISP routing infrastructure; CDN work is a side job. Expect something like **1 GB of RAM and one core** instead of 8–16 GB.
+2. **Runtime limits:** platforms like **Cloudflare Workers** run code in **V8 isolates** (Chrome's JavaScript engine) for very low latency. The environment is restricted: no file system, and no ordinary TCP-based connections the way a server has them. (🔧 Workers now offer an outbound TCP `connect()` API from `cloudflare:sockets`, but it's still not a normal server environment.)
+
+So the edge **complements** primary servers; it can't replace them yet.
+
+### 🔧 Going deeper: an auth check in a Cloudflare Worker
+
+A session lookup at the edge needs a store close to the edge. Verifying a **signed token** needs no lookup at all, which is why edge auth often uses JWTs. This example stays in TypeScript on purpose: Workers run JavaScript natively in V8 isolates, which is where the millisecond cold starts come from. (Cloudflare also offers Python Workers, built on Pyodide, which must load a Python runtime into the isolate.) Your Python backend only sees the result, as the `X-User-Id` header:
+
+```ts title="worker.ts"
+import { jwtVerify } from 'jose';
+
+export default {
+  async fetch(request: Request, env: { JWT_SECRET: string }): Promise<Response> {
+    const auth = request.headers.get('Authorization') ?? '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    if (!token) return new Response('Unauthorized', { status: 401 });
+
+    try {
+      const { payload } = await jwtVerify(token, new TextEncoder().encode(env.JWT_SECRET));
+      const forwarded = new Request(request);
+      forwarded.headers.set('X-User-Id', String(payload.sub));  // the origin trusts this only from the edge
+      return fetch(forwarded);                                    // pass through to the origin
+    } catch {
+      return new Response('Unauthorized', { status: 401 });       // rejected in a few ms, near the user
+    }
+  },
+};
+```
+
+Edge case: the origin must **only accept traffic from the edge** (firewall to the CDN's IP ranges, or a shared secret header); otherwise attackers skip the edge and send a forged `X-User-Id`.
+
+---
+
+## 8. Multi-region architecture ➕
+
+CDNs and the edge bring **cached content** and **simple logic** close to users, but every write and every uncached request still crosses the ocean to one region; running the backend itself in several regions is the next step, and the most expensive one.
+
+<Mermaid chart={`flowchart TB
+  subgraph AP["Active-passive"]
+    direction LR
+    U1["all users"] --> R1["region A<br/>app + primary DB"]
+    R1 -. "async replication" .-> R2["region B<br/>small app fleet + replica<br/>idle until failover"]
+  end
+  subgraph AA["Active-active, partitioned by home region"]
+    direction LR
+    EU["EU users"] --> RE["eu-west<br/>app + DB for EU tenants"]
+    US["US users"] --> RU["us-east<br/>app + DB for US tenants"]
+    RE -. "only global directory<br/>and async copies" .- RU
+  end`} />
+
+#### 8.1 Why go multi-region, and why not ➕
+
+**Problem.** Three needs push a backend beyond one region:
+1. **Latency for dynamic work.** Read replicas (section 4.1) and CDNs (section 6) help reads and static content. A Tokyo user's **writes** and personalized pages still pay about 100 ms or more of round trip to `us-east-1`, often several times per page.
+2. **Regional outages.** Availability zones protect against a data-centre failure; a whole region can still have a bad day (a control-plane incident, a networking event). One region is one failure domain.
+3. **Law.** Some customers or regulations require that data stays in a jurisdiction (section 8.4).
+
+**What it costs.** At least double the infrastructure, cross-region data-transfer charges, a much harder data layer (section 5), and every operational procedure (deploys, migrations, incident response) multiplied by the number of regions.
+
+**Rule of thumb.** Run **multi-AZ in one region** first; it covers most failures for a fraction of the cost. Go multi-region when one of the three needs above is real and measured, not as a default.
+
+#### 8.2 Active-passive: a standby region ➕
+
+**Mechanism.** One region (A) serves all traffic. Region B holds an **asynchronous replica** of the database and a minimal app fleet (or none, deployed on demand). On a regional failure:
+1. **Detect** the failure (health checks from outside region A, plus a human decision for anything ambiguous).
+2. **Promote** B's replica to primary.
+3. **Scale up** B's app fleet.
+4. **Switch traffic**: DNS failover or a global load balancer points users at B.
+
+Two numbers describe it:
+- **RPO** (recovery point objective, how much data you lose): the **replication lag** at the moment A failed. Asynchronous replication means the last seconds of writes may be gone. Managed offerings narrow it; AWS documents Aurora Global Database replication to secondary regions as typically **under a second**.
+- **RTO** (recovery time objective, how long you're down): detection + promotion + scale-up + DNS TTL + cache warm-up. Minutes is realistic; it's mostly decided by how practised the procedure is.
+
+```text title="Route 53 failover records (conceptually)"
+api.example.com  A  ALIAS alb-us-east-1   failover=PRIMARY    health-check=us-east-1-api  TTL 60
+api.example.com  A  ALIAS alb-eu-west-1   failover=SECONDARY  TTL 60
+```
+
+**Edge cases.**
+- **Split brain.** If A wasn't really dead (only unreachable from the monitor), you can end up with two primaries accepting writes. **Fence** the old primary (revoke its network access or credentials) before promoting.
+- **Untested failover doesn't work.** Run it on a schedule (game days). The common failures are in the details: expired credentials in B, missing secrets, quotas too low to scale up, DNS TTLs that clients ignore.
+- **Failback** (returning to A) is a second migration, with its own replication setup. Plan it too.
+
+#### 8.3 Active-active: every region serves users ➕
+
+**Problem.** Active-passive pays for a region that does nothing, and doesn't help latency. Active-active serves users from their nearest region, but if two regions accept writes for the **same** data, they can conflict.
+
+**Mechanism 1 (most common): partition by home region.** Each tenant or user gets a **home region**, chosen at signup by location or contract. All writes for that tenant go to its home region; other regions can hold read-only copies. There are no write conflicts, because each piece of data has exactly one writer region. Users travelling abroad pay the extra latency for writes, which is usually acceptable. The router runs at the edge, so like the auth worker in section 7 it's a JavaScript (TypeScript) Cloudflare Worker:
+
+```ts title="edge-router.ts (Cloudflare Worker)"
+const ORIGINS: Record<string, string> = {
+  'eu-west': 'https://eu.api.example.com',
+  'us-east': 'https://us.api.example.com',
+};
+
+export default {
+  async fetch(request: Request, env: { DIRECTORY: KVNamespace }): Promise<Response> {
+    const tenant = request.headers.get('X-Tenant-Id');
+    if (!tenant) return new Response('missing tenant', { status: 400 });
+
+    // the global directory stores only tenant -> region: no personal data
+    const region = (await env.DIRECTORY.get(`tenant:${tenant}`, { cacheTtl: 300 })) ?? 'us-east';
+    const url = new URL(request.url);
+    return fetch(new Request(ORIGINS[region] + url.pathname + url.search, request));
+  },
+};
+```
+
+**Mechanism 2: multi-writer with conflict handling.** Every region accepts writes for any data, and replication merges them. Either accept a merge rule (last-writer-wins, CRDTs, section 5.3), or use a distributed SQL database (CockroachDB, Spanner, YugabyteDB) that reaches consensus across regions, which means each strongly consistent write pays at least one round trip to a quorum of regions (PACELC's EC, section 5.2).
+
+**Edge cases.**
+- **Global uniqueness** (usernames, email addresses) needs a single owner: one region or a global table that every signup consults.
+- **Avoid cross-region transactions** on the request path; use asynchronous events between regions.
+- **Capacity:** if one region fails, the others must absorb its users. Two active regions each running at 70% can't absorb each other; plan each for its own peak plus its share of a failed region's.
+
+#### 8.4 Data residency ➕
+
+**Problem.** A European customer's contract (or a regulation) says their personal data must stay in the EU. GDPR, for example, restricts transfers of personal data outside the EEA unless conditions such as an adequacy decision or approved safeguards (standard contractual clauses) are met. The database is in `eu-west-1`, so you're compliant, until you look at where copies of the data actually go.
+
+**Why it's hard.** Personal data leaks into many places besides the primary database: **backups** copied to another region, **logs and traces** shipped to an observability vendor in the US, **analytics** pipelines, **search indexes**, **caches and CDNs**, **support tools**, **error trackers**, and **queues** consumed by a worker in another region.
+
+**Mechanism: residency as a property of the tenant, enforced by the architecture.**
+- Store `region` on the tenant at signup; route all its traffic to that region (the home-region pattern above).
+- Run a **complete stack per region**: database, queues, workers, object storage, search, cache, backups in the same jurisdiction.
+- Keep the **global layer minimal**: a directory with tenant ID to region, billing identifiers, nothing personal.
+- **Scrub personal data from telemetry** before it leaves the region, or run observability per region.
+
+**Edge cases.**
+- **Support staff** in another country viewing customer data can itself count as a transfer; access controls and audit logs are part of the design.
+- **Moving a tenant between regions** (an acquisition, a contract change) is a data migration like section 4.3.4, with legal sign-off.
+- This is engineering, not legal advice: get the actual requirements from your legal team, then design to them.
+
+---
+
+## 9. Cell-based architecture and blast radius ➕
+
+Regions limit the damage of a **regional** failure, but a bad deploy, a poison request or one huge customer can still take down every user in a region at once; cells apply the same isolation idea inside a region, at a much finer grain.
+
+<Mermaid chart={`flowchart LR
+  C["clients"] --> RT["cell router<br/>tenant to cell lookup<br/>thin and dumb"]
+  RT --> C1["cell 1<br/>app + DB + cache + queue<br/>tenants A-F"]
+  RT --> C2["cell 2<br/>app + DB + cache + queue<br/>tenants G-M"]
+  RT --> C3["cell 3<br/>app + DB + cache + queue<br/>tenants N-Z"]
+  CP["control plane<br/>create cells, place and<br/>migrate tenants"] -.-> RT
+  CP -.-> C1
+  CP -.-> C2
+  CP -.-> C3
+  style C2 fill:#f87171,color:#000`} />
+
+#### 9.1 Blast radius: why one fleet is one failure domain ➕
+
+**Problem.** Horizontal scaling gives you 50 identical instances behind one load balancer, sharing one database. That's redundancy against a **machine** failing, but not against failures that hit every instance the same way:
+- a **bad deploy** that rolls out everywhere;
+- a **poison-pill request** (a malformed input that crashes the process), which the client retries against every instance in turn;
+- a **noisy neighbour**: one tenant's import job saturates the shared database for everyone;
+- an **overloaded shared dependency** (the database, the cache).
+
+The **blast radius** of all of these is 100% of users.
+
+**Mechanism: cells.** Split the system into several complete, independent copies of the stack (**cells**), and assign each tenant to one cell. A cell shares nothing with other cells: its own app instances, database, cache and queues. AWS's guidance on cell-based architecture puts it simply: with 10 cells, a failure in one leaves **90%** of requests unaffected.
+
+#### 9.2 Cell anatomy: partition key, router, control plane ➕
+
+**Mechanism.**
+- **Partition key:** the natural unit of your workload with the fewest cross-unit interactions, usually customer, tenant or account ID.
+- **Cell router:** the thinnest possible layer. It looks up the cell for the partition key and forwards the request. No business logic, few dependencies, mostly a cached lookup table, because it's the one component shared by everyone.
+- **Cells:** each runs the full stack and is sized to a **fixed maximum** that you have load-tested. Growth means **adding cells**, not growing cells beyond the size you know works (Part 1, section 15.3).
+- **Control plane:** creates cells, places new tenants, and migrates tenants between cells. It can be down for a while without affecting live traffic.
+
+```nginx title="cell-router.conf (static map, regenerated by the control plane)"
+map $http_x_tenant_id $cell_upstream {
+  default        cell_1;
+  include        /etc/nginx/tenant-cells.map;   # lines like:  acme  cell_2;
+}
+
+upstream cell_1 { server cell-1.internal:443; }
+upstream cell_2 { server cell-2.internal:443; }
+upstream cell_3 { server cell-3.internal:443; }
+
+server {
+  listen 443 ssl;
+  location / { proxy_pass https://$cell_upstream; }
+}
+```
+
+**Edge cases.**
+- **The router is the new shared component.** Keep it static and boring: config pushed by the control plane, no database lookup per request, deployed carefully and separately.
+- **Cross-cell features** (a global admin dashboard, analytics across tenants, a user who belongs to two tenants) need a separate read path, usually asynchronous aggregation, never a synchronous call across all cells.
+- **Big tenants outgrow cells.** A tenant that is 40% of traffic needs its own dedicated cell, or the cell size must be designed around it.
+
+#### 9.3 Deploying cell by cell ➕
+
+**Problem.** With one fleet, every deploy is an all-or-nothing bet; a canary on 5% of instances still sends 5% of **every** tenant's traffic to the new version and shares the database with the rest.
+
+**Mechanism: waves.** Deploy to one **canary cell** (with internal or low-risk tenants), let it bake while watching error rates and latency, then deploy to progressively larger waves: 1 cell, then 10%, then 50%, then the rest. Roll back automatically if a wave's metrics regress.
+
+```yaml title="deploy-waves.yaml (pipeline sketch)"
+waves:
+  - name: canary
+    cells: [cell-0]            # internal tenants only
+    bake: 30m
+  - name: wave-1
+    cells: [cell-1, cell-2]
+    bake: 1h
+  - name: wave-2
+    cells: "10%"
+    bake: 2h
+  - name: rest
+    cells: "100%"
+rollback_on:
+  - metric: http_5xx_ratio
+    above: 0.01
+  - metric: p99_latency_ms
+    above_baseline_percent: 20
+```
+
+**Edge case.** **Schema migrations** must be compatible with both versions during the rollout (expand, deploy, then contract), because some cells run the old code for hours.
+
+#### 9.4 Shuffle sharding: isolation without one cell per customer ➕
+
+**Problem.** Plain sharding puts each customer on one group of servers. A poison customer takes down that whole group, and every other customer on it.
+
+**Mechanism.** Give each customer a **random combination** of k workers out of n, instead of a fixed group. A failure caused by one customer takes out only its k workers; another customer is fully affected only if it got **exactly the same** combination, and otherwise still has a healthy worker to retry on.
+
+The numbers come straight from combinatorics:
+- 8 workers, combinations of 2: C(8, 2) = **28** distinct shards, so a random other customer shares both workers with a poison customer with probability 1 in 28.
+- 100 workers, combinations of 5: C(100, 5) = **75,287,520** distinct shards.
+
+```python title="shuffle_shard.py"
+import hashlib
+
+
+# deterministic: the same customer always gets the same k workers
+def shuffle_shard(customer_id: str, workers: list[str], k: int) -> list[str]:
+    def score(worker: str) -> int:
+        digest = hashlib.sha256(f"{customer_id}:{worker}".encode()).digest()
+        return int.from_bytes(digest[:4], "big")
+
+    return sorted(workers, key=score)[:k]  # rendezvous-style pick
+```
+
+**Edge cases.**
+- Clients must **retry on another worker of their shard** for the isolation to help.
+- Shuffle sharding isolates **per-customer** failures. A bad deploy to every worker still hits everyone, which is why it's combined with cells and wave deploys.
+
+---
+
+## 10. Asynchronous processing 🎓
+
+Unlike horizontal scaling (adopted past a threshold, say 10,000–50,000 users), async processing is something you usually adopt **from day one**, because the payoff is immediate: it cuts **perceived latency**, the time the user actually waits.
+
+### What has to be synchronous, and what doesn't
+- **Synchronous behaviour:** updating your name. You can't say "saved" until the `UPDATE` succeeds, because the user expects to see the change on refresh.
+- **Doesn't need to be:** work whose result the user doesn't need to see **right now**.
+
+### Example 1: inviting a team member
+The user types `user1@gmail.com` and clicks **Invite**. The handler (ignoring validation and auth):
+1. Checks that the person isn't already on the team (DB).
+2. Inserts an `invites` row with status **PENDING** (later ACCEPTED or REJECTED).
+3. Sends the invitation email via an external provider (Mailchimp, SendGrid, Resend).
+
+Steps 1–2 take about **50–100 ms** (DB in the same region). Step 3 is an external call to infrastructure you don't control: about **200–300 ms**. Done synchronously, the user sees a **~400 ms** spinner, and much longer, or an error, if the provider is slow or down.
+
+**But the user doesn't need the email to have been sent** before they see "invited (pending)". So reply right after step 2 (**~100 ms**) and send the email **in the background**.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant API as API (producer)
+  participant DB as Postgres
+  participant Q as Queue (Redis / RabbitMQ)
+  participant W as Worker (consumer)
+  participant M as Email provider
+  B->>API: POST /invites
+  API->>DB: check member + INSERT invite PENDING
+  API->>Q: enqueue send-invite-email
+  API-->>B: 201 (about 100 ms)
+  Q->>W: deliver job
+  W->>M: send email (200-300 ms, retried on failure)
+  M-->>W: accepted`} />
+
+**The mechanism (from the series' background jobs lesson):**
+- The API is the **producer**: it pushes a **job** ("send invite email to X") into a **queue**, typically Redis-based or **RabbitMQ** (Kafka for event streaming).
+- **Consumers (workers)** pick jobs off the queue and do the work.
+- Workers can run from the **same codebase** (a separate process) or a **separate service**, so you can **scale workers independently** when the backlog grows.
+
+### Example 2: YouTube uploads
+While uploading, you keep the tab open (the browser is reading bytes from your disk). Once the upload finishes you can close it. YouTube queues **thumbnail generation**, **HD encoding** and **subtitle generation**, in parallel or in sequence, finishing in 10 or 20 minutes depending on load. Users expect it to take time.
+
+### Example 3: deleting an account
+A to-do app's "delete account" must remove data from many tables (categories, calendar schedules, to-dos, profile, finally the `users` row last, because of foreign keys) in a transaction. A 10-year user may have **a million rows per table**. The lesson's ballpark: about **4 s** of deletes across eight tables, about **8 s** end to end. An 8-second spinner is unacceptable.
+
+Async version: check the user exists and is authenticated (**50–80 ms**), reply "account deleted", log them out, and enqueue `delete-user(id)`. Whether the worker takes 5 s or 30 s doesn't matter; nobody is waiting.
+
+**Good candidates:** emails, notifications, video and image processing (resizing too), deleting user data. The tooling is cheap: a managed Redis (e.g. **Upstash**) plus a library like **arq** (asyncio, Redis-backed) or **Celery**/**Dramatiq** for Python, with retries and error handling built in.
+
+### 🔧 Going deeper: an arq producer and worker, done safely
+
+```python title="queues.py"
+import os
+
+from arq import create_pool
+from arq.connections import ArqRedis, RedisSettings
+
+REDIS = RedisSettings(host=os.environ["REDIS_HOST"], port=6379)
+
+
+async def create_queue() -> ArqRedis:  # call once in the app's lifespan, keep it on app.state
+    return await create_pool(REDIS)
+```
+
+```python title="invites.py (FastAPI side)"
+from arq.connections import ArqRedis
+from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+async def invite(session: AsyncSession, queue: ArqRedis, team_id: int, email: str) -> Invite:
+    if await session.scalar(select(Member.id).where(Member.team_id == team_id, Member.email == email)):
+        raise HTTPException(status_code=409, detail="already a member")
+    invite = Invite(team_id=team_id, email=email, status="PENDING")
+    session.add(invite)
+    await session.commit()
+
+    await queue.enqueue_job(
+        "send_invite_email", invite.id,
+        _job_id=f"invite-{invite.id}",  # dedupe: enqueuing the same job ID again is a no-op
+    )
+    return invite  # ~100 ms, the email happens later
+```
+
+```python title="email_worker.py (separate process: arq email_worker.WorkerSettings, scale it independently)"
+from datetime import UTC, datetime
+
+import httpx
+from arq import Retry
+
+from queues import REDIS
+
+
+async def send_invite_email(ctx: dict, invite_id: int) -> None:
+    async with Session() as session:
+        invite = await session.get_one(Invite, invite_id)
+        if invite.email_sent_at:  # idempotent: delivery is at-least-once
+            return
+        try:
+            await send_email(to=invite.email, subject="You are invited", html=render(invite))
+        except httpx.HTTPError as e:
+            raise Retry(defer=2 ** ctx["job_try"]) from e  # 2 s, 4 s, 8 s... when the provider is down
+        invite.email_sent_at = datetime.now(UTC)
+        await session.commit()
+
+
+class WorkerSettings:
+    functions = [send_invite_email]
+    redis_settings = REDIS
+    max_jobs = 10   # jobs running concurrently in this worker process
+    max_tries = 5
+```
+
+```python title="delete_user_worker.py (batches keep each transaction and lock short)"
+from sqlalchemy import text
+
+TABLES = ("todos", "calendar_schedules", "categories")  # fixed in code, never from user input
+
+
+async def delete_in_batches(table: str, user_id: int) -> None:
+    assert table in TABLES
+    stmt = text(f"DELETE FROM {table} WHERE id IN "
+                f"(SELECT id FROM {table} WHERE user_id = :user_id LIMIT 5000)")
+    while True:
+        async with engine.begin() as conn:  # one short transaction per batch
+            result = await conn.execute(stmt, {"user_id": user_id})
+        if result.rowcount == 0:
+            break
+# API side: mark the user DELETING (and block logins) synchronously, then enqueue the job
+```
+
+Edge cases:
+- **Dual write:** if the process dies after the DB commit but before `enqueue_job`, the job is lost. For critical jobs, use the **transactional outbox**: insert the job into an `outbox` table in the **same transaction**, and have a relay publish it.
+- **At-least-once delivery:** a worker can crash after sending the email but before recording it, so the job reruns. Make handlers idempotent (the `email_sent_at` check) and use provider idempotency keys where offered.
+- **Poison jobs:** after the final attempt (`max_tries`), the job is recorded as failed. Alert on failures, because "async" must not mean "silently lost".
+
+---
+
+## 11. Microservices 🎓
+
+You'll constantly hear "split it into microservices to scale". Here's what that really means.
+
+### The monolith
+A **monolith** is one **deployable unit**: auth, orders, notifications, payments and webhooks are modules (files) in one codebase, running as one process (or several identical processes when scaled horizontally). It's **simple to develop, test, refactor and deploy**: one repository, change two modules, deploy once. And you can always scale it horizontally.
+
+### Microservices scale teams, not machines
+The lesson's key point: microservices are mainly about **scaling the organization**, the humans, not the machine's performance. The **prerequisite is a large team**, on the order of **100–200+ developers** on one application. Problems that appear at that size:
+
+1. **Deployment coupling.** The payments team has a critical change ready; the notifications team has unfinished (not broken, just not ready) work on `main`. Since everything ships as one unit, one team blocks the other. Feature flags and branch discipline work in a 10–30 person startup where everyone knows what everyone else is doing; with 500–1,000 developers they stop being enough.
+2. **Uniform scaling.** Notifications is light (some inserts, a WebSocket push); payments and orders are CPU- and memory-heavy and must not fail during a spike. In a monolith **you scale everything together**. With services, **scale only what's hot**.
+3. **One tech stack.** A blogging platform (Medium, Hashnode, dev.to) needs **Node** for a great npm Markdown library, but its **image processing** runs in about **500 ms** in Node or Python versus about **50 ms** in **Go or Rust** (CPU-bound work, as in Part 1). A monolith forces one language; services can each use the right one.
+
+<Mermaid chart={`flowchart LR
+  subgraph Mono["Monolith: one deploy, one runtime"]
+    direction TB
+    m1["auth"] --- m2["orders"] --- m3["payments"] --- m4["notifications"]
+  end
+  subgraph Micro["Microservices: separate deploys"]
+    direction TB
+    G["gateway"] --> s1["orders<br/>Node, 10 pods"]
+    G --> s2["payments<br/>Go, 20 pods"]
+    G --> s3["notifications<br/>Node, 2 pods"]
+    G --> s4["images<br/>Rust"]
+    s1 --> d1[("orders DB")]
+    s2 --> d2[("payments DB")]
+  end`} />
+
+### What microservices cost
+1. **The network.** A function call becomes a **network call** (HTTP or gRPC): it adds latency, and it can **fail**. Now you need **timeouts, retries and failure handling** everywhere.
+2. **Debugging.** One request passes through the load balancer, router, orders, payments and notifications. Understanding it means reading **logs from four services**. You need **distributed tracing** (Part 1) and services designed for it.
+3. **Data consistency.** Each service eventually owns **its own database**, which brings back replication lag and keeping data consistent across stores.
+
+### When they make sense
+- **Large teams** with clear boundaries, so the org chart and the service boundaries line up.
+- **Genuinely different scaling needs** per component.
+- **Genuinely different technology needs.**
+
+Without clear answers to these, the complexity outweighs the benefits, and microservices **usually aren't worth it**.
+
+### 🔧 Going deeper: what "handle the network" means in code
+
+```python title="payments_client.py"
+import asyncio
+import random
+
+import httpx
+
+
+async def create_charge(client: httpx.AsyncClient, order_id: str, amount: int) -> dict:
+    # client: one shared AsyncClient with base_url=PAYMENTS_URL (Part 1, section 12)
+    for attempt in range(3):
+        try:
+            res = await client.post(
+                "/charges",
+                json={"order_id": order_id, "amount": amount},
+                headers={"Idempotency-Key": f"charge-{order_id}"},  # a retry must not charge twice
+                timeout=0.8,  # never wait forever for another service
+            )
+            if res.status_code < 500:
+                return res.json()  # 4xx: our bug, don't retry
+        except httpx.TransportError:
+            pass  # timeout or connection error: retry
+        await asyncio.sleep(0.1 * 2**attempt * random.uniform(0.5, 1.5))  # backoff + jitter
+    raise RuntimeError("payments unavailable")  # the caller decides: fail, or queue for later
+```
+
+Retries without idempotency keys turn one timeout into double charges, and retries without backoff turn a slow service into a dead one. 🔧 A common middle path is a **modular monolith**: strict module boundaries inside one deployable, so the pieces can be extracted later if the team really grows.
+
+---
+
+## 12. Serverless 🎓
+
+### What came before: the server model
+You rent a VM (EC2 or similar) with an OS (Ubuntu), install your stack (NGINX, Docker...), configure it to build and run your code, and **manage it for its whole life** (config, DNS, patches). You know exactly what you have, e.g. **4 GB RAM, 2 cores, 30 GB SSD, 1 TB/month of bandwidth**, and it serves requests as they come. This has worked for decades.
+
+### Problem 1: capacity planning
+You must decide in advance how many servers and how big, which means **predicting traffic** before you launch.
+- **Under-provision** (4 GB) and a spike from a campaign or blog post arrives: the server **crashes** or every request takes **3–4 s**. New users leave before converting; paying users start looking for alternatives. Financial and reputational loss.
+- **Over-provision** (32 GB "to be safe") and you survive the spike, but pay for idle capacity. The lesson's example: a week at 32 GB costs about **$5,000** while you used ~20% of it; the **8 GB** you actually needed would have cost about **$500**.
+
+Either way, you lose, because predicting user behaviour is impossible.
+
+### The standard answer: autoscaling
+Watch metrics and add instances when they cross a threshold. Two 4 GB servers reach **70%** memory; the autoscaler adds a third, and each drops to about **40%**.
+
+<Mermaid chart={`flowchart LR
+  M["metrics<br/>CPU or memory"] --> D{"above 70%?"}
+  D -->|yes| P["provision instance<br/>boot OS, start app,<br/>register with LB"]
+  P -->|"seconds to minutes later"| LB["traffic spread over N+1"]
+  D -->|"below scale-in threshold"| R["remove instance<br/>but never below min"]
+  P -. "spike shorter than boot time:<br/>overloaded anyway" .-> X["errors"]`} />
+
+**Its drawbacks:**
+1. **Time.** A new instance must boot an OS, fetch or build the code, start the process and register with the LB: **seconds to minutes**. A spike that arrives in 3–4 seconds beats it.
+2. **Limits you must set.** `min` and `max` instances. Max too low (10) and you're under-provisioned again. Max too high (1,000) and an attack, or a real Black Friday, scales you to 500–600 instances and a bill like **$100,000 in a day**.
+3. **It's reactive.** It acts only **after** load crosses the threshold, so by the time help arrives you're already overloaded. It can't predict.
+4. **Always-on cost.** There's always a minimum (2 instances, or one machine's size) that you pay for whether traffic is 500 req/s or zero.
+
+Autoscaling is still the standard practice. For **steady, predictable traffic** (most SaaS apps), always-on servers make sense. For **spiky or rare** traffic, serverless was invented.
+
+🔧 What the lesson's knobs look like in Kubernetes:
+
+```yaml title="hpa.yaml"
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
+  minReplicas: 2          # the always-on cost floor
+  maxReplicas: 20         # the bill ceiling (and the under-provisioning cap)
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+```
+
+### The serverless model
+"Serverless" still runs on servers. **You just don't manage them**: no machine size, no OS, no configuration. You provide only:
+- **Functions:** your code.
+- **Events:** what triggers them. For HTTP, an **API gateway** maps routes to functions.
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant G as API gateway
+  participant P as Provider (Lambda / Workers)
+  participant F as Function instance
+  C->>G: GET /thumbnails/42
+  G->>P: route maps to function resize
+  alt no warm instance
+    P->>F: cold start (boot sandbox + runtime + your init)
+  else warm instance available
+    P->>F: reuse
+  end
+  F-->>G: response
+  G-->>C: response
+  Note over P,F: instance kept warm a few seconds, then reclaimed
+`} />
+
+**How it differs:**
+- **Compute model.** Deploying provisions nothing. When the first request (event) arrives, the provider takes your code, starts an instance on some machine (you don't know or care which), runs it, and returns the response. Afterwards the instance stays alive briefly (a few seconds to ~30 s, depending on the provider) or returns to a **pool**, so the next request can reuse it instead of starting a new one.
+- **Pricing model.** Servers cost money **24/7**. Serverless bills only for the **time your code actually runs** (CPU/memory time per invocation). Your monthly bill is the sum of those milliseconds, which saves a lot for spiky or rare workloads.
+
+### The catches
+**1. Cold starts.** No machine is ready in advance, so a request that needs a **new** instance waits for it to start. This has always been serverless's number one problem. Two causes, and the fixes for each:
+- **Booting a VM/OS.** Traditional hypervisor VMs are slow to boot. AWS built **Firecracker** (KVM-based **microVMs**) for Lambda, now the industry standard for this kind of workload. 🔧 Firecracker states a boot time under 125 ms and a memory overhead under 5 MiB per microVM.
+- **Starting the language runtime.** Interpreted languages like JavaScript and Python start quickly; the JVM and similar runtimes take much longer to start. **Cloudflare Workers** avoids both costs: **V8 isolates** inside an already-running process (Cloudflare claims about 0–1 ms to create one) plus JavaScript, giving cold starts of roughly **5 ms**. 🔧 Cloudflare's docs say an isolate starts about a hundred times faster than a Node process in a container or VM.
+- **Keep-warm pings:** send synthetic requests every few seconds so an instance is always up. It works, but overdo it and you're paying for always-on instances again, which defeats the point.
+- Cold starts will **never fully disappear**; an always-on server always wins on that one.
+
+**2. Execution limits.** For example, **AWS Lambda functions can run for at most 15 minutes** (🔧 the timeout defaults to 3 s and goes up to 900 s). A 30-minute job dies halfway.
+
+**3. Statelessness, taken to the extreme.** Traditional servers quietly rely on long-lived state: **TCP connections to the database** (pools), **WebSocket connections** to browsers. Serverless instances live seconds and get replaced constantly, so none of that holds. It all has to be **re-imagined**.
+
+### 🔧 Going deeper: database connections from functions
+
+```python title="handler.py (AWS Lambda, Python)"
+import json
+import os
+
+import psycopg
+
+_conn: psycopg.Connection | None = None
+
+
+def get_conn() -> psycopg.Connection:
+    # created once per instance, outside the request, reused while the instance stays warm
+    global _conn
+    if _conn is None or _conn.closed:
+        _conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
+    return _conn
+
+
+def handler(event: dict, context) -> dict:
+    product_id = (event.get("pathParameters") or {}).get("id")
+    row = get_conn().execute("SELECT id, name FROM products WHERE id = %s", (product_id,)).fetchone()
+    body = {"id": row[0], "name": row[1]} if row else None
+    return {"statusCode": 200 if row else 404, "body": json.dumps(body)}
+```
+
+A Lambda instance handles one invocation at a time, so one connection per instance is the right size. But even so, 1,000 concurrent invocations means **1,000 instances, so 1,000 connections**: the Part 1 connection-limit problem, multiplied. Put a pooler in between (**RDS Proxy**, PgBouncer, Neon's pooled endpoint) or use an HTTP-based serverless driver. That's what the lesson means by "you'll need a serverless database".
+
+### When to use it, and when not to
+**Avoid serverless for:**
+- **Latency-sensitive, user-facing paths** where you can't afford cold-start spikes (the lesson cites banking and payments).
+- **Long-running work:** long HTTP calls, WebSocket connections.
+- **Heavy database-connection workloads**, unless you also adopt serverless-friendly database access.
+
+**Ideal for:**
+- **Occasional, heavy, specific jobs:** image and video processing, resizing. Instead of paying 24/7 for a big box, spin up per job.
+- **Event-driven work:** a new queue message, a file uploaded to a bucket, a database change triggering a pipeline.
+
+<Mermaid chart={`flowchart TD
+  Q{"Traffic shape?"} -->|"steady, predictable"| S["Always-on servers + autoscaling"]
+  Q -->|"spiky, rare, event-driven"| Q2{"Latency-critical or long-running<br/>or needs persistent connections?"}
+  Q2 -->|yes| S
+  Q2 -->|no| L["Serverless functions"]
+  L --> E["e.g. image resize on upload,<br/>queue consumers, webhooks"]`} />
+
+The lesson's verdict: the industry is **somewhat overhyped** about serverless. It's a powerful tool for specific cases, **not a universal replacement for servers**. Knowing where it fits is what matters.
+
+---
+
+## 13. Cost as a scaling dimension ➕
+
+The serverless section already compares paying for idle servers with paying per millisecond; that comparison generalizes, because at scale the bill grows with traffic like latency does, and it needs the same measure-first treatment.
+
+<Mermaid chart={`flowchart LR
+  T["traffic"] --> CMP["compute<br/>instances, functions"]
+  T --> DT["data transfer<br/>cross-AZ, NAT, egress"]
+  T --> ST["storage and DB<br/>IOPS, replicas, backups"]
+  T --> OBS["observability<br/>logs, metrics, traces"]
+  CMP & DT & ST & OBS --> U["cost per 1M requests<br/>or per active customer"]
+  U --> D{"growing faster<br/>than traffic?"}
+  D -->|yes| F["find the line item,<br/>fix the architecture"]`} />
+
+#### 13.1 Cost per request: making the bill comparable to traffic ➕
+
+**Problem.** The monthly bill went up 40%. Is that bad? Traffic went up 60%, so maybe not. A total bill can't tell you whether the system is getting more or less efficient.
+
+**Mechanism: a unit cost.** Divide cost by a unit of work: **cost per million requests**, per active customer, or per order. Track it over time like a latency percentile. Example (the instance price is an assumption for the maths, not a quote):
+
+> 26 instances × $0.10 per hour = $2.60 per hour
+> average 2,000 req/s × 3,600 s = 7.2 million requests per hour
+> compute cost ≈ $2.60 ÷ 7.2 ≈ **$0.36 per million requests**
+
+The same arithmetic shows the price of headroom. Capacity planning (Part 1, section 15.3) sized the fleet for a **7,200 req/s** peak, but the average is 2,000 req/s, so on average you use about 28% of the work you pay for. Lowering the minimum fleet off-peak with autoscaling, or moving work that can wait (section 10) out of the peak, cuts that directly.
+
+**Edge case.** Unit costs need **cost allocation**: tag every resource with its service and team, or the per-service numbers are guesses.
+
+#### 13.2 Serverless vs always-on: computing the break-even ➕
+
+**Problem.** "Serverless is cheaper" and "serverless is expensive at scale" are both true, depending on the traffic shape. You can work out which applies to you.
+
+**Mechanism: price both models for the same workload.** AWS Lambda's published first-tier price (x86, us-east-2 Ohio) is **$0.20 per million requests** plus **$0.0000166667 per GB-second**. For a function with 512 MB that runs 100 ms per request:
+
+> compute per request = 0.5 GB × 0.1 s × $0.0000166667 ≈ $0.00000083
+> plus the request charge $0.0000002 ⇒ about **$1.03 per million requests**
+
+| Traffic (average) | Requests per month | Lambda (approx.) | Always-on (assumed $0.10 per instance-hour) |
+|---|---|---|---|
+| 20 req/s | 52 million | about $53 | 2 instances minimum: about $146 |
+| 2,000 req/s | 5.2 billion | about $5,340 | 26 instances: about $1,900 |
+
+At low or spiky traffic, serverless wins because idle time is free. At high, steady traffic, always-on wins, because a busy server's cost per request is far lower than per-millisecond billing. The break-even moves with function duration, memory size and how well you keep servers utilized.
+
+**Edge cases.**
+- Lambda bills **duration while your function waits**, including waiting on a database or an HTTP call, so I/O-heavy functions cost more than their CPU use suggests.
+- Add the extras on both sides: API gateway charges, connection poolers for serverless (section 12), load balancers and operations time for servers.
+
+#### 13.3 The hidden line items: data transfer ➕
+
+**Problem.** Compute is optimized, yet the bill keeps rising. The growth is in "data transfer" and "NAT gateway", lines nobody designed.
+
+**Why it happens.** Cloud networks charge by the gigabyte in places that look free in an architecture diagram. On AWS:
+- **Between availability zones** in the same region: **$0.01 per GB in each direction**, so effectively 2 cents per GB sent between two instances in different zones.
+- **Through a NAT gateway**: an hourly charge plus **$0.045 per GB** processed (us-east-2 pricing), on top of any transfer charge. Private instances that download container images, call third-party APIs or reach S3 through NAT pay it on every byte.
+- **To the internet**: egress pricing per GB, which is one reason the CDN (section 6) also saves money.
+
+A chatty service pair sending 50 MB/s across zones moves about 129,600 GB a month: at 2 cents per GB that's about **$2,600 a month** for one link, often more than the instances themselves.
+
+**Mechanism.**
+- **Keep traffic in its zone.** Prefer same-zone endpoints for service-to-service calls; in Kubernetes, a Service with `trafficDistribution: PreferSameZone` prefers endpoints in the client's zone (older Kubernetes versions only know the now-deprecated alias `PreferClose`).
+- **Bypass NAT for cloud services.** An S3 **gateway VPC endpoint** sends S3 traffic over the AWS network without NAT processing charges.
+- **Send fewer bytes** between services: compression, smaller payloads (Part 1, section 7), batching.
+
+```yaml title="service.yaml"
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory
+spec:
+  selector: { app: inventory }
+  ports: [{ port: 80, targetPort: 3000 }]
+  trafficDistribution: PreferSameZone  # route to same-zone pods when there are healthy ones
+```
+
+**Edge case.** Zone-local routing can **unbalance** load: if one zone has more clients than pods, its pods run hotter. Keep pods spread evenly across zones (topology spread constraints) when you enable it.
+
+#### 13.4 Guardrails: making cost fail safely ➕
+
+**Problem.** The lesson's examples, a $50,000 day from an autoscaled DDoS (section 6) and a $100,000 day from a high `maxReplicas` (section 12), are cost **incidents**. They need the same protection as availability incidents.
+
+**Mechanism.**
+- **Ceilings everywhere:** `maxReplicas`, Lambda reserved concurrency, queue worker caps, log retention. Each one bounds the worst-case bill.
+- **Budgets and anomaly alerts** on daily spend per service, so a runaway is found in hours, not at month end.
+- **Cheaper capacity for interruptible work:** spot or preemptible instances suit queue workers and batch jobs that can be retried, not stateful databases.
+- **Rightsizing from data:** instances at 15% CPU all month are oversized; use the load-test capacity numbers (Part 1, section 5.3) to pick sizes, not guesses.
+- **Observability cost:** log volume grows with traffic; sample debug logs and traces ([Logging and observability](/docs/backend-first-principles/18-logging-monitoring-observability)) instead of storing everything.
+
+**Edge case.** Cost cuts must not remove the **headroom** that keeps latency low (Part 1, section 4) or the redundancy that survives a zone failure. A cheaper system that falls over at the next spike costs more.
+
+---
+
+## 14. Rules of thumb for the whole series (the lesson's recap) 🎓
+
+Both parts covered latency and throughput, database optimization, caching, vertical and horizontal scaling, distributed systems, infrastructure (API gateways, load balancers) and organizational choices (microservices). Everything discussed is a **solution**. The takeaways are about **when** to use them.
+
+<Mermaid chart={`flowchart LR
+  A["1. Start with the problem<br/>measure first"] --> B["2. Prefer simple solutions"]
+  B --> C["3. Scale for the problems<br/>you have"]
+  C --> D["4. Observability from day one<br/>the exception to rule 2"]
+  D --> E["5. Performance is a mindset"]`} />
+
+### 1. Always start with the problem, and measure
+Before reaching for any technique, find out **whether** the system is slow, **how** slow, **which component** is slow, and **why**: not just "the database", but "the database, because this index is missing" or "because one table needs sharding". Use observability (**traces, metrics, logs**) and **load and performance testing**. Tools: **Prometheus + Grafana** (self-built) or a managed product like **New Relic**. Applying solutions without that is **premature optimization**. The worst outcome is fixing the **wrong bottleneck**: it feels like progress while the real problem grows.
+
+### 2. Prefer simple solutions
+Complexity always has a cost: **every component is another thing that can fail, another thing to monitor, another thing to understand and operate**. Simpler is easier to understand, debug and run. The lesson's pairs:
+
+| Prefer first | Before |
+|---|---|
+| One large vertically scaled server | Horizontal scaling from day one |
+| Proper indexes | A Redis cache in front of every query |
+| A monolith | Microservices |
+| Plain deployments | Kubernetes, until you clearly need it |
+
+Accept complexity **only when simplicity is genuinely insufficient**. That doesn't mean always picking the simplest option; it means complexity needs a justification.
+
+### 3. Scale for the problems you have
+Don't build for a million users on day one; most products never get there. Build for your **current scale plus reasonable headroom**, and let measurements show you the bottlenecks as you grow. Advice from Netflix, Facebook or Google engineering blogs may not apply to **your** system; your own measurements are worth more than someone else's solution.
+
+### 4. Measure from day one (the exception)
+Observability is the one place to **skip "simple first"**. Production-grade **logs, metrics and traces from the start** pay off: no mysterious errors or crashes, no guessing where the bottleneck is, and early warning before growth causes trouble, so you can change the system or infrastructure **before** users notice.
+
+### 5. It's a mindset
+Like security (an earlier lesson), performance is ongoing learning built from experience: build, watch the system struggle, optimize, see what helped and what didn't. Your job isn't to **predict every problem**; it's to build systems that **handle problems gracefully** when they happen, and to develop the skills to **measure, diagnose and fix** them quickly.
+
+### Recap of the topics beyond the lesson ➕
+
+| Topic | The rule to remember |
+|---|---|
+| Overload protection (section 3) | Reject early and cheaply: cap in-flight work, shed low-priority requests on event-loop lag, distributed token bucket for quotas, retry budgets (at most 10% retries), limit how fast new pods connect |
+| Consistent hashing (section 4.3) | `mod N` moves about N ÷ (N + 1) of keys on resize; rings with virtual nodes or fixed slots move about 1 ÷ (N + 1); rebalance by copy, catch up, switch, clean up |
+| CAP and PACELC (section 5) | During a partition choose availability or consistency; otherwise choose latency or consistency; decide per operation, set `synchronous_commit` per transaction |
+| Multi-region (section 8) | Multi-AZ first; active-passive trades RPO and RTO for simplicity; active-active works best with a home region per tenant; residency covers backups, logs and telemetry too |
+| Cells (section 9) | Complete, isolated copies of the stack per group of tenants, a thin router, fixed tested cell size, wave deploys; shuffle sharding for per-customer isolation |
+| Cost (section 13) | Track cost per request; compute the serverless break-even; watch cross-AZ and NAT data transfer; ceilings and budget alerts on everything that autoscales |
+
+---
+
+## Interview questions
+
+1. **What does "stateless" mean and why does horizontal scaling need it?** No instance holds data the others can't reach, so any instance can serve any request. Sessions go in Redis, files in object storage, data in a shared DB.
+2. **A user logs in and gets a 401 on the next request. Why?** The session was stored in one instance's memory, and the next request hit another instance. Externalize sessions (sticky sessions only hide it).
+3. **Round robin vs least connections?** Round robin rotates blindly, which is fine for uniform requests and servers. Least connections uses in-flight work as a live load signal, so heavy requests steer traffic away from busy servers.
+4. **What is weighted round robin for?** Unequal servers: a node with twice the capacity gets twice the share.
+5. **How do health checks work?** The LB probes each instance (e.g. every second), removes it after failures, keeps probing, and re-adds it after successes. Separate liveness from readiness; drain before shutdown.
+6. **What do read replicas solve and what do they cost?** They offload the 70–90% of traffic that is reads and serve reads near users. The cost is replication lag, which makes read-after-write return stale data.
+7. **How do you get read-your-writes with replicas?** Route reads to the primary for a short window after a write, wait until the replica's replay LSN reaches the write's LSN, or design the UI to avoid an instant refetch.
+8. **What does sharding solve, and what makes a shard key good?** Both per-query volume and per-instance capacity, including writes. A good key spreads writes evenly and keeps common queries on one shard; date ranges create hot shards.
+9. **Why can't a server in us-east-1 answer Tokyo in 10 ms?** Light in fibre covers about 200,000 km/s, and a round trip of about 20,000 km takes about 100 ms before any processing. CDNs and the edge move content and logic closer.
+10. **What are the three benefits of a CDN?** Latency (100 ms down to about 3 ms), lower origin load, and DDoS absorption.
+11. **Edge computing vs a CDN cache?** A cache returns stored files by name; edge computing runs code at the PoP (auth, localization, routing), limited by small resources and restricted runtimes.
+12. **What should go async?** Anything the user doesn't need to see immediately: emails, notifications, media processing, account deletion. Producer, queue, workers; idempotent handlers, retries with backoff, an outbox for critical jobs.
+13. **What do microservices really scale?** Teams. They help with deployment independence, per-service scaling and per-service tech, at the cost of network calls, harder debugging and data consistency.
+14. **Name four autoscaling drawbacks.** Boot time, min/max trade-offs (outages vs runaway bills), reactiveness, and an always-on cost floor.
+15. **What causes cold starts and how are they reduced?** Booting the sandbox or VM and starting the language runtime. Firecracker microVMs, V8 isolates, light runtimes, and keep-warm pings (in moderation).
+16. **When is serverless a bad fit?** Latency-critical paths, long-running work or persistent connections, and heavy DB-connection workloads without a pooler.
+17. ➕ **Why does an overloaded service serve fewer successful requests than its capacity?** Queues grow without bound, clients time out while the server still works on their requests (wasted work, no goodput), and retries add load. Reject early: concurrency caps, bounded queues, load shedding by priority.
+18. ➕ **How do you rate-limit per customer across 20 instances?** A token bucket in Redis, updated atomically by a Lua script using Redis's clock; per-instance in-memory limits multiply with the instance count. Decide fail-open vs fail-closed per limiter.
+19. ➕ **What is a retry budget?** A cap on retries as a share of requests (Google's SRE book uses 10% per client, plus at most 3 attempts per request), so a partial outage can't double the load on the struggling service.
+20. ➕ **Why do autoscale events or DB failovers knock over Postgres?** Every new pod or reconnecting instance opens its pool at once (a connection storm). Budget `maxReplicas × pool size`, use an external pooler, reconnect with jitter, and limit scale-up speed.
+21. ➕ **Why is `hash mod N` bad for sharding, and what replaces it?** Going from N to N + 1 shards moves about N ÷ (N + 1) of keys (80% for 4 to 5). Consistent hashing with virtual nodes, jump hash, or fixed slots mapped to nodes (Redis Cluster's 16,384) move only about 1 ÷ (N + 1).
+22. ➕ **State CAP and PACELC correctly.** CAP: during a network partition, a replicated system must choose availability or consistency per request. PACELC: and when there's no partition, it must choose low latency or consistency, the trade-off you pay every day.
+23. ➕ **Active-passive vs active-active multi-region?** Active-passive: one serving region, an async replica elsewhere; RPO = replication lag, RTO = detection to traffic switch. Active-active: every region serves users; avoid write conflicts by giving each tenant a home region.
+24. ➕ **What is a cell-based architecture?** Several independent copies of the full stack, each serving a subset of tenants via a thin router, so a bad deploy, poison request or noisy tenant affects one cell instead of everyone.
+25. ➕ **Explain shuffle sharding.** Each customer gets a random combination of k of n workers; with 8 workers and k = 2 there are 28 combinations, so a poison customer rarely takes down all of another customer's workers.
+26. ➕ **When is serverless more expensive than servers?** At high, steady traffic: at about $1 per million requests for a 512 MB, 100 ms function, 2,000 req/s costs several times more than a well-utilized always-on fleet. At low or spiky traffic it's cheaper because idle time is free.
+27. ➕ **Name hidden cloud costs that grow with traffic.** Cross-AZ transfer ($0.01 per GB each way on AWS), NAT gateway processing ($0.045 per GB), internet egress, and log and trace volume.
+
+## Sources
+
+- [Lesson video: Backend Scaling and Performance Engineering, Part 2 (Sriniously)](https://youtu.be/sOhAopEwjH4)
+- [Part 1 of this lesson](/docs/backend-first-principles/21-scaling-performance-part-1)
+- [NGINX: HTTP load balancing](https://docs.nginx.com/nginx/admin-guide/load-balancer/http-load-balancer/)
+- [HAProxy: health checks](https://www.haproxy.com/documentation/haproxy-configuration-tutorials/reliability/health-checks/)
+- [Kubernetes: liveness, readiness and startup probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+- [Kubernetes: Horizontal Pod Autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)
+- [PostgreSQL: Replication and standby servers](https://www.postgresql.org/docs/current/warm-standby.html)
+- [PostgreSQL: System administration functions (WAL / LSN)](https://www.postgresql.org/docs/current/functions-admin.html)
+- [PostgreSQL: Table partitioning](https://www.postgresql.org/docs/current/ddl-partitioning.html)
+- [Vitess (used by PlanetScale)](https://vitess.io/)
+- [Cloudflare: Purge cache by cache-tags](https://developers.cloudflare.com/cache/how-to/purge-cache/purge-by-tags/)
+- [Cloudflare Workers: how Workers works (V8 isolates)](https://developers.cloudflare.com/workers/reference/how-workers-works/)
+- [Cloudflare Workers: TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
+- [MDN: Cache-Control](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control)
+- [arq documentation](https://arq-docs.helpmanual.io/)
+- [Celery documentation](https://docs.celeryq.dev/en/stable/)
+- [redis-py: asyncio client and Lua scripting](https://redis.readthedocs.io/en/stable/)
+- [Uvicorn: settings (workers, limit-concurrency, graceful shutdown)](https://www.uvicorn.org/settings/)
+- [Firecracker microVMs](https://firecracker-microvm.github.io/)
+- [AWS Lambda: function timeout](https://docs.aws.amazon.com/lambda/latest/dg/configuration-timeout.html)
+- [AWS: Amazon RDS Proxy](https://aws.amazon.com/rds/proxy/)
+- ➕ [Google SRE book: Handling overload (criticality, retry budgets, adaptive throttling)](https://sre.google/sre-book/handling-overload/)
+- ➕ [Stripe: Scaling your API with rate limiters](https://stripe.com/blog/rate-limiters)
+- ➕ [@fastify/under-pressure](https://github.com/fastify/under-pressure)
+- ➕ [NGINX: limit_req module](https://nginx.org/en/docs/http/ngx_http_limit_req_module.html)
+- ➕ [Kubernetes: HPA scaling behaviour (configurable scaling policies)](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#configurable-scaling-behavior)
+- ➕ [Consistent hashing (Wikipedia, including Karger et al. 1997)](https://en.wikipedia.org/wiki/Consistent_hashing)
+- ➕ [Lamping and Veach: A fast, minimal memory, consistent hash algorithm (jump hash)](https://arxiv.org/abs/1406.2294)
+- ➕ [Redis Cluster specification (hash slots, MOVED and ASK, hash tags)](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)
+- ➕ [PostgreSQL: Logical replication row filters](https://www.postgresql.org/docs/current/logical-replication-row-filter.html)
+- ➕ [Gilbert and Lynch: Brewer's conjecture and the feasibility of consistent, available, partition-tolerant web services](https://dl.acm.org/doi/10.1145/564585.564601)
+- ➕ [PACELC design principle (Wikipedia)](https://en.wikipedia.org/wiki/PACELC_design_principle)
+- ➕ [PostgreSQL: synchronous_commit and synchronous_standby_names](https://www.postgresql.org/docs/current/runtime-config-wal.html)
+- ➕ [AWS: Aurora Global Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database.html)
+- ➕ [AWS Route 53: failover routing](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy-failover.html)
+- ➕ [European Commission: rules on international data transfers (GDPR)](https://commission.europa.eu/law/law-topic/data-protection/international-dimension-data-protection/rules-international-data-transfers_en)
+- ➕ [AWS Well-Architected: Reducing the scope of impact with cell-based architecture](https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/what-is-a-cell-based-architecture.html)
+- ➕ [AWS Builders' Library: Workload isolation using shuffle-sharding](https://aws.amazon.com/builders-library/workload-isolation-using-shuffle-sharding/)
+- ➕ [AWS Lambda pricing](https://aws.amazon.com/lambda/pricing/)
+- ➕ [Amazon VPC pricing (NAT gateway)](https://aws.amazon.com/vpc/pricing/)
+- ➕ [AWS Architecture Blog: Overview of data transfer costs for common architectures](https://aws.amazon.com/blogs/architecture/overview-of-data-transfer-costs-for-common-architectures/)
+- ➕ [Kubernetes: Service traffic distribution](https://kubernetes.io/docs/concepts/services-networking/service/#traffic-distribution)

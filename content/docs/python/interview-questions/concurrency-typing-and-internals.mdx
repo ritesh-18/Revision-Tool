@@ -1,0 +1,833 @@
+---
+title: "Concurrency, Typing and Internals: Interview Questions"
+description: Twenty interview questions on the GIL and free-threaded Python, threads, processes and asyncio, cancellation, TaskGroup, type hints, generics and variance, Pydantic, memory management and performance, with verified outputs.
+---
+
+These are the questions that separate "writes Python" from "runs Python in production": how concurrency really works under the GIL, how to keep an async service responsive, what type hints do (and don't do) at runtime, and how CPython manages memory. All outputs come from CPython 3.14 with the GIL enabled (the default build) on Windows; timings are reduced to `True`/`False` comparisons so they are reproducible.
+
+## The GIL and concurrency models
+
+### 1. What is the GIL, and what does it mean for threads? **Medium**
+
+**Short answer:** The Global Interpreter Lock is a mutex in the default CPython build that lets only one thread execute Python bytecode at a time. Threads still help for I/O-bound work, because the GIL is released while waiting on sockets, files or `sleep`, but they don't speed up pure-Python CPU-bound work.
+
+The GIL exists because CPython's memory management (reference counts on every object) and many C extensions were not thread-safe; one big lock made the interpreter simple and single-threaded code fast. A running thread is asked to release the GIL every 5 ms (`sys.getswitchinterval()`) so others get a turn. C extensions such as NumPy, hashlib or zlib release it during heavy work, so they can run in parallel.
+
+```python
+import sys, time
+from concurrent.futures import ThreadPoolExecutor
+
+def io_task(_):
+    time.sleep(0.2)            # releases the GIL while waiting
+
+def cpu_task(_):
+    return sum(i * i for i in range(1_500_000))
+
+def timed(fn, workers):
+    start = time.perf_counter()
+    with ThreadPoolExecutor(workers) as pool:
+        list(pool.map(fn, range(4)))
+    return time.perf_counter() - start
+
+print("GIL enabled:", sys._is_gil_enabled(), "switch interval:", sys.getswitchinterval())
+print("I/O, 4 threads faster than 1:", timed(io_task, 4) < timed(io_task, 1) / 2)
+print("CPU, 4 threads faster than 1:", timed(cpu_task, 4) < timed(cpu_task, 1) / 2)
+```
+
+```text title="Output"
+GIL enabled: True switch interval: 0.005
+I/O, 4 threads faster than 1: True
+CPU, 4 threads faster than 1: False
+```
+
+**Likely follow-up:** "Does the GIL make my code thread-safe?" No. It protects the interpreter's internals, not your invariants. A thread can be switched out between any two bytecodes, so compound operations like `counter += 1` can still race (see question 4).
+
+<Callout type="info" title="Coming from JS">
+  Node runs your JS on one thread and uses a thread pool (libuv) for some I/O; you get parallelism with worker threads that share no objects. Python threads *do* share objects, but under the GIL only one runs Python code at a time.
+</Callout>
+
+See [concurrency models and the GIL](/docs/python/concurrency-models-and-the-gil).
+
+### 2. What is free-threaded Python, and should you use it today? **Medium**
+
+**Short answer:** Free-threaded CPython is a separate build with the GIL removed (PEP 703), so threads can run Python code on several cores at once. It was experimental in 3.13 and became officially supported, but still optional and not the default, in 3.14 (PEP 779). It costs a few percent of single-threaded speed and needs C extensions built for it, so check your dependencies before switching.
+
+To make it safe without the GIL, CPython uses biased reference counting, per-object locks inside `dict`, `list` and `set`, immortal objects and the mimalloc allocator. If you import an extension that isn't marked free-threading-safe, the interpreter re-enables the GIL and prints a warning. You can check at runtime:
+
+```python
+import sys, sysconfig
+
+print("free-threaded build:", sysconfig.get_config_var("Py_GIL_DISABLED") == 1)
+print("GIL enabled now:", sys._is_gil_enabled())
+```
+
+```text title="Output"
+free-threaded build: False
+GIL enabled now: True
+```
+
+(Run on the default build. On a free-threaded build, usually installed as `python3.14t`, both lines flip, unless the GIL was re-enabled with `PYTHON_GIL=1` or `-X gil=1`.)
+
+**Likely follow-up:** "What changes for your code?" Code that was racy under the GIL stays racy, but races become more likely to show up. Use `threading.Lock`, queues and immutable data, exactly as you should have anyway. Python 3.15 (released this month) continues the work, for example with a stable ABI for free-threaded extensions (PEP 803).
+
+### 3. When do you choose threads, processes or asyncio? **Medium**
+
+**Short answer:** asyncio for high-concurrency I/O (thousands of sockets, HTTP calls, database queries) with async-aware libraries; threads for I/O with blocking libraries or a modest number of concurrent tasks; processes for CPU-bound work that must use several cores. Many real services combine them: an asyncio server that offloads blocking calls to threads and heavy computation to a process pool or a job queue.
+
+| Model | Parallel CPU? | Best for | Cost and risks |
+|---|---|---|---|
+| `asyncio` | No (one thread) | Many concurrent I/O waits | Blocking calls freeze everything; needs async libraries |
+| `threading` | No with the GIL, yes when free-threaded | Blocking I/O libraries, background work | Shared state needs locks; around 8 MB of reserved stack per thread on Linux |
+| `multiprocessing` | Yes | CPU-bound work | Process startup, pickling arguments and results, more memory |
+
+**Likely follow-up:** "What about subinterpreters?" Python 3.14 added `concurrent.interpreters` and `InterpreterPoolExecutor` (PEP 734): several isolated interpreters in one process, each with its own GIL. They give multi-core parallelism with cheaper startup than processes, but many third-party extension modules don't support them yet.
+
+<Callout type="info" title="Coming from JS">
+  asyncio maps to Node's event loop, `multiprocessing` to `child_process`/`cluster`, and threads to `worker_threads`, except Python threads share memory freely.
+</Callout>
+
+### 4. Can you get a race condition with the GIL? Show one. **Medium**
+
+**Short answer:** Yes. The GIL makes individual bytecodes atomic, but `counter += 1` is several bytecodes (load, add, store), and a thread switch between them loses updates. Protect shared state with a `threading.Lock` or avoid sharing it (use a `queue.Queue`).
+
+The race below is made reliable by forcing a thread switch (`time.sleep(0)`) between the read and the write, which is what the interpreter can do at any moment.
+
+```python
+import threading, time
+
+counter = 0
+lock = threading.Lock()
+
+def unsafe_increment():
+    global counter
+    for _ in range(200):
+        current = counter
+        time.sleep(0)          # let another thread run here
+        counter = current + 1
+
+def safe_increment():
+    global counter
+    for _ in range(200):
+        with lock:
+            current = counter
+            time.sleep(0)
+            counter = current + 1
+
+for target in (unsafe_increment, safe_increment):
+    counter = 0
+    threads = [threading.Thread(target=target) for _ in range(4)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    print(target.__name__, counter == 800)
+```
+
+```text title="Output"
+unsafe_increment False
+safe_increment True
+```
+
+**Likely follow-up:** "Can asyncio code race too?" Yes, at every `await`. If a coroutine reads a value, awaits something, and then writes based on the old value, another task may have changed it in between. Use `asyncio.Lock` for those sections. The difference is that asyncio can only switch at an `await`, never in the middle of plain code.
+
+See [threading](/docs/python/threading).
+
+## asyncio
+
+### 5. How does asyncio work? What is the difference between a coroutine and a task? **Medium**
+
+**Short answer:** asyncio runs an event loop on one thread. A coroutine (the object returned by calling an `async def` function) does nothing until something awaits it or wraps it in a Task. A Task schedules the coroutine on the loop so it runs concurrently; the loop drives it step by step, and every `await` on something that isn't ready suspends it and lets other tasks run.
+
+Under the hood a coroutine is a generator-like object; the loop resumes it with `send()`. When it awaits a future that isn't done (say, a socket read), it yields control back to the loop, which uses the OS selector (`epoll`, `kqueue`, IOCP) to wait for I/O and resumes whichever task's future completed.
+
+```python
+import asyncio
+
+async def fetch(name, delay):
+    print(f"start {name}")
+    await asyncio.sleep(delay)
+    print(f"end {name}")
+    return name
+
+async def main():
+    coro = fetch("never-awaited", 0)
+    print(type(coro).__name__)
+    coro.close()                       # avoid the "never awaited" warning
+
+    await fetch("sequential-1", 0.02)  # awaiting directly: no concurrency
+    t1 = asyncio.create_task(fetch("a", 0.05))
+    t2 = asyncio.create_task(fetch("b", 0.01))
+    print(await t1, await t2)
+
+asyncio.run(main())
+```
+
+```text title="Output"
+coroutine
+start sequential-1
+end sequential-1
+start a
+start b
+end b
+end a
+a b
+```
+
+**Likely follow-up:** "What happens if you call an async function without awaiting it?" You get a coroutine object, the body never runs, and when it is garbage-collected Python warns `RuntimeWarning: coroutine '...' was never awaited`. That is a frequent bug when porting JS code, where calling an async function starts it immediately.
+
+<Callout type="info" title="Coming from JS">
+  This is the biggest asyncio surprise for Node developers: a JS Promise starts running the moment you call the function. A Python coroutine is lazy. `asyncio.create_task()` is what gives you the "start now, await later" behaviour of a Promise.
+</Callout>
+
+See [asyncio](/docs/python/asyncio).
+
+### 6. What happens if you call `time.sleep` or `requests.get` inside an `async def`? **Medium**
+
+**Short answer:** It blocks the whole event loop: no other task, request or heartbeat runs until the call returns, because asyncio can only switch tasks at an `await`. Use async libraries (`asyncio.sleep`, `httpx.AsyncClient`, `asyncpg`) or push the blocking call to a thread with `await asyncio.to_thread(func, ...)`.
+
+```python
+import asyncio, time
+
+async def ticker():
+    for i in range(3):
+        print("tick", i)
+        await asyncio.sleep(0.05)
+
+async def blocking_work():
+    time.sleep(0.2)                      # blocks the loop
+    print("blocking done")
+
+async def offloaded_work():
+    await asyncio.to_thread(time.sleep, 0.2)
+    print("offloaded done")
+
+async def main():
+    await asyncio.gather(ticker(), blocking_work())
+    print("---")
+    await asyncio.gather(ticker(), offloaded_work())
+
+asyncio.run(main())
+```
+
+```text title="Output"
+tick 0
+blocking done
+tick 1
+tick 2
+---
+tick 0
+tick 1
+tick 2
+offloaded done
+```
+
+In the first run the ticker was frozen for 200 ms. In the second, the sleep ran in a worker thread and the loop kept ticking.
+
+**Likely follow-up:** "How do you find blocking calls in production?" Run with asyncio debug mode (`PYTHONASYNCIODEBUG=1` or `asyncio.run(main(), debug=True)`), which logs any callback that holds the loop longer than 100 ms, and watch event-loop lag metrics.
+
+<Callout type="info" title="Coming from JS">
+  The same rule as never using `fs.readFileSync` in a Node request handler. The difference is that most of the Python ecosystem (`requests`, many SDKs and ORMs) is synchronous by default, so it is much easier to block the loop by accident.
+</Callout>
+
+### 7. In a FastAPI service, when do you write `async def` endpoints and when plain `def`? **Medium**
+
+**Short answer:** Use `async def` when everything the handler awaits is async (async database driver, `httpx.AsyncClient`, an async LLM SDK). Use plain `def` when the handler calls blocking libraries: FastAPI then runs it in a thread pool, so it doesn't block the event loop. The one thing never to do is call blocking code directly inside an `async def` handler.
+
+FastAPI (through Starlette and AnyIO) checks whether your endpoint is a coroutine function. `async def` handlers run on the event loop; `def` handlers are sent to a thread pool with a limited number of threads (40 by default in AnyIO), which caps how many blocking requests run at once.
+
+```python title="main.py"
+import asyncio
+import time
+import httpx
+from fastapi import FastAPI
+
+app = FastAPI()
+client = httpx.AsyncClient()
+
+@app.get("/async-ok")
+async def async_ok():
+    r = await client.get("https://example.com")   # non-blocking
+    return {"status": r.status_code}
+
+@app.get("/sync-ok")
+def sync_ok():
+    time.sleep(1)          # runs in the thread pool: other requests keep flowing
+    return {"ok": True}
+
+@app.get("/broken")
+async def broken():
+    time.sleep(1)          # blocks the event loop for every request
+    return {"ok": False}
+
+@app.get("/fixed")
+async def fixed():
+    await asyncio.to_thread(time.sleep, 1)
+    return {"ok": True}
+```
+
+(FastAPI isn't installed in the environment used for this page, so this snippet has no output block. The behaviour is the same as in question 6.)
+
+**Likely follow-up:** "Which is faster?" For I/O-heavy endpoints, `async def` with async libraries scales to far more concurrent requests, because waiting costs a small coroutine instead of a thread. For simple endpoints with blocking libraries, `def` is perfectly fine. Mixing is normal.
+
+<Callout type="info" title="Coming from JS">
+  NestJS controllers are always async-capable and the libraries are non-blocking by default. In FastAPI you choose per endpoint, and the choice must match the libraries you call.
+</Callout>
+
+### 8. How do you keep a CPU-heavy endpoint from blocking an async service? **Hard**
+
+**Short answer:** Move the computation off the event loop *and* out of the GIL: run it in a `ProcessPoolExecutor` via `loop.run_in_executor`, or for long jobs hand it to a task queue (Celery, RQ, arq, Dramatiq) and return a job id. A thread alone (`to_thread`) keeps the loop responsive for C code that releases the GIL, but pure-Python CPU work would still compete for the GIL.
+
+Create one process pool at startup (FastAPI `lifespan`) and reuse it, since starting processes is expensive. Arguments and results are pickled, so pass small inputs (ids, paths) rather than huge objects. Run several server workers (`uvicorn --workers N` or gunicorn) to use more cores for request handling itself.
+
+```python
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+def cpu_heavy(n):
+    return sum(i * i for i in range(n))
+
+async def heartbeat(stop):
+    beats = 0
+    while not stop.is_set():
+        beats += 1
+        await asyncio.sleep(0.01)
+    return beats
+
+async def main(pool):
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    hb = asyncio.create_task(heartbeat(stop))
+    result = await loop.run_in_executor(pool, cpu_heavy, 5_000_000)
+    stop.set()
+    print("result:", result)
+    print("loop stayed responsive:", await hb > 5)
+
+if __name__ == "__main__":          # required with the spawn start method
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        asyncio.run(main(pool))
+```
+
+```text title="Output"
+result: 41666654166667500000
+loop stayed responsive: True
+```
+
+**Likely follow-up:** "Why is the `__main__` guard needed?" With the `spawn` start method (default on Windows and macOS) and `forkserver` (default on Linux since 3.14), child processes import your main module; without the guard, each child would try to create its own pool.
+
+<Callout type="info" title="Coming from JS">
+  The Node equivalent is `worker_threads` or a `piscina` pool for CPU work, plus BullMQ for long jobs. The structure is the same; the reason in Python is the GIL rather than the single JS thread.
+</Callout>
+
+See [multiprocessing](/docs/python/multiprocessing).
+
+### 9. What is the difference between `asyncio.gather` and `asyncio.TaskGroup`? **Medium**
+
+**Short answer:** `TaskGroup` (3.11+) gives structured concurrency: if one task fails, the others are cancelled, and all errors are raised together as an `ExceptionGroup` when the `async with` block exits. With `gather`, the first exception propagates to the awaiting code but the other tasks keep running in the background; with `return_exceptions=True` it returns errors as values instead.
+
+Prefer `TaskGroup` for "all of these must succeed" work, since no task outlives the block. Use `gather(..., return_exceptions=True)` when you want every result and will handle failures one by one.
+
+```python
+import asyncio
+
+async def job(name, delay, fail=False):
+    try:
+        await asyncio.sleep(delay)
+        if fail:
+            raise ValueError(f"{name} failed")
+        return name
+    except asyncio.CancelledError:
+        print(f"{name} cancelled")
+        raise
+
+async def main():
+    results = await asyncio.gather(job("a", 0.01), job("b", 0.02, fail=True),
+                                   return_exceptions=True)
+    print(results)
+
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(job("slow", 1))
+            tg.create_task(job("bad", 0.01, fail=True))
+    except* ValueError as eg:
+        print("TaskGroup errors:", [str(e) for e in eg.exceptions])
+
+asyncio.run(main())
+```
+
+```text title="Output"
+['a', ValueError('b failed')]
+slow cancelled
+TaskGroup errors: ['bad failed']
+```
+
+**Likely follow-up:** "How would you bound concurrency, say to 10 calls to an LLM API at a time?" Wrap the call in an `asyncio.Semaphore(10)` (`async with sem:`) inside each task, or use a fixed number of worker tasks reading from an `asyncio.Queue`.
+
+<Callout type="info" title="Coming from JS">
+  `gather` is `Promise.all` (or `Promise.allSettled` with `return_exceptions=True`), and like `Promise.all` it doesn't cancel the losers. `TaskGroup` has no direct JS equivalent; it is closer to an `AbortController` shared by all the promises.
+</Callout>
+
+### 10. How does task cancellation work in asyncio? **Hard**
+
+**Short answer:** `task.cancel()` schedules a `CancelledError` to be raised inside the coroutine at its current (or next) `await`. The coroutine can run cleanup in `finally` or `except CancelledError`, but it should re-raise the error. Timeouts (`asyncio.timeout`, `asyncio.wait_for`) are built on cancellation and convert it into `TimeoutError` at the boundary.
+
+`CancelledError` inherits from `BaseException`, so `except Exception` doesn't catch it. Swallowing it breaks `TaskGroup` and timeouts, which rely on the cancellation coming back out. Use `asyncio.shield` to protect a critical inner operation from an outer cancellation.
+
+```python
+import asyncio
+
+async def worker():
+    try:
+        await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        print("cleaning up")
+        raise
+    finally:
+        print("finally runs")
+
+async def main():
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(0.01)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print("task cancelled:", task.cancelled())
+
+    try:
+        async with asyncio.timeout(0.05):
+            await asyncio.sleep(1)
+    except TimeoutError:
+        print("timed out")
+
+asyncio.run(main())
+```
+
+```text title="Output"
+cleaning up
+finally runs
+task cancelled: True
+timed out
+```
+
+**Likely follow-up:** "What happens to an in-flight HTTP request when the client disconnects?" Depending on the server and framework, the handler task may be cancelled; with proper `async with` cleanup the connection and database session are released. Code that catches and ignores `CancelledError` keeps working on requests nobody is waiting for.
+
+<Callout type="info" title="Coming from JS">
+  JS promises can't be cancelled; you pass an `AbortSignal` around by hand. In asyncio any task can be cancelled from outside, and the cancellation arrives as an exception at the next `await`.
+</Callout>
+
+### 11. Why can a fire-and-forget `asyncio.create_task()` disappear? **Hard**
+
+**Short answer:** The event loop keeps only a *weak* reference to tasks. If you don't store the task returned by `create_task`, it can be garbage-collected before it finishes, and its exceptions go unnoticed. Keep a strong reference (a set you remove from on completion), or better, use a `TaskGroup` or a real background job system.
+
+The asyncio documentation explicitly recommends this pattern:
+
+```python
+import asyncio
+
+background_tasks = set()
+
+async def send_email(to):
+    await asyncio.sleep(0.01)
+    print("sent to", to)
+
+def fire_and_forget(coro):
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)                       # strong reference
+    task.add_done_callback(background_tasks.discard) # drop it when done
+    return task
+
+async def main():
+    for user in ["ana", "bo"]:
+        fire_and_forget(send_email(user))
+    print("pending:", len(background_tasks))
+    await asyncio.sleep(0.05)
+    print("pending:", len(background_tasks))
+
+asyncio.run(main())
+```
+
+```text title="Output"
+pending: 2
+sent to ana
+sent to bo
+pending: 0
+```
+
+**Likely follow-up:** "In FastAPI, what would you use instead?" `BackgroundTasks` for small jobs tied to a response (they run after the response is sent, in the same process), and a durable queue (Celery, arq, a message broker) for anything that must survive a restart or retry on failure.
+
+## Processes
+
+### 12. What should you know about `multiprocessing` before using it? **Medium**
+
+**Short answer:** Each worker is a separate interpreter with its own memory and its own GIL, so CPU work runs in parallel, but everything sent to or from a worker is pickled. That means functions must be importable at module level (no lambdas or local functions), large arguments are expensive to send, and start-up takes time. The default start method is `spawn` on Windows and macOS and, since Python 3.14, `forkserver` on Linux (it used to be `fork`).
+
+`fork` copied the parent process, which was fast but unsafe when the parent had threads (a lock held by another thread is copied in the locked state). `forkserver` and `spawn` start clean processes, which is safer but means module-level code is re-imported in the child.
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+
+def square(x):
+    return x * x
+
+if __name__ == "__main__":
+    print("start method:", mp.get_start_method())
+    with ProcessPoolExecutor(max_workers=2) as pool:
+        print(list(pool.map(square, range(5))))
+        try:
+            list(pool.map(lambda x: x + 1, range(3)))
+        except Exception as e:
+            print(type(e).__name__)
+```
+
+```text title="Output"
+start method: spawn
+[0, 1, 4, 9, 16]
+PicklingError
+```
+
+**Likely follow-up:** "How do you share large read-only data with workers?" Load it in each worker once (an `initializer` function for the pool), use `multiprocessing.shared_memory` for raw buffers or NumPy arrays, or memory-map a file. Avoid sending it with every task.
+
+## Typing
+
+### 13. Are type hints checked at runtime? **Easy**
+
+**Short answer:** No. The interpreter stores annotations but never enforces them; `def f(x: int)` happily accepts a string. Static checkers (mypy, pyright, and newer tools such as ty and Pyrefly) use them before the code runs, and libraries like Pydantic, FastAPI and dataclasses read them at runtime to generate behaviour.
+
+Since Python 3.14 (PEP 649 and 749), annotations are evaluated lazily: they are compiled into a function that runs only when someone asks for them, so forward references to names defined later no longer need quotes. `annotationlib.get_annotations` can return them in different formats.
+
+```python
+import annotationlib
+
+def greet(name: int) -> str:
+    return "hi " + str(name)
+
+print(greet("not an int"))
+print(greet.__annotations__)
+
+def make(user: User) -> None:       # User doesn't exist yet: fine in 3.14
+    pass
+
+class User:
+    pass
+
+print(make.__annotations__)
+print(annotationlib.get_annotations(greet, format=annotationlib.Format.STRING))
+```
+
+```text title="Output"
+hi not an int
+{'name': <class 'int'>, 'return': <class 'str'>}
+{'user': <class '__main__.User'>, 'return': None}
+{'name': 'int', 'return': 'str'}
+```
+
+On Python 3.13 or older, the `make` definition raises `NameError` unless you quote `"User"` or use `from __future__ import annotations`.
+
+**Likely follow-up:** "So how does FastAPI validate request bodies?" It reads your handler's annotations at startup (via `inspect` and Pydantic) and builds validators from them. That is runtime use of annotations by a library, not enforcement by Python.
+
+<Callout type="info" title="Coming from JS">
+  Like TypeScript, types are not enforced at runtime. Unlike TypeScript, they are not erased: the annotations remain available as real objects, which is what makes FastAPI and Pydantic possible. A TS equivalent would need decorators plus `reflect-metadata`.
+</Callout>
+
+See [type hints basics](/docs/python/type-hints-basics).
+
+### 14. How do you write generic functions and classes? **Medium**
+
+**Short answer:** Since Python 3.12 (PEP 695) you declare type parameters in brackets: `def first[T](items: list[T]) -> T` and `class Stack[T]:`. Before that you created a `TypeVar("T")` and inherited from `Generic[T]`. Bounds and constraints are written `[T: Number]` or `[T: (int, str)]`, and `type Alias = ...` defines a type alias.
+
+```python
+from collections.abc import Sequence
+
+def first[T](items: Sequence[T]) -> T:
+    return items[0]
+
+class Stack[T]:
+    def __init__(self) -> None:
+        self._items: list[T] = []
+    def push(self, item: T) -> None:
+        self._items.append(item)
+    def pop(self) -> T:
+        return self._items.pop()
+
+type JSON = dict[str, JSON] | list[JSON] | str | int | float | bool | None
+
+s = Stack[int]()
+s.push(1)
+print(first(["a", "b"]), s.pop())
+print(Stack.__type_params__, first.__type_params__)
+print(JSON.__value__)
+```
+
+```text title="Output"
+a 1
+(T,) (T,)
+dict[str, JSON] | list[JSON] | str | int | float | bool | None
+```
+
+**Likely follow-up:** "What does the type checker infer for `first(["a", "b"])`?" `str`, because `T` is solved from the argument. At runtime the generic parameters do nothing, so `Stack[int]()` accepts any item.
+
+<Callout type="info" title="Coming from JS">
+  The new syntax reads almost exactly like TypeScript generics (`function first<T>(items: T[]): T`), with square brackets instead of angle brackets.
+</Callout>
+
+See [advanced typing](/docs/python/advanced-typing).
+
+### 15. Why can't you pass a `list[int]` where `list[float]` is expected? **Hard**
+
+**Short answer:** `list` is *invariant* because it is mutable: a function that takes `list[float]` could append a float, corrupting your `list[int]`. Read-only types like `Sequence` and `Mapping` values are *covariant*, so `Sequence[int]` is accepted where `Sequence[float]` is expected. Accept the most abstract read-only type your function needs.
+
+Variance describes how subtyping of the parameter carries over to the container. Covariant: `Box[Sub]` is a subtype of `Box[Base]` (safe for producers). Contravariant: the reverse (safe for consumers, like `Callable` arguments). Invariant: neither. With PEP 695 syntax, type checkers infer the variance of your own generic classes from how you use `T`.
+
+```python
+from collections.abc import Sequence
+
+def append_float(values: list[float]) -> None:
+    values.append(3.14)
+
+def total(values: Sequence[float]) -> float:
+    return sum(values)
+
+ints: list[int] = [1, 2]
+print(total(ints))
+append_float(ints)
+print(ints)
+```
+
+```text title="Output"
+3
+[1, 2, 3.14]
+```
+
+At runtime nothing stops the bad call. mypy 2.4 catches it:
+
+```text title="mypy output"
+variance.py:11: error: Argument 1 to "append_float" has incompatible type "list[int]"; expected "list[float]"  [arg-type]
+variance.py:11: note: "list" is invariant -- see https://mypy.readthedocs.io/en/stable/common_issues.html#variance
+variance.py:11: note: Consider using "Sequence" instead, which is covariant
+Found 1 error in 1 file (checked 1 source file)
+```
+
+**Likely follow-up:** "Is `int` really a subtype of `float`?" Not as classes, but the typing spec treats `int` as acceptable wherever `float` is expected (the "numeric tower" shortcut), so the checker allows it.
+
+<Callout type="info" title="Coming from JS">
+  TypeScript treats arrays covariantly for convenience, so it accepts the equivalent of `append_float(ints)` and is unsound there. Python type checkers are stricter.
+</Callout>
+
+### 16. What is the difference between `Any` and `object` in type hints? **Medium**
+
+**Short answer:** `Any` switches type checking off: every operation on it is allowed, and it is compatible with every type in both directions. `object` is the top type: anything can be passed in, but you can only do what all objects support until you narrow it with `isinstance`. Use `object` (or a precise type) for "accepts anything", and keep `Any` for genuinely untyped boundaries.
+
+```python
+from typing import Any
+
+def with_any(x: Any) -> None:
+    x.upper()
+
+def with_object(x: object) -> None:
+    x.upper()
+    if isinstance(x, str):
+        print(x.upper())
+```
+
+```text title="mypy output"
+anyobj.py:7: error: "object" has no attribute "upper"  [attr-defined]
+Found 1 error in 1 file (checked 1 source file)
+```
+
+(This file only defines functions, so running it prints nothing; the interesting output is the checker's.) Line 4 passes because `x` is `Any`; line 7 fails because `object` has no `upper`; line 9 passes because `isinstance` narrowed `x` to `str`.
+
+**Likely follow-up:** "And `X | None`?" It means the value may be `None`, and the checker forces you to handle that case before using it. `Optional[X]` is the older spelling of the same thing. It doesn't make the parameter optional; only a default value does that.
+
+<Callout type="info" title="Coming from JS">
+  `Any` is TypeScript's `any`, and `object` plays the role of `unknown`.
+</Callout>
+
+### 17. How does Pydantic validate data, and what is lax versus strict mode? **Medium**
+
+**Short answer:** Pydantic builds a validator from your model's type hints when the class is created (the core is written in Rust, `pydantic-core`). On `model_validate` or construction it checks and *coerces* input in lax mode by default (`"42"` becomes `42`), collects every error into one `ValidationError`, and returns a typed model. Strict mode (per field or per model) refuses conversions such as string-to-int.
+
+```python
+from pydantic import BaseModel, Field, ValidationError, ConfigDict
+
+class CreateUser(BaseModel):
+    email: str = Field(pattern=r".+@.+")
+    age: int = Field(ge=18)
+    tags: list[str] = []
+
+print(CreateUser.model_validate({"email": "a@b.co", "age": "42"}))
+
+try:
+    CreateUser.model_validate({"email": "nope", "age": 10})
+except ValidationError as e:
+    print(e.error_count(), [err["loc"][0] for err in e.errors()])
+
+class StrictUser(BaseModel):
+    model_config = ConfigDict(strict=True)
+    age: int
+
+try:
+    StrictUser(age="42")
+except ValidationError as e:
+    print(e.errors()[0]["type"])
+```
+
+```text title="Output"
+email='a@b.co' age=42 tags=[]
+2 ['email', 'age']
+int_type
+```
+
+**Likely follow-up:** "How do you skip validation for trusted data?" `Model.model_construct(**data)` creates an instance without validating, for data you already validated (for example, rows from your own database). Use it carefully, because nothing checks the values.
+
+<Callout type="info" title="Coming from JS">
+  Pydantic is to Python what Zod is to TS, except the schema *is* the class and its type hints, so you don't write the type and the schema separately.
+</Callout>
+
+See [Pydantic and runtime validation](/docs/python/pydantic-and-runtime-validation).
+
+### 18. How would you use Pydantic to get reliable structured output from an LLM? **Medium**
+
+**Short answer:** Define the expected shape as a Pydantic model, send its JSON Schema (`model_json_schema()`) to the model as a tool or response-format definition, then parse the reply with `model_validate_json`. On a `ValidationError`, either retry with the error messages included in the prompt or fail clearly. Validators enforce rules the schema can't express.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+class TicketTriage(BaseModel):
+    category: Literal["billing", "bug", "other"]
+    priority: int = Field(ge=1, le=5)
+    summary: str
+
+    @field_validator("summary")
+    @classmethod
+    def not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("summary must not be empty")
+        return v.strip()
+
+print(sorted(TicketTriage.model_json_schema()["properties"]))
+
+good = '{"category": "bug", "priority": 2, "summary": " App crashes on login "}'
+print(TicketTriage.model_validate_json(good))
+
+bad = '{"category": "urgent", "priority": 9, "summary": ""}'
+try:
+    TicketTriage.model_validate_json(bad)
+except ValidationError as e:
+    for err in e.errors():
+        print(err["loc"], err["msg"])
+```
+
+```text title="Output"
+['category', 'priority', 'summary']
+category='bug' priority=2 summary='App crashes on login'
+('category',) Input should be 'billing', 'bug' or 'other'
+('priority',) Input should be less than or equal to 5
+('summary',) Value error, summary must not be empty
+```
+
+**Likely follow-up:** "Why `model_validate_json` and not `json.loads` then `model_validate`?" It parses and validates in one pass inside the Rust core, which is faster and reports JSON syntax errors as validation errors in the same format.
+
+## Memory and performance
+
+### 19. How does CPython manage memory? **Hard**
+
+**Short answer:** Mainly by reference counting: every object has a count of references to it, and when it drops to zero the object is freed immediately. Reference counting can't free reference cycles, so a separate cyclic garbage collector periodically looks for groups of container objects that only reference each other. Small objects come from the `pymalloc` allocator (mimalloc in the free-threaded build).
+
+Because of reference counting, files and sockets are usually closed as soon as the last reference goes away, but you shouldn't rely on that (use `with`). The cyclic GC is generational: new objects are checked often, survivors less often. Python 3.14.0 to 3.14.4 shipped an incremental collector, but 3.14.5 reverted to the 3.13 generational collector after reports of memory pressure, so the exact GC design depends even on the patch version.
+
+```python
+import sys, gc, weakref
+
+class Node:
+    def __init__(self, name):
+        self.name = name
+        self.other = None
+    def __del__(self):
+        print("freed", self.name)
+
+a = Node("a")
+print(sys.getrefcount(a))       # includes the temporary argument reference
+b = a
+print(sys.getrefcount(a))
+del a, b                        # count hits zero: freed immediately
+
+x, y = Node("x"), Node("y")
+x.other, y.other = y, x         # a reference cycle
+del x, y
+print("after del: nothing freed yet")
+print("collected:", gc.collect() >= 2)
+
+cache = weakref.WeakValueDictionary()
+n = Node("cached")
+cache["k"] = n
+del n
+print("k" in cache)
+```
+
+```text title="Output"
+2
+3
+freed a
+after del: nothing freed yet
+freed x
+freed y
+collected: True
+freed cached
+False
+```
+
+**Likely follow-up:** "How do you find a memory leak in a Python service?" Use `tracemalloc` to compare snapshots and see which lines allocate the growing memory; typical culprits are unbounded caches (module-level dicts, `lru_cache` without `maxsize`), objects kept alive by global registries or closures, and C extensions. A `weakref` breaks "keep alive" links for caches and observers.
+
+<Callout type="info" title="Coming from JS">
+  V8 has only a tracing GC, so objects are freed at unpredictable times. CPython frees most objects deterministically the moment their last reference disappears, and needs the tracing collector only for cycles.
+</Callout>
+
+See [CPython memory management](/docs/python/cpython-memory-management).
+
+### 20. A Python endpoint is slow. How do you make it faster? **Medium**
+
+**Short answer:** Measure first: profile to find where time actually goes (`cProfile`, py-spy, or the new sampling profiler in 3.15). In a backend, it is usually I/O (N+1 queries, sequential HTTP calls), so batch and parallelise those. For CPU hot spots: better algorithms and data structures, built-ins and comprehensions instead of Python loops, caching, NumPy or Polars for numeric work, and moving the remaining hot code to a compiled extension (Cython, Rust with PyO3) or a separate process.
+
+Built-ins like `sum`, `sorted`, `str.join` and set operations run their loops in C, avoiding per-iteration bytecode dispatch. That is often a 2 to 10 times speedup without changing the algorithm.
+
+```python
+import timeit, cProfile, pstats
+
+data = list(range(200_000))
+lookup = set(range(0, 200_000, 7))
+
+def slow():
+    total = 0
+    for x in data:
+        if x in list(lookup)[:50]:      # rebuilds a list every iteration
+            total += x
+    return total
+
+def loop_sum():
+    total = 0
+    for x in data:
+        total += x
+    return total
+
+print("sum() beats a Python loop:",
+      timeit.timeit(lambda: sum(data), number=20) < timeit.timeit(loop_sum, number=20))
+
+profiler = cProfile.Profile()
+profiler.runcall(slow)
+stats = pstats.Stats(profiler).stats      # {(file, line, name): (calls, ..., tottime, ...)}
+hottest = max(stats.items(), key=lambda item: item[1][2])
+print("hottest function:", hottest[0][2])
+```
+
+```text title="Output"
+sum() beats a Python loop: True
+hottest function: slow
+```
+
+**Likely follow-up:** "Does Python have a JIT?" CPython 3.13 added an experimental copy-and-patch JIT (off by default, built with `--enable-experimental-jit`), and 3.14 and 3.15 keep improving it. The bigger everyday wins so far came from the specialising adaptive interpreter introduced in 3.11. PyPy is a mature JIT-based alternative for pure-Python workloads.
+
+<Callout type="info" title="Coming from JS">
+  V8's JIT makes plain JS loops fast, so "avoid loops, use built-ins" sounds odd to Node developers. In CPython it is the single most effective micro-optimisation, because each bytecode instruction has real overhead.
+</Callout>
+
+See [performance and profiling](/docs/python/performance-and-profiling).

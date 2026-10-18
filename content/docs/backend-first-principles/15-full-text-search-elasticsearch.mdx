@@ -1,0 +1,1148 @@
+---
+title: "Full Text Search Using Elasticsearch"
+description: Why LIKE queries collapse at scale, how an inverted index flips the search problem, how BM25 relevance, field boosting and fuzzy matching work, Postgres full-text search vs Elasticsearch, and the lesson's 50,000-review benchmark.
+---
+
+<Callout type="info">
+  Notes for [Full text search using Elasticsearch](https://youtu.be/7_sovzAhRSM) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The lesson tells the story of a search feature that worked for 5,000 products and fell apart at millions, then explains the one idea, the **inverted index**, that fixes speed and makes **relevance** and **typo tolerance** possible. It ends with a live benchmark of Postgres vs Elasticsearch.
+
+<Mermaid chart={`flowchart LR
+  A["2005: LIKE search breaks"] --> B["Librarian analogy"]
+  B --> C["Inverted index"]
+  C --> D["Lucene, Elasticsearch, Postgres FTS"]
+  D --> E["Relevance: BM25 + field boosting"]
+  E --> F["Typo tolerance, type-ahead"]
+  F --> G["Postgres or Elasticsearch?"]
+  G --> H["Demo: 50k reviews benchmark"]`} />
+
+---
+
+## 1. The story: a search box that stopped working 🎓
+
+It's **2005**. You're an engineer at a fast-growing e-commerce company with about **5,000 products**, and you're asked to build a search API. The obvious query:
+
+```sql
+SELECT * FROM products
+WHERE name ILIKE '%laptop%' OR description ILIKE '%laptop%';
+```
+
+`ILIKE` is a case-insensitive match, and the `%` on each side means "any characters before and after". It works, and returns in about **50 ms**.
+
+Then the company grows to **millions of products**. The same query now takes **30 seconds**. Customers and your manager are unhappy, and on top of "make it fast" come new requirements:
+
+| Requirement | Example |
+|---|---|
+| **Fast** | Milliseconds, not seconds. Even a 2-second delay is huge by today's standards |
+| **Relevant** | Searching "laptop" should show a **MacBook Pro** before a **laptop bag** |
+| **Typo-tolerant** | Shoppers in a hurry during a sale type "lpatop" and still expect laptops |
+
+These three requirements are why search engines like **Elasticsearch** exist.
+
+---
+
+## 2. Why `LIKE` fails: the librarian analogy 🎓
+
+Think of your relational database as a **librarian** who knows exactly where every book is **by its shelf position**, but has one fatal flaw.
+
+Ask for "books about machine learning" and the librarian has to **walk every shelf and read every title**, one by one: *Harry Potter and the Philosopher's Stone*: no. *Game of Thrones*: no. *Introduction to Machine Learning*: match! …and so on through the whole library. With 10 million or a billion books, that takes hours or days.
+
+Two separate problems:
+1. **Speed:** the work grows with the size of the library.
+2. **No sense of relevance:** a book titled *Introduction to Machine Learning* and a book that mentions "machine learning" once on its last page are both just "matches", returned in whatever order the scan happened to find them. The best result may be at position 1,000 or 10,000.
+
+That is exactly what `ILIKE '%laptop%'` does: scan every row, examine every text field, and pattern-match character by character. **Thorough, but painfully slow, and blind to relevance.**
+
+### 🔧 The first-principles reason it's slow
+A normal B-tree index stores values **sorted**. Sorted order helps when you know how a value **starts** (`name LIKE 'lap%'` can jump to the "lap…" region). With a **leading wildcard**, the match could be anywhere inside the string, so sorted order is useless and Postgres falls back to a **sequential scan**:
+
+```sql
+EXPLAIN ANALYZE SELECT id FROM products WHERE name ILIKE '%laptop%';
+-- Seq Scan on products  (cost=0.00..183334.00 rows=...)
+--   Filter: (name ~~* '%laptop%'::text)
+```
+
+Cost is roughly **rows × average text length**. That's why going from 5,000 to millions of rows took you from 50 ms to 30 s: the algorithm was always linear; the data just got big.
+
+---
+
+## 3. Where the fix came from 🎓
+
+By the mid-2000s the web had exploded. **Google** was crawling and indexing billions of pages, **Amazon** was cataloguing millions of products, **LinkedIn** was indexing millions of profiles. None of them could make users wait 30 seconds; at their scale, slow search means lost revenue.
+
+The answer wasn't new. **Information retrieval** has been researched since the **1960s**, and its key idea was to **flip the problem around**.
+
+---
+
+## 4. The inverted index 🎓
+
+### The idea
+Instead of searching **through the books** for a word at query time, **do the work once, when a book arrives**: record every word in it, and for each word keep a list of **which books contain it and where**.
+
+Then a query doesn't scan books; it **looks up the word** and reads its list. You go from *content → terms* to *terms → content*. That inversion is where the name comes from.
+
+The lesson's example index:
+
+| Term | Where it appears (book: pages) |
+|---|---|
+| **machine** | *Introduction to Machine Learning*: 1, 15, 23 · *The Machine Age*: 5, 89 · *Coffee Machine Manual*: 1 |
+| **learning** | *Introduction to Machine Learning*: 1, 16, 24 · *Learning to Cook*: 2 places · *Deep Learning Fundamentals*: 3 places |
+
+(In a real book on machine learning these words would appear on hundreds of pages; three keeps the example small.)
+
+Now the librarian answers "machine learning" by reading two short lists, regardless of how many books are in the library.
+
+<Mermaid chart={`flowchart LR
+  subgraph Docs["Documents (indexing time)"]
+    D1["doc 1: Introduction to Machine Learning"]
+    D2["doc 2: The Machine Age"]
+    D3["doc 3: Deep Learning Fundamentals"]
+  end
+  subgraph Index["Inverted index"]
+    T1["machine: doc 1, doc 2"]
+    T2["learning: doc 1, doc 3"]
+    T3["introduction: doc 1"]
+    T4["deep: doc 3"]
+  end
+  D1 --> T1 & T2 & T3
+  D2 --> T1
+  D3 --> T2 & T4
+  Q["query: machine learning"] --> T1 & T2
+  T1 & T2 --> R["candidates: doc 1 (both terms), doc 2, doc 3<br/>then rank by score"]`} />
+
+### 🔧 How an index is actually built: the analysis pipeline
+"Record every word" hides the important step. Before text goes into the index, it passes through an **analyzer**, and **the same analyzer runs on the query** so both sides match:
+
+<Mermaid chart={`flowchart LR
+  SRC["The Running MacBooks!"] --> CF["Character filters<br/>strip HTML etc."]
+  CF --> TK["Tokenizer<br/>split on word boundaries"]
+  TK --> LC["Lowercase filter"]
+  LC --> SW["Stop words<br/>drop: the, a, of"]
+  SW --> ST["Stemmer<br/>running to run, macbooks to macbook"]
+  ST --> OUT["terms: run, macbook"]`} />
+
+- Because both document and query are lowercased and stemmed, "Running" matches "runs" and "LAPTOPS" matches "laptop".
+- Each entry in a term's **postings list** stores the document ID, and usually the **term frequency** and **positions**. Positions are what make **phrase queries** possible ("machine" immediately followed by "learning").
+- A multi-word query becomes a **merge of sorted postings lists**: union for OR, intersection for AND. Merging two sorted lists is linear in **their** lengths, not in the size of the collection.
+
+🔧 A toy version in Python, to make the mechanism concrete:
+
+```python title="tiny_inverted_index.py"
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+STOP = {"the", "a", "an", "of", "to", "and"}
+
+
+def analyze(text: str) -> list[str]:
+    terms = [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t and t not in STOP]
+    return [re.sub(r"(ing|s)$", "", t) for t in terms]  # a crude stemmer, for illustration only
+
+
+@dataclass
+class Posting:
+    doc_id: int
+    positions: list[int] = field(default_factory=list)
+
+
+class InvertedIndex:
+    def __init__(self) -> None:
+        self._postings: defaultdict[str, list[Posting]] = defaultdict(list)
+        self._doc_len: dict[int, int] = {}
+
+    def add(self, doc_id: int, text: str) -> None:
+        terms = analyze(text)
+        self._doc_len[doc_id] = len(terms)
+        for pos, term in enumerate(terms):
+            postings = self._postings[term]
+            if not postings or postings[-1].doc_id != doc_id:
+                postings.append(Posting(doc_id))
+            postings[-1].positions.append(pos)
+
+    # OR query; score = sum of term frequencies (BM25 refines this, see section 6)
+    def search(self, query: str) -> list[tuple[int, int]]:
+        scores: defaultdict[int, int] = defaultdict(int)
+        for term in analyze(query):
+            for p in self._postings.get(term, []):
+                scores[p.doc_id] += len(p.positions)
+        return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+```
+
+**The trade-off:** you pay at **write time** (analysing text, updating postings) and in **disk space**, to make reads cheap. That's the opposite of the `LIKE` approach, which writes cheaply and pays on every read.
+
+### Choosing analyzers: languages, multi-fields and synonyms ➕
+
+The analyzer decides which terms exist in the index at all, so a wrong choice can't be fixed by clever queries later; it's the first relevance decision you make, and changing it means reindexing.
+
+#### Language analyzers, and testing them with `_analyze`
+**Problem:** you index product text with the `standard` analyzer, and "running shoes" doesn't match "run shoe". Or you use `english` on German reviews, and "Häuser" never matches "Haus".
+
+**Why it happens:** `standard` only tokenises and lowercases; it doesn't stem. Stemming is **language-specific** (English drops "-ing", German has different plurals and compound words), and stop-word lists differ per language. Languages without spaces between words (Chinese, Japanese) need a different **tokenizer** altogether, typically from the ICU, kuromoji (Japanese) or smartcn (Chinese) analysis plugins.
+
+**Mechanism:** pick a built-in language analyzer (`english`, `german`, `french`, `hindi` and many more) for prose fields, and **look at the terms it produces** before committing. The `_analyze` API shows exactly what goes into the index:
+
+```json title="POST /_analyze"
+{ "analyzer": "english", "text": "The Running MacBooks are running hotter" }
+```
+
+```json title="response (abridged)"
+{ "tokens": [ { "token": "run" }, { "token": "macbook" }, { "token": "run" }, { "token": "hotter" } ] }
+```
+
+**Edge cases:**
+- **Over-stemming:** aggressive stemmers conflate words you want apart ("university" and "universe" both reduce to the same stem in some stemmers). Test with real queries from your logs.
+- **Mixed-language content** in one field gets one analyzer's rules. If languages are known per document, index each into a language-specific field (`description_en`, `description_de`) and query the right one.
+
+#### Multi-fields: one value, several analyses
+**Problem:** the same `title` needs stemmed matching ("laptops" finds "laptop"), exact matching for sorting and aggregations, and prefix matching for type-ahead. One analyzer can't do all three.
+
+**Mechanism:** a **multi-field** indexes the same source value several ways under sub-field names, at the cost of more index space. Query the precise sub-field for precision and the stemmed one for recall, and combine them with boosts:
+
+```json title="PUT /products (mappings)"
+{
+  "mappings": {
+    "properties": {
+      "title": {
+        "type": "text",
+        "analyzer": "english",
+        "fields": {
+          "exact":   { "type": "text", "analyzer": "standard" },
+          "raw":     { "type": "keyword", "ignore_above": 256 },
+          "suggest": { "type": "search_as_you_type" }
+        }
+      }
+    }
+  }
+}
+```
+
+```json title="exact-word matches outrank stem-only matches"
+{ "query": { "multi_match": { "query": "running shoes", "fields": ["title.exact^3", "title"], "type": "most_fields" } } }
+```
+
+**Edge cases:** every sub-field counts against the mapping's field limit (section 10) and adds indexing work; add sub-fields because a query needs them, not by default.
+
+#### Synonyms that can change without reindexing
+**Problem:** users search "notebook", "laptop" and "macbook" for the same thing, and the business adds new synonyms every week. If synonyms are applied at **index** time, every change means reindexing everything.
+
+**Why it happens:** index-time synonyms are baked into the stored terms. Search-time synonyms are applied only to the query, so they can change whenever the query analyzer is reloaded.
+
+**Mechanism:** apply synonyms in a **search analyzer** with the `synonym_graph` filter (which also handles multi-word synonyms such as "smart phone, smartphone" correctly), and manage the list with the **synonyms API** (Elasticsearch 8.10+). Updating a synonyms set reloads the search analyzers that use it automatically.
+
+```json title="PUT /_synonyms/product-synonyms"
+{ "synonyms_set": [
+  { "id": "laptops", "synonyms": "laptop, notebook, macbook" },
+  { "id": "phones",  "synonyms": "smart phone, smartphone, mobile" }
+] }
+```
+
+```json title="index settings + mapping"
+{
+  "settings": { "analysis": {
+    "filter":   { "product_syn": { "type": "synonym_graph", "synonyms_set": "product-synonyms", "updateable": true } },
+    "analyzer": { "product_search": { "tokenizer": "standard", "filter": ["lowercase", "product_syn", "porter_stem"] } }
+  } },
+  "mappings": { "properties": {
+    "title": { "type": "text", "analyzer": "english", "search_analyzer": "product_search" }
+  } }
+}
+```
+
+**Edge cases:**
+- **Keep the search analyzer's other steps aligned with the index analyzer** (same lowercasing and stemming), or synonym expansions produce terms that were never indexed.
+- **Synonyms change scoring.** Expanding "laptop" to three terms changes BM25 statistics; measure with the relevance tests in section 6 before and after.
+- **One-way rules** (`macbook => laptop, macbook`) are often better than equivalence: a search for "macbook" shouldn't return every laptop.
+
+---
+
+## 5. Lucene, Elasticsearch, and the alternatives 🎓
+
+- **Apache Lucene** is the library that implements the inverted index and scoring. **Elasticsearch** is built on top of it (and adds the distributed cluster, the REST API and the JSON query language).
+- Elasticsearch isn't the only option. Many full-text search tools use Lucene underneath, and even relational databases like **Postgres have built-in full-text search**.
+- In Elasticsearch, each stored item is a **document**: a JSON object, a bit like a MongoDB document. Documents live in an **index**.
+
+The lesson's advice on depth: you **don't need** to understand the scoring maths or index internals to use these tools well, unless you're building a search library yourself. Know **when** to reach for full-text search, follow the docs and best practices, and move on. (The Elasticsearch docs are a good place to dig deeper if you're curious.)
+
+### Shards, replicas and cluster sizing ➕
+
+"Elasticsearch adds the distributed cluster" on top of Lucene; the two numbers you set on every index, **primary shards** and **replicas**, decide how that cluster scales and survives failures, and one of them is hard to change later.
+
+#### Primary shards: how an index is split
+**Problem:** an index of 300 GB can't live on one machine's disk or be searched by one CPU fast enough.
+
+**Why it works this way:** an Elasticsearch index is split into **primary shards**, and each shard is a complete, independent Lucene index. A document goes to one shard by hashing its routing value (the `_id` by default) modulo the number of primaries. A search fans out to one copy of every shard in parallel, and a coordinating node merges the per-shard top results.
+
+That hashing is why the **primary count is fixed** when the index is created: change the divisor and every document would belong to a different shard. To change it you use the **split** API (more primaries, by a multiple), **shrink** (fewer, on a read-only index), or **reindex** into a new index (section 11).
+
+```json title="PUT /products_v1"
+{ "settings": { "number_of_shards": 3, "number_of_replicas": 1 } }
+```
+
+**Edge cases:**
+- **Too many small shards (oversharding)** is the more common mistake. Every shard has fixed memory and per-search overhead, and a query over 500 tiny shards pays 500 times. Elastic's guidance is shards of roughly **10–50 GB**, fewer than **200 million documents** per shard, and a cap of about **1,000 non-frozen shards per node**.
+- **One shard is fine for most application search indexes.** A few GB of products doesn't need 5 shards; since 7.0 the default is 1 primary and 1 replica.
+
+#### Replicas: availability and read throughput
+**Problem:** the node holding a shard dies, and every search that needs that shard fails.
+
+**Mechanism:** a **replica** is a full copy of a primary shard, always placed on a **different node** from its primary. If the primary's node fails, a replica is promoted. Replicas also serve searches, so more replicas means more read capacity (as long as there are nodes to put them on).
+
+| Cluster health | Meaning |
+|---|---|
+| **green** | All primaries and replicas are allocated |
+| **yellow** | All primaries are allocated, some replicas aren't (data is searchable, but one more failure may lose availability) |
+| **red** | At least one primary is unallocated: some data can't be searched or written |
+
+**Edge cases:**
+- **A single-node cluster is always yellow** with `number_of_replicas: 1`, because a replica can't sit on the same node as its primary. That's normal in development; in production it means you have no redundancy.
+- **Replicas cost indexing work**: every write is applied on the primary and then on each replica. For a large initial load, set replicas to 0 and raise it afterwards (section 11).
+
+#### Memory: heap and the filesystem cache
+**Problem:** the cluster is slow or nodes run out of memory, even though "the data fits on disk".
+
+**Why it happens:** Elasticsearch needs **two** kinds of memory. The JVM **heap** holds per-shard structures, aggregations and query state. The operating system's **filesystem cache** holds the Lucene index files themselves; search speed largely depends on how much of the index fits there.
+
+**Mechanism:** let Elasticsearch size its heap automatically (the default, recommended for most production setups). If you set it by hand, the docs say: no more than **50% of the node's RAM**, and below the compressed-pointer limit (about **26 GB** is safe on most systems), leaving the rest to the filesystem cache.
+
+**Edge cases:** a bigger heap is not faster: it steals filesystem cache and lengthens garbage-collection pauses. Watch heap usage and GC time in node stats before resizing.
+
+---
+
+## 6. Relevance scoring 🎓
+
+Speed is half the win; the other half is **ranking**. Looking at the example index, a human would rank *Introduction to Machine Learning* first because:
+1. The term is **in the title**, which is a strong signal on its own.
+2. It appears **often** in that book.
+
+*The Machine Age* also has it in the title but uses it less, so it comes second; the coffee machine manual uses it least and comes third.
+
+Elasticsearch ranks with an algorithm called **BM25**, built from these factors:
+
+| Factor | Question it answers | Effect |
+|---|---|---|
+| **Term frequency (TF)** | How often does the term appear **in this document**? | More often → higher score |
+| **Document frequency (DF)** | How common is the term **across all documents**? | Rare terms count more than common ones |
+| **Document length** | Is this a short title or a whole book? | A match in a short field means more than one in a very long text |
+| **Field boosting** | **Which field** matched? | You decide, e.g. title more than description more than content |
+
+**Field boosting is the knob you'll use most.** It isn't fixed: at query time you say how much each field matters, and you can reverse it if your use case needs to (say, content more important than title). Queries are written in Elasticsearch's **JSON query DSL**.
+
+```json title="POST /books/_search"
+{
+  "query": {
+    "multi_match": {
+      "query": "machine learning",
+      "fields": ["title^3", "description^2", "content"]
+    }
+  }
+}
+```
+
+`^3` multiplies a title match's score by 3.
+
+### 🔧 Going deeper: what BM25 actually computes
+For each query term `t` in document `d`:
+
+```text
+score(t, d) = IDF(t) × tf × (k1 + 1) / (tf + k1 × (1 − b + b × docLen / avgDocLen))
+
+IDF(t) = ln(1 + (N − n + 0.5) / (n + 0.5))      N = number of docs, n = docs containing t
+```
+
+The defaults in Elasticsearch are **k1 = 1.2** and **b = 0.75**. What each part does:
+- **IDF** is the document-frequency factor: "the" appears in every document, so its IDF is near zero; "macbook" is rare, so it counts a lot.
+- **Saturation (k1):** the 1st occurrence of a term adds a lot, the 20th adds very little. This stops a page that repeats "laptop" 500 times from beating a genuinely relevant one, which is the big improvement over plain TF-IDF.
+- **Length normalisation (b):** dividing by `docLen / avgDocLen` means a term in a 5-word title outweighs the same term buried in a 5,000-word body. With `b = 0` length is ignored; with `b = 1` it's fully normalised.
+
+### 🔧 Solving the "laptop bag vs MacBook" requirement
+BM25 alone may rank "laptop bag" above "MacBook Pro" (the bag literally contains the word). Real search adds **business signals**:
+- Index a `category` field and boost matches where the category is laptops.
+- Combine text score with popularity or sales rank using `function_score`.
+- Add **synonyms** at analysis time (`laptop, notebook, macbook`) so the MacBook matches at all.
+
+```json
+{
+  "query": {
+    "function_score": {
+      "query": { "multi_match": { "query": "laptop", "fields": ["title^3", "category^2", "description"] } },
+      "functions": [{ "field_value_factor": { "field": "sales_rank_score", "modifier": "log1p" } }],
+      "boost_mode": "sum"
+    }
+  }
+}
+```
+
+### Measuring relevance instead of guessing ➕
+
+Boosts, synonyms and function scores are knobs, and every change helps some queries while hurting others; without a measurement you only find out which from customer complaints.
+
+#### Judgment lists and ranking metrics
+**Problem:** someone raises `title^3` to `title^5` because one query looked better. Two hundred other queries quietly got worse.
+
+**Why it happens:** relevance is a property of **many queries at once**. Eyeballing one result page can't see regressions elsewhere.
+
+**Mechanism:** build a **judgment list**: a few hundred real queries (from your search logs, weighted towards the frequent ones), each with documents rated for relevance (0 = irrelevant to 3 = perfect), and score every ranking change against it with standard metrics:
+
+| Metric | Question it answers |
+|---|---|
+| **Precision@k** | Of the top k results, what fraction are relevant? |
+| **MRR** (mean reciprocal rank) | How high is the **first** relevant result? (1 for position 1, 1/2 for position 2…) |
+| **NDCG@k** | Are the **most** relevant results at the top, with graded ratings and a discount for lower positions? |
+
+Elasticsearch runs this for you with the **`_rank_eval`** API: you send the queries, the ratings and a metric, and it returns the score per query and overall.
+
+```json title="GET /products/_rank_eval"
+{
+  "requests": [
+    { "id": "laptop",
+      "request": { "query": { "multi_match": { "query": "laptop", "fields": ["title^3", "category^2", "description"] } } },
+      "ratings": [
+        { "_index": "products", "_id": "macbook-pro-14", "rating": 3 },
+        { "_index": "products", "_id": "thinkpad-x1",    "rating": 3 },
+        { "_index": "products", "_id": "laptop-bag-15",  "rating": 1 }
+      ] }
+  ],
+  "metric": { "dcg": { "k": 10, "normalize": true } }
+}
+```
+
+**Edge cases:**
+- **Unrated documents** in the results count as irrelevant (or are reported as unrated); after a big change, rate the new documents that appear, or the metric punishes the change unfairly.
+- **Keep the list in version control** and run it in CI for every analyzer, mapping or query change, like any other regression test.
+
+#### Explaining a single score
+**Problem:** "why is the laptop bag above the MacBook for this query?"
+
+**Mechanism:** add `"explain": true` to a search (or call `GET /products/_explain/<id>` for one document) and Elasticsearch returns the score tree: which field matched, the IDF, term frequency, length normalisation and boost of every part. You can see whether the bag wins on a short title (length normalisation), on a field boost, or on a function score.
+
+```json title="GET /products/_explain/laptop-bag-15"
+{ "query": { "multi_match": { "query": "laptop", "fields": ["title^3", "description"] } } }
+```
+
+**Edge cases:** explain output is per shard; with several shards, IDF is computed per shard, so the same document can score slightly differently depending on where it lives. On small indexes with several shards this can visibly reorder results; one shard (or `search_type=dfs_query_then_fetch` for debugging) removes the effect.
+
+#### Production signals
+**Problem:** a judgment list covers the queries you knew about; real users type things you've never seen.
+
+**Mechanism:** log every search with the query, the result IDs shown, and what the user did next, then watch a few signals per query and overall:
+- **Zero-result rate:** queries returning nothing (missing synonyms, typos beyond fuzziness, products you don't stock).
+- **Click-through rate and click position:** good results are clicked, and clicked near the top.
+- **Reformulation rate:** a user searching again right away usually means the first results failed.
+
+```python title="search_log.py"
+from datetime import UTC, datetime
+
+
+async def log_search(query: str, hits: list[dict], user_id: str, session_id: str) -> None:
+    await search_log.insert(
+        query=query,
+        normalized=query.strip().lower(),
+        result_ids=[h["_id"] for h in hits],
+        total=len(hits),
+        user_id=user_id,
+        session_id=session_id,
+        at=datetime.now(UTC),
+    )
+    # later, per click: {"session_id": ..., "query": ..., "clicked_id": ..., "position": ...}
+```
+
+**Edge cases:** clicks are biased towards whatever is already ranked first (position bias), so a high CTR at position 1 partly reflects the ranking itself. Use clicks to **find** problem queries, and judgments to **decide** whether a change fixed them.
+
+---
+
+## 7. Typo tolerance and type-ahead 🎓
+
+**The lesson's demo:** in Google, start typing "what is" and suggestions appear immediately. That's a **type-ahead** interface (Amazon's search box works the same way). Then type "what is **treading** today" with a deliberate typo: search still understands you meant **trending**. (Nobody outside Google knows exactly what it runs on, but it's the same family of technology as Elasticsearch.) Full-text search engines give you both behaviours.
+
+### 🔧 How typo tolerance works: edit distance
+A **fuzzy** query matches terms within a small **edit distance**: the number of single-character insertions, deletions or substitutions to turn one word into another (Elasticsearch also counts swapping two adjacent letters as one edit by default).
+
+- "treading" → "trending": the words line up letter for letter except the 4th (`a` vs `n`), so it's **1 substitution**.
+- "lpatop" → "laptop": one transposition (swap `p` and `a`).
+
+`"fuzziness": "AUTO"` picks the allowed distance by term length, which avoids silly matches on short words:
+
+| Term length | Edits allowed |
+|---|---|
+| 0–2 characters | 0 (exact match) |
+| 3–5 characters | 1 |
+| more than 5 | 2 |
+
+```json title="Fuzzy product search"
+{
+  "query": {
+    "multi_match": {
+      "query": "lpatop",
+      "fields": ["title^3", "description"],
+      "fuzziness": "AUTO",
+      "prefix_length": 1
+    }
+  }
+}
+```
+
+- `prefix_length: 1` requires the first letter to be correct. That's both a relevance choice (people rarely mistype the first letter) and a performance one, because the engine has far fewer candidate terms to check.
+- Under the hood Lucene doesn't compare the query with every term one by one; it builds an automaton for "all strings within N edits" and walks the sorted term dictionary with it.
+- Fuzziness works with `best_fields` and `most_fields` style multi-match queries, but **not** with `phrase` or `cross_fields`.
+
+### 🔧 How type-ahead works
+Searching "mac" should match "macbook" **as you type**. Two common approaches:
+- The **`search_as_you_type`** field type, which indexes prefixes (edge n-grams) for you; query it with a `bool_prefix` multi-match.
+- A **completion suggester** for very fast, prefix-only suggestions.
+
+```json title="Mapping + query for type-ahead"
+PUT /products
+{ "mappings": { "properties": { "title": { "type": "search_as_you_type" } } } }
+
+POST /products/_search
+{ "query": { "multi_match": { "query": "macb", "type": "bool_prefix",
+  "fields": ["title", "title._2gram", "title._3gram"] } } }
+```
+
+The trade-off is the same as before: more terms in the index (bigger index, slower writes) for instant reads. Pair it with **debouncing** on the client (send a request after ~150–250 ms of no typing) so you don't fire one request per keystroke.
+
+---
+
+## 8. Paginating search results ➕
+
+Once results are ranked, the API has to hand them out a page at a time, and the obvious `from`/`size` approach has a hard ceiling that every search backend eventually hits.
+
+### Why deep `from`/`size` pages are expensive
+**Problem:** page 1 of a search returns in 20 ms; page 500 takes seconds, and page 1,001 of 10 results fails with an error.
+
+**Why it happens:** ranking is global, but data is split across shards. To return results 10,000–10,010, **every shard** must find its own top 10,010 documents and send them to the coordinating node, which merges `shards × 10,010` candidates and throws almost all of them away. Cost grows with page depth. To protect the cluster, `from + size` is capped at **10,000** by default (`index.max_result_window`).
+
+**Mechanism:** for UI pagination, **don't offer deep pages**: almost nobody goes past page 5, so show "about 8,000 results" and the first pages, and steer users to filters. Raising `max_result_window` just moves the cost.
+
+```json title="fine for the first pages"
+{ "from": 20, "size": 10, "query": { "match": { "review": "battery life" } } }
+```
+
+**Edge cases:**
+- **The total is approximate by default.** `track_total_hits` counts accurately up to 10,000 and then reports a lower bound (`"relation": "gte"`). Setting it to `true` gives the exact count but disables an optimisation that lets Elasticsearch skip non-competitive documents, so it slows every query; only ask for exact totals where they matter.
+- **Pages shift under writes.** A document indexed between page 1 and page 2 pushes everything down one place, so the user sees a repeat. That's acceptable for a results page, not for an export.
+
+### `search_after` with a point in time: deep and stable
+**Problem:** you need **all** matching documents (an export, a sync job, infinite scroll) or stable pages while the index changes.
+
+**Mechanism:** instead of "skip N", say "give me the next page **after** this sort position". Each shard can then jump straight past that position instead of collecting everything before it. A **point in time (PIT)** freezes a view of the index so pages stay consistent while writes continue, and with a PIT Elasticsearch adds an implicit `_shard_doc` tiebreaker so the sort is unique. The docs explicitly no longer recommend the older scroll API for deep pagination.
+
+```python title="export_all.py"
+from elasticsearch import AsyncElasticsearch
+
+
+async def export_negative_reviews(es: AsyncElasticsearch) -> None:
+    pit = await es.open_point_in_time(index="reviews", keep_alive="1m")
+    pit_id = pit["id"]
+    search_after: list | None = None
+    try:
+        while True:
+            res = await es.search(
+                size=1000,
+                pit={"id": pit_id, "keep_alive": "1m"},      # each request extends the PIT
+                query={"match": {"sentiment": "negative"}},
+                sort=[{"_score": "desc"}],                    # _shard_doc tiebreaker is added implicitly
+                search_after=search_after,                    # None is left out of the request
+                track_total_hits=False,
+            )
+            pit_id = res["pit_id"]                            # the PIT ID can change between responses
+            hits = res["hits"]["hits"]
+            if not hits:
+                break
+            await write_rows([h["_source"] for h in hits])
+            search_after = hits[-1]["sort"]
+    finally:
+        await es.close_point_in_time(id=pit_id)              # free the resources it pins
+```
+
+**Edge cases:**
+- **No random access:** you can't jump to page 37, only to "next". That suits infinite scroll and exports, not numbered page links.
+- **PITs hold resources** (they keep old index segments alive). Close them when done and keep `keep_alive` short; an export abandoned without closing holds them until it expires.
+- **For a public API cursor**, encode the last `sort` values (and the PIT ID, if used) into an opaque cursor string rather than exposing raw values clients might tamper with.
+
+---
+
+## 9. Postgres full-text search or Elasticsearch? 🎓
+
+The lesson gives two paths:
+- **Postgres** has full-text search built in, so for many apps it's enough.
+- If your company **already runs Elasticsearch**, use it. Elasticsearch is also the "E" of the **ELK stack** (**Elasticsearch, Logstash, Kibana**), widely used for **log management**, because it's very fast at searching logs, computing statistics and powering visualisations. If it's already there for logs, using it for product search too makes sense.
+
+### 🔧 A decision table
+
+<Mermaid chart={`flowchart TD
+  S{"Need search over text?"} -->|"exact or prefix only"| B["B-tree index + LIKE 'term%'"]
+  S -->|"words inside text"| E{"Elasticsearch already in the stack,<br/>or search is a core feature?"}
+  E -->|"yes"| ES["Elasticsearch<br/>sync from Postgres via queue"]
+  E -->|"no"| PG["Postgres FTS: tsvector + GIN<br/>pg_trgm for typos and ILIKE"]
+  PG -->|"outgrow ranking, typo, facet or traffic needs"| ES`} />
+
+| | Postgres FTS (+ `pg_trgm`) | Elasticsearch |
+|---|---|---|
+| Extra infrastructure | None | A cluster to run, monitor and keep in sync |
+| Consistency with your data | Same transaction, always up to date | Near real-time (refresh about every second), and you must sync it |
+| Relevance tuning | Basic (`ts_rank`, weights A–D) | Rich: BM25, per-query boosts, function scores, synonyms |
+| Typo tolerance | Trigram similarity via `pg_trgm` | Built-in fuzziness |
+| Type-ahead, facets, aggregations at scale | Possible but limited | First-class |
+| Good fit | Search inside your app's own data, up to millions of rows | Search is a core product feature, many languages, heavy traffic, logs |
+
+### 🔧 Postgres FTS, done properly
+The fix for section 2's slow query, without new infrastructure:
+
+```sql title="postgres-fts.sql"
+-- 1. A generated tsvector column: title weighted higher (A) than description (B)
+ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(name, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(description, '')), 'B')
+  ) STORED;
+
+-- 2. A GIN index: Postgres's inverted index
+CREATE INDEX products_search_idx ON products USING GIN (search);
+
+-- 3. Query with Google-like syntax, ranked
+SELECT id, name, ts_rank(search, q) AS rank
+FROM products, websearch_to_tsquery('english', 'gaming laptop -refurbished') AS q
+WHERE search @@ q
+ORDER BY rank DESC
+LIMIT 20;
+```
+
+And to make **existing** `ILIKE '%…%'` queries fast and add typo tolerance, the `pg_trgm` extension indexes 3-character chunks ("lap", "apt", "pto"…), so even a leading-wildcard pattern can use the index:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX products_name_trgm ON products USING GIN (name gin_trgm_ops);
+
+SELECT name FROM products WHERE name ILIKE '%laptop%';                 -- now uses the index
+SELECT name FROM products WHERE name % 'lpatop' ORDER BY similarity(name, 'lpatop') DESC LIMIT 10; -- fuzzy
+```
+
+Edge case: a pattern too short to contain a trigram (like `'%a%'`) can't use the index well and degrades to scanning the whole index.
+
+---
+
+## 10. The demo: Postgres vs Elasticsearch on 50,000 reviews 🎓
+
+### Setup
+- A **Next.js** app (chosen only because LLMs generate Next.js prototypes quickly). The UI runs the same search against both systems side by side.
+- **Fair conditions:** a **Neon** serverless Postgres and an **Elastic Cloud** deployment, both in the **US-West** region, so network distance isn't a factor.
+- **Data:** a CSV of about **50,000 reviews**, each with a `review` text and a `sentiment` (positive or negative).
+- **Postgres table:** `reviews(id, review text, sentiment)`.
+
+### The populate script (Node.js)
+1. Read the database URL, Elasticsearch address and API key from the environment; throw if any is missing.
+2. Create the Neon and Elasticsearch clients, and read the CSV.
+3. **Postgres:** create the table if it doesn't exist, reset the ID sequence, drop rows missing either field, then insert in **batches of 1,000** (Neon limits how much you can insert in one statement).
+4. **Elasticsearch:** if the `reviews` index exists, delete it to start fresh; create it with a **mapping**: `review` as **`text`** and `sentiment` as **`keyword`**. Then **bulk insert** all 50,000 documents.
+5. Verify: the Elastic Cloud console shows 50,000 documents, and `SELECT count(*) FROM reviews` returns 50,000.
+
+**`text` vs `keyword`** is the key mapping decision:
+- **`text`** is analysed: split into terms, lowercased and so on, so you can search for words inside it.
+- **`keyword`** is stored **as one exact value**: right for `positive`/`negative`, IDs, tags, statuses, and anything you **filter, sort or aggregate** on.
+
+### Mappings in production: dynamic mapping and explosions ➕
+
+The demo writes its mapping by hand; in production the dangerous case is the one where you **don't**, because Elasticsearch then invents a mapping from the first document it sees, and mappings can't be changed in place afterwards.
+
+#### What dynamic mapping guesses
+**Problem:** you index without a mapping. Later, sorting on `sku` fails, a filter on `price` behaves like text, and an `order_ref` field became a `date` because the first value looked like one.
+
+**Why it happens:** with dynamic mapping on (the default), the **first document** that contains a new field decides its type for the life of the index. A JSON string becomes `text` with a `.keyword` sub-field (`ignore_above: 256`), unless it passes **date detection**, in which case it becomes a `date`. A number becomes `long` or `float` depending on whether the first value had a decimal point. Every later document must fit the guess or is rejected.
+
+**Mechanism:** define mappings explicitly, and make unknown fields an **error** instead of a silent guess with `"dynamic": "strict"` (or `false`, which keeps unknown fields in `_source` but doesn't index them):
+
+```json title="PUT /products_v2"
+{
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "sku":        { "type": "keyword" },
+      "title":      { "type": "text", "analyzer": "english", "fields": { "raw": { "type": "keyword" } } },
+      "price":      { "type": "scaled_float", "scaling_factor": 100 },
+      "created_at": { "type": "date" },
+      "attributes": { "type": "flattened" }
+    }
+  }
+}
+```
+
+**Edge cases:**
+- **`.keyword` sub-fields silently skip long values**: strings over 256 characters aren't indexed in `.keyword`, so exact filters on them find nothing.
+- **Strict mapping turns schema drift into indexing errors**; your indexer must surface them (see the bulk failures in section 11), or "strict" just means "silently missing documents".
+
+#### Mapping explosion
+**Problem:** products have free-form attributes (`{ "color": "red", "ram_gb": 16, ... }`), and each seller invents new keys. After a few months the index has 30,000 fields, the cluster's heap pressure rises, searches slow down, and new documents are rejected with "Limit of total fields [1000] has been exceeded".
+
+**Why it happens:** each distinct key becomes a **field in the mapping**, and the mapping is cluster state that every node keeps in memory and updates on every new field. Elastic calls this a **mapping explosion**; the default guard is `index.mapping.total_fields.limit: 1000`, which counts object fields, leaf fields, multi-fields and aliases.
+
+**Mechanism:** never let user data create fields. Two standard shapes:
+- **`flattened`**: index the whole object as **one** field whose leaf values are keywords. Queries like `attributes.color: red` still work, but there's no numeric range support or highlighting.
+- **Key/value pairs** in a `nested` array (`[{ "key": "ram_gb", "num": 16 }]`) when you need typed ranges over arbitrary attributes, at the cost of more complex `nested` queries.
+
+```json title="query a flattened field"
+{ "query": { "bool": { "filter": [ { "term": { "attributes.color": "red" } } ] } } }
+```
+
+**Edge cases:** raising `total_fields.limit` is a temporary relief, not a fix. `index.mapping.total_fields.ignore_dynamic_beyond_limit: true` lets documents in while ignoring the extra dynamic fields, which avoids rejections but hides data.
+
+#### You can't change a field's type in place
+**Problem:** `price` was mapped as `text` by accident. `PUT _mapping` with the new type fails.
+
+**Why it happens:** every document already indexed has its `price` terms laid out as text in immutable Lucene segments; a new type would need all of them rewritten.
+
+**Mechanism:** you can **add** new fields to a mapping at any time, but changing an existing field means creating a new index and **reindexing**, behind an alias (section 11). That's why the application should always read and write through an alias from day one, even with a single index.
+
+🔧 A Python version of that script, with SQLAlchemy's async engine and the official `elasticsearch` client:
+
+```python title="populate.py"
+import asyncio
+import csv
+import os
+
+from elasticsearch import AsyncElasticsearch
+from elasticsearch.helpers import async_bulk
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+DATABASE_URL = os.environ.get("DATABASE_URL")  # postgresql+psycopg://...
+ES_URL = os.environ.get("ES_URL")
+ES_API_KEY = os.environ.get("ES_API_KEY")
+if not (DATABASE_URL and ES_URL and ES_API_KEY):
+    raise RuntimeError("missing env vars")
+
+
+async def main() -> None:
+    engine = create_async_engine(DATABASE_URL)
+    es = AsyncElasticsearch(ES_URL, api_key=ES_API_KEY)
+
+    with open("reviews.csv", newline="", encoding="utf-8") as f:
+        rows = [
+            {"review": r["review"], "sentiment": r["sentiment"]}
+            for r in csv.DictReader(f)
+            if r.get("review") and r.get("sentiment")
+        ]
+
+    # Postgres: batched inserts
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS reviews "
+            "(id serial PRIMARY KEY, review text NOT NULL, sentiment text NOT NULL)"
+        ))
+        await conn.execute(text("TRUNCATE reviews RESTART IDENTITY"))
+        insert = text("INSERT INTO reviews (review, sentiment) VALUES (:review, :sentiment)")
+        for i in range(0, len(rows), 1000):
+            await conn.execute(insert, rows[i : i + 1000])  # a list of dicts runs as one batched insert
+
+    # Elasticsearch: recreate the index with an explicit mapping, then bulk load
+    if await es.indices.exists(index="reviews"):
+        await es.indices.delete(index="reviews")
+    await es.indices.create(
+        index="reviews",
+        mappings={"properties": {"review": {"type": "text"}, "sentiment": {"type": "keyword"}}},
+    )
+    successful, failed = await async_bulk(
+        es,
+        ({"_index": "reviews", "_source": r} for r in rows),
+        stats_only=True,
+        raise_on_error=False,
+    )
+    print(f"{successful} documents inserted, {failed} failed")
+
+    await es.close()
+    await engine.dispose()
+
+
+asyncio.run(main())
+```
+
+### The search API: streaming two results
+The endpoint takes the search term (400 if it's missing) and opens a **stream** back to the browser. Both searches start at once, and **whichever finishes first is streamed immediately**, so the slower one doesn't hold back the faster one, and you can see the difference live.
+
+- **Postgres:** start a timer, run `SELECT id, review, sentiment FROM reviews WHERE review ILIKE '%term%'`, send the results and the elapsed time.
+- **Elasticsearch:** start a timer, run a `query_string` search on the `reviews` index with the term **lower-cased and wrapped in wildcards**, so both systems use the **same matching rule**; send results and time.
+
+```python title="app/api/search.py"
+import asyncio
+import json
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy import text
+
+from app.clients import engine, es  # AsyncEngine and AsyncElasticsearch, created at startup
+
+router = APIRouter()
+
+
+class SearchBody(BaseModel):
+    term: str | None = None
+
+
+async def timed(engine_name: str, run: Callable[[], Awaitable[int]]) -> dict:
+    t0 = time.perf_counter()
+    try:
+        count = await run()
+        return {"engine": engine_name, "count": count, "ms": round((time.perf_counter() - t0) * 1000)}
+    except Exception as e:
+        return {"engine": engine_name, "error": str(e)}
+
+
+@router.post("/api/search")
+async def search(body: SearchBody) -> StreamingResponse:
+    term = body.term
+    if not term or not term.strip():
+        raise HTTPException(status_code=400, detail="bad request")
+
+    async def postgres() -> int:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT id, review, sentiment FROM reviews WHERE review ILIKE :pattern"),
+                {"pattern": f"%{term}%"},
+            )
+            return len(result.all())
+
+    async def elasticsearch() -> int:
+        r = await es.search(
+            index="reviews", size=10, track_total_hits=True,
+            query={"query_string": {"query": f"*{term.lower()}*", "default_field": "review"}},
+        )
+        return r["hits"]["total"]["value"]
+
+    async def ndjson() -> AsyncIterator[str]:
+        # both searches run at once; whichever finishes first is streamed first
+        for finished in asyncio.as_completed([timed("postgres", postgres), timed("elasticsearch", elasticsearch)]):
+            yield json.dumps(await finished) + "\n"
+
+    return StreamingResponse(ndjson(), media_type="application/x-ndjson")
+```
+
+### What the demo shows
+| Search | Elasticsearch | Postgres `ILIKE` |
+|---|---|---|
+| "laptop" | about **1 s** | about **3–4 s** |
+| a common word | about **500 ms**, ~8,000 results | about **7.5 s**, the **same** ~8,000 results |
+
+Same results, same matching rule, and the database is many times slower. That's with only 50,000 rows.
+
+### 🔧 Reading the benchmark carefully
+- **It deliberately compares like with like** (substring matching on both), to isolate speed. Leading-wildcard queries are actually among the **slowest** things you can ask Elasticsearch to do, because they can't use the term dictionary efficiently. A normal `match` query on analysed terms would be faster still **and** ranked by relevance.
+- **Postgres wasn't using any index.** Adding a `pg_trgm` GIN index, or using a `tsvector` column (section 9), would close much of the gap. The fair conclusion isn't "Postgres can't search"; it's "**unindexed `ILIKE` can't search at scale**".
+- Timings include network and serverless cold starts; for real decisions, run each query many times and compare percentiles (p50, p95), not one run.
+
+---
+
+## 11. 🔧 Going deeper: keeping Elasticsearch in sync
+
+The lesson's demo loads data once. In production, **Postgres stays the source of truth** and Elasticsearch is a **derived read model** that must follow every change. That's where most of the real engineering is.
+
+### Problem: dual writes drift
+If the API writes to Postgres and then to Elasticsearch, a crash or an Elasticsearch timeout between the two leaves them **inconsistent**, permanently and silently.
+
+### Mechanism: event-driven sync through a queue
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant API as Backend
+  participant DB as Postgres
+  participant Q as Queue
+  participant W as Indexer worker
+  participant ES as Elasticsearch
+  API->>DB: UPDATE product + INSERT outbox row (one transaction)
+  DB-->>API: committed
+  Note over DB,Q: relay or CDC publishes product.changed
+  DB->>Q: product.changed (id 42)
+  Q->>W: job
+  W->>DB: SELECT current row 42
+  W->>ES: index doc 42 (or delete if gone)
+  W->>Q: ack`} />
+
+Why this shape works:
+- **Outbox or CDC** (change data capture, e.g. Debezium reading the Postgres WAL) guarantees every committed change produces an event.
+- The worker **re-reads the current row** instead of trusting the event payload, so events arriving out of order or twice still converge on the latest state. Indexing by the same `_id` is **idempotent**: it overwrites.
+
+### Where the sync pipeline breaks ➕
+
+The outbox-plus-worker shape guarantees an event for every change; it doesn't by itself guarantee that the index ends up **equal** to the database, because three failure modes slip through it.
+
+#### Out-of-order writes from concurrent workers
+**Problem:** product 42 changes twice quickly. Worker A reads version 1 from Postgres; worker B reads version 2 and indexes it; then A, delayed by a GC pause, indexes version 1 **over** version 2. The index is now stale until the next change, which may never come.
+
+**Why it happens:** "re-read the current row" protects against stale **events**, but not against a slow **worker** whose read is already old by the time it writes. Overwrite-by-ID means last write wins, and the last write isn't always the newest data.
+
+**Mechanism:** make Elasticsearch reject older data with **external versioning**. Keep a monotonically increasing version on the row (a `version` column bumped on every update, or an `updated_at` in microseconds), and index with `version_type: external`. Elasticsearch accepts the write only if the version is **strictly higher** than the stored one; otherwise it returns `409`, which the worker treats as success (something newer is already there).
+
+```python title="indexer_worker.py"
+from contextlib import suppress
+
+from elasticsearch import AsyncElasticsearch, ConflictError, NotFoundError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+async def sync_product(session: AsyncSession, es: AsyncElasticsearch, product_id: int) -> None:
+    row = await session.get(Product, product_id)
+    if row is None:
+        with suppress(NotFoundError):                         # already gone from the index: fine
+            await es.delete(index="products", id=str(product_id))
+        return
+    try:
+        await es.index(
+            index="products", id=str(row.id),
+            version=row.version, version_type="external",     # older data can't overwrite newer
+            document=to_search_doc(row),
+        )
+    except ConflictError:                                     # 409: a newer version is already indexed: fine
+        return
+    # any other exception propagates → retry via the queue
+```
+
+**Edge cases:**
+- **Deletes need care too.** A late "index version 5" arriving after the delete would resurrect the document. Soft-delete in Postgres (a `deleted_at` plus a version bump) and index a tombstone or delete with the version, or run the reconciliation below.
+- **External versions survive a full rebuild only if you reindex with them**; a fresh index built from Postgres should use the same row versions.
+
+#### Bulk requests that "succeed" with failures inside
+**Problem:** the nightly bulk sync reports success; 3,000 documents are missing from the index.
+
+**Why it happens:** the `_bulk` API returns HTTP **200** even when individual items fail (mapping conflicts under `dynamic: strict`, a document too large, a version conflict, a rejected request under load). The failures are only visible in the per-item results, with `errors: true` at the top.
+
+**Mechanism:** always inspect item results. The Python client's `async_streaming_bulk` helper, with `raise_on_error=False`, yields an `(ok, item)` pair for every document after its retries; route the failures to a dead-letter table and alert on them.
+
+```python title="bulk_sync.py"
+import json
+import logging
+from collections.abc import Iterable
+
+from elasticsearch import AsyncElasticsearch
+from elasticsearch.helpers import async_streaming_bulk
+from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
+
+
+def actions(rows: Iterable[ProductRow]):
+    for r in rows:
+        yield {
+            "_index": "products", "_id": str(r.id),
+            "version": r.version, "version_type": "external",
+            "_source": to_search_doc(r),
+        }
+
+
+async def bulk_sync(es: AsyncElasticsearch, session: AsyncSession, rows: Iterable[ProductRow]) -> None:
+    failed = 0
+    async for ok, item in async_streaming_bulk(
+        es, actions(rows),
+        max_retries=3,                                   # retries 429 (rejections) with backoff
+        raise_on_error=False,                            # report failed items instead of raising
+    ):
+        if ok:
+            continue
+        result = item["index"]
+        if result["status"] == 409:                      # newer already indexed
+            continue
+        failed += 1
+        session.add(SearchDeadLetter(doc_id=result["_id"], status=result["status"], error=json.dumps(result.get("error"))))
+    await session.commit()
+    if failed:
+        logger.error("bulk sync had failures", extra={"failed": failed})
+```
+
+**Edge cases:** `429` from bulk means the cluster's write queue is full; the fix is smaller or fewer concurrent bulk requests, not more retries.
+
+#### Drift, and the reconciliation job
+**Problem:** despite all of the above, the index slowly drifts: an outbox row lost during a manual database fix, a bug in `toSearchDoc` that was fixed later, a delete during an outage.
+
+**Why it happens:** every pipeline that copies data has some failure path nobody thought of. Event-driven sync fixes documents only when they **change again**.
+
+**Mechanism:** periodically **compare** the two stores and repair differences, independent of events. Walk the ID space in ranges, compare counts and a cheap fingerprint (the max `version` or a hash of `id:version` pairs), and only drill into ranges that differ.
+
+```python title="reconcile.py"
+from sqlalchemy import text
+
+RANGE = 10_000
+
+
+async def reconcile(session: AsyncSession, es: AsyncElasticsearch, max_id: int) -> None:
+    for start in range(0, max_id, RANGE):
+        end = start + RANGE
+        result = await session.execute(
+            text("SELECT id, version FROM products WHERE id >= :start AND id < :end AND deleted_at IS NULL"),
+            {"start": start, "end": end},
+        )
+        in_db = {row.id: row.version for row in result}
+        es_hits = await es.search(
+            index="products", size=RANGE, source=False, version=True,
+            query={"range": {"id": {"gte": start, "lt": end}}},
+        )
+        in_es = {int(h["_id"]): h["_version"] for h in es_hits["hits"]["hits"]}
+        for product_id, version in in_db.items():
+            if in_es.get(product_id) != version:
+                await index_queue.enqueue("reindex", id=product_id)
+        for product_id in in_es.keys() - in_db.keys():
+            await index_queue.enqueue("reindex", id=product_id)   # worker deletes it
+```
+
+**Edge cases:** run it against a read replica and at low traffic; a range with 10,000 rows is also the `from`/`size` ceiling, so keep ranges at or below it (or use `search_after`, section 8). Count the repairs: a reconciler that fixes thousands of documents every night is pointing at a bug in the main pipeline.
+
+### Changing mappings without downtime
+You can't change an existing field's type in place. Create `products_v2` with the new mapping, **reindex** into it, then atomically move an **alias** (`products`) from v1 to v2. The app always queries the alias.
+
+```json
+POST /_aliases
+{ "actions": [
+  { "remove": { "index": "products_v1", "alias": "products" } },
+  { "add":    { "index": "products_v2", "alias": "products" } }
+] }
+```
+
+### Zero-downtime reindexing, end to end ➕
+
+The alias swap above is the last ten milliseconds of a reindex; the hard parts are the hours before it, while users keep changing data, and having a way back if v2 turns out worse.
+
+#### Not losing writes that happen during the reindex
+**Problem:** reindexing 20 million products into `products_v2` takes two hours. During those hours, 50,000 products change. If the indexer keeps writing only to v1, those changes are missing from v2 at cutover.
+
+**Why it happens:** a reindex copies a **snapshot**; the source keeps moving.
+
+**Mechanism:** point the indexer at **both** indices before the copy starts, then backfill:
+1. Create `products_v2` with the new mapping.
+2. Make the sync worker write every change to **v1 and v2**.
+3. Backfill v2 from Postgres (the source of truth), with **external versions** (section above), so a backfilled old row can never overwrite a newer change the worker already wrote.
+4. Verify v2 (counts, the relevance tests from section 6), then swap the read alias.
+5. Stop writing to v1 only after the swap has proven itself.
+
+```python title="dual_index_writer.py"
+import asyncio
+import os
+from contextlib import suppress
+
+from elasticsearch import ConflictError
+
+# "products_v1,products_v2" during a migration
+WRITE_INDICES = os.environ.get("SEARCH_WRITE_INDICES", "products_v1").split(",")
+
+
+async def index_product(row: ProductRow) -> None:
+    async def write(index: str) -> None:
+        with suppress(ConflictError):                     # 409: newer data already there
+            await es.index(
+                index=index, id=str(row.id), version=row.version, version_type="external",
+                document=to_search_doc(row, index),
+            )
+
+    await asyncio.gather(*(write(index) for index in WRITE_INDICES))
+```
+
+**Edge cases:** backfilling from Postgres, rather than with the `_reindex` API from v1, also picks up fields that v1 never had. `_reindex` from v1 is faster but copies v1's mistakes; use it when only the mapping changed, not the document builder.
+
+#### Making the bulk load fast
+**Problem:** the backfill competes with live search traffic, and at default settings it takes far longer than necessary.
+
+**Mechanism:** while v2 isn't serving reads yet, the docs' indexing-speed advice applies directly: set `refresh_interval` to `-1` (no refreshes during the load) and `number_of_replicas` to `0` (no duplicate indexing work), send bulk requests sized by experiment (start around 100 documents, double until throughput stops improving, and stay well below tens of MB per request), then restore both settings. With `_reindex`, `slices: auto` parallelises the copy across shards.
+
+```json title="before the load"
+PUT /products_v2/_settings
+{ "index": { "refresh_interval": "-1", "number_of_replicas": 0 } }
+```
+
+```json title="after the load, before the swap"
+PUT /products_v2/_settings
+{ "index": { "refresh_interval": "1s", "number_of_replicas": 1 } }
+```
+
+**Edge cases:** with zero replicas, a node failure during the load loses v2's shards; that's acceptable because v2 can be rebuilt, but don't swap the alias until replicas are allocated again (cluster health back to green).
+
+#### Cutover and rollback
+**Problem:** v2 goes live and conversion drops. You need to be back on v1 in seconds, not after another two-hour reindex.
+
+**Mechanism:** keep **separate read and write aliases**, and keep v1 up to date (dual writes) until v2 has been live long enough. Rolling back is then the same atomic alias action in reverse. With one alias spanning several indices, `is_write_index` marks which one receives writes sent to the alias.
+
+```json title="POST /_aliases (cutover; swap index names to roll back)"
+{ "actions": [
+  { "remove": { "index": "products_v1", "alias": "products_read" } },
+  { "add":    { "index": "products_v2", "alias": "products_read" } }
+] }
+```
+
+**Edge cases:** delete v1 only after the rollback window closes; until then it costs disk and indexing work. Queries that hard-code an index name instead of the alias silently keep using v1, so grep for them before the cutover.
+
+### Near real-time
+A newly indexed document becomes searchable after the next **refresh** (by default about once a second). A user who saves a product and immediately searches for it may not see it yet; design the UI for that, or pass `refresh="wait_for"` to that one `es.index(...)` call.
+
+---
+
+## 12. The lesson's closing advice 🎓
+
+- If you have **any kind of search or type-ahead** feature, reach for full-text search: **Postgres FTS** or a tool like **Elasticsearch**.
+- It belongs in your toolbox, but you **don't need to master it**. Docs, examples and snippets cover most search use cases; read deeper only when you need to optimise.
+- **Databases are different.** They are involved in almost all of your backend code, so you must truly master them: how to work with them, optimise them, and understand **indexes** inside out.
+
+### Recap of the additions ➕
+
+- **Analyzers:** choose per language and verify with `_analyze`; use multi-fields for exact, stemmed and prefix matching; apply synonyms at search time with `synonym_graph` and the synonyms API.
+- **Cluster basics:** the primary shard count is fixed at creation (split, shrink or reindex to change it); aim for 10–50 GB shards and avoid oversharding; replicas give failover and read capacity; heap at most 50% of RAM.
+- **Relevance:** measure ranking changes against a judgment list with `_rank_eval` (precision, MRR, NDCG), debug single scores with `explain`, and watch zero-result and reformulation rates.
+- **Pagination:** `from`/`size` stops at 10,000 and gets slower with depth; use `search_after` with a point in time for deep or stable paging.
+- **Mappings:** explicit and `strict`; free-form attributes go into `flattened` or key/value shapes to avoid mapping explosions; type changes need a reindex.
+- **Sync:** external versioning stops stale overwrites, bulk responses must be checked item by item, and a reconciliation job catches drift.
+- **Reindexing:** dual-write, backfill from the source of truth, load with refresh off and no replicas, swap a read alias, keep v1 for rollback.
+
+---
+
+## Interview questions
+
+1. **Why does `ILIKE '%term%'` get slow as data grows?** **A leading wildcard can't use a sorted B-tree index, so the database scans every row and pattern-matches every string: linear in the data size.**
+2. **What is an inverted index?** **A map from each term to the list of documents (and positions) containing it, built at write time, so a query looks up terms instead of scanning documents.**
+3. **What does an analyzer do, and why must it run on both documents and queries?** **It tokenises, lowercases, removes stop words and stems; if the query isn't processed the same way, its terms won't match the indexed terms.**
+4. **Name the factors in BM25.** **Term frequency (with saturation), inverse document frequency, document length normalisation; plus field boosts applied at query time.**
+5. **Why does BM25 saturate term frequency?** **So repeating a word many times can't inflate a score; the first occurrences matter most.**
+6. **`text` vs `keyword` in Elasticsearch?** **text is analysed for full-text search; keyword is stored as one exact value for filtering, sorting and aggregations.**
+7. **How does fuzzy matching work, and what does `fuzziness: AUTO` do?** **It matches terms within an edit distance; AUTO allows 0 edits for 1–2 characters, 1 edit for 3–5, and 2 for longer terms.**
+8. **How would you build type-ahead?** **Index prefixes (search_as_you_type or edge n-grams, or a completion suggester), query with bool_prefix, and debounce requests on the client.**
+9. **When is Postgres FTS enough?** **When search is over your own app data at moderate scale and basic ranking is fine; a tsvector column with a GIN index, plus pg_trgm for fuzziness.**
+10. **When would you choose Elasticsearch?** **When search is a core feature needing rich relevance tuning, fuzziness, facets and high traffic, or when it's already in your stack (for example for logs in ELK).**
+11. **How do you keep Elasticsearch consistent with Postgres?** **Treat Postgres as the source of truth; publish changes via an outbox or CDC to a queue; an idempotent worker re-reads the row and indexes it by ID.**
+12. **How do you change a mapping in production?** **Create a new index with the new mapping, reindex into it, then atomically swap an alias the application queries.**
+13. ➕ **Why can't you change the number of primary shards on an existing index?** **Documents are routed by hash modulo the primary count; changing it would move every document, so you split, shrink or reindex instead.**
+14. ➕ **What is oversharding and why does it hurt?** **Many small shards each carry fixed memory and per-query overhead; aim for roughly 10–50 GB per shard.**
+15. ➕ **How would you change synonyms weekly without reindexing?** **Apply them only in a search analyzer with synonym_graph, managed through the synonyms API, which reloads the analyzers when the set changes.**
+16. ➕ **How do you know a boost change improved search?** **Score it against a judgment list of rated queries with _rank_eval (NDCG, MRR, precision@k), and watch zero-result and reformulation rates in production.**
+17. ➕ **Why does from/size fail beyond 10,000 results, and what replaces it?** **Every shard must return from + size candidates for the coordinator to merge, so cost grows with depth; search_after with a point in time pages efficiently and consistently.**
+18. ➕ **What is a mapping explosion and how do you prevent it?** **User data creating unbounded new fields, bloating cluster state and slowing the cluster; use strict mappings and flattened or key/value fields for free-form attributes.**
+19. ➕ **Two indexer workers race on the same product. How do you stop an old version overwriting a new one?** **Index with version_type external using a row version; Elasticsearch rejects older versions with 409, which the worker treats as success.**
+20. ➕ **Why can a bulk sync silently lose documents?** **_bulk returns 200 even when items fail; inspect per-item results (the (ok, item) pairs from the Python bulk helper) and dead-letter the failures.**
+21. ➕ **How do you reindex without losing writes made during the copy?** **Dual-write changes to old and new indices, backfill the new one from the source of truth with external versions, then swap a read alias and keep the old index for rollback.**
+
+## Sources
+
+- [Lesson video: Full text search using Elasticsearch (Sriniously)](https://youtu.be/7_sovzAhRSM)
+- [Elasticsearch: Similarity settings (BM25 defaults)](https://www.elastic.co/docs/reference/elasticsearch/index-settings/similarity)
+- [Elasticsearch: Multi-match query (field boosts, fuzziness support)](https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-multi-match-query)
+- [Elasticsearch: Match query](https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-match-query)
+- [Elasticsearch: Common options (fuzziness AUTO)](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/common-options)
+- [Elasticsearch: search_as_you_type field type](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/search-as-you-type)
+- [Elasticsearch Python client: bulk helpers](https://www.elastic.co/docs/reference/elasticsearch/clients/python/client-helpers)
+- [PostgreSQL: Text search tables and indexes](https://www.postgresql.org/docs/current/textsearch-tables.html)
+- [PostgreSQL: pg_trgm](https://www.postgresql.org/docs/current/pgtrgm.html)
+- [Apache Lucene](https://lucene.apache.org/)
+- [Elasticsearch: Configure synonyms (synonyms API, synonym_graph)](https://www.elastic.co/docs/solutions/search/full-text/search-with-synonyms)
+- [Elasticsearch: Size your shards](https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards)
+- [Elasticsearch: JVM settings (heap sizing)](https://www.elastic.co/docs/reference/elasticsearch/jvm-settings)
+- [Elasticsearch: Ranking evaluation API](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-rank-eval)
+- [Elasticsearch: Paginate search results (search_after, PIT)](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/paginate-search-results)
+- [Elasticsearch: The search API (track_total_hits)](https://www.elastic.co/docs/solutions/search/the-search-api)
+- [Elasticsearch: Mapping limit settings](https://www.elastic.co/docs/reference/elasticsearch/index-settings/mapping-limit)
+- [Elasticsearch: Mapping explosion](https://www.elastic.co/docs/troubleshoot/elasticsearch/mapping-explosion)
+- [Elasticsearch: Flattened field type](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/flattened)
+- [Elasticsearch: Dynamic templates and dynamic mapping](https://www.elastic.co/docs/manage-data/data-store/mapping/dynamic-templates)
+- [Elasticsearch: Index API (external versioning)](https://www.elastic.co/docs/api/doc/elasticsearch/operation/operation-index)
+- [Elasticsearch: Tune for indexing speed](https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/indexing-speed)

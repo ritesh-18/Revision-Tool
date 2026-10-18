@@ -1,0 +1,395 @@
+---
+title: "Concurrency Models and the GIL"
+description: "Concurrency vs parallelism, IO-bound vs CPU-bound work, what CPython's Global Interpreter Lock really protects, free-threaded Python, and how to choose between threads, processes and asyncio."
+---
+
+Before you touch `threading`, `multiprocessing` or `asyncio`, you need one mental model: **what is actually running at the same instant, and what is only taking turns?** In Node the answer is simple (your JavaScript runs on one thread, libuv does the waiting). In Python the answer depends on the tool you pick and on the **Global Interpreter Lock (GIL)**. This page builds that model. The next three pages go deep on each tool.
+
+All snippets on this page were run on **CPython 3.14.6** (the standard build, with the GIL) on a 16-core Windows machine. Timings depend on hardware and will differ on yours. The ratios are the point.
+
+For the language-neutral background (scheduling, context switches, contention), see the backend lesson [Concurrency and parallelism](/docs/backend-first-principles/23-concurrency-parallelism).
+
+## Concurrency vs parallelism
+
+- **Concurrency** means several tasks are *in progress* during the same period. They can take turns on one core. It is about *structure*: how you deal with many things at once.
+- **Parallelism** means several tasks are *executing* at the same instant on different cores. It is about *execution*: doing many things at once.
+
+A single-core machine can be concurrent but never parallel. A Node server handling 10,000 sockets is very concurrent but runs your JavaScript with zero parallelism.
+
+<Mermaid chart={`flowchart TB
+  subgraph C["Concurrency on 1 core"]
+    direction LR
+    A1["Task A"] --> B1["Task B"] --> A2["Task A"] --> B2["Task B"]
+  end
+  subgraph P["Parallelism on 2 cores"]
+    direction LR
+    PA["Core 1: Task A ......."]
+    PB["Core 2: Task B ......."]
+  end`} />
+
+## IO-bound vs CPU-bound
+
+The kind of work decides which tool helps.
+
+| | IO-bound | CPU-bound |
+|---|---|---|
+| Where time goes | waiting on network, disk, DB, an LLM API | executing instructions: parsing, hashing, maths, model inference in pure Python |
+| What speeds it up | overlapping the waits | more cores |
+| Typical Python tool | `asyncio` or threads | processes, C extensions that release the GIL, free-threaded build |
+| Node analogy | the event loop handles this natively | `worker_threads` or a child process |
+
+A quick test: if your CPU usage is near 0% while the program is "slow", you are IO-bound. If one core is pinned at 100%, you are CPU-bound.
+
+## What the GIL is
+
+The GIL is a single mutex inside the CPython interpreter. **A thread must hold it to execute Python bytecode or touch Python objects.** So in a standard CPython process, no matter how many OS threads you create, only one of them runs Python code at any moment. The threads are real OS threads (pthreads or Windows threads), scheduled by the OS. They just queue up for one lock.
+
+You can ask the interpreter about it:
+
+```python
+import sys, sysconfig
+print(sys.version.split()[0])
+print("GIL enabled:", sys._is_gil_enabled())
+print("free-threaded build:", bool(sysconfig.get_config_var("Py_GIL_DISABLED")))
+print("switch interval:", sys.getswitchinterval())
+```
+
+```text title="Output"
+3.14.6
+GIL enabled: True
+free-threaded build: False
+switch interval: 0.005
+```
+
+### Why CPython has it: reference counting
+
+Every CPython object carries a reference count (`ob_refcnt`). Each new reference increments it, each dropped reference decrements it, and when it hits zero the object is freed right away.
+
+```python
+import sys
+data = []
+print(sys.getrefcount(data))   # +1 for the temporary argument reference
+alias = data
+print(sys.getrefcount(data))
+del alias
+print(sys.getrefcount(data))
+```
+
+```text title="Output"
+2
+3
+2
+```
+
+These increments and decrements happen *constantly*: on every assignment, function call, list append and attribute read. If two threads did `ob_refcnt += 1` on the same object at the same time without synchronisation, one update could be lost. The count would then drop to zero too early (use-after-free, a crash) or never reach zero (a leak).
+
+The fix options in the 1990s were:
+
+1. Make every refcount change an atomic CPU instruction, plus add a lock to every mutable container. That is slow for single-threaded code, which was almost all code back then.
+2. Put **one big lock** around the whole interpreter. That is cheap, simple, and makes C extensions easy to write because they can assume nobody else is touching Python objects.
+
+CPython chose option 2. The GIL also protects interpreter-wide state (the allocator, the import system, internal caches), and it is a big reason the C extension ecosystem (NumPy, lxml, psycopg) grew so fast.
+
+<Callout title="Coming from JS">
+V8 does not need a GIL because a V8 isolate is single-threaded by design: one isolate means one thread running JS. `worker_threads` creates **separate isolates** with separate heaps, so objects are never shared (only copied, or shared as raw `SharedArrayBuffer` bytes). CPython took the opposite route: threads share one heap and every object, and the GIL makes that safe. Python's closest relative to worker isolates is subinterpreters (`concurrent.interpreters`, new in 3.14), covered briefly below.
+</Callout>
+
+## What the GIL does and does not protect
+
+The GIL makes **each bytecode instruction** atomic with respect to other threads. It keeps the *interpreter* consistent. It does **not** make *your code* thread-safe, because one line of Python is usually several bytecode instructions, and a thread switch can happen between them.
+
+### `+=` is not atomic
+
+```python
+import dis
+counter = 0
+def increment():
+    global counter
+    counter += 1
+dis.dis(increment)
+```
+
+```text title="Output"
+  3           RESUME                   0
+
+  5           LOAD_GLOBAL              0 (counter)
+              LOAD_SMALL_INT           1
+              BINARY_OP               13 (+=)
+              STORE_GLOBAL             0 (counter)
+              LOAD_CONST               1 (None)
+              RETURN_VALUE
+```
+
+`counter += 1` is a **read** (`LOAD_GLOBAL`), a **compute** (`BINARY_OP`) and a **write** (`STORE_GLOBAL`). If thread A reads 41, then thread B reads 41, both write 42, and one increment is lost.
+
+Here is the subtle part. On recent GIL builds this exact loop often *looks* safe:
+
+```python
+import threading
+counter = 0
+def work(n):
+    global counter
+    for _ in range(n):
+        counter += 1
+threads = [threading.Thread(target=work, args=(1_000_000,)) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(counter)
+```
+
+```text title="Output"
+4000000
+```
+
+That is luck plus an implementation detail. Since CPython 3.10, the interpreter only checks "should I hand over the GIL?" at certain points (function calls, backward jumps in loops), not between every instruction. The tiny `+=` sequence happens not to contain such a point. Add a function call inside the read-modify-write and the race shows up at once:
+
+```python
+import threading
+counter = 0
+def work(n):
+    global counter
+    for _ in range(n):
+        counter = counter + int("1")   # a call inside the read-modify-write
+threads = [threading.Thread(target=work, args=(1_000_000,)) for _ in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(counter)
+```
+
+```text title="Output (varies on every run)"
+2347157
+```
+
+Nearly 1.7 million increments vanished. On a free-threaded build even the plain `+=` version loses updates. **Rule: never rely on the GIL for the correctness of your own data. Use a `Lock`** (see [threading](/docs/python/threading)).
+
+### Atomicity myths
+
+| Belief | Reality |
+|---|---|
+| "The GIL makes Python thread-safe." | It makes the interpreter memory-safe. Your invariants still need locks. |
+| "`x += 1` is atomic." | Read, compute, write. Not atomic. |
+| "`list.append` is atomic." | In practice a single `append` call on a built-in list is safe (one C call under the GIL, and per-object locks on free-threaded builds). But "check then append" (`if x not in lst: lst.append(x)`) is two steps and races. |
+| "`dict[k] = v` is atomic." | Usually, for built-in keys. But a key with a Python `__hash__` or `__eq__` runs Python code in the middle, and a switch can happen there. |
+| "My code works in tests, so it is safe." | Races are timing-dependent. They appear under load, on other Python versions, or on free-threaded builds. |
+
+## When the GIL is released
+
+The GIL would be useless for concurrency if a thread held it while waiting. It does not. A thread **gives up the GIL**:
+
+1. **Around blocking IO.** Socket `recv`, `send`, file reads, `select`, DB driver calls. The C code calls `Py_BEGIN_ALLOW_THREADS`, does the system call, then re-acquires the GIL.
+2. **During `time.sleep`.**
+3. **Inside many C extensions doing heavy work** that doesn't touch Python objects: `hashlib` on large buffers, `zlib` compression, NumPy vector operations, many image libraries.
+4. **When forced by the switch interval** (next section).
+
+Point 1 is why threads work well for IO:
+
+```python
+import threading, time
+
+def fake_io():
+    time.sleep(1)   # releases the GIL while waiting
+
+start = time.perf_counter()
+for _ in range(4): fake_io()
+print(f"sequential : {time.perf_counter() - start:.2f}s")
+
+start = time.perf_counter()
+ts = [threading.Thread(target=fake_io) for _ in range(4)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(f"4 threads  : {time.perf_counter() - start:.2f}s")
+```
+
+```text title="Output"
+sequential : 4.00s
+4 threads  : 1.00s
+```
+
+Point 3 means that threads *can* give real parallelism when the heavy lifting is in a GIL-releasing C function:
+
+```python
+import hashlib, time
+from concurrent.futures import ThreadPoolExecutor
+
+blob = b"x" * 200_000_000         # 200 MB
+def digest(_):
+    return hashlib.sha256(blob).hexdigest()[:8]
+
+start = time.perf_counter()
+[digest(i) for i in range(8)]
+print(f"sequential : {time.perf_counter() - start:.2f}s")
+
+start = time.perf_counter()
+with ThreadPoolExecutor(max_workers=8) as pool:
+    list(pool.map(digest, range(8)))
+print(f"8 threads  : {time.perf_counter() - start:.2f}s")
+```
+
+```text title="Output (timings vary)"
+sequential : 0.80s
+8 threads  : 0.15s
+```
+
+About a 5x speedup on 8 threads with the GIL on, because `hashlib` releases the GIL for buffers larger than about 2 KB.
+
+But **pure-Python CPU work gets no speedup** from threads. It is often a little slower, because of the cost of handing the lock back and forth:
+
+```python
+import threading, time
+
+def countdown(n):
+    while n > 0:
+        n -= 1
+
+N = 20_000_000
+start = time.perf_counter()
+countdown(N); countdown(N)
+print(f"sequential : {time.perf_counter() - start:.2f}s")
+
+start = time.perf_counter()
+ts = [threading.Thread(target=countdown, args=(N,)) for _ in range(2)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(f"2 threads  : {time.perf_counter() - start:.2f}s")
+```
+
+```text title="Output (timings vary)"
+sequential : 1.40s
+2 threads  : 1.52s
+```
+
+## The switch interval
+
+What stops one CPU-bound thread from holding the GIL forever? Since Python 3.2 the GIL works like this:
+
+1. A thread that wants the GIL waits on a condition variable with a timeout equal to the **switch interval** (`sys.getswitchinterval()`, default **0.005 s = 5 ms**).
+2. If the timeout expires and the GIL is still held, the waiter sets a `gil_drop_request` flag.
+3. The running thread checks that flag at its next "eval breaker" check (calls, loop back-edges) and releases the GIL.
+4. The OS decides which waiting thread gets it next. Python does not control the order.
+
+<Mermaid chart={`sequenceDiagram
+  participant T1 as Thread 1 - CPU loop
+  participant G as GIL
+  participant T2 as Thread 2 - waiting
+  T1->>G: holds GIL, runs bytecode
+  T2->>G: wait up to 5 ms
+  Note over T2: timeout expires
+  T2->>G: set drop request
+  T1->>G: sees request at next check, releases
+  G->>T2: T2 acquires, runs bytecode
+  T1->>G: now T1 waits up to 5 ms`} />
+
+You can change it with `sys.setswitchinterval(seconds)`. A smaller value gives better responsiveness for IO threads competing with a CPU thread, at the cost of more switching overhead. You almost never need to touch it. If you are tuning it, you probably want a process instead.
+
+<Callout type="warn">
+The "convoy effect": an IO thread that releases the GIL for every tiny `recv` may have to wait up to a full switch interval to get it back if a CPU-bound thread is running. Mixing heavy CPU threads and latency-sensitive IO threads in one process gives bad tail latency. Move the CPU work to a process.
+</Callout>
+
+## Free-threaded CPython (no GIL)
+
+**PEP 703** (accepted 2023) adds a build of CPython compiled with `--disable-gil`. In that build, threads run Python bytecode truly in parallel.
+
+How it stays memory-safe without a global lock:
+
+- **Biased reference counting.** Each object records its owning thread. The owner updates the refcount with cheap non-atomic operations. Other threads use atomic operations on a separate shared counter.
+- **Immortal objects** (PEP 683): `None`, `True`, small ints and interned strings never change their refcount, so there is no contention on the hottest objects.
+- **Per-object locks** (critical sections) inside built-in containers like `list`, `dict` and `set`, so a single operation like `lst.append(x)` stays safe.
+- **mimalloc** as the allocator, which is thread-safe and lets the GC find objects without a global list.
+- **Deferred reference counting** for some objects such as functions and modules, which are accessed by many threads.
+
+### Status by version
+
+| Version | Status |
+|---|---|
+| 3.13 (Oct 2024) | Phase I: **experimental**. Separate installer option, executable `python3.13t`. The specialising interpreter was turned off, so single-thread overhead was large (about 40% on pyperformance). |
+| 3.14 (Oct 2025) | Phase II per **PEP 779**: **officially supported but optional**. Executable `python3.14t`. Specialisation re-enabled. Single-thread overhead about 5 to 10%, memory about 15 to 20% higher. |
+| Later | Phase III (free-threaded build as the *default*) needs its own future decision. The GIL build is still the default as of 3.15. |
+
+Check what you are running:
+
+```python
+import sys, sysconfig
+print(bool(sysconfig.get_config_var("Py_GIL_DISABLED")))  # True on python3.14t
+print(sys._is_gil_enabled())                             # usually False on python3.14t
+```
+
+The GIL can come back at runtime on a free-threaded build. If you import a C extension that has not declared itself free-threading-safe (via `Py_mod_gil`), CPython **re-enables the GIL** and prints a warning. You can force it either way with `PYTHON_GIL=0` or `PYTHON_GIL=1`, or with `-X gil=0` or `-X gil=1`.
+
+### The costs
+
+- **Single-threaded slowdown** of about 5 to 10% (3.14), plus extra memory.
+- **Extensions must be rebuilt** for the `cp314t` ABI. Wheels for the free-threaded build are a separate download, and not every package ships them yet.
+- **Your races become real.** Code that "worked" because of the GIL (like the plain `+=` loop above) starts losing updates. Thread-safety bugs in libraries get exposed.
+- **Not a free lunch for IO-bound code.** If your service spends its time waiting on Postgres, removing the GIL changes almost nothing.
+
+The big winners are CPU-bound pure-Python workloads that need shared memory: data pipelines, inference pre-processing, tree search, simulation, where processes would mean pickling large objects back and forth.
+
+### Subinterpreters (3.14)
+
+A third option arrived in 3.14: `concurrent.interpreters` (PEP 734) and `concurrent.futures.InterpreterPoolExecutor`. Each subinterpreter has **its own GIL** and its own module state in the same process. That gives you parallelism with isolation, very much like Node's `worker_threads`. The limits today: slow startup, high per-interpreter memory, very limited object sharing, and many third-party extensions don't support it yet.
+
+## Choosing between threads, processes and asyncio
+
+<Mermaid chart={`flowchart TB
+  S["What is the bottleneck?"] --> IO["Waiting on IO"]
+  S --> CPU["CPU in pure Python"]
+  S --> CEXT["CPU inside a C extension<br/>that releases the GIL"]
+  IO --> Q1{"Async libraries available?<br/>e.g. httpx, asyncpg"}
+  Q1 -->|"yes - many connections"| AS["asyncio"]
+  Q1 -->|"no - blocking SDK only"| TH["threads<br/>ThreadPoolExecutor"]
+  CPU --> PR["processes<br/>ProcessPoolExecutor"]
+  CPU --> FT["or free-threaded 3.14t<br/>if deps support it"]
+  CEXT --> TH2["threads are fine"]`} />
+
+| Factor | Threads | Processes | asyncio |
+|---|---|---|---|
+| Parallel Python bytecode (GIL build) | No | Yes | No |
+| Best for | blocking IO, blocking SDKs, GIL-releasing C code | CPU-bound pure Python | many concurrent network connections |
+| Memory per unit | about 8 MB virtual stack, small real use | a whole interpreter, tens of MB | a few KB per task |
+| Practical scale | tens to low hundreds | about one per core | tens of thousands |
+| Sharing data | shared heap, needs locks | pickled messages, shared memory, managers | shared heap, no locks needed between awaits |
+| Switch points | anywhere (preemptive) | separate processes | only at `await` (cooperative) |
+| Main danger | races and deadlocks | pickling cost, startup cost | one blocking call freezes everything |
+| Node equivalent | roughly the libuv thread pool | `child_process`, `cluster` | the event loop |
+
+Real systems mix them. A FastAPI service runs on asyncio, calls a blocking SDK with `asyncio.to_thread`, offloads CPU-heavy work to a `ProcessPoolExecutor`, and is itself run as several worker processes behind Gunicorn or Uvicorn.
+
+<Callout title="Coming from JS">
+In Node you rarely choose a concurrency model. The event loop is the model, and libuv's thread pool quietly handles file IO, DNS and crypto. Python makes you choose explicitly. The mapping is roughly: **asyncio** is the event loop, **threads** do what the libuv thread pool does (but you manage them), and **processes** play the role of `cluster` or `child_process`. The one thing Node has no direct equivalent for is shared-memory Python threads running your own code, and that is exactly the thing the GIL limits.
+</Callout>
+
+## Interview questions
+
+1. **What is the GIL and why does CPython have it?**
+   **A mutex that a thread must hold to run Python bytecode. It exists mainly to keep non-atomic reference counting and interpreter state safe without per-object locks, and it made C extensions simple to write.**
+
+2. **Does the GIL make `counter += 1` thread-safe?**
+   **No. It compiles to load, add, store, and a thread switch between them loses updates. It may appear safe on some versions, but you must use a lock.**
+
+3. **Why do threads still help an IO-bound Python program?**
+   **Blocking IO calls and `time.sleep` release the GIL while they wait, so other threads run during the wait.**
+
+4. **When can threads give real CPU parallelism even with the GIL?**
+   **When the heavy work runs in C code that releases the GIL, such as `hashlib`, `zlib` or NumPy operations.**
+
+5. **What is the switch interval?**
+   **The time (default 5 ms) a waiting thread waits before asking the running thread to drop the GIL. It is set with `sys.setswitchinterval`.**
+
+6. **What is the status of free-threaded Python in 3.14?**
+   **Officially supported but optional (PEP 779, phase II), shipped as `python3.14t`. It has about 5 to 10% single-thread overhead and needs extensions built for it. The GIL build is still the default.**
+
+7. **How does the free-threaded build keep refcounts safe?**
+   **Biased reference counting (cheap owner-thread updates, atomic updates for others), immortal objects, deferred refcounting, and per-object locks in built-in containers.**
+
+8. **You need to call 500 HTTP endpoints and then do heavy pure-Python parsing on each response. What do you use?**
+   **asyncio (or threads) for the fetching, then a `ProcessPoolExecutor` for the parsing, so each bottleneck gets the matching tool.**
+
+## Recap
+
+- Concurrency is about structure (taking turns). Parallelism is about execution (doing things at the same instant).
+- Identify the bottleneck first: IO-bound work needs overlapping waits, CPU-bound work needs cores.
+- The GIL lets only one thread run Python bytecode at a time. It exists to protect reference counts and interpreter state.
+- The GIL protects the interpreter, not your invariants. `+=` and check-then-act sequences race, so use locks.
+- The GIL is released during blocking IO, sleeps and many C extension calls, and is handed over on request every 5 ms by default.
+- Free-threaded CPython (`python3.14t`) is officially supported but optional in 3.14, with modest single-thread overhead and an ecosystem still catching up.
+- Use asyncio for many network connections, threads for blocking libraries, and processes (or free-threading) for CPU-bound Python.

@@ -1,0 +1,462 @@
+---
+title: "Introduction and Setup"
+description: "What Python actually is, how CPython compiles your code to bytecode and runs it, and how to set up versions, virtual environments and a clean project with uv."
+---
+
+Before learning syntax, it pays to know what happens when you type `python app.py`. Most Python "mysteries" (why a `.pyc` file appeared, why your script ran code on import, why `pip install` broke another project) are easy once you know how the interpreter, modules and environments fit together.
+
+<Callout type="info">
+All snippets on this page were run on **CPython 3.14.6** (Windows). Bytecode listings in particular change between versions, so yours may look slightly different. Python 3.15 was released on 9 October 2026; where it changes something on this page, that is pointed out.
+</Callout>
+
+## What "Python" means
+
+"Python" is two things:
+
+1. **The language**: the syntax and semantics described in the Python Language Reference. Changes go through the PEP process (Python Enhancement Proposals), e.g. PEP 8 (style guide), PEP 634 (`match`), PEP 750 (template strings).
+2. **An implementation**: a program that runs code written in that language.
+
+| Implementation | Written in | Notes |
+|---|---|---|
+| **CPython** | C | The reference implementation. What you get from python.org, `uv`, conda, Homebrew. Almost all libraries target it. |
+| **PyPy** | RPython | Has a tracing JIT. Often several times faster for long-running pure-Python loops. Lags a version or two behind CPython. |
+| **MicroPython** | C | Small subset for microcontrollers. |
+| **GraalPy** | Java (GraalVM) | Runs on the JVM, can call Java. |
+| **Jython / IronPython** | Java / .NET | Mostly historical; Jython is still stuck on Python 2. |
+
+When people say "Python does X", they almost always mean "CPython does X". These notes do the same, and they flag behaviour that is an **implementation detail** (something CPython happens to do, which the language does not promise).
+
+```python
+import sys, platform
+print(platform.python_implementation(), sys.version_info[:3])
+print(sys.implementation.name, sys.implementation.cache_tag)
+```
+
+```text title="Output"
+CPython (3, 14, 6)
+cpython cpython-314
+```
+
+<Callout title="Coming from JS">
+The split is the same as in JavaScript: ECMAScript is the language, and V8, SpiderMonkey and JavaScriptCore are engines. CPython is like a single dominant engine that is also the spec's reference. The big difference: V8 JIT-compiles hot code to machine code. CPython historically has **not** done that. It interprets bytecode, which is why pure-Python loops are much slower than the same loop in Node. (3.13 added an experimental JIT and 3.14 ships it in the Windows and macOS binaries, but it is off by default and the gains are still modest.)
+</Callout>
+
+## Compiled, then interpreted
+
+Python is often called "interpreted", but CPython actually works in two stages:
+
+1. **Compile**: your source is tokenized, parsed into an AST (abstract syntax tree), and compiled to **bytecode**, a compact list of instructions for a virtual machine. The result is a **code object**.
+2. **Interpret**: the CPython virtual machine (the "eval loop", the C function `_PyEval_EvalFrameDefault` in `Python/ceval.c`) walks through the bytecode one instruction at a time and does what each one says.
+
+<Mermaid chart={`flowchart LR
+  A["app.py<br/>source text"] --> B[Tokenizer]
+  B --> C[Parser]
+  C --> D["AST"]
+  D --> E[Compiler]
+  E --> F["Code object<br/>bytecode + constants + names"]
+  F --> G["Eval loop<br/>stack-based VM"]
+  F -.->|imported modules only| H["__pycache__/mod.cpython-314.pyc"]
+  H -.->|next import if source unchanged| F`} />
+
+### Looking at bytecode with `dis`
+
+The `dis` module disassembles a function's bytecode. This is the single best tool for answering "what does Python really do here?"
+
+```python
+import dis
+
+def add_tax(price, rate=0.2):
+    total = price * (1 + rate)
+    return round(total, 2)
+
+dis.dis(add_tax)
+```
+
+```text title="Output"
+  3           RESUME                   0
+
+  4           LOAD_FAST_BORROW         0 (price)
+              LOAD_SMALL_INT           1
+              LOAD_FAST_BORROW         1 (rate)
+              BINARY_OP                0 (+)
+              BINARY_OP                5 (*)
+              STORE_FAST               2 (total)
+
+  5           LOAD_GLOBAL              1 (round + NULL)
+              LOAD_FAST_BORROW         2 (total)
+              LOAD_SMALL_INT           2
+              CALL                     2
+              RETURN_VALUE
+```
+
+How to read it:
+
+- The VM is a **stack machine**. `LOAD_*` pushes a value onto the value stack, `BINARY_OP` pops two and pushes the result, `STORE_FAST` pops into a local variable slot.
+- Local variables are **slots in an array** (`LOAD_FAST 0` is "slot 0"), not dictionary lookups. That is why locals are faster than globals: `LOAD_GLOBAL` has to look in the module's globals dict and then in builtins (with caching to make that cheap).
+- `round` is looked up at run time, every call. Nothing stops someone from rebinding `round` in that module. Python resolves almost everything late.
+- Instruction names are **not stable** across versions. `LOAD_SMALL_INT` and `LOAD_FAST_BORROW` are new in 3.14; 3.12 would show `LOAD_CONST` and `LOAD_FAST`. Never write code that depends on bytecode details.
+
+The code object itself is a regular Python object you can inspect:
+
+```python
+c = add_tax.__code__
+print(type(c))
+print(c.co_varnames)
+print(c.co_consts)
+print(c.co_code[:12])
+```
+
+```text title="Output"
+<class 'code'>
+('price', 'rate', 'total')
+(1,)
+b'\x80\x00V\x00^\x01V\x01,\x00\x00\x00'
+```
+
+### The specializing interpreter
+
+Since 3.11, CPython's eval loop is **adaptive** (PEP 659). After an instruction runs a few times, it rewrites itself into a specialized version based on the types it actually saw. For example, `BINARY_OP (+)` that keeps seeing two ints becomes an int-only add that skips the generic dispatch. If the types change, it falls back. You can see this with `dis.dis(fn, adaptive=True)` after calling `fn` many times. This is the main reason 3.11+ is noticeably faster than 3.10, and it is a small taste of what V8 does much more aggressively.
+
+### `.pyc` files and `__pycache__`
+
+Compiling takes time, so CPython caches the bytecode of **imported** modules on disk:
+
+```python
+# greet.py
+def greet(name):
+    return f"Hello, {name}"
+
+print("module __name__ is", __name__)
+
+if __name__ == "__main__":
+    print(greet("world"))
+```
+
+```python
+# app.py
+import greet
+print(greet.greet("from app"))
+```
+
+Running `python app.py` creates `__pycache__/greet.cpython-314.pyc`. The `cpython-314` part is the **cache tag**, so different Python versions can share one folder without clobbering each other's caches.
+
+Key facts:
+
+- Only **imported** modules are cached. The script you run directly (`python app.py`) is compiled every time and never written to a `.pyc`.
+- A `.pyc` header records the source file's modification time and size (or a hash, see PEP 552). If the source changed, Python recompiles. You never need to delete `__pycache__` for correctness; it is safe to delete, and you should add it to `.gitignore`.
+- `.pyc` files are **not** a security or obfuscation mechanism. They decompile easily.
+- If Python cannot write the folder (read-only filesystem), it silently compiles in memory every time. `PYTHONDONTWRITEBYTECODE=1` turns caching off (common in Docker images), and `python -m compileall src/` pre-compiles a tree.
+
+<Callout title="Coming from JS">
+Node has a similar idea in V8's code cache, but you never see it. Python makes the cache visible as files next to your source. Think of `__pycache__` as Python's equivalent of a build artifact folder that gets rebuilt automatically.
+</Callout>
+
+## The REPL
+
+Typing `python` with no arguments starts the interactive interpreter (REPL). Since 3.13, CPython ships a new REPL (based on PyPy's) with multi-line editing, history, colour, and paste mode (`F3`). 3.14 adds syntax highlighting and import auto-completion. Set `PYTHON_BASIC_REPL=1` to get the old one.
+
+Useful REPL habits:
+
+- `_` holds the last expression result.
+- `help(obj)` shows docs, `dir(obj)` lists attributes, `type(obj)` tells you what something is.
+- `python -i script.py` runs a script then drops into a REPL with its globals loaded. Great for poking at a failed state.
+- `exit` and `quit` work without parentheses since 3.13.
+
+For serious exploratory work (data, AI), most people use **IPython** or **Jupyter** notebooks, which add rich display, `%timeit`, and better completion.
+
+## Running code: scripts, `-c` and `-m`
+
+| Command | What it does |
+|---|---|
+| `python app.py` | Run a file. Its directory is put at `sys.path[0]`. |
+| `python -c "print(1+1)"` | Run a string. `sys.path[0]` is the current directory. |
+| `python -m package.module` | Find a module on `sys.path` (like an import) and run it as `__main__`. `sys.path[0]` is the current directory. |
+| `python -m pkg` | Runs `pkg/__main__.py`. |
+| `python -i app.py` | Run, then stay in the REPL. |
+| `python -O app.py` | Strip `assert` statements and set `__debug__` to `False`. |
+| `python -X importtime -c "import json"` | Print how long each import took. |
+
+`-m` is worth understanding properly because you will use it all the time:
+
+- `python -m venv .venv`, `python -m pip install ...`, `python -m pytest`, `python -m http.server 8000`, `python -m json.tool file.json`, `python -m asyncio` (a REPL with top-level `await`).
+- `python -m pip` guarantees you use the pip belonging to **that** interpreter. Plain `pip` might belong to a different Python on your PATH. This is a classic source of "I installed it but it says module not found".
+- Running a module inside a package with `python src/pkg/sub.py` breaks relative imports (`from . import x`) because the file is not run as part of the package. `python -m pkg.sub` from the project root fixes that.
+
+```bash
+echo '{"b":1,"a":[1,2]}' | python -m json.tool
+```
+
+```text title="Output"
+{
+    "b": 1,
+    "a": [
+        1,
+        2
+    ]
+}
+```
+
+## `if __name__ == "__main__"`
+
+Every module has a global `__name__`. When a file is imported, `__name__` is the module's name (`"greet"`). When a file is run directly (or via `-m`), Python names it `"__main__"`.
+
+Importing a module **executes its top-level code**, top to bottom, once. Using the `greet.py` and `app.py` files from above:
+
+```bash
+python greet.py
+python app.py
+```
+
+```text title="Output"
+module __name__ is __main__
+Hello, world
+module __name__ is greet
+Hello, from app
+```
+
+The `print` at the top level of `greet.py` ran on import, but the guarded block did not. So the guard means "only do this when I am the program, not when I am a library".
+
+Rules of thumb:
+
+- Keep import-time side effects minimal (no network calls, no heavy model loading, no `argparse` parsing at the top level). They run for every importer, including your test runner.
+- Put the entry point in a `main()` function and call it under the guard. That keeps variables out of module globals and makes `main` testable.
+- On Windows and macOS, `multiprocessing` starts child processes by **re-importing** your main module. Without the guard, the children would spawn children forever. The guard is mandatory there.
+
+```python
+def main() -> None:
+    ...
+
+if __name__ == "__main__":
+    main()
+```
+
+<Callout title="Coming from JS">
+The Node equivalent is `if (require.main === module)` in CommonJS, or comparing `import.meta.url` to `process.argv[1]` in ESM. Module execution is otherwise very similar: both run top-level code once on first import and then cache the module object (`sys.modules` in Python, `require.cache` in Node).
+</Callout>
+
+## Installing Python and managing versions
+
+You will need several Python versions over time (a service pinned to 3.12, a new project on 3.14). Do not rely on the system Python (on Linux and macOS it belongs to the OS; break it and OS tools break).
+
+Options:
+
+- **uv** (recommended): a fast, all-in-one tool written in Rust by Astral. It installs Python versions, creates virtual environments, resolves and locks dependencies, and runs tools. It replaces `pyenv` + `venv` + `pip` + `pip-tools` + `pipx` for most people.
+- **python.org installers**. On Windows the new **Python install manager** (`py` command, PEP 773) replaces the old `py.exe` launcher and can install and switch versions (`py install 3.14`, `py -3.13 app.py`).
+- **pyenv** (Unix) or **conda / miniconda** (common in data science; manages non-Python native libraries too).
+
+```bash
+uv python list            # versions installed and available
+uv python install 3.14    # download a managed CPython build
+uv run --python 3.13 python -c "import sys; print(sys.version)"
+```
+
+## Virtual environments
+
+### The problem
+
+`pip install` puts packages in a `site-packages` directory belonging to one interpreter. If two projects need different versions of `pydantic`, a single global `site-packages` cannot satisfy both. Python has no equivalent of Node's per-project `node_modules` resolution built into the import system.
+
+### The solution: a venv
+
+A **virtual environment** is a directory with:
+
+- a `pyvenv.cfg` file pointing at the base interpreter,
+- a `python` executable (a copy or symlink, or a small launcher on Windows),
+- its own empty `site-packages`.
+
+When Python starts, it looks for `pyvenv.cfg` next to (or one level above) the executable. If found, it sets `sys.prefix` to the venv and uses the venv's `site-packages` instead of the global one. That is the whole trick. "Activating" a venv just puts its `bin/` (or `Scripts\` on Windows) first on your `PATH` so `python` resolves to it; you can always call `.venv/bin/python` directly without activating.
+
+```bash
+python -m venv .venv
+cat .venv/pyvenv.cfg
+.venv/Scripts/python -c "import sys; print(sys.prefix); print(sys.base_prefix); print(sys.prefix != sys.base_prefix)"
+```
+
+```text title="Output"
+home = C:\Users\ritesh-18\miniconda3
+include-system-site-packages = false
+version = 3.14.6
+executable = C:\Users\ritesh-18\miniconda3\python.exe
+command = C:\Users\ritesh-18\miniconda3\python.exe -m venv ...\.venv
+...\.venv
+C:\Users\ritesh-18\miniconda3
+True
+```
+
+`sys.prefix != sys.base_prefix` is the standard way to detect "am I in a venv?".
+
+<Mermaid chart={`flowchart TB
+  subgraph Base["Base interpreter (miniconda3)"]
+    BP["python.exe"]
+    BL["Lib/ standard library"]
+    BS["site-packages (global)"]
+  end
+  subgraph V1[".venv of project A"]
+    V1P["Scripts/python.exe"]
+    V1C["pyvenv.cfg: home = base"]
+    V1S["site-packages: pydantic 2.x"]
+  end
+  subgraph V2[".venv of project B"]
+    V2P["Scripts/python.exe"]
+    V2S["site-packages: pydantic 1.x"]
+  end
+  V1P --> V1C
+  V1C --> BL
+  V1P --> V1S
+  V2P --> V2S
+  V2P --> BL`} />
+
+The standard library is shared with the base interpreter; only third-party packages are per-environment. A venv is tied to the exact interpreter it was created from. If you upgrade or delete that interpreter, recreate the venv. Never commit `.venv` to git; commit the dependency files instead.
+
+<Callout title="Coming from JS">
+
+| Node | Python |
+|---|---|
+| `package.json` | `pyproject.toml` |
+| `package-lock.json` / `pnpm-lock.yaml` | `uv.lock` (or `requirements.txt` with pinned hashes) |
+| `node_modules/` | `.venv/` (one per project) |
+| `npm install` | `uv sync` |
+| `npm install zod` | `uv add pydantic` |
+| `npx tsc` | `uvx ruff` or `uv run ruff` |
+| `nvm use 20` | `uv python pin 3.14` (writes `.python-version`) |
+
+The key difference: Node resolves `require` by walking up directories looking for `node_modules`, so isolation is automatic. Python imports from whatever `site-packages` the **running interpreter** uses, so you must run the right interpreter. Running the wrong `python` is the number one beginner setup bug.
+</Callout>
+
+### A project with uv
+
+```bash
+uv init orders-api        # creates pyproject.toml, .python-version, main.py
+cd orders-api
+uv add fastapi pydantic   # resolves, writes uv.lock, creates .venv, installs
+uv add --dev pytest ruff
+uv run python main.py     # runs inside .venv, syncing first if needed
+uv run pytest
+uvx ruff check .          # run a tool in a throwaway environment (like npx)
+```
+
+`uv run` checks that `.venv` matches `uv.lock` before every run, so you rarely think about activation. The classic workflow without uv is `python -m venv .venv`, activate, `python -m pip install -r requirements.txt`. Packaging and `pyproject.toml` get a full page later (see packaging-and-environments).
+
+## The Zen of Python
+
+`import this` prints the design principles written by Tim Peters (PEP 20):
+
+```python
+import this
+```
+
+```text title="Output"
+The Zen of Python, by Tim Peters
+
+Beautiful is better than ugly.
+Explicit is better than implicit.
+Simple is better than complex.
+Complex is better than complicated.
+Flat is better than nested.
+Sparse is better than dense.
+Readability counts.
+Special cases aren't special enough to break the rules.
+Although practicality beats purity.
+Errors should never pass silently.
+Unless explicitly silenced.
+In the face of ambiguity, refuse the temptation to guess.
+There should be one-- and preferably only one --obvious way to do it.
+Although that way may not be obvious at first unless you're Dutch.
+Now is better than never.
+Although never is often better than *right* now.
+If the implementation is hard to explain, it's a bad idea.
+If the implementation is easy to explain, it may be a good idea.
+Namespaces are one honking great idea -- let's do more of those!
+```
+
+These lines explain many design choices you will meet:
+
+- **"Explicit is better than implicit"**: methods take `self` explicitly; there is no implicit type coercion between `str` and `int` (`"1" + 1` is a `TypeError`, not `"11"`).
+- **"Errors should never pass silently"**: a missing dict key raises `KeyError` rather than returning `undefined`.
+- **"In the face of ambiguity, refuse the temptation to guess"**: `bytes` and `str` never mix silently.
+- **"One obvious way"**: the language deliberately resists having five ways to do the same thing (though it does not always succeed).
+
+## PEP 8 basics
+
+PEP 8 is the community style guide. You do not memorize it; you run a formatter and linter (**Ruff** does both and is the current default choice; **Black** is the older formatter). Still, know the core conventions because every codebase follows them:
+
+| Thing | Convention | Example |
+|---|---|---|
+| Variables, functions, modules | `snake_case` | `user_id`, `get_user()`, `order_service.py` |
+| Classes, exceptions, type aliases | `PascalCase` | `OrderService`, `NotFoundError` |
+| Constants | `UPPER_SNAKE_CASE` | `MAX_RETRIES = 3` |
+| "Internal" names | leading underscore | `_cache`, `_helper()` |
+| Name clash with keyword | trailing underscore | `class_`, `type_` |
+| Indentation | 4 spaces, never tabs | |
+| Line length | 79 by PEP 8; many teams use 88 (Black/Ruff default) or more | |
+| Imports | one per line, at the top, grouped stdlib, third-party, local | |
+| Comparisons to `None` | `is None`, `is not None` | not `== None` |
+| Boolean checks | `if items:` | not `if len(items) > 0:` |
+
+<Callout title="Coming from JS">
+`camelCase` functions in Python look as foreign as `snake_case` does in TS. Python has no `private` keyword: a single leading underscore is a convention ("don't touch"), and a double leading underscore triggers name mangling inside classes (covered in the classes page). Ruff is roughly ESLint + Prettier in one fast binary.
+</Callout>
+
+## Indentation is syntax
+
+Python has no braces for blocks. A colon ends a block header (`if`, `for`, `def`, `class`, `with`, `try`), and the block is whatever is indented more deeply after it.
+
+Underneath, the **tokenizer** turns indentation into explicit `INDENT` and `DEDENT` tokens using a stack of indentation levels. When a line is indented more than the top of the stack, it pushes and emits `INDENT`. When it is indented less, it pops until it finds a matching level, emitting a `DEDENT` per pop. If no level matches, you get an error. So the parser sees something equivalent to braces; you just do not type them.
+
+```python
+def f():
+    x = 1
+      y = 2
+```
+
+```text title="Output"
+  File "bad.py", line 3
+    y = 2
+IndentationError: unexpected indent
+```
+
+Mixing tabs and spaces in a way that makes the meaning depend on tab width is rejected:
+
+```text title="Output"
+  File "bad2.py", line 3
+    y = 2
+TabError: inconsistent use of tabs and spaces in indentation
+```
+
+Traps and details:
+
+- An empty block is a syntax error. Use `pass` (or `...`) as a placeholder.
+- Inside parentheses, brackets and braces, newlines and indentation are ignored. That is how you split long expressions across lines; prefer this over the backslash `\` line continuation.
+- Configure your editor to insert 4 spaces for Tab. Copy-pasting code from a web page with mixed whitespace is the usual cause of `TabError`.
+
+## Interview questions
+
+**Is Python compiled or interpreted?**
+**Both. CPython compiles source to bytecode (a code object), caches it as `.pyc` for imported modules, and then interprets that bytecode in a stack-based virtual machine. Since 3.11 the interpreter specializes instructions based on observed types; there is an experimental JIT since 3.13, off by default.**
+
+**What is the difference between CPython and PyPy?**
+**CPython is the reference implementation written in C, with the widest library support (especially C extensions like NumPy). PyPy is an alternative implementation with a tracing JIT that is often much faster for pure-Python CPU-bound code but lags in version support and C-extension compatibility.**
+
+**When is a `.pyc` file created and when is it reused?**
+**When a module is imported (not for the script run directly). It is written to `__pycache__` with a version tag in the name and reused on later imports as long as the recorded source mtime and size (or hash) still match.**
+
+**What does `if __name__ == "__main__":` do and why is it needed?**
+**`__name__` is `"__main__"` only for the module being run as the program. The guard keeps entry-point code from running when the file is imported, and it is required for `multiprocessing` on spawn-based platforms, which re-import the main module in each child.**
+
+**Why prefer `python -m pip` over `pip`?**
+**It guarantees the packages go into the environment of that exact interpreter. A bare `pip` on PATH may belong to a different Python.**
+
+**How does a virtual environment work?**
+**It is a directory with its own `site-packages` and a `pyvenv.cfg`. At startup, Python sees `pyvenv.cfg` near its executable, sets `sys.prefix` to the venv and uses its `site-packages`. Activation only edits `PATH`.**
+
+**Why are local variables faster than globals in CPython?**
+**Locals are stored in a fixed array on the frame and accessed by index (`LOAD_FAST`); globals need a dictionary lookup in the module globals and then builtins (`LOAD_GLOBAL`), even though it is cached.**
+
+## Recap
+
+- "Python" is a language; CPython is the reference implementation you almost always use. PyPy, MicroPython and GraalPy exist.
+- CPython compiles to bytecode and interprets it. `dis` shows the bytecode; `__pycache__/*.cpython-3XX.pyc` caches it for imported modules.
+- Importing runs a module's top-level code once. `if __name__ == "__main__":` separates "program" from "library".
+- Use `python -m tool` to run tools with the right interpreter.
+- Use a virtual environment per project; uv manages Python versions, venvs and lockfiles in one tool.
+- Follow PEP 8 via Ruff. Indentation is real syntax, turned into `INDENT` and `DEDENT` tokens.

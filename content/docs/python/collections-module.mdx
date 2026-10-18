@@ -1,0 +1,697 @@
+---
+title: "The collections Module (plus heapq and bisect)"
+description: Specialised containers from the standard library, how each one works underneath, and the realistic backend problems they solve.
+---
+
+The built-in `list`, `dict`, `set` and `tuple` cover most needs, but a handful of recurring patterns (grouping, counting, queues, records, LRU caches, layered config, priority queues, range lookups) each have a purpose-built tool in the standard library. Using them is shorter, faster (most are written in C) and communicates intent to the next reader.
+
+<Callout type="info">
+Snippets run on **CPython 3.14.6**. `collections` lives in `Lib/collections/__init__.py` with C accelerators in `Modules/_collectionsmodule.c`; `heapq` and `bisect` also have C implementations.
+</Callout>
+
+| Tool | Replaces | One-line pitch |
+|---|---|---|
+| `defaultdict` | `setdefault` / "if key not in d" boilerplate | dict that builds missing values on demand |
+| `Counter` | hand-rolled count dicts | multiset with `most_common` and arithmetic |
+| `deque` | `list.pop(0)` queues | O(1) at both ends, optional fixed size |
+| `namedtuple` / `NamedTuple` | bare tuples, tiny classes | tuple with field names |
+| `OrderedDict` | (mostly) plain dict | order-aware equality, `move_to_end` |
+| `ChainMap` | merging dicts repeatedly | layered lookups without copying |
+| `heapq` | sorting to get the min | priority queue on a list |
+| `bisect` | linear search in sorted data | binary search and sorted insert |
+
+## 1. `defaultdict`: a dict that fills its own gaps
+
+### What it is and how it works
+
+`defaultdict(factory)` is a `dict` subclass. When `d[key]` misses, `dict.__getitem__` calls the subclass hook `__missing__(key)`, which `defaultdict` implements as: call `factory()` with no arguments, **store** the result under `key`, return it. Everything else is a normal dict.
+
+```python
+from collections import defaultdict
+orders = [("alice", 120), ("bob", 40), ("alice", 15)]
+by_user = defaultdict(list)
+for user, amount in orders:
+    by_user[user].append(amount)
+print(by_user)
+print(dict(by_user))
+totals = defaultdict(int)
+for user, amount in orders:
+    totals[user] += amount
+print(dict(totals))
+```
+
+```text title="Output"
+defaultdict(<class 'list'>, {'alice': [120, 15], 'bob': [40]})
+{'alice': [120, 15], 'bob': [40]}
+{'alice': 135, 'bob': 40}
+```
+
+`int()` returns `0`, `list()` returns `[]`, `set()` returns an empty set. The factory is any zero-argument callable, so a lambda works for richer defaults:
+
+```python
+from collections import defaultdict
+counts = defaultdict(lambda: {"ok": 0, "err": 0})
+for status in [200, 500, 200, 404]:
+    counts["/login"]["ok" if status < 400 else "err"] += 1
+print(dict(counts))
+```
+
+```text title="Output"
+{'/login': {'ok': 2, 'err': 2}}
+```
+
+### Traps
+
+**Reading creates keys.** Any `d[key]` on a miss inserts it, which is surprising when you only meant to check:
+
+```python
+from collections import defaultdict
+d = defaultdict(list)
+print("x" in d)
+d["x"]
+print("x" in d, dict(d))
+print(d.get("y"), "y" in d)
+```
+
+```text title="Output"
+False
+True {'x': []}
+None False
+```
+
+`in` and `.get()` do **not** trigger the factory. Use them for read-only checks, especially in templates or serializers that might "touch" keys. And before returning a `defaultdict` from an API layer, convert it with `dict(...)` so callers don't inherit the auto-vivifying behaviour.
+
+**Auto-vivifying trees** are a neat trick for building nested JSON, but typos silently create branches:
+
+```python
+from collections import defaultdict
+import json
+def tree():
+    return defaultdict(tree)
+routes = tree()
+routes["api"]["v1"]["users"] = "UsersController"
+print(json.dumps(routes))
+```
+
+```text title="Output"
+{"api": {"v1": {"users": "UsersController"}}}
+```
+
+**Backend use:** grouping query rows by foreign key before building a response (`orders_by_customer[row.customer_id].append(row)`), building adjacency lists for dependency graphs, aggregating metrics per endpoint.
+
+<Callout title="Coming from JS">
+The JS idiom is `(map.get(k) ?? map.set(k, []).get(k)).push(x)` or lodash's `groupBy`. ES2024 added `Object.groupBy` and `Map.groupBy` for the one-shot case. `defaultdict` covers that and also incremental grouping in a loop.
+</Callout>
+
+## 2. `Counter`: counting and multisets
+
+### What it is
+
+A `dict` subclass mapping elements to integer counts. Missing keys return `0` (via `__missing__`, but *without* inserting them), and it adds counting-specific methods.
+
+```python
+from collections import Counter
+log = ["GET /a", "POST /b", "GET /a", "GET /c", "GET /a", "POST /b"]
+c = Counter(log)
+print(c)
+print(c.most_common(2))
+print(c["DELETE /x"])
+print(c.total())
+```
+
+```text title="Output"
+Counter({'GET /a': 3, 'POST /b': 2, 'GET /c': 1})
+[('GET /a', 3), ('POST /b', 2)]
+0
+6
+```
+
+`most_common(k)` uses `heapq.nlargest` under the hood when `k` is given (O(n log k)), and a full sort otherwise. `total()` was added in 3.10.
+
+### Arithmetic
+
+Counters support multiset operations. `+` and `-` add/subtract counts and **drop zero or negative results**; `&` takes the minimum, the pipe operator takes the maximum. The `subtract()` method keeps negatives; unary `+` strips them.
+
+```python
+from collections import Counter
+yesterday = Counter(api=10, web=4, worker=1)
+today = Counter(api=7, web=9)
+print(yesterday + today)
+print(today - yesterday)
+print(yesterday & today, yesterday | today)
+yesterday.subtract(today)
+print(yesterday)
+print(+yesterday)
+```
+
+```text title="Output"
+Counter({'api': 17, 'web': 13, 'worker': 1})
+Counter({'web': 5})
+Counter({'api': 7, 'web': 4}) Counter({'api': 10, 'web': 9, 'worker': 1})
+Counter({'api': 3, 'worker': 1, 'web': -5})
+Counter({'api': 3, 'worker': 1})
+```
+
+### Trap: `update` adds, it doesn't replace
+
+```python
+from collections import Counter
+c = Counter()
+c.update(["a", "b", "a"])
+c.update({"a": 10})
+print(c)
+d = {"a": 1}
+d.update({"a": 10})
+print(d)
+```
+
+```text title="Output"
+Counter({'a': 12, 'b': 1})
+{'a': 10}
+```
+
+Same method name as `dict.update`, opposite semantics. Also note `Counter("hello")` counts *characters*; to count words pass `text.split()`.
+
+**Backend use:** top-N endpoints or error codes from access logs, simple per-process rate-limit tallies, word/token frequency for search or NLP preprocessing, comparing two inventories (`expected - actual` shows what's missing).
+
+## 3. `deque`: a double-ended queue
+
+### How it works underneath
+
+A `deque` ("deck") is a **doubly linked list of fixed-size blocks**, each holding 64 pointers in CPython. Appending or popping at either end touches only the end block, so both ends are **O(1)** without any shifting. The trade-off: indexing into the middle must walk blocks, so `dq[i]` is O(n) toward the centre (O(1) at the ends).
+
+<Mermaid chart={`flowchart LR
+  L["leftblock<br/>64 slots"] <--> M["block<br/>64 slots"] <--> R["rightblock<br/>64 slots"]
+  HL["appendleft / popleft"] --> L
+  HR["append / pop"] --> R
+`} />
+
+```python
+from collections import deque
+q = deque([1, 2, 3])
+q.append(4)
+q.appendleft(0)
+print(q)
+print(q.popleft(), q.pop(), q)
+q.rotate(1)
+print(q)
+q.extendleft([10, 20])
+print(q)
+```
+
+```text title="Output"
+deque([0, 1, 2, 3, 4])
+0 4 deque([1, 2, 3])
+deque([3, 1, 2])
+deque([20, 10, 3, 1, 2])
+```
+
+`extendleft` adds items one by one to the left, so they end up **reversed**.
+
+The performance difference against a list used as a queue is not subtle (200k items, 20k operations each):
+
+```python
+import timeit
+print("list.pop(0)    ", round(timeit.timeit("l.pop(0)", "l=list(range(200_000))", number=20_000), 4))
+print("deque.popleft()", round(timeit.timeit("d.popleft()", "from collections import deque; d=deque(range(200_000))", number=20_000), 4))
+print("list[mid]      ", round(timeit.timeit("l[100_000]", "l=list(range(200_000))", number=20_000), 4))
+print("deque[mid]     ", round(timeit.timeit("d[100_000]", "from collections import deque; d=deque(range(200_000))", number=20_000), 4))
+```
+
+```text title="Output"
+list.pop(0)     5.9335
+deque.popleft() 0.0014
+list[mid]       0.0009
+deque[mid]      0.13
+```
+
+Pick a deque for FIFO work, a list for random access.
+
+### `maxlen`: a ring buffer for free
+
+With `maxlen=n`, appending to a full deque silently discards from the **opposite** end:
+
+```python
+from collections import deque
+recent = deque(maxlen=3)
+for event in ["login", "view", "click", "logout", "login"]:
+    recent.append(event)
+    print(list(recent))
+```
+
+```text title="Output"
+['login']
+['login', 'view']
+['login', 'view', 'click']
+['view', 'click', 'logout']
+['click', 'logout', 'login']
+```
+
+That makes "keep the last N" trivial, including a memory-bounded `tail -n 3` over a file of any size:
+
+```python
+from collections import deque
+import io
+logfile = io.StringIO("".join(f"line {i}\n" for i in range(1, 1001)))
+print(list(deque(logfile, maxlen=3)))
+```
+
+```text title="Output"
+['line 998\n', 'line 999\n', 'line 1000\n']
+```
+
+And BFS, the textbook queue algorithm, here walking a service dependency graph:
+
+```python
+from collections import deque
+graph = {"svc-a": ["svc-b", "svc-c"], "svc-b": ["svc-d"], "svc-c": ["svc-d"], "svc-d": []}
+def bfs(start):
+    seen, order, q = {start}, [], deque([start])
+    while q:
+        node = q.popleft()
+        order.append(node)
+        for nxt in graph[node]:
+            if nxt not in seen:
+                seen.add(nxt)
+                q.append(nxt)
+    return order
+print(bfs("svc-a"))
+```
+
+```text title="Output"
+['svc-a', 'svc-b', 'svc-c', 'svc-d']
+```
+
+**Backend use:** sliding-window rate limiting (store request timestamps, `popleft` while the oldest is outside the window), the last N log lines or errors attached to a crash report, recent-latency samples for a moving average, in-process work queues for BFS-like crawls.
+
+*Threading note:* `append` and `popleft` are atomic in CPython (and documented as thread-safe), so a deque is fine as a simple producer/consumer buffer. If you need blocking waits use `queue.Queue` (threads) or `asyncio.Queue` (coroutines), both built on a deque internally.
+
+<Callout title="Coming from JS">
+JS arrays have `shift`/`unshift`, which are O(n) (V8 has some tricks for small arrays, but don't count on it). There's no built-in deque in JS; people reach for a library or a two-index ring buffer. In Python, `deque` is the standard answer and `list.pop(0)` in a loop is a code smell.
+</Callout>
+
+## 4. `namedtuple` vs `typing.NamedTuple`
+
+### `collections.namedtuple`
+
+A factory that **generates a tuple subclass** with named properties. Instances are real tuples (same memory, immutable, hashable, unpackable); field access is a C-level descriptor that reads by index.
+
+```python
+from collections import namedtuple
+Row = namedtuple("Row", ["id", "email", "active"], defaults=[True])
+r = Row(1, "a@x.io")
+print(r)
+print(r.email, r[1], r._asdict())
+r2 = r._replace(active=False)
+print(r2, r)
+id_, email, active = r
+print(id_, email, active)
+print(Row._fields, isinstance(r, tuple))
+try:
+    r.email = "b@x.io"
+except AttributeError as e:
+    print("AttributeError:", e)
+```
+
+```text title="Output"
+Row(id=1, email='a@x.io', active=True)
+a@x.io a@x.io {'id': 1, 'email': 'a@x.io', 'active': True}
+Row(id=1, email='a@x.io', active=False) Row(id=1, email='a@x.io', active=True)
+1 a@x.io True
+('id', 'email', 'active') True
+AttributeError: can't set attribute
+```
+
+The underscore methods (`_replace`, `_asdict`, `_make`, `_fields`) have a leading underscore only to avoid clashing with your field names; they are public API.
+
+**Backend use:** lightweight row objects from a DB cursor. `sqlite3` and many DB-API drivers return plain tuples; a namedtuple built from `cursor.description` gives readable access with no ORM:
+
+```python
+from collections import namedtuple
+import sqlite3
+conn = sqlite3.connect(":memory:")
+conn.execute("create table users (id integer, email text)")
+conn.executemany("insert into users values (?, ?)", [(1, "a@x.io"), (2, "b@x.io")])
+cur = conn.execute("select id, email from users")
+User = namedtuple("User", [c[0] for c in cur.description])
+for row in map(User._make, cur):
+    print(row)
+```
+
+```text title="Output"
+User(id=1, email='a@x.io')
+User(id=2, email='b@x.io')
+```
+
+### `typing.NamedTuple`
+
+The same thing written as a class with type annotations, which reads better and lets you add methods and docstrings:
+
+```python
+from typing import NamedTuple
+class Point(NamedTuple):
+    x: float
+    y: float = 0.0
+    def dist(self) -> float:
+        return (self.x ** 2 + self.y ** 2) ** 0.5
+p = Point(3, 4)
+print(p, p.dist(), Point(1))
+print(Point("not", "checked"))
+print(p == (3, 4))
+```
+
+```text title="Output"
+Point(x=3, y=4) 5.0 Point(x=1, y=0.0)
+Point(x='not', y='checked')
+True
+```
+
+Two things to notice: annotations are **not enforced at runtime** (a type checker like mypy or Pyright will catch it, Python won't), and a named tuple **equals a plain tuple** with the same values, which can be surprising: `Point(3, 4) == Color(3, 4)` is also `True` for any other 2-field named tuple.
+
+| | `namedtuple` | `typing.NamedTuple` | `@dataclass` |
+|---|---|---|---|
+| Is a tuple | yes | yes | no |
+| Type hints | no | yes | yes |
+| Mutable | no | no | yes by default, `frozen=True` optional |
+| Unpacking, indexing | yes | yes | no |
+| Equal to plain tuples | yes | yes | no |
+| Methods, docstrings | awkward | yes | yes |
+
+Rule of thumb: `typing.NamedTuple` when the thing genuinely *is* a small fixed record you'll unpack or use as a dict key (coordinates, `(host, port)`, a return value with names); a **dataclass** for domain objects (see [Dataclasses, slots and enums](/docs/python/dataclasses-slots-and-enums)); Pydantic models at API boundaries where runtime validation matters.
+
+## 5. `OrderedDict`: still useful after 3.7
+
+Plain dicts keep insertion order now, so `OrderedDict` is no longer needed *for ordering*. It survives for three reasons:
+
+1. **Order-sensitive equality**: two `OrderedDict`s are equal only if their order matches too.
+2. **`move_to_end(key, last=True)`**: O(1) reordering. Plain dicts can't move a key without delete-and-reinsert.
+3. **`popitem(last=False)`**: O(1) removal from the **front** (FIFO). Plain `dict.popitem` only pops the last item.
+
+Underneath, CPython's `OrderedDict` is a dict plus a doubly linked list of keys, which is what makes moves cheap (and why it uses more memory than a dict).
+
+```python
+from collections import OrderedDict
+od = OrderedDict(a=1, b=2, c=3)
+od.move_to_end("a")
+print(list(od))
+od.move_to_end("c", last=False)
+print(list(od))
+print(od.popitem(last=False), list(od))
+print(dict(a=1, b=2) == dict(b=2, a=1), OrderedDict(a=1, b=2) == OrderedDict(b=2, a=1))
+```
+
+```text title="Output"
+['b', 'c', 'a']
+['c', 'b', 'a']
+('c', 3) ['b', 'a']
+True False
+```
+
+### LRU cache in a dozen lines
+
+Those two operations are exactly what an LRU (least recently used) cache needs: on access, move the key to the end; on overflow, evict from the front.
+
+```python
+from collections import OrderedDict
+class LRUCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.data = OrderedDict()
+    def get(self, key):
+        if key not in self.data:
+            return None
+        self.data.move_to_end(key)
+        return self.data[key]
+    def put(self, key, value):
+        self.data[key] = value
+        self.data.move_to_end(key)
+        if len(self.data) > self.capacity:
+            evicted, _ = self.data.popitem(last=False)
+            print("evict", evicted)
+cache = LRUCache(2)
+cache.put("u1", "Asha")
+cache.put("u2", "Ben")
+cache.get("u1")
+cache.put("u3", "Chen")
+print(list(cache.data))
+```
+
+```text title="Output"
+evict u2
+['u1', 'u3']
+```
+
+For memoising a pure function you don't need to write this: `functools.lru_cache` (or `functools.cache` for unbounded) does it for you, in C:
+
+```python
+from functools import lru_cache
+@lru_cache(maxsize=2)
+def load_user(uid):
+    print("db hit", uid)
+    return {"id": uid}
+for uid in [1, 1, 2, 3, 1]:
+    load_user(uid)
+print(load_user.cache_info())
+```
+
+```text title="Output"
+db hit 1
+db hit 2
+db hit 3
+db hit 1
+CacheInfo(hits=1, misses=4, maxsize=2, currsize=2)
+```
+
+Hand-rolled `OrderedDict` caches are still the right tool when you need per-entry control: TTLs, explicit invalidation by key, or caching objects that aren't function results. Neither is shared across worker processes; for that you need Redis or similar.
+
+<Callout title="Coming from JS">
+A JS `Map` also preserves insertion order, and the common LRU trick is `map.delete(k); map.set(k, v)` to move a key to the end, with `map.keys().next().value` as the oldest. `OrderedDict.move_to_end` and `popitem(last=False)` are the explicit, O(1) versions of those moves.
+</Callout>
+
+## 6. `ChainMap`: layered lookups without merging
+
+### What it is
+
+`ChainMap(m1, m2, m3)` presents several mappings as **one view**. Lookups search each map in order and return the first hit. Writes, updates and deletes go **only to the first map**. Nothing is copied, so later changes to any underlying dict are visible immediately.
+
+The classic backend use is **configuration precedence**: CLI flags over environment variables over defaults.
+
+```python
+from collections import ChainMap
+defaults = {"PORT": "8000", "DEBUG": "false", "LOG_LEVEL": "info"}
+env = {"DEBUG": "true"}
+cli = {"PORT": "9000"}
+config = ChainMap(cli, env, defaults)
+print(config["PORT"], config["DEBUG"], config["LOG_LEVEL"])
+config["LOG_LEVEL"] = "debug"
+print(cli)
+print(defaults["LOG_LEVEL"])
+print(dict(config))
+```
+
+```text title="Output"
+9000 true info
+{'PORT': '9000', 'LOG_LEVEL': 'debug'}
+info
+{'PORT': '9000', 'DEBUG': 'true', 'LOG_LEVEL': 'debug'}
+```
+
+The write landed in `cli` (the first map), leaving `defaults` untouched. In real code you'd pass `os.environ` directly as one of the layers.
+
+`new_child()` pushes a fresh empty (or given) map on the front; `parents` drops the front one. That's a scope chain, exactly how you'd model nested variable scopes in a template engine or interpreter:
+
+```python
+from collections import ChainMap
+globals_ = {"x": 1}
+scope = ChainMap(globals_)
+inner = scope.new_child({"x": 2, "y": 3})
+print(inner["x"], inner["y"], scope["x"])
+print(inner.parents["x"], inner.maps)
+```
+
+```text title="Output"
+2 3 1
+1 [{'x': 2, 'y': 3}, {'x': 1}]
+```
+
+When to use it: when the layers have independent lifetimes or are large and you don't want to copy them. When you just need a one-off merged dict, `defaults | env | cli` is simpler (note the reversed order: in a merge the **last** wins, in a `ChainMap` the **first** wins).
+
+<Callout title="Coming from JS">
+`ChainMap` is essentially JavaScript's **prototype chain** as a data structure: reads fall through to the next object, writes land on the first. `Object.create(defaults)` with own properties on top behaves very similarly.
+</Callout>
+
+## 7. Companion: `heapq` (priority queues)
+
+### How it works
+
+`heapq` is not a class; it's a set of functions that maintain the **binary min-heap invariant** on an ordinary list: `heap[k] <= heap[2k+1]` and `heap[k] <= heap[2k+2]`. The smallest item is always `heap[0]`. Push and pop are **O(log n)** (sift up/down one root-to-leaf path), `heapify` is **O(n)**, peeking at `heap[0]` is O(1).
+
+```python
+import heapq
+tasks = [(3, "send-email"), (1, "charge-card"), (2, "resize-image")]
+heapq.heapify(tasks)
+print(tasks[0])
+heapq.heappush(tasks, (0, "page-oncall"))
+while tasks:
+    print(heapq.heappop(tasks))
+```
+
+```text title="Output"
+(1, 'charge-card')
+(0, 'page-oncall')
+(1, 'charge-card')
+(2, 'resize-image')
+(3, 'send-email')
+```
+
+Tuples compare element by element, so `(priority, payload)` sorts by priority.
+
+### Trap: ties fall through to the payload
+
+If two priorities are equal, Python compares the next tuple element. Dicts and most objects aren't orderable:
+
+```python
+import heapq, itertools
+h = [(1, {"id": "a"})]
+try:
+    heapq.heappush(h, (1, {"id": "b"}))
+except TypeError as e:
+    print("TypeError:", e)
+counter = itertools.count()
+pq = []
+for prio, job in [(1, {"id": "a"}), (1, {"id": "b"})]:
+    heapq.heappush(pq, (prio, next(counter), job))
+print([heapq.heappop(pq)[2]["id"] for _ in range(2)])
+```
+
+```text title="Output"
+TypeError: '<' not supported between instances of 'dict' and 'dict'
+['a', 'b']
+```
+
+The `(priority, sequence_number, payload)` pattern fixes it **and** makes equal-priority items FIFO.
+
+### Top-N, max-heaps and merging
+
+```python
+import heapq
+latencies = {"/a": 120, "/b": 950, "/c": 30, "/d": 410, "/e": 700}
+print(heapq.nlargest(3, latencies.items(), key=lambda kv: kv[1]))
+print(heapq.nsmallest(2, [5, 1, 8, 3]))
+print(list(heapq.merge([1, 4, 9], [2, 3, 10])))
+```
+
+```text title="Output"
+[('/b', 950), ('/e', 700), ('/d', 410)]
+[1, 3]
+[1, 2, 3, 4, 9, 10]
+```
+
+`nlargest(k, ...)` keeps a k-sized heap, so it's O(n log k): ideal for "top 10 of a million". `merge` lazily merges already-sorted iterables (think merging sorted log files or paginated results from several shards) without loading everything.
+
+For a max-heap the traditional trick is to push negated numbers. Python **3.14** added public max-heap functions (`heapify_max`, `heappush_max`, `heappop_max` and friends):
+
+```python
+import heapq, sys
+h = []
+for x in [5, 1, 8]:
+    heapq.heappush(h, -x)
+print(-heapq.heappop(h))
+print(sys.version_info[:2], hasattr(heapq, "heappush_max"))
+h2 = []
+for x in [5, 1, 8]:
+    heapq.heappush_max(h2, x)
+print(heapq.heappop_max(h2))
+```
+
+```text title="Output"
+8
+(3, 14) True
+8
+```
+
+**Backend use:** job schedulers (run the task with the earliest `run_at`), Dijkstra-style routing, top-N leaderboards, merging sorted streams, timeouts in an event loop (asyncio keeps its scheduled callbacks in a heap).
+
+## 8. Companion: `bisect` (binary search on sorted lists)
+
+`bisect_left(a, x)` / `bisect_right(a, x)` return the index where `x` would be inserted to keep `a` sorted, in **O(log n)** comparisons. `insort` inserts at that point (the search is O(log n), but the list insert is still O(n) shifting).
+
+The idiomatic use is mapping a value onto **ranges** without an if/elif ladder, e.g. pricing tiers by request count:
+
+```python
+import bisect
+tiers = [0, 1000, 5000, 20000]
+names = ["free", "starter", "growth", "enterprise"]
+def tier_for(requests):
+    return names[bisect.bisect_right(tiers, requests) - 1]
+print([tier_for(n) for n in [0, 999, 1000, 7500, 50000]])
+```
+
+```text title="Output"
+['free', 'free', 'starter', 'growth', 'enterprise']
+```
+
+```python
+import bisect
+scores = [10, 20, 30]
+bisect.insort(scores, 25)
+print(scores)
+print(bisect.bisect_left(scores, 20), bisect.bisect_right(scores, 20))
+events = [(100, "a"), (250, "b"), (400, "c")]
+i = bisect.bisect_left(events, 200, key=lambda e: e[0])
+print(events[i:])
+```
+
+```text title="Output"
+[10, 20, 25, 30]
+1 2
+[(250, 'b'), (400, 'c')]
+```
+
+`bisect_left` lands before equal elements, `bisect_right` after them. The `key=` parameter (3.10+) lets you search records by a field; note the `x` you pass is compared against `key(element)`, so you pass the bare timestamp `200`, not a tuple.
+
+**Backend use:** "find all events after timestamp T" in an in-memory sorted list, percentile and histogram bucketing, IP-range or version-range lookups, rate tiers.
+
+## Interview questions
+
+1. **How does `defaultdict` produce default values, and when does it not?**
+   **Its `__missing__` hook calls the factory and stores the result on a `d[key]` miss; `in`, `get()` and iteration never call the factory.**
+
+2. **Why is a `deque` better than a list for a queue, and when is it worse?**
+   **It's a linked list of fixed-size blocks, so appends and pops at both ends are O(1), whereas `list.pop(0)` is O(n). Indexing into the middle of a deque is O(n), so lists win for random access.**
+
+3. **What does `deque(maxlen=n)` do when full?**
+   **Appending on one end silently drops an item from the other end, giving a bounded ring buffer.**
+
+4. **Why does `OrderedDict` still exist now that dicts are ordered?**
+   **Order-sensitive equality, O(1) `move_to_end`, and `popitem(last=False)`, which together make it ideal for LRU caches and reordering.**
+
+5. **`namedtuple` vs `dataclass`?**
+   **A namedtuple is an immutable tuple subclass (indexable, unpackable, hashable, equal to plain tuples); a dataclass is a regular class with generated methods, mutable by default and not a sequence.**
+
+6. **How does `ChainMap` handle lookups and writes?**
+   **Lookups search each mapping in order and return the first hit; writes and deletes affect only the first mapping. Nothing is copied.**
+
+7. **Why do heap entries often look like `(priority, counter, item)`?**
+   **When priorities tie, tuple comparison falls through to the next element; a monotonically increasing counter prevents comparing unorderable payloads and keeps equal priorities FIFO.**
+
+8. **What's the complexity of `bisect.insort` on a list?**
+   **O(log n) to find the position but O(n) overall, because inserting into a list shifts the tail.**
+
+## Recap
+
+- `defaultdict` builds missing values via `__missing__`; reads with `[]` create keys, `in`/`get` don't.
+- `Counter` is a multiset: `most_common`, `total`, and arithmetic that drops non-positive counts; its `update` **adds**.
+- `deque` gives O(1) at both ends and a free ring buffer via `maxlen`; it's the right queue, not `list.pop(0)`.
+- `namedtuple` / `typing.NamedTuple` are named, immutable tuples; prefer dataclasses for domain objects.
+- `OrderedDict` earns its keep with `move_to_end` and FIFO `popitem` (LRU caches); `functools.lru_cache` handles memoisation.
+- `ChainMap` layers mappings for config precedence and scopes without copying.
+- `heapq` turns a list into a min-heap (3.14 adds max-heap functions); `bisect` does binary search and range lookups on sorted lists.
+
+## Sources
+
+- [`collections` documentation (`Counter.total` added in 3.10, `namedtuple` defaults added in 3.7, `OrderedDict` vs `dict`)](https://docs.python.org/3/library/collections.html)
+- [`heapq` documentation (max-heap functions added in 3.14)](https://docs.python.org/3/library/heapq.html)
+- [`bisect` documentation](https://docs.python.org/3/library/bisect.html)
+- [`functools.lru_cache` documentation](https://docs.python.org/3/library/functools.html#functools.lru_cache)
+- [`typing.NamedTuple` documentation](https://docs.python.org/3/library/typing.html#typing.NamedTuple)

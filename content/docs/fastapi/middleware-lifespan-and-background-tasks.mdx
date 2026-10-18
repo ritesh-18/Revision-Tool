@@ -1,0 +1,804 @@
+---
+title: "Middleware, lifespan and background tasks"
+description: "The code that runs around your endpoints: the middleware onion and its execution order, @app.middleware('http') vs pure ASGI middleware and why pure ASGI wins for streaming, request-ID and timing middleware, CORS, GZip and TrustedHost, the lifespan context manager with app.state and shared clients, and BackgroundTasks vs real task queues."
+---
+
+Endpoints are not the only code in a FastAPI app. Some code runs **around every request** (middleware), some runs **once per process** (lifespan), and some runs **after the response** (background tasks). Each has a precise place in the ASGI call chain, and most bugs here come from not knowing that place: a timing header that measures nothing, a request ID missing from exactly the responses you need to debug, an HTTP client created per request, an email that silently never gets sent.
+
+All snippets were run on **CPython 3.14.6** with **FastAPI 0.143.0**, **Starlette 1.8.0**, **Uvicorn 0.54.0** and **httpx 0.28.1**. It helps to have read [ASGI and the request lifecycle](/docs/fastapi/asgi-and-the-request-lifecycle) first.
+
+## Middleware is an onion
+
+An ASGI app is an async callable `app(scope, receive, send)`. **Middleware** is an ASGI app that wraps another ASGI app: it receives the call, may inspect or change `scope`, `receive` and `send`, and calls the inner app. Stack several and you get an onion. A request travels inwards through every layer, and the response travels back out through the same layers in reverse.
+
+<Mermaid chart={`flowchart LR
+  subgraph SE["ServerErrorMiddleware, always outermost"]
+    subgraph U1["your middleware added LAST"]
+      subgraph U2["your middleware added FIRST"]
+        subgraph EX["ExceptionMiddleware"]
+          subgraph AS["AsyncExitStackMiddleware"]
+            R["Router and endpoint"]
+          end
+        end
+      end
+    end
+  end
+  C["Client"] -->|request| SE
+  SE -->|response| C`} />
+
+`app.build_middleware_stack()` builds the chain when the app first receives a request. With no user middleware, it is:
+
+```python
+from fastapi import FastAPI
+app = FastAPI()
+x = app.build_middleware_stack()
+while type(x).__name__ != "APIRouter":
+    print(type(x).__module__ + "." + type(x).__name__)
+    x = x.app
+print("APIRouter")
+```
+
+```text title="Output"
+starlette.middleware.errors.ServerErrorMiddleware
+fastapi.telemetry._asgi.ExceptionTelemetryMiddleware
+starlette.middleware.exceptions.ExceptionMiddleware
+fastapi.middleware.asyncexitstack.AsyncExitStackMiddleware
+APIRouter
+```
+
+- **`ServerErrorMiddleware`** is outermost. It catches any unhandled exception, logs it, and sends a plain 500 (or the debug traceback page with `debug=True`). Handlers registered for `500` or `Exception` run here.
+- **`ExceptionMiddleware`** runs your `@app.exception_handler(...)` handlers for `HTTPException`, `RequestValidationError` and your own exception classes.
+- **`AsyncExitStackMiddleware`** holds the exit stack that `yield` dependencies with `scope="request"` are registered on (see [dependency injection](/docs/fastapi/dependency-injection)).
+- `ExceptionTelemetryMiddleware` belongs to FastAPI 0.143's built-in OpenTelemetry support.
+- **Your middleware goes between `ServerErrorMiddleware` and `ExceptionMiddleware`.**
+
+### Execution order
+
+`add_middleware` **prepends**: each call wraps everything added before it. So the middleware added **last** is the **outermost** user layer and runs first.
+
+```python
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+class Tag:
+    """Pure ASGI middleware that logs on the way in and on the way out."""
+    def __init__(self, app, name: str):
+        self.app = app
+        self.name = name
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        print(f"-> {self.name}")
+        await self.app(scope, receive, send)
+        print(f"<- {self.name}")
+
+
+app.add_middleware(Tag, name="A (added first)")
+app.add_middleware(Tag, name="B (added second)")
+
+
+@app.middleware("http")
+async def c(request: Request, call_next):
+    print("-> C (@app.middleware, defined last)")
+    response = await call_next(request)
+    print("<- C")
+    return response
+
+
+@app.get("/")
+def root():
+    print("   endpoint")
+    return {"ok": True}
+
+
+TestClient(app).get("/")
+print([m.cls.__name__ + (f"({m.kwargs.get('name')})" if m.kwargs.get('name') else "")
+       for m in app.user_middleware])
+```
+
+```text title="Output"
+-> C (@app.middleware, defined last)
+-> B (added second)
+-> A (added first)
+   endpoint
+<- C
+<- A (added first)
+<- B (added second)
+['BaseHTTPMiddleware', 'Tag(B (added second))', 'Tag(A (added first))']
+```
+
+The way **in** is exactly as expected: C, B, A, endpoint. The way **out** is not a mirror image: `<- C` printed **before** A and B finished. That's the first hint that `@app.middleware("http")` is not a plain onion layer.
+
+<Callout title="Order matters for real middleware">
+Put `CORSMiddleware` **outermost** (add it last), so that even error responses and responses produced by other middleware (like a 401 from an auth middleware or a 429 from a rate limiter) carry CORS headers. Otherwise the browser shows a misleading CORS error instead of the real status. Put a request-ID/logging middleware near the outside too, so it sees and tags everything.
+</Callout>
+
+## `@app.middleware("http")` vs pure ASGI middleware
+
+There are two ways to write middleware.
+
+**`@app.middleware("http")`** is sugar for Starlette's `BaseHTTPMiddleware`. You get a `Request` and a `call_next` function, and you return a `Response`. It's easy to write. Here is what `call_next` actually does (Starlette 1.8, `starlette/middleware/base.py`):
+
+1. It starts the inner app in a **separate task** inside an AnyIO task group.
+2. It gives the inner app a fake `send` that pushes messages into an in-memory stream.
+3. As soon as the inner app sends `http.response.start` (status and headers), `call_next` **returns** a `_StreamingResponse` whose body iterator reads the rest of the stream.
+4. When you return that response, Starlette streams the body out, chunk by chunk, while the inner task keeps producing it.
+
+So `call_next` returns when the **headers** are ready, not when the response is finished. That's why `<- C` printed early. It's harmless for small JSON responses. For streaming responses, it changes what your code measures.
+
+**Pure ASGI middleware** is a class with `__call__(scope, receive, send)`. You wrap `send` to observe or modify outgoing messages and call the inner app directly. There are no extra tasks, no streams and no `Request`/`Response` objects. Your code after `await self.app(...)` runs when the response is **completely** sent.
+
+### The streaming difference, measured
+
+A timing middleware in both styles, around an endpoint that streams 3 chunks 0.5 s apart (like an LLM token stream):
+
+```python
+import asyncio
+import time
+
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+
+T0 = time.perf_counter()
+def now(): return f"{time.perf_counter() - T0:4.1f}s"
+
+
+async def slow_stream():
+    for i in range(3):
+        await asyncio.sleep(0.5)
+        print(f"  {now()} chunk {i} produced")
+        yield f"chunk {i}\n"
+
+
+# --- version 1: @app.middleware("http") -----------------------------------
+app1 = FastAPI()
+
+@app1.middleware("http")
+async def timing(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed = time.perf_counter() - start
+    response.headers["X-Process-Time"] = f"{elapsed:.2f}"
+    print(f"  {now()} http middleware: call_next returned after {elapsed:.2f}s")
+    return response
+
+@app1.get("/stream")
+async def stream1():
+    return StreamingResponse(slow_stream())
+
+
+# --- version 2: pure ASGI ---------------------------------------------------
+class TimingMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        start = time.perf_counter()
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                ttfb = time.perf_counter() - start
+                message.setdefault("headers", [])
+                message["headers"].append((b"x-time-to-headers", f"{ttfb:.2f}".encode()))
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            print(f"  {now()} ASGI middleware: full response took {time.perf_counter() - start:.2f}s")
+
+
+app2 = FastAPI()
+app2.add_middleware(TimingMiddleware)
+
+@app2.get("/stream")
+async def stream2():
+    return StreamingResponse(slow_stream())
+
+
+print("@app.middleware('http'):")
+r = TestClient(app1).get("/stream")
+print("  header X-Process-Time =", r.headers["x-process-time"])
+T0 = time.perf_counter()
+print("pure ASGI:")
+r = TestClient(app2).get("/stream")
+print("  header x-time-to-headers =", r.headers["x-time-to-headers"])
+```
+
+```text title="Output"
+@app.middleware('http'):
+   0.0s http middleware: call_next returned after 0.00s
+   0.5s chunk 0 produced
+   1.0s chunk 1 produced
+   1.5s chunk 2 produced
+  header X-Process-Time = 0.00
+pure ASGI:
+   0.5s chunk 0 produced
+   1.0s chunk 1 produced
+   1.5s chunk 2 produced
+   1.5s ASGI middleware: full response took 1.53s
+  header x-time-to-headers = 0.00
+```
+
+The `BaseHTTPMiddleware` version reports **0.00 s** for a response that took 1.5 s. Its "after" code ran before the first chunk existed. The pure ASGI version knows both numbers: time to headers (which must be sent before the body, so that's all a header can carry) and total duration (which it can log or record as a metric).
+
+Note the fundamental limit too: once headers are sent, they're gone. No middleware of either kind can put the **total** duration of a streaming response into a header. Record it in logs or metrics instead.
+
+### The overhead, measured
+
+Three pass-through layers of each kind, driven in-process with `httpx.ASGITransport` (no network), 3,000 requests each:
+
+```python
+def make_app(kind: str, layers: int = 3) -> FastAPI:
+    app = FastAPI()
+
+    @app.get("/")
+    async def root():
+        return {"ok": True}
+
+    for _ in range(layers):
+        if kind == "http":
+            @app.middleware("http")
+            async def passthrough(request: Request, call_next):
+                return await call_next(request)
+        elif kind == "asgi":
+            class Passthrough:
+                def __init__(self, app): self.app = app
+                async def __call__(self, scope, receive, send):
+                    await self.app(scope, receive, send)
+            app.add_middleware(Passthrough)
+    return app
+```
+
+```text title="Output (two runs)"
+ none:    207 us per request
+ asgi:    198 us per request
+ http:    889 us per request
+ none:    215 us per request
+ asgi:    225 us per request
+ http:    906 us per request
+```
+
+Pure ASGI layers cost nothing measurable. Each `BaseHTTPMiddleware` layer cost about 230 µs here, from the task group, the memory stream and the extra `Request`/`Response` objects. On a real network that's small compared with a database query, but it's paid on every request, for every layer.
+
+### When to use which
+
+| | `@app.middleware("http")` | Pure ASGI |
+|---|---|---|
+| Effort | a few lines, uses `Request`/`Response` | must work with raw ASGI messages |
+| Runs "after" code | when headers are ready | when the response is fully sent |
+| Streaming / SSE / large files | timing and body handling are misleading | correct |
+| WebSockets and lifespan | HTTP only | sees every scope type (you choose) |
+| Overhead | a task and a stream per request | one function call |
+| Reading the request body | consumes the body stream; tricky | wrap `receive` |
+
+Use `@app.middleware("http")` for quick, header-only logic on ordinary JSON APIs. Use pure ASGI for anything reusable, anything that measures time, and anything in an app that streams, which includes every LLM backend (see [streaming LLM responses](/docs/fastapi/streaming-llm-responses)).
+
+## A request-ID and access-log middleware
+
+Every log line for a request should carry the same ID, so you can find all of them later. The ID should also go back to the client in a response header, so a user can quote it in a bug report. If a gateway already assigned one, reuse it. A `ContextVar` makes the ID visible to every log call in the request without passing it around, because each asyncio task gets its own copy of the context.
+
+```python
+import logging
+import sys
+import time
+import uuid
+from contextvars import ContextVar
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from starlette.datastructures import MutableHeaders
+
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_var.get()
+        return True
+
+
+handler = logging.StreamHandler(sys.stdout)
+handler.addFilter(RequestIdFilter())
+handler.setFormatter(logging.Formatter("%(levelname)s [%(request_id)s] %(message)s"))
+log = logging.getLogger("app")
+log.addHandler(handler)
+log.setLevel(logging.INFO)
+log.propagate = False
+
+
+class RequestContextMiddleware:
+    """Request ID + access log + timing, as a pure ASGI middleware."""
+
+    def __init__(self, app, header: str = "x-request-id"):
+        self.app = app
+        self.header = header
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        incoming = dict(scope["headers"]).get(self.header.encode())
+        rid = incoming.decode() if incoming else uuid.uuid4().hex[:12]
+        token = request_id_var.set(rid)
+        scope.setdefault("state", {})["request_id"] = rid
+        start = time.perf_counter()
+        status = None
+
+        async def send_wrapper(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                headers = MutableHeaders(scope=message)
+                headers.append(self.header, rid)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            if status is None:                        # crashed before sending anything
+                await send_wrapper({"type": "http.response.start", "status": 500,
+                                    "headers": [(b"content-type", b"text/plain")]})
+                await send_wrapper({"type": "http.response.body",
+                                    "body": b"Internal Server Error"})
+            raise                                     # let the server log the traceback
+        finally:
+            ms = (time.perf_counter() - start) * 1000
+            log.info("%s %s -> %s in %.1fms", scope["method"], scope["path"], status, ms)
+            request_id_var.reset(token)
+
+
+app = FastAPI()
+app.add_middleware(RequestContextMiddleware)
+
+
+@app.get("/orders/{order_id}")
+async def get_order(order_id: int):
+    log.info("loading order %s", order_id)          # same request id, no plumbing
+    return {"order_id": order_id}
+
+
+@app.get("/crash")
+async def crash():
+    raise RuntimeError("boom")
+
+
+client = TestClient(app, raise_server_exceptions=False)
+r = client.get("/orders/7")
+print("response header:", r.headers["x-request-id"])
+r = client.get("/orders/8", headers={"X-Request-ID": "from-gateway-123"})
+print("response header:", r.headers["x-request-id"])
+r = client.get("/crash")
+print("crash:", r.status_code, r.text, r.headers.get("x-request-id"))
+```
+
+```text title="Output"
+INFO [b41587a00dcc] loading order 7
+INFO [b41587a00dcc] GET /orders/7 -> 200 in 1.1ms
+response header: b41587a00dcc
+INFO [from-gateway-123] loading order 8
+INFO [from-gateway-123] GET /orders/8 -> 200 in 0.3ms
+response header: from-gateway-123
+INFO [21817df9f2b2] GET /crash -> 500 in 0.3ms
+crash: 500 Internal Server Error 21817df9f2b2
+```
+
+The mechanics, piece by piece:
+
+- **Headers are raw bytes in the scope.** `scope["headers"]` is a list of `(bytes, bytes)` pairs with lowercase names. `MutableHeaders(scope=message)` edits the outgoing header list in place.
+- **`scope["state"]`** is the dict behind `request.state`, so endpoints can read `request.state.request_id`.
+- **`request_id_var.reset(token)`** restores the previous value. It matters when the same task handles several requests, as with HTTP keep-alive in some servers.
+- **The `except` branch** exists because of the onion. An unhandled exception propagates **through** your middleware up to `ServerErrorMiddleware`, which sits outside it and builds the 500 there. Without the fallback, the 500 (the response you most need to trace) would go out **without** the request ID. Running the same code without the `except` block gave `crash: 500 False` for "has an x-request-id header". The fallback sends its own 500 first, then re-raises so the server still logs the traceback. `ServerErrorMiddleware` sees that a response already started and doesn't send a second one.
+
+<Callout type="warn">
+User data in a request ID header is untrusted. If you echo an incoming `X-Request-ID` into logs, validate its length and characters first (for example, at most 64 characters of `[A-Za-z0-9-]`), or a client can inject fake log lines or huge values.
+</Callout>
+
+## Built-in middleware: CORS, GZip, TrustedHost
+
+### CORSMiddleware
+
+[Authentication and security](/docs/fastapi/authentication-and-security#cors-is-not-authentication) covers CORS in depth, including real preflight responses. The short version for configuration:
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(                       # add it LAST so it is outermost
+    CORSMiddleware,
+    allow_origins=["https://app.example.com"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+    allow_credentials=True,
+    max_age=600,                          # browsers cache preflights for 10 min
+)
+```
+
+It answers `OPTIONS` preflights itself, before routing, and adds `Access-Control-*` headers to normal responses from allowed origins. The defaults are restrictive: only `GET`, no extra headers and no credentials.
+
+### GZipMiddleware
+
+```python
+from fastapi import FastAPI, Request
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
+app.add_middleware(TrustedHostMiddleware,
+                   allowed_hosts=["api.example.com", "*.example.com", "testserver"])
+
+
+@app.get("/small")
+def small():
+    return {"msg": "hi"}
+
+
+@app.get("/big")
+def big():
+    return {"rows": [{"id": i, "name": f"row {i}", "status": "active"} for i in range(200)]}
+
+
+c = TestClient(app)
+for path in ["/small", "/big"]:
+    r = c.get(path, headers={"Accept-Encoding": "gzip"})
+    print(path, r.status_code, "content-encoding:", r.headers.get("content-encoding"),
+          "| wire bytes:", r.headers.get("content-length"), "| decoded bytes:", len(r.content),
+          "| vary:", r.headers.get("vary"))
+
+r = c.get("/small", headers={"Host": "evil.attacker.net"})
+print("bad host:", r.status_code, r.text)
+r = c.get("/small", headers={"Host": "eu.example.com"})
+print("wildcard host:", r.status_code, r.json())
+```
+
+```text title="Output"
+/small 200 content-encoding: None | wire bytes: 12 | decoded bytes: 12 | vary: None
+/big 200 content-encoding: gzip | wire bytes: 1026 | decoded bytes: 8990 | vary: Accept-Encoding
+bad host: 400 Invalid host header
+wildcard host: 200 {'msg': 'hi'}
+```
+
+- Only responses at least `minimum_size` bytes long are compressed (the Starlette default is 500). Tiny bodies would grow.
+- The 9 KB JSON shrank to about 1 KB, an 89% saving, because JSON is repetitive.
+- `Vary: Accept-Encoding` tells caches to store compressed and uncompressed versions separately.
+- Compression costs CPU on the event loop. In Starlette 1.8 bodies over 128 KiB (`thread_minimum_size`) are compressed in a thread. Lower `compresslevel` trades size for speed. The Starlette default is 9 (slowest).
+- Starlette skips already-compressed or streaming types by default: images, audio, video, zip, gRPC, and `text/event-stream`. Compressing SSE would buffer tokens inside the compressor and break the streaming.
+- In production, a reverse proxy or CDN often does compression better. Do it in one place, not both.
+
+### TrustedHostMiddleware
+
+It rejects requests whose `Host` header isn't in the allow list, with `400 Invalid host header`. This defends against **Host header attacks**: if your app builds absolute URLs from the `Host` header (password-reset links, redirects, `request.url_for`), an attacker who sends `Host: evil.attacker.net` can make your app generate links pointing to their site. `*.example.com` matches any subdomain. `testserver` is the host `TestClient` uses.
+
+## Lifespan: startup and shutdown
+
+Some objects must exist **once per process** and be closed cleanly: a database engine with its pool, an `httpx.AsyncClient` with its connection pool, a loaded ML model, a Redis client. The **lifespan** is an async context manager that runs once when the server starts and once when it stops. The code before `yield` is startup, and the code after is shutdown. If [context managers](/docs/python/context-managers) are new, read that page first.
+
+```python
+from contextlib import asynccontextmanager
+from typing import Annotated, TypedDict
+
+import httpx
+from fastapi import Depends, FastAPI, Request
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+
+def fake_upstream(request: httpx.Request) -> httpx.Response:
+    # stands in for a real API so the example runs offline
+    return httpx.Response(200, json={"rate": 1.08, "path": request.url.path})
+
+
+class State(TypedDict):
+    http: httpx.AsyncClient
+    engine: AsyncEngine
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("startup: creating engine and HTTP client")
+    engine = create_async_engine("sqlite+aiosqlite://")
+    http = httpx.AsyncClient(
+        base_url="https://rates.example.com",
+        timeout=httpx.Timeout(5.0),
+        transport=httpx.MockTransport(fake_upstream),
+    )
+    async with engine.connect() as conn:                 # fail fast if the DB is down
+        await conn.execute(text("select 1"))
+    app.state.settings = {"currency": "EUR"}             # option 1: app.state
+    try:
+        yield {"http": http, "engine": engine}           # option 2: lifespan state
+    finally:
+        print("shutdown: closing HTTP client and disposing engine")
+        await http.aclose()
+        await engine.dispose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_http(request: Request) -> httpx.AsyncClient:
+    return request.state.http
+
+
+HttpDep = Annotated[httpx.AsyncClient, Depends(get_http)]
+
+
+@app.get("/convert")
+async def convert(amount: float, http: HttpDep, request: Request):
+    r = await http.get("/latest")
+    rate = r.json()["rate"]
+    return {"amount": amount, "converted": round(amount * rate, 2),
+            "currency": request.app.state.settings["currency"],
+            "same_client_object": id(http)}
+
+
+print("before TestClient: no lifespan has run yet")
+with TestClient(app) as client:
+    a = client.get("/convert?amount=100").json()
+    b = client.get("/convert?amount=5").json()
+    print(a)
+    print(b["converted"], "same client both times:", a["same_client_object"] == b["same_client_object"])
+print("after the with block")
+
+print("--- without 'with': lifespan does not run")
+try:
+    TestClient(app).get("/convert?amount=1")
+except Exception as e:
+    print(type(e).__name__, ":", e)
+```
+
+```text title="Output"
+before TestClient: no lifespan has run yet
+startup: creating engine and HTTP client
+{'amount': 100.0, 'converted': 108.0, 'currency': 'EUR', 'same_client_object': 3687674028304}
+5.4 same client both times: True
+shutdown: closing HTTP client and disposing engine
+after the with block
+--- without 'with': lifespan does not run
+AttributeError : 'State' object has no attribute 'http'
+```
+
+### How it works
+
+The server speaks the ASGI **lifespan protocol** with your app: it calls the app once with `scope["type"] == "lifespan"` and sends `lifespan.startup`. Starlette enters your context manager and replies `lifespan.startup.complete` when it reaches `yield`. Only then does the server accept connections. On shutdown (SIGTERM, Ctrl+C), the server stops accepting connections, waits for in-flight requests, sends `lifespan.shutdown`, and Starlette resumes your generator after `yield`.
+
+<Mermaid chart={`sequenceDiagram
+  participant S as Uvicorn
+  participant L as lifespan
+  participant R as Requests
+  S->>L: lifespan.startup
+  L->>L: create engine, HTTP client, load model
+  L-->>S: startup.complete at yield
+  S->>R: accept connections
+  R->>R: handle many requests sharing the objects
+  S->>S: SIGTERM, stop accepting, drain in-flight
+  S->>L: lifespan.shutdown
+  L->>L: code after yield, close and dispose
+  L-->>S: shutdown.complete`} />
+
+### Two ways to share objects
+
+1. **`app.state`** is a plain attribute bag on the app. Set it in the lifespan and read it via `request.app.state.x`. Simple, but untyped and global.
+2. **Yield a dict** from the lifespan. Starlette stores it in the lifespan scope's `state`, and the server (Uvicorn, or `TestClient`) puts a shallow copy into every request's `scope["state"]`, so endpoints read `request.state.http`. The copy is shallow: rebinding a key in one request doesn't leak into others, but mutating a shared object does. Wrapping access in a dependency (`HttpDep` above) keeps endpoints clean and lets tests override it.
+
+Either way, wrap access in a dependency. Endpoints then don't know where the client lives, and `app.dependency_overrides[get_http]` swaps it in tests.
+
+### Why one shared client matters
+
+`httpx.AsyncClient` holds a **connection pool**. Creating one per request means a new TCP and TLS handshake to the upstream every time (often 50 to 150 ms to a distant API), plus sockets left in `TIME_WAIT`. A shared client reuses warm connections. The same reasoning applies to the database engine in [Databases with SQLAlchemy](/docs/fastapi/databases-with-sqlalchemy). LLM SDK clients (OpenAI, Anthropic) are httpx clients underneath, so create them once in the lifespan too (see [calling LLM APIs](/docs/fastapi/calling-llm-apis)).
+
+### Startup failures
+
+If startup raises, the server refuses to start. That's what you want: a pod that can't reach its database should fail its rollout, not serve 500s.
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("startup: connecting to database...", flush=True)
+    raise ConnectionRefusedError("db:5432 connection refused")
+    yield
+```
+
+```text title="Terminal: uvicorn ls2:app, then the shell's exit code (traceback trimmed)"
+INFO:     Started server process [28920]
+INFO:     Waiting for application startup.
+startup: connecting to database...
+ERROR:    Traceback (most recent call last):
+ConnectionRefusedError: db:5432 connection refused
+
+ERROR:    Application startup failed. Exiting.
+exit code: 3
+```
+
+<Callout title="Lifespan details that bite">
+- **`TestClient` runs the lifespan only inside `with TestClient(app) as client:`.** Without `with`, startup never ran, which is why the last request above failed with `AttributeError`.
+- **Each worker process runs its own lifespan.** With 4 Uvicorn workers you get 4 engines and 4 HTTP clients. That's correct, since pools can't be shared across processes. It also means lifespan is the wrong place for one-off tasks like migrations.
+- **`@app.on_event("startup")` is deprecated.** It still works in 0.143 but emits `DeprecationWarning: on_event is deprecated, use lifespan event handlers instead.` Don't mix the two: in a quick test with both, the `lifespan=` context manager ran and the `@app.on_event("startup")` handler was **silently skipped**.
+- **Use `try/finally` around `yield`**, so cleanup runs even if shutdown is triggered by an error.
+- Shutdown code only runs on a **graceful** stop. `SIGKILL`, an OOM kill or a power loss skips it. See [graceful shutdown](/docs/backend-first-principles/19-graceful-shutdown).
+</Callout>
+
+## Background tasks
+
+`BackgroundTasks` lets an endpoint schedule work to run **after the response is sent**: a welcome email, an audit log write, a cache warm-up. Add the `BackgroundTasks` parameter and FastAPI injects one per request. Here's when everything actually runs:
+
+```python
+import threading
+import time
+from typing import Annotated
+
+from fastapi import BackgroundTasks, Depends, FastAPI
+from fastapi.testclient import TestClient
+
+T0 = time.perf_counter()
+def log(msg): print(f"{time.perf_counter() - T0:4.2f}s {msg}")
+
+
+class SendSpy:
+    def __init__(self, app): self.app = app
+    async def __call__(self, scope, receive, send):
+        async def spy(message):
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                log("[server] response fully sent")
+        await self.app(scope, receive, spy)
+        log("[server] ASGI app call returned, request finished")
+
+
+app = FastAPI()
+app.add_middleware(SendSpy)
+
+
+def get_session():
+    log("dep: session opened")
+    yield "session"
+    log("dep: session closed (scope=request teardown)")
+
+
+def send_welcome_email(email: str):
+    log(f"task 1: emailing {email} on thread {threading.current_thread().name!r}")
+    time.sleep(0.3)
+    log("task 1: done")
+
+
+async def record_signup(email: str):
+    log(f"task 2: recording signup for {email} on thread {threading.current_thread().name!r}")
+
+
+@app.post("/signup")
+async def signup(email: str, tasks: BackgroundTasks,
+                 session: Annotated[str, Depends(get_session)]):
+    tasks.add_task(send_welcome_email, email)
+    tasks.add_task(record_signup, email)
+    log("endpoint: returning")
+    return {"status": "created"}
+
+
+client = TestClient(app)
+r = client.post("/signup?email=ada@example.com")
+log(f"client got {r.status_code} {r.json()}")
+```
+
+```text title="Output"
+0.08s dep: session opened
+0.08s endpoint: returning
+0.09s [server] response fully sent
+0.09s task 1: emailing ada@example.com on thread 'AnyIO worker thread'
+0.39s task 1: done
+0.39s task 2: recording signup for ada@example.com on thread 'asyncio-portal-2eff2af1390'
+0.39s dep: session closed (scope=request teardown)
+0.39s [server] ASGI app call returned, request finished
+0.39s client got 200 {'status': 'created'}
+```
+
+What this shows:
+
+1. **The response goes out first.** A real client has its 200 at 0.09 s. (`TestClient` only returns once the whole ASGI call finishes, so here the client line appears last. Over a real socket, the client is long gone by then.)
+2. **Tasks run sequentially, in the order added.** Task 2 waited for task 1's 0.3 s sleep.
+3. **Sync tasks run in the threadpool, async tasks on the event loop**, the same rule as endpoints and dependencies. A blocking call in an `async def` task freezes the server.
+4. **They run inside the request's ASGI call.** Background tasks are attached to the `Response` object and awaited by `Response.__call__` right after the last body byte is sent. So the request isn't "finished" until they complete. Request-scoped `yield` dependencies tear down **after** the tasks, which means a background task can still use the request's DB session, but that session holds a pooled connection the whole time.
+
+### When a background task fails
+
+The same code under a real Uvicorn server, where the first task raises:
+
+```python
+def flaky_email(email: str):
+    print("task 1 running", flush=True)
+    raise ConnectionError("smtp.example.com:587 refused")
+
+def record_signup(email: str):
+    print("task 2 ran", flush=True)
+
+@app.post("/signup")
+def signup(email: str, tasks: BackgroundTasks):
+    tasks.add_task(flaky_email, email)
+    tasks.add_task(record_signup, email)
+    return {"status": "created"}
+```
+
+```text title="Output (client, then Uvicorn's log; traceback trimmed)"
+CLIENT: 200 {'status': 'created'} 41ms
+INFO:     127.0.0.1:63703 - "POST /signup?email=bob%40example.com HTTP/1.1" 200 OK
+task 1 running
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+ConnectionError: smtp.example.com:587 refused
+```
+
+- The client got **200**. It will never learn that the email failed.
+- **"task 2 ran" never printed.** An exception in one task aborts the remaining tasks of that request.
+- There's **no retry**. The only trace is a log line. If nobody alerts on `Exception in ASGI application`, the failure is silent.
+
+Wrap each task body in `try/except` with logging if the tasks are independent, and accept that failures are best-effort.
+
+### What happens if the worker dies
+
+Background tasks live **in the worker's memory**, as a list of callables on a response object. Nothing is persisted.
+
+- **Deploys and scale-downs:** on SIGTERM, Uvicorn stops accepting connections and waits for in-flight requests, including their background tasks, up to `--timeout-graceful-shutdown` (no limit by default). Kubernetes then kills the pod after `terminationGracePeriodSeconds` (30 s by default). A task still running at that point is lost.
+- **Crashes, OOM kills, `SIGKILL`:** every pending and running task is lost, with no record that it ever existed.
+- **CPU-heavy tasks** (PDF rendering, image resizing, embeddings) steal CPU from the same process that serves requests, raising latency for everyone.
+
+### BackgroundTasks vs a real task queue
+
+<Mermaid chart={`flowchart LR
+  subgraph BT["BackgroundTasks"]
+    E1["Endpoint"] --> M["Task list in worker memory"]
+    M --> RUN1["Runs in same process after response"]
+  end
+  subgraph Q["Task queue"]
+    E2["Endpoint"] --> BR[("Broker<br/>Redis, RabbitMQ, SQS, Postgres")]
+    BR --> W1["Worker process 1"]
+    BR --> W2["Worker process 2"]
+    W1 -. ack or retry .-> BR
+  end`} />
+
+| | `BackgroundTasks` | Task queue (Celery, arq, Dramatiq, RQ, SQS, Temporal) |
+|---|---|---|
+| Survives a crash or deploy | no | yes, the message is persisted in the broker |
+| Retries with backoff | no | yes |
+| Runs where | the web worker, after the response | separate worker processes, scaled independently |
+| Visibility | a log line on failure | job status, dead-letter queue, dashboards |
+| Scheduling, delays, rate limits | no | yes |
+| Setup | none | a broker plus worker deployment |
+| Good for | fast, best-effort, losable work: metrics, cache warm-up, non-critical notifications | anything that **must** happen, takes more than a few seconds, or needs retries: payments, emails users rely on, reports, LLM batch jobs |
+
+A useful rule: **if losing the task would generate a support ticket, it doesn't belong in `BackgroundTasks`.** For must-run work without a separate broker, the **transactional outbox** pattern writes a "job" row in the same DB transaction as the business change, and a worker polls and processes it. See [task queues and background jobs](/docs/backend-first-principles/14-task-queues-background-jobs) for the theory and [agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs) for the FastAPI version.
+
+<Callout title="What about asyncio.create_task?">
+Firing off `asyncio.create_task(work())` from an endpoint is even less safe than `BackgroundTasks`: the event loop holds only a weak reference (the task can be garbage-collected mid-flight unless you store it), exceptions go to "Task exception was never retrieved", and shutdown doesn't wait for it. If you use it, keep the task in a set, discard it with a done-callback, and cancel and await the set in the lifespan shutdown. See [asyncio](/docs/python/asyncio).
+</Callout>
+
+## Common mistakes
+
+1. **Assuming `add_middleware` order is top-down.** The last one added is the outermost and runs first.
+2. **Timing streaming responses with `@app.middleware("http")`.** `call_next` returns at the headers, so you measure about 0 ms. Use pure ASGI middleware and log total duration.
+3. **Adding headers after the body started.** Headers leave with `http.response.start`. Modify them in your `send` wrapper at that moment, or not at all.
+4. **Expecting middleware to see 500 responses.** Unhandled exceptions pass through user middleware as exceptions. `ServerErrorMiddleware`, outside your middleware, builds the 500. Catch and handle the case where nothing was sent yet.
+5. **CORS middleware added too early (too deep)**, so errors from outer middleware lack CORS headers and the browser reports "CORS error".
+6. **Creating clients or engines per request** instead of once in the lifespan.
+7. **Using `TestClient(app)` without `with`**, so the lifespan never runs in tests.
+8. **Running migrations or one-time jobs in the lifespan**, which runs once per worker.
+9. **Putting must-run work in `BackgroundTasks`.** There are no retries, no persistence, and one failure aborts later tasks.
+10. **Blocking inside an `async def` background task or middleware.** It runs on the event loop and stalls every request.
+
+## Key points
+
+- Middleware wraps the ASGI app in layers. The last added is the outermost. FastAPI places yours between `ServerErrorMiddleware` and `ExceptionMiddleware`.
+- `@app.middleware("http")` (`BaseHTTPMiddleware`) runs the inner app in a separate task, and `call_next` returns at the headers. It's simple, but slower and wrong for streaming measurements.
+- Pure ASGI middleware wraps `send`/`receive`, adds no overhead, and sees the true end of the response. Prefer it for anything reusable.
+- A request-ID middleware should reuse an incoming ID, store it in a `ContextVar` for logging, echo it in the response, and also tag the 500s.
+- `CORSMiddleware` goes outermost. `GZipMiddleware` skips small bodies and SSE. `TrustedHostMiddleware` blocks Host header attacks.
+- The lifespan is an async context manager that runs once per worker process. Create pools and clients before `yield`, close them after, share them via `app.state` or yielded state behind a dependency.
+- `BackgroundTasks` run in-process after the response is sent, sequentially, inside the same ASGI call. A failure is only logged and aborts the remaining tasks. A dying worker loses them all.
+- Work that must happen belongs in a durable task queue.

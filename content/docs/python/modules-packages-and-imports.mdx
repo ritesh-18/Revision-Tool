@@ -1,0 +1,759 @@
+---
+title: "Modules, Packages and Imports"
+description: "What the import statement really does in CPython, from sys.modules and finders to packages, circular imports, lazy imports and reloading."
+---
+
+`import` looks like a declaration, but it's an ordinary statement that runs at the moment execution reaches it. It finds a file, creates a module object, **executes the file top to bottom** inside that object's namespace, caches the result, and binds a name. Almost every import puzzle (circular imports, code that runs twice, `from x import y` not seeing updates, slow startup) follows from that one sentence.
+
+Snippets were run on **CPython 3.14.6** on Windows unless marked otherwise. The `lazy import` examples ran on **3.15.0b4**. Long temp paths are shortened.
+
+## What `import json` does, step by step
+
+<Mermaid chart={`flowchart TD
+  A["import json"] --> B{"'json' in sys.modules?"}
+  B -->|"yes"| Z["bind the name json to the cached module"]
+  B -->|"no"| C["ask each finder on sys.meta_path: find_spec('json')"]
+  C --> D["BuiltinImporter<br/>compiled into the interpreter"]
+  C --> E["FrozenImporter<br/>frozen bytecode"]
+  C --> F["PathFinder<br/>walks sys.path entries"]
+  F --> G["FileFinder for each directory<br/>looks for json/__init__.py, json.py, .pyd/.so"]
+  D --> H{"spec found?"}
+  E --> H
+  G --> H
+  H -->|"no"| X["ModuleNotFoundError"]
+  H -->|"yes"| I["loader.create_module(spec)<br/>new empty module object"]
+  I --> J["insert into sys.modules BEFORE executing"]
+  J --> K["loader.exec_module(module)<br/>run the code top to bottom"]
+  K -->|"raises"| R["remove from sys.modules, propagate the error"]
+  K -->|"ok"| Z
+`} />
+
+1. **Check the cache.** `sys.modules` is a plain dict mapping names to module objects. If the name is in it, you're done: no file access and no re-execution.
+2. **Find.** Otherwise Python asks each object on `sys.meta_path` in turn, "can you find a spec for this name?" A **spec** (`ModuleSpec`) records the name, which loader to use, where the code lives (`origin`), and for packages, where to look for submodules.
+3. **Create.** The loader creates an empty module object.
+4. **Cache first, then execute.** The module goes into `sys.modules` *before* its code runs. That's what makes circular imports possible at all (and what makes them fail in strange ways).
+5. **Execute** the module's code with the module's `__dict__` as the global namespace. If execution raises, the half-built module is removed from `sys.modules`.
+6. **Bind** a name in the importing namespace.
+
+```python
+import sys
+print("json" in sys.modules)
+import json
+print("json" in sys.modules, json is sys.modules["json"])
+print(type(json), json.__name__)
+print(json.__spec__.name, type(json.__spec__.loader).__name__)
+print(json.__file__.split("Lib")[-1])
+import json as j2
+print(j2 is json)
+print(len(sys.modules), "modules already loaded")
+```
+
+```text title="Output"
+False
+True True
+<class 'module'> json
+json SourceFileLoader
+\json\__init__.py
+True
+63 modules already loaded
+```
+
+Even an "empty" program has about 60 modules loaded before your first line runs: the interpreter imports `os`, `site`, `codecs`, `io`, `abc` and others at startup.
+
+### Finders and loaders
+
+You can ask the machinery what it would do without importing anything:
+
+```python
+import importlib.util, os
+
+for name in ("json", "asyncio.events", "math", "sys", "zipimport", "does_not_exist"):
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        print(f"{name:15} -> not found")
+        continue
+    loader = spec.loader if isinstance(spec.loader, type) else type(spec.loader)
+    origin = spec.origin if spec.origin in ("built-in", "frozen") else os.path.basename(spec.origin)
+    print(f"{name:15} -> {loader.__name__:17} origin={origin}")
+```
+
+```text title="Output"
+json            -> SourceFileLoader  origin=__init__.py
+asyncio.events  -> SourceFileLoader  origin=events.py
+math            -> BuiltinImporter   origin=built-in
+sys             -> BuiltinImporter   origin=built-in
+zipimport       -> FrozenImporter    origin=frozen
+does_not_exist  -> not found
+```
+
+(`math` is compiled into the interpreter on Windows. On most Linux builds it's a separate `.so` file loaded by `ExtensionFileLoader`.)
+
+The finders installed by default:
+
+```python
+import sys
+for finder in sys.meta_path:
+    print(finder)
+print(sys.path_hooks)
+```
+
+```text title="Output"
+<_distutils_hack.DistutilsMetaFinder object at 0x000001B304BB8440>
+<class '_frozen_importlib.BuiltinImporter'>
+<class '_frozen_importlib.FrozenImporter'>
+<class '_frozen_importlib_external.PathFinder'>
+[<class 'zipimport.zipimporter'>, <function FileFinder.path_hook.<locals>.path_hook_for_FileFinder at 0x000001B3049E8300>]
+```
+
+The first entry isn't standard. setuptools installed it through a `.pth` file in this conda environment. Any package can add finders this way, which is how editable installs, import hooks such as pytest's assertion rewriting work.
+
+You can plug in your own finder to watch the machinery work:
+
+```python
+import sys, importlib.abc
+
+class AuditFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        print(f"  finder asked for {name!r}, search path={'sys.path' if path is None else 'parent.__path__'}")
+        return None                      # "not mine": the next finder on sys.meta_path tries
+
+sys.meta_path.insert(0, AuditFinder())
+import colorsys                          # not loaded yet: the finders are consulted
+import colorsys                          # sys.modules hit: no finder is asked
+import xml.dom                           # parent package first, then the submodule
+print("done")
+```
+
+```text title="Output"
+  finder asked for 'colorsys', search path=sys.path
+  finder asked for 'xml', search path=sys.path
+  finder asked for 'xml.dom', search path=parent.__path__
+  finder asked for 'xml.dom.domreg', search path=parent.__path__
+done
+```
+
+Note what this shows: importing `xml.dom` imports `xml` first. Top-level names are searched on `sys.path`, but submodules are searched only inside the parent package's `__path__`.
+
+### `sys.path`
+
+```python
+import sys
+for p in sys.path:
+    print(repr(p))
+```
+
+```text title="Output"
+'C:\\work\\demo'
+'C:\\Users\\ritesh-18\\miniconda3\\python314.zip'
+'C:\\Users\\ritesh-18\\miniconda3\\DLLs'
+'C:\\Users\\ritesh-18\\miniconda3\\Lib'
+'C:\\Users\\ritesh-18\\miniconda3'
+'C:\\Users\\ritesh-18\\miniconda3\\Lib\\site-packages'
+```
+
+In order:
+
+1. The **script's directory** (or the current directory for `-m`, `-c` and the REPL). This entry is why a file called `random.py` or `logging.py` next to your script hides the standard library module. Recent versions print a "consider renaming" hint when they detect this.
+2. Anything in the `PYTHONPATH` environment variable.
+3. The standard library (zip, `DLLs`/`lib-dynload`, `Lib`).
+4. `site-packages` of the active environment (a virtual environment swaps this entry), plus paths added by `.pth` files there.
+
+`python -I` (isolated mode) and `python -P` (3.11+) both leave out the script directory, which protects against accidental shadowing in scripts.
+
+### Bytecode caching: `__pycache__`
+
+`SourceFileLoader` compiles source to bytecode and writes it to `__pycache__/name.cpython-314.pyc`, with a header that records the source file's modification time and size (or a hash). The next import checks the header and skips compilation if it still matches.
+
+```python
+import importlib.util, sys
+print(importlib.util.cache_from_source("app/models.py"))
+print(sys.implementation.cache_tag)
+```
+
+```text title="Output"
+app\__pycache__\models.cpython-314.pyc
+cpython-314
+```
+
+The tag includes the version, so 3.13 and 3.14 can share a directory without clashing. `.pyc` files make *startup* faster, not execution: the bytecode is the same either way.
+
+<Callout title="Coming from JS">
+`sys.modules` is the counterpart of Node's `require.cache` (CommonJS) or the ESM module map. Both run a module once and share it. The big difference from **ESM** is that ESM links all `import` declarations *statically* before running any code, and its bindings are *live*. Python imports are dynamic statements executed in order, and `from m import x` copies the current value (see below). Python is much closer to CommonJS `require()`: synchronous, run on demand, returns a cached object, and a cycle hands you a partially filled object.
+</Callout>
+
+## Modules are singletons
+
+Because of the cache, every importer gets the **same module object**. Module-level state is effectively process-wide shared state:
+
+```python
+# settings.py
+print("settings.py is executing")
+DEBUG = False
+```
+
+```python
+# a.py
+import settings
+settings.DEBUG = True
+```
+
+```python
+# main.py
+import settings
+import a
+from settings import DEBUG
+import settings as again
+print("settings.DEBUG:", settings.DEBUG, "| copied DEBUG:", DEBUG, "| same object:", again is settings)
+settings.DEBUG = False
+print("after reset -> settings.DEBUG:", settings.DEBUG, "| copied DEBUG still:", DEBUG)
+```
+
+```text title="Output"
+settings.py is executing
+settings.DEBUG: True | copied DEBUG: True | same object: True
+after reset -> settings.DEBUG: False | copied DEBUG still: True
+```
+
+- The file ran **once**, even though three statements imported it.
+- `from settings import DEBUG` is just `DEBUG = settings.DEBUG`: a new name bound to whatever object `settings.DEBUG` pointed to *at that moment*. Later reassignments in `settings` don't affect it.
+
+That's why mocking a name with `unittest.mock.patch` has to target **where it's looked up**: `patch("myapp.views.send_email")`, not `patch("myapp.mail.send_email")`, if `views` did `from myapp.mail import send_email`.
+
+Singletons are useful (a module is the simplest singleton pattern, and a good place for one connection pool or settings object). They're also a trap: tests that mutate module state leak into each other.
+
+## Packages and `__init__.py`
+
+A **package** is a module that can contain submodules. Concretely it's a directory, and its module object has a `__path__` attribute listing where to look for submodules.
+
+```text
+pkgdemo/
+├── main.py
+└── shop/
+    ├── __init__.py          # runs when "shop" is first imported
+    ├── cart.py
+    └── payments/
+        ├── __init__.py      # empty
+        ├── fees.py
+        └── stripe.py
+```
+
+```python
+# shop/__init__.py
+print("running shop/__init__.py")
+from .cart import Cart          # re-export: callers can write shop.Cart
+__all__ = ["Cart"]
+```
+
+```python
+# shop/payments/stripe.py
+from ..cart import Cart          # relative: up one package
+from . import fees               # sibling module
+def charge(cart: Cart) -> str:
+    return f"charged {len(cart.items)} items, fee {fees.FEE}"
+```
+
+```python
+# main.py
+import shop
+print("shop.__path__:", [p.rsplit("\\", 1)[-1] for p in shop.__path__])
+print("Cart re-exported:", shop.Cart)
+try:
+    shop.payments
+except AttributeError as e:
+    print("AttributeError:", e)
+import shop.payments.stripe
+print(shop.payments.stripe.charge(shop.Cart()))
+import sys
+print(sorted(m for m in sys.modules if m.startswith("shop")))
+```
+
+```text title="Output"
+running shop/__init__.py
+running shop/cart.py
+shop.__path__: ['shop']
+Cart re-exported: <class 'shop.cart.Cart'>
+AttributeError: module 'shop' has no attribute 'payments'
+charged 0 items, fee 0.3
+['shop', 'shop.cart', 'shop.payments', 'shop.payments.fees', 'shop.payments.stripe']
+```
+
+Key facts:
+
+- Importing a package runs its `__init__.py` and **doesn't import its submodules**. `shop.payments` didn't exist until something imported it.
+- Importing `shop.payments.stripe` imports `shop`, then `shop.payments`, then `stripe`, and sets each child as an **attribute on its parent** (`shop.payments = <module>`). That's why `import shop.payments.stripe` lets you write the full dotted path afterwards.
+- A common pattern is to re-export the public API from `__init__.py` so users write `from shop import Cart`. Keep `__init__.py` light, though: everything it imports is paid for by every importer of any submodule.
+
+### Namespace packages (no `__init__.py`)
+
+Since 3.3 (PEP 420) a directory *without* `__init__.py` can still be imported as a **namespace package**. Its special power is that one package name can be **spread across several directories**:
+
+```text
+team_a/acme/billing/__init__.py
+team_b/acme/search/__init__.py
+```
+
+```python
+import os, sys
+sys.path[:0] = ["team_a", "team_b"]
+import acme.billing, acme.search
+print(acme.billing.NAME, acme.search.NAME)
+print("acme.__file__:", acme.__file__)
+print(type(acme.__path__).__name__, [os.path.relpath(p) for p in acme.__path__])
+```
+
+```text title="Output"
+billing search
+acme.__file__: None
+_NamespacePath ['team_a\\acme', 'team_b\\acme']
+```
+
+`PathFinder` scans *all* of `sys.path`. If it finds no regular package or module named `acme` but finds one or more plain directories called `acme`, it combines them into one namespace package. This is how separately installed distributions such as `google-cloud-storage` and `google-cloud-pubsub` share the `google.cloud` namespace.
+
+Traps:
+
+- Because a regular package or module anywhere on `sys.path` wins, a forgotten `__init__.py` usually still "works", which hides mistakes (and some tools, such as older pytest or mypy setups, treat it differently).
+- Namespace packages are slightly slower to import, since every `sys.path` entry is scanned.
+- **Rule:** use regular packages (with `__init__.py`) for your own code. Use namespace packages only when you genuinely ship one namespace in several distributions.
+
+## Absolute vs relative imports
+
+```python
+from shop.cart import Cart        # absolute: from the top of sys.path
+from ..cart import Cart           # relative: based on this module's __package__
+from . import fees
+```
+
+Relative imports are resolved against `__package__`, not against the file's location on disk. They therefore only work when the module was imported **as part of a package**:
+
+```text title="Output"
+$ python shop/payments/stripe.py
+    from ..cart import Cart          # relative: up one package
+    ^^^^^^^^^^^^^^^^^^^^^^^
+ImportError: attempted relative import with no known parent package
+
+$ python -m shop.payments.stripe
+running shop/__init__.py
+running shop/cart.py
+```
+
+Run as a file path, the module is called `__main__` and `__package__` is `None`, so `..` means nothing. Run with `-m`, Python imports it as `shop.payments.stripe`, so `__package__` is `"shop.payments"`.
+
+Style guidance (PEP 8 and common practice): prefer absolute imports for clarity. Explicit relative imports are fine inside a package to avoid repeating a long package name. Implicit relative imports (Python 2's `import cart` meaning "the sibling") no longer exist.
+
+<Callout title="Coming from JS">
+In Node, `./cart` is relative to the **file**, and bare names like `express` go to `node_modules`. In Python, *every* non-dotted import is a "bare specifier" searched on `sys.path`, and dotted relative imports are relative to the **package name**, not the folder. There's no file extension and no `index.js` convention. `__init__.py` plays the role of `index.js`. Path aliases like `@/utils` don't exist either: you make your project a package that's importable from `sys.path` (see the src layout in [Packaging and environments](/docs/python/packaging-and-environments)).
+</Callout>
+
+## `__all__` and star imports
+
+`from module import *` imports the names listed in `module.__all__`. If there's no `__all__`, it imports every global that doesn't start with an underscore, **including modules the file imported**.
+
+```python
+# helpers.py
+__all__ = ["slugify"]
+import re
+def slugify(s): return re.sub(r"\W+", "-", s.lower()).strip("-")
+def _private(): ...
+def internal_helper(): ...
+```
+
+```python
+# nohall.py
+import re
+def public(): ...
+def _private(): ...
+```
+
+```python
+# main.py
+from helpers import *
+print(slugify("Hello, World!"))
+print("internal_helper" in dir(), "re" in dir())
+from nohall import *
+print("public" in dir(), "_private" in dir(), "re" in dir())
+from helpers import internal_helper   # explicit import ignores __all__
+print(internal_helper.__name__)
+```
+
+```text title="Output"
+hello-world
+False False
+True False True
+internal_helper
+```
+
+- `__all__` controls `*` only. Explicit imports can still reach everything. Python has no truly private module members, and the underscore prefix is a convention.
+- Linters and type checkers read `__all__` as "the public API", and documentation tools use it too.
+- Avoid `import *` in application code: it hides where names come from and can silently overwrite names you already have. The REPL and `__init__.py` re-exports are the reasonable uses.
+
+## `if __name__ == "__main__":`
+
+Every module has `__name__`. It's the dotted import name normally, and `"__main__"` for the module Python was asked to run. The guard lets a file be both importable and runnable:
+
+```python
+def main() -> None:
+    ...
+
+if __name__ == "__main__":
+    main()
+```
+
+Without the guard, importing the file (from a test, or by `multiprocessing`'s spawn start method, which re-imports your main module in every child) would run the program.
+
+### The double-import trap
+
+The script being run is stored in `sys.modules["__main__"]`, **not** under its file name. If another module imports it by name, Python finds no `"app"` in the cache and executes the file a second time as a separate module:
+
+```python
+# app.py
+import sys
+print(f"executing app.py as __name__={__name__!r}")
+registry = []
+def register(x):
+    registry.append(x)
+if __name__ == "__main__":
+    import plugin             # plugin does "import app"
+    register("from main")
+    print("main registry:", registry)
+    print("app in sys.modules:", "app" in sys.modules, "| __main__ is app:", sys.modules["__main__"] is sys.modules["app"])
+```
+
+```python
+# plugin.py
+import app
+app.register("from plugin")
+print("plugin sees app.registry:", app.registry)
+```
+
+```text title="Output"
+executing app.py as __name__='__main__'
+executing app.py as __name__='app'
+plugin sees app.registry: ['from plugin']
+main registry: ['from main']
+app in sys.modules: True | __main__ is app: False
+```
+
+There are now two `registry` lists, two copies of every class (so `isinstance` checks between them fail), and two sets of side effects. The fix: keep entry-point scripts thin. They should import the real code from a package and call it, and nothing should ever import the entry-point script.
+
+## Running with `-m`
+
+`python -m pkg.module` locates the module through the import system (so it must be importable), then runs it as `__main__` with the package context set up.
+
+```python
+# tools/where.py
+import sys, os
+print("__name__:", __name__, "| __package__:", repr(__package__))
+print("sys.path[0]:", os.path.relpath(sys.path[0]) if sys.path[0] else repr(sys.path[0]))
+```
+
+```text title="Output"
+$ python tools/where.py
+__name__: __main__ | __package__: None
+sys.path[0]: tools
+
+$ python -m tools.where
+__name__: __main__ | __package__: 'tools'
+sys.path[0]: .
+```
+
+Two differences matter:
+
+- With `-m`, `sys.path[0]` is the **current directory**, so your project root is importable. With a file path, it's the **script's own folder**, which is why `python tools/where.py` often can't `import myproject`.
+- With `-m`, `__package__` is set, so relative imports work.
+
+`python -m pkg` (a package) runs `pkg/__main__.py`. That's how `python -m pip`, `python -m venv`, `python -m http.server` and `python -m pytest` work. Prefer `python -m pip` over a bare `pip`, because it guarantees the pip of *this* interpreter.
+
+## Circular imports
+
+### Why they happen
+
+Module A starts executing and is placed in `sys.modules` while still empty. Partway through it imports B. B imports A, finds the **half-initialized** A in the cache, and continues. If B then needs a name A hasn't defined yet, it fails.
+
+```python
+# app/models.py
+print("models: start")
+from app.services import notify   # services needs models.User...
+class User:
+    def __init__(self, name): self.name = name
+print("models: end")
+```
+
+```python
+# app/services.py
+print("services: start")
+from app.models import User       # ...but models is only half-built
+def notify(user: User): return f"notify {user.name}"
+print("services: end")
+```
+
+```text title="Output"
+$ cat main.py
+import app.models
+$ python main.py
+models: start
+services: start
+models: start
+services: start
+Traceback (most recent call last):
+  File "main.py", line 1, in <module>
+    import app.models
+  File "app/models.py", line 2, in <module>
+    from app.services import notify   # services needs models.User...
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "app/services.py", line 2, in <module>
+    from app.models import User       # ...but models is only half-built
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ImportError: cannot import name 'User' from partially initialized module 'app.models' (most likely due to a circular import) (app/models.py)
+```
+
+<Mermaid chart={`sequenceDiagram
+  participant M as app.models
+  participant SM as sys.modules
+  participant S as app.services
+  M->>SM: register empty app.models
+  M->>S: from app.services import notify
+  S->>SM: register empty app.services
+  S->>SM: from app.models import User
+  SM-->>S: app.models exists but has no User yet
+  S--xM: ImportError, partially initialized module
+`} />
+
+A surprise in the output: the `start` lines print **twice**. While building the "did you mean" suggestion, the 3.14 traceback printer re-imports the failed module (`traceback._compute_suggestion_error` calls `__import__`), which runs its top-level code again. It's another reason to keep import-time side effects out of modules.
+
+### How to fix them
+
+In order of preference:
+
+1. **Restructure.** A cycle usually means two modules share a concept that belongs in a third module. Move `User` (or a protocol, or shared constants) into a lower-level module that both import. Aim for layered dependencies, for example `models` then `repositories` then `services` then `api`, where imports only point downward.
+2. **Import the module, not the name.** `import app.services` (or `from app import services`) binds the module object even if it's half-built. You then use `services.notify` *at call time*, by which point both modules have finished loading:
+
+```python
+# models.py
+print("models: start")
+import services                  # module object, not a name
+class User:
+    def __init__(self, name): self.name = name
+def welcome(name): return services.notify(User(name))
+print("models: end")
+```
+
+```python
+# services.py
+print("services: start")
+import models                    # gets the partially initialised module, no error
+def notify(user: "models.User"): return f"notify {user.name}"
+print("services: end")
+```
+
+```text title="Output"
+$ python -c "import models; print(models.welcome('ada'))"
+models: start
+services: start
+services: end
+models: end
+notify ada
+```
+
+3. **Imports needed only for type hints** go under `if TYPE_CHECKING:`. Type checkers act as if it's `True`. At runtime it's `False`, so the import never runs. In 3.14 annotations are evaluated lazily (PEP 649), so the hint doesn't need quotes. On older versions use `from __future__ import annotations` or string annotations:
+
+```python
+from __future__ import annotations
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:                # only type checkers execute this
+    from models import User
+def notify(user: User) -> str:
+    return f"notify {user.name}"
+```
+
+4. **Move the import into the function** that needs it, as a last resort. It works, but it hides the dependency.
+
+<Callout title="Coming from JS">
+NestJS solves cycles with `forwardRef(() => OtherModule)`, and in CommonJS a cycle gives you `{}` from `require()`. ESM survives many cycles because bindings are live, and fails only with a TDZ `ReferenceError` when you touch an export before it's initialized. Python behaves like CommonJS: the half-built module is a real object, and `import module` (attribute access later) survives while `from module import name` (a copy right now) breaks.
+</Callout>
+
+## Import-time side effects
+
+Everything at module top level runs at import time: connecting to a database, reading environment variables, loading a model, registering routes, configuring logging. That leads to:
+
+- **Slow startup.** CLIs, serverless cold starts and test collection all pay for it.
+- **Order dependence.** The result depends on which module happened to be imported first.
+- **Untestable code.** You can't import the module without a database.
+- **Surprise re-runs.** The double-import trap, `importlib.reload`, and the traceback printer shown above all re-execute top-level code.
+
+Measure where the time goes with `-X importtime` (it prints self time and cumulative time in microseconds, to stderr):
+
+```text title="Output"
+$ python -X importtime -c "import asyncio" 2>&1 | sort -t'|' -k2 -n | tail -4
+import time:      1048 |      36614 |       concurrent.futures._base
+import time:       477 |      37709 |     concurrent.futures
+import time:      1098 |      70984 |   asyncio.base_events
+import time:       573 |      84847 | asyncio
+```
+
+On my machine `import asyncio` takes about 85 ms on a cold run. Tools such as `tuna` turn this output into a flame graph. The usual fixes: wrap side effects in functions (`create_app()`, `get_settings()` with `functools.cache`), run them from your entry point or the framework's startup hook (FastAPI's `lifespan`), and import heavy libraries lazily.
+
+## Lazy imports
+
+### Function-level import
+
+The simplest form: move the import into the function that needs it. The first call pays the cost, and later calls are a dict lookup in `sys.modules`.
+
+```python
+def handler(x):
+    import heavy                 # paid on first call, then a sys.modules dict hit
+    return heavy.predict(x)
+print("module loaded")
+print(handler(1))
+print(handler(2))
+```
+
+```text title="Output"
+module loaded
+  [heavy.py executing: imagine loading torch here]
+2
+4
+```
+
+### Module `__getattr__` (PEP 562)
+
+A module can define `__getattr__`. It's called only when a normal attribute lookup fails, which lets a package expose heavy submodules lazily. NumPy, SciPy and many other libraries do this.
+
+```python
+# mylib.py
+import importlib
+_LAZY = {"heavy": "heavy"}
+def __getattr__(name):           # PEP 562: called only when normal lookup fails
+    if name in _LAZY:
+        mod = importlib.import_module(_LAZY[name])
+        globals()[name] = mod    # cache so __getattr__ is not hit again
+        return mod
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+```
+
+```python
+import mylib
+print("mylib imported")
+print(mylib.heavy.predict(21))
+try:
+    mylib.nope
+except AttributeError as e:
+    print(e)
+```
+
+```text title="Output"
+mylib imported
+  [heavy.py executing: imagine loading torch here]
+42
+module 'mylib' has no attribute 'nope'
+```
+
+### `importlib.util.LazyLoader`
+
+This one creates the module object right away but delays executing it until the first attribute access:
+
+```python
+import importlib.util, sys
+def lazy_import(name):
+    spec = importlib.util.find_spec(name)
+    loader = importlib.util.LazyLoader(spec.loader)
+    spec.loader = loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+heavy = lazy_import("heavy")
+print("got module object:", type(heavy).__name__)
+print(heavy.predict(5))
+```
+
+```text title="Output"
+got module object: _LazyModule
+  [heavy.py executing: imagine loading torch here]
+10
+```
+
+### The `lazy` keyword (3.15, PEP 810)
+
+Python 3.15 adds a `lazy` soft keyword. The statement binds a lightweight proxy, and the real import happens the first time the name is used. If the import fails, the error is raised at that first use, and its traceback points back to the import statement.
+
+```python
+import sys
+lazy import heavy
+lazy from json import dumps
+print("after lazy imports, heavy in sys.modules:", "heavy" in sys.modules)
+print("type before use:", type(globals()["heavy"]).__name__)
+print(heavy.predict(3))
+print(dumps({"ok": True}))
+print("type after use:", type(globals()["heavy"]).__name__)
+```
+
+```text title="Output"
+after lazy imports, heavy in sys.modules: False
+type before use: lazy_import
+  [heavy.py executing: imagine loading torch here]
+6
+{"ok": true}
+type after use: module
+```
+
+Rules and controls (3.15):
+
+- Only at module scope. `lazy import` inside a function, a class body or a `try` block is a `SyntaxError` (`lazy import not allowed inside functions`), and so are `lazy from m import *` and `lazy from __future__ import ...`.
+- `-X lazy_imports=all` (or `PYTHON_LAZY_IMPORTS=all`) makes every import lazy. `sys.set_lazy_imports_filter()` lets you exclude modules that must run eagerly for their side effects.
+- A module-level `__lazy_modules__ = ["json", ...]` makes the listed plain imports lazy on 3.15 and is ignored on older versions, so it's a backward-compatible way to opt in.
+
+Trap for every lazy technique: import errors and import side effects move to first use, which might be in the middle of a request. For a web server, it's often better to pay import costs at startup than on the first user's request.
+
+## `importlib`: dynamic imports and reloading
+
+`importlib.import_module("pkg.mod")` imports a module whose name is a runtime string. It's the right tool for plugin systems, a `"myapp.handlers:process"` style config entry, or Django's `INSTALLED_APPS`. (`__import__` is the low-level hook behind the `import` statement. Don't call it directly.)
+
+`importlib.reload(module)` re-executes the module's code **in the same module object**. It does **not** update anything that already holds a reference to the old contents:
+
+```python
+import importlib, pathlib
+import shapes
+from shapes import Circle
+old = shapes.Circle()
+
+pathlib.Path("shapes.py").write_text(
+    "VERSION = 2\nclass Circle:\n    def area(self): return 'v2 area'\n")
+importlib.invalidate_caches()
+shapes = importlib.reload(shapes)        # re-executes the file in the SAME module object
+
+print("shapes.VERSION:", shapes.VERSION)
+print("new instance:", shapes.Circle().area())
+print("old instance:", old.area())
+print("name bound by from-import:", Circle().area())
+print("isinstance(old, shapes.Circle):", isinstance(old, shapes.Circle))
+```
+
+```text title="Output"
+shapes.VERSION: 2
+new instance: v2 area
+old instance: v1 area
+name bound by from-import: v1 area
+isinstance(old, shapes.Circle): False
+```
+
+Old instances keep pointing at the old class object, `from` imports keep the old function, and the class identity changes, so `isinstance` fails. Names removed from the new source *stay* in the module, because the namespace is reused, not cleared. That's why dev servers like `uvicorn --reload` restart the **whole process** instead of calling `reload`. Use `reload` for quick REPL experiments only.
+
+## Interview questions
+
+1. **What happens the second time you `import` a module?** **Python finds it in `sys.modules` and just binds the name. The file isn't read or executed again.**
+2. **Why does `from config import DEBUG` not see later changes to `config.DEBUG`?** **`from` import copies the current reference into a new name in the importer. Reassigning `config.DEBUG` rebinds the module attribute, not your copy. Use `import config` and `config.DEBUG`.**
+3. **Why do circular imports fail with "partially initialized module"?** **A module is placed in `sys.modules` before its body runs. A cycle hands the second module the half-executed first one, and `from a import X` fails if `X` isn't defined yet. Fix it by restructuring, importing modules instead of names, or using `TYPE_CHECKING` imports.**
+4. **Difference between `python path/to/file.py` and `python -m pkg.file`?** **`-m` imports the module by name, sets `__package__` (so relative imports work), and puts the current directory on `sys.path[0]` instead of the script's folder.**
+5. **What is a namespace package?** **A package without `__init__.py`. Directories with the same name across several `sys.path` entries are merged, and `__path__` is a `_NamespacePath` while `__file__` is `None`. It's used to split one namespace across distributions.**
+6. **What does `__all__` do?** **It defines which names `from m import *` exports and documents the public API. It doesn't stop explicit imports.**
+7. **Why is `importlib.reload` dangerous?** **It re-runs code in the same module object, but existing instances, `from` imports and other references keep the old objects, so `isinstance` and identity checks break.**
+8. **How can you make an import lazy?** **Import inside a function, use module `__getattr__` (PEP 562), use `importlib.util.LazyLoader`, or on 3.15+ use `lazy import` (PEP 810).**
+
+## Recap
+
+- `import` checks `sys.modules`, asks the finders on `sys.meta_path` for a spec, creates the module, caches it, *then* executes it, and finally binds a name.
+- Modules are singletons. `from m import x` copies a reference. Patch names where they're looked up.
+- Packages are modules with `__path__`. `__init__.py` runs on first import, and submodules load only when imported. Namespace packages merge same-named directories.
+- Relative imports depend on `__package__`, so run package code with `-m`. Guard entry points with `if __name__ == "__main__"` and never import the entry script.
+- Circular imports fail because of half-initialized modules. Restructure layers, import modules instead of names, or use `TYPE_CHECKING`.
+- Keep import time free of side effects, measure it with `-X importtime`, lazy-load heavy dependencies (`lazy import` in 3.15), and restart the process rather than `reload`.

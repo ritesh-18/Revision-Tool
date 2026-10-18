@@ -1,0 +1,1648 @@
+---
+title: "Backend Scaling and Performance Engineering: Part 1"
+description: Latency, percentiles, throughput, utilization, finding bottlenecks, database fixes (N+1, indexes, pooling), caching and vertical vs horizontal scaling, explained at the engineering level.
+---
+
+<Callout type="info">
+  Notes for [Backend Scaling and Performance Engineering, Part 1](https://youtu.be/z7kt_p44rjs) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (formulas, code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The lesson's goal isn't a list of tricks. It builds a **mental model of how a system behaves under load**: what "fast" means in numbers, why latency explodes near full capacity, how to find the part that is actually slow, and only then the standard fixes (database work, caching, scaling). Part 2 ([Part 2](/docs/backend-first-principles/22-scaling-performance-part-2)) continues with statelessness, load balancers, database scaling, CDNs, async work, microservices and serverless.
+
+<Mermaid chart={`flowchart LR
+  A["What is fast?<br/>latency"] --> B["Percentiles<br/>P50 P90 P99"]
+  B --> C["Throughput"]
+  C --> D["Utilization and<br/>the latency curve"]
+  D --> E["Find the bottleneck<br/>measure, profile, trace"]
+  E --> F["Database fixes<br/>N+1, indexes, pools"]
+  F --> G["Caching"]
+  G --> H["Vertical vs<br/>horizontal scaling"]`} />
+
+---
+
+## 1. What "fast" actually means: latency 🎓
+
+### The request path
+A user clicks a button, and a chain of work starts. Every link in the chain adds time.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant U as User
+  participant B as Browser
+  participant S as API server
+  participant D as Database
+  participant E as Email API (Resend)
+  U->>B: click
+  B->>S: HTTP request over the internet
+  S->>D: query
+  D-->>S: rows
+  S->>E: send email
+  E-->>S: accepted
+  S-->>B: JSON response over the internet
+  B->>B: parse JSON, run JS, render cards
+  Note over U,B: latency = click to cards on screen`} />
+
+- **Latency** is the total time from the user's action to the result being visible. When someone says "the app is slow", they mean latency, whether or not they know the word.
+- It's the first **measurable** performance metric. "Fast" and "slow" are feelings; latency is a number in milliseconds.
+
+### Latency is a distribution, not a number
+Two requests to the same endpoint can take 50 ms and 200 ms. In real traffic, the reasons vary:
+- One hit a **cache** (a CDN or Redis) and skipped the trip to a far-away database; the other ran a full DB query.
+- Or one arrived when the server was **idle**, and the other arrived while the server was already handling 50 other requests, so it waited.
+
+So "our latency is 500 ms" says almost nothing. You need to describe the **whole spread**.
+
+---
+
+## 2. Why averages lie, and why we use percentiles 🎓
+
+### The problem
+Take **1,000 requests**: 99% finish in about **50 ms**, 1% take **5 s**.
+
+> average ≈ 0.99 × 50 ms + 0.01 × 5,000 ms = 49.5 + 50 ≈ **100 ms**
+
+"Average 100 ms" sounds healthy. It hides the people waiting 5 seconds. Scale it up: at **1,000,000 requests per day**, 1% is **10,000 requests a day** where someone stares at a spinner for 5 s. The average never tells you they exist, and it never shows you where the system's limits are.
+
+**Why it happens (first principles):** latency distributions are **long-tailed**. Most requests take the fast path; a few hit a slow path (cache miss, lock wait, GC pause, queueing, a slow third-party call). A mean mixes the two populations into one number that describes neither.
+
+### Percentiles
+A percentile answers "what latency do X% of requests stay under?"
+
+| Name | Meaning | Example | How to read it |
+|---|---|---|---|
+| **P50** (median) | half of requests are faster than this | 400 ms | the typical experience |
+| **P90** | 90% are faster, **10% are slower** | 900 ms | 1 user in 10 waits at least this long |
+| **P99** | 99% are faster, **1% are slower** | 2 s | 1 request in 100 waits at least this long |
+
+The lesson's shortcut: subtract the number from 100. P99 means **the slowest 1%**; P90 means **the slowest 10%**.
+
+<Mermaid chart={`flowchart LR
+  subgraph Dist["1,000 requests sorted by latency"]
+    direction LR
+    F["fastest 500<br/>below P50"] --> M["next 400<br/>P50 to P90"] --> S["next 90<br/>P90 to P99"] --> T["slowest 10<br/>above P99: the tail"]
+  end`} />
+
+### Why backend engineers watch P95 and P99 🎓
+Not only because those users are unhappy:
+- The slowest requests are usually the ones running the **most complex work**: heavy queries, multi-step business logic, calls to external services, webhooks, emails.
+- Those workflows tend to belong to the **most valuable users**. Someone **paying or checking out** triggers far more work than someone browsing. A slow tail often means your best customers are the ones suffering.
+
+### 🔧 Going deeper: computing percentiles correctly
+
+**Never average percentiles** across servers or time windows (the mean of five P99s isn't a P99). Record a **histogram** and compute quantiles from the merged buckets.
+
+```python title="metrics.py"
+import time
+
+from fastapi import FastAPI, Request
+from prometheus_client import Histogram
+
+app = FastAPI()
+
+HTTP_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request latency",
+    ["method", "route", "status"],
+    buckets=[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],  # fine near your SLO, coarse in the tail
+)
+
+
+@app.middleware("http")
+async def timing(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")  # set by the router: the template "/products/{id}", not the raw URL
+    HTTP_DURATION.labels(
+        method=request.method,
+        route=getattr(route, "path", "unknown"),
+        status=response.status_code,
+    ).observe(time.perf_counter() - start)
+    return response
+```
+
+```text
+# P99 per route over the last 5 minutes, merged across all instances
+histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
+```
+
+For an offline sample (a load-test result), the nearest-rank method is enough:
+
+```python
+import math
+
+
+def percentile(sorted_values: list[float], p: float) -> float:
+    return sorted_values[max(0, math.ceil(p / 100 * len(sorted_values)) - 1)]
+```
+
+### 🔧 Going deeper: why the tail matters even more with fan-out
+If one page load calls **N** backend services in parallel, the page is as slow as the **slowest** call. If each call is "slow" 1% of the time (above its own P99), the chance that at least one of 100 calls is slow is
+
+> 1 − 0.99¹⁰⁰ ≈ **63%**
+
+So a backend P99 becomes a **typical** user experience once requests fan out. This is the core argument of Google's "The Tail at Scale".
+
+---
+
+## 3. Throughput 🎓
+
+- **Latency:** how long **one** request takes.
+- **Throughput:** how many requests the system completes **per unit of time** (requests per second or per minute).
+
+You need both, because they're linked. A system might answer in **150 ms at 10 req/s** and in **2 s at 1,000 req/s**. Throughput together with latency answers the real questions:
+- Can we survive the **Black Friday** spike?
+- What happens if an **email campaign** goes out, or we're featured on a big podcast or blog?
+- How many **concurrent users** can we support, and at what request rate do we need more resources?
+
+The relationship isn't linear. As throughput rises, latency creeps up slowly at first, then **shoots up** past some point. Section 4 explains why.
+
+### 🔧 Going deeper: Little's law connects them
+For any stable system:
+
+> **L = λ × W**
+> L = requests in the system at once (concurrency), λ = arrival rate (throughput), W = time each request spends inside (latency)
+
+Engineering uses:
+- **1,000 req/s × 0.2 s = 200 requests in flight** at any moment. Your server must hold 200 concurrent requests (sockets, memory, event-loop work) to sustain that rate.
+- **DB pool sizing:** 2,000 queries/s × 5 ms per query = **10 connections busy** on average. A pool of 15–20 gives headroom; a pool of 200 is waste.
+- **Diagnosis:** if latency W doubles at the same λ, concurrency L doubles, which exhausts pools and threads. That's how a slow dependency takes the whole service down.
+
+---
+
+## 4. Utilization: why latency explodes near 100% 🎓
+
+### The ice cream shop
+- **Sunday evening, empty shop:** you order and get your cone at once. **Low utilization, low latency.**
+- **Tuesday lunchtime, long queue:** the server still takes exactly **2 minutes per ice cream**, but you wait much longer, because you're behind everyone else.
+
+The key point: **the worker didn't get slower. The waiting did.** Servers behave the same way. At low utilization, the CPU picks up each request immediately. As load rises, requests wait for the ones ahead of them and a **queue** forms. Higher utilization means a longer queue and a longer wait.
+
+**Utilization** = the percentage of the system's capacity in use. 0% is idle; 100% is maxed out and on the edge of collapse.
+
+### The counterintuitive curve
+You'd expect latency to grow **linearly** with utilization. It doesn't. It stays flat for a while, then bends sharply upward as utilization approaches 100%.
+
+### The highway analogy
+| Highway load | What happens |
+|---|---|
+| 50% | Gaps everywhere, overtaking is easy, arrival times are predictable |
+| 80% | Slowdowns; lane changes need planning |
+| 90% | **Unpredictable**: sometimes it flows, sometimes one braking driver sends a ripple back and everyone stops |
+| 100% | Every spot is filled. Nobody moves |
+
+### 🔧 Going deeper: the math behind the curve
+In the simplest queueing model (one server, random arrivals, an M/M/1 queue), with service time **S** and utilization **ρ**:
+
+> average time in system **W = S ÷ (1 − ρ)**
+
+| Utilization ρ | W (S = 10 ms) | Multiple of the idle latency |
+|---|---|---|
+| 50% | 20 ms | 2× |
+| 80% | 50 ms | 5× |
+| 90% | 100 ms | 10× |
+| 95% | 200 ms | 20× |
+| 99% | 1,000 ms | 100× |
+
+Going from 90% to 99% busy makes requests **ten times slower** without any code change. Real systems differ in detail, but the shape (a `1 ÷ (1 − ρ)` blow-up) is the same, and **variance** (bursty arrivals, uneven request costs) makes it worse.
+
+<Mermaid chart={`flowchart LR
+  A["Arrivals<br/>bursty"] --> Q[["Queue<br/>grows like 1/(1 - utilization)"]]
+  Q --> S["Server<br/>fixed speed"]
+  S --> R["Responses"]
+  Q -. "at 90%+ busy, waiting time dominates" .-> W["Latency spikes"]`} />
+
+### The engineering conclusion 🎓
+- **You can't run a system at 100% and expect it to perform.** You need **headroom**.
+- Production systems typically run at **60–80% utilization**, keeping about 20% as a buffer.
+- The buffer exists because **traffic comes in bursts**, not like a metronome: a flood one minute, nothing the next, a thousand requests half an hour later. A system averaging 40–50% can briefly go **above 100%** during a burst. Without headroom, it falls over.
+
+🔧 **How to implement headroom:** set autoscaling targets around 60–70% CPU (not 90%); alert on **saturation** (queue length, pool wait time, event-loop lag) as well as CPU; and load-test to find the knee of your own curve.
+
+---
+
+## 5. Load testing: measuring the knee of your own curve ➕
+
+Section 4 tells you to find the knee of your own latency curve. The only way to see it before your users do is to generate load on purpose, and the most common way of doing that quietly measures the wrong thing.
+
+<Mermaid chart={`flowchart LR
+  subgraph Closed["Closed model: N virtual users in a loop"]
+    direction TB
+    c1["send request"] --> c2["wait for response"] --> c3["think time"] --> c1
+  end
+  subgraph Open["Open model: arrivals on a clock"]
+    direction TB
+    o1["scheduler: 500 starts per second"] --> o2["new request<br/>whether or not<br/>earlier ones finished"]
+  end
+  Closed -. "server slows down,<br/>the test sends less" .-> X["hides the knee"]
+  Open -. "server slows down,<br/>requests pile up" .-> Y["shows the knee,<br/>like real traffic"]`} />
+
+#### 5.1 Closed vs open workload models ➕
+
+**Problem.** Most load tools start with "100 virtual users". Each one sends a request, waits for the response, maybe sleeps, then sends the next. That is a **closed** model: a fixed population of clients, and a new request only starts when an old one finishes.
+
+**Why it misleads (first principles).** In a closed model the arrival rate is not something you set. It falls out of Little's law (section 3): with N users, response time W and think time Z,
+
+> arrival rate λ = N ÷ (W + Z)
+
+With 100 users, no think time and W = 50 ms, the test generates 100 ÷ 0.05 = **2,000 req/s**. Now the server starts to struggle and W rises to 500 ms. The same 100 users can only generate 100 ÷ 0.5 = **200 req/s**. The load test **backs off exactly when the system is in trouble**, so it settles at a comfortable point and never pushes you past the knee. Real users on the internet don't coordinate with your server like that. A product launch keeps sending new visitors whether or not your API is slow. That is an **open** model: arrivals come at a rate set by the outside world.
+
+**Mechanism.** Use an open-model generator for anything internet-facing: you set the **arrival rate**, and the tool starts new requests on schedule, using as many concurrent clients as it needs. In k6 that is the `constant-arrival-rate` and `ramping-arrival-rate` executors. k6's own docs show the difference: with requests that take 6 s, one closed-loop virtual user completes about 10 iterations in a minute, while an open model at 1 iteration per second starts about 60.
+
+**When the closed model is right.** When the real client population really is fixed: a pool of 20 batch workers, a mobile app that syncs one request at a time per device, an internal service with a fixed connection pool. Model the system the way its real clients behave.
+
+**Edge cases.**
+- An open model needs enough pre-allocated clients. If k6 runs out of virtual users it can't start iterations on time and reports them in the `dropped_iterations` metric. Any non-zero value means the **generator** became the bottleneck, and the run is invalid.
+- In an open test, an overloaded server makes concurrency grow without bound (L = λW again). Cap `maxVUs` so the generator itself doesn't fall over, and treat hitting the cap as "past the knee".
+
+#### 5.2 Coordinated omission ➕
+
+**Problem.** Even with the right model, a tool can **leave the slowest samples out** of its own statistics. Gil Tene named this **coordinated omission**: the load generator coordinates with the system it measures, and omits exactly the measurements that would have been bad.
+
+**Why it happens, with numbers.** A test plans one request every 10 ms (100 req/s) for 100 s, so 10,000 samples. Normally each takes 1 ms. Once during the run, the server freezes for **2 s** (a GC pause, a lock, a failover).
+- A closed-loop client sends one request, which takes 2 s, and sends nothing else during the freeze. It records about 9,800 samples of 1 ms and **one** sample of 2 s. Its P99 is **1 ms**.
+- Real users kept arriving every 10 ms during the freeze. About 200 of them (2% of all requests) waited between 2 s and 10 ms, depending on when they arrived. The true P99 is the 100th slowest of those: about **1 s**.
+
+The tool reports a P99 a thousand times better than what users felt.
+
+**Mechanism.** Measure each request's latency from the time it **should have been sent** according to the schedule, not from the time the tool actually managed to send it. Tools that do this:
+- **wrk2** (Gil Tene's fork of wrk) issues requests at a constant rate and corrects for the omission.
+- **autocannon** corrects for it when you give it a rate (`--overallRate` or `--connectionRate`); without a rate it is a closed-loop tool.
+- **k6 arrival-rate executors** start each iteration on schedule on a free virtual user, so a stalled request doesn't stop new ones from being sent, as long as `dropped_iterations` stays at zero.
+- **Locust**, the popular Python load tool, is a closed-loop tool by design: each simulated user waits for its response before the next task. `constant_throughput` paces users, but a user stuck on a 2 s request sends nothing meanwhile, so Locust does **not** correct for coordinated omission. It's great for realistic user journeys; use an open-model tool when the tail is what you're measuring.
+- Record into **HdrHistogram**-style histograms so the tail keeps its resolution.
+
+```bash
+# closed loop: 100 connections, latency numbers hide stalls
+npx autocannon -c 100 -d 60 http://localhost:3000/products/42
+
+# open loop at 2,000 req/s overall, latencies corrected for coordinated omission
+npx autocannon -c 200 -d 60 --overallRate 2000 http://localhost:3000/products/42
+```
+
+**Edge case: your server metrics have the same blind spot.** A server-side histogram (section 2) starts timing when your handler runs. Time spent waiting in the kernel's accept queue, in the load balancer, or in an event loop that was blocked before your middleware ran never shows up. Compare server-side P99 with the client-side or load-balancer P99; a big gap means queueing in front of your code.
+
+#### 5.3 Writing a test that finds the knee (k6) ➕
+
+**Problem.** A single "hit it with 1,000 users" run gives one number and no curve. You want throughput and P99 at **several** load levels, so you can see where the latency line bends.
+
+**Mechanism.** Ramp the arrival rate in steps, hold each step long enough to reach a steady state, use realistic request mixes and IDs, and let thresholds decide pass or fail.
+
+```js title="find-knee.k6.js"
+import http from 'k6/http';
+import { check } from 'k6';
+import { SharedArray } from 'k6/data';
+
+// real IDs, so the cache hit rate looks like production instead of 100%
+const ids = new SharedArray('ids', () => JSON.parse(open('./product-ids.json')));
+
+export const options = {
+  scenarios: {
+    knee: {
+      executor: 'ramping-arrival-rate',   // open model
+      startRate: 100,
+      timeUnit: '1s',
+      preAllocatedVUs: 200,
+      maxVUs: 3000,
+      stages: [                           // each step: ramp 30 s, then hold 2 min
+        { target: 200, duration: '30s' }, { target: 200, duration: '2m' },
+        { target: 400, duration: '30s' }, { target: 400, duration: '2m' },
+        { target: 800, duration: '30s' }, { target: 800, duration: '2m' },
+        { target: 1600, duration: '30s' }, { target: 1600, duration: '2m' },
+      ],
+    },
+  },
+  thresholds: {
+    'http_req_duration{name:GET /products/:id}': ['p(99)<300'],
+    http_req_failed: ['rate<0.01'],
+    dropped_iterations: ['count<1'],      // the generator must keep up, or the run is invalid
+  },
+};
+
+export default function () {
+  const id = ids[Math.floor(Math.random() * ids.length)];
+  const res = http.get(`${__ENV.BASE_URL}/products/${id}`, { tags: { name: 'GET /products/:id' } });
+  check(res, { 'status is 200': (r) => r.status === 200 });
+}
+```
+
+```bash
+k6 run -e BASE_URL=https://staging.example.com find-knee.k6.js
+```
+
+k6 scripts are JavaScript (k6 embeds its own JS runtime, so there is no Python version of this file). If you'd rather keep load tests in Python, Locust can step through the same levels. Remember the caveat from section 5.2: Locust is closed-model, so pace each user at one request per second and treat "users" as an approximate arrival rate that sags once responses slow down.
+
+```python title="find_knee.py (Locust: locust -f find_knee.py --headless --host https://staging.example.com)"
+import json
+import random
+from pathlib import Path
+
+from locust import FastHttpUser, LoadTestShape, constant_throughput, events, task
+
+# real IDs, so the cache hit rate looks like production instead of 100%
+IDS = json.loads(Path("product-ids.json").read_text())
+
+
+class Shopper(FastHttpUser):
+    wait_time = constant_throughput(1)  # at most 1 request/s per user, so users ≈ target req/s
+
+    @task
+    def get_product(self) -> None:
+        self.client.get(f"/products/{random.choice(IDS)}", name="GET /products/:id")
+
+
+class Steps(LoadTestShape):
+    # (end of stage in seconds, users): each step ramps for 30 s, then holds for 2 min
+    stages = [(30, 200), (150, 200), (180, 400), (300, 400),
+              (330, 800), (450, 800), (480, 1600), (600, 1600)]
+
+    def tick(self):
+        run_time = self.get_run_time()
+        for end, users in self.stages:
+            if run_time < end:
+                return users, 50  # (target user count, users started per second)
+        return None  # stop the test
+
+
+@events.quitting.add_listener
+def enforce_thresholds(environment, **_kwargs) -> None:
+    stats = environment.stats.get("GET /products/:id", "GET")
+    if stats.get_response_time_percentile(0.99) > 300 or environment.stats.total.fail_ratio > 0.01:
+        environment.process_exit_code = 1  # fail the run, like a failed k6 threshold
+```
+
+**Reading the result.** Plot, per step, the **achieved** throughput against the **target**, and the P99. Below the knee, achieved equals target and P99 is flat. At the knee, P99 bends upward; past it, achieved throughput stops following the target and errors appear. Your **sustainable capacity** is the highest step where P99 still meets the SLO, not the highest throughput you ever saw. That number feeds capacity planning (section 15.3).
+
+**The usual test types**, all variations of the script above:
+
+| Type | Shape | What it finds |
+|---|---|---|
+| Smoke | 1–5 req/s for a minute | the script and environment work |
+| Load | expected peak, held 10–30 min | whether you meet the SLO at normal peak |
+| Stress | steps past the expected peak | the knee and how the system fails |
+| Spike | jump from low to very high in seconds | autoscaling lag, cold caches, connection storms |
+| Soak | normal load for hours | memory leaks and slow resource exhaustion (section 9) |
+
+#### 5.4 Test hygiene: making the numbers mean something ➕
+
+A load test that is easy to run is also easy to get wrong. Each rule below fixes a specific way the result lies.
+- **The generator must not be the bottleneck.** If the k6 machine is near 100% CPU, its own scheduling delays show up as latency. Watch its CPU, and spread load across several machines if needed.
+- **Warm up, then measure.** The first minute includes lazy imports, empty caches, pools that are still opening connections, and JIT warm-up on runtimes that have one. Discard it, or ramp slowly into the first step.
+- **Use production-sized data.** A query plan on 1,000 rows is not the plan on 50 million rows; the planner may choose a sequential scan on the small table and an index on the big one (section 11.2). Test against a copy with realistic volume and distribution.
+- **Use realistic key distributions.** Hitting one product ID gives a 100% cache hit rate; uniformly random IDs give an unrealistically low one. Real traffic is usually skewed, with a few hot keys. Sample IDs from production access logs if you can.
+- **Stub third parties.** Don't load-test someone else's email or payment API. Point those calls at a stub with a realistic, fixed delay (e.g. 200 ms), so the test still includes the waiting.
+- **Isolate the environment.** Other teams' tests, a shared database or a CDN in front can change the result. Know what's in the path, and test through the CDN only when that's what you mean to test.
+
+#### 5.5 Performance budgets and regression detection in CI ➕
+
+**Problem.** Systems rarely get slow in one big step. One pull request adds a query, another adds a field to a hot JSON response, a third adds a middleware. Each costs a few milliseconds, none fails a test, and six months later the knee has moved from 800 to 400 req/s.
+
+**Mechanism: budgets that the pipeline enforces.** A **performance budget** is a number per critical path, such as "P99 of `GET /products/:id` stays under 300 ms at 200 req/s on the reference environment", or "this endpoint runs at most 3 SQL queries". Checks that run in CI turn the budget into a failing build. k6 exits with a **non-zero code** when any threshold fails, so a short fixed-rate run is a CI gate on its own:
+
+```yaml title=".github/workflows/perf.yml"
+name: perf-budget
+on: [pull_request]
+jobs:
+  k6:
+    runs-on: [self-hosted, perf]          # a dedicated runner: shared runners are too noisy
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f docker-compose.perf.yml up -d --wait   # app + seeded Postgres
+      - run: k6 run -e BASE_URL=http://localhost:3000 perf/budget.k6.js   # non-zero exit fails the job
+```
+
+**Deterministic budgets beat timing budgets.** Timing in CI is noisy: other jobs, CPU throttling, disk caches. Some of the most useful budgets don't measure time at all, because they don't vary between runs:
+- **Query count per request**: catches N+1 (section 11.1) on the PR that introduces it.
+- **Response size**: catches overfetching (section 7).
+- **Number of outbound HTTP calls** per request.
+
+```python title="test_products_perf.py (runs in the normal pytest suite)"
+from fastapi.testclient import TestClient
+from sqlalchemy import event
+
+from app.db import engine  # the app's AsyncEngine
+from app.main import app
+
+
+def test_get_posts_stays_within_query_and_size_budget():
+    queries = 0
+
+    def count(*_args) -> None:
+        nonlocal queries
+        queries += 1
+
+    # every SQL statement the app sends passes through this hook
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        with TestClient(app) as client:
+            res = client.get("/posts", params={"limit": 20})
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+
+    assert res.status_code == 200
+    assert queries <= 2                 # posts + authors, never 1 + N
+    assert len(res.content) < 50_000    # 50 KB for one page
+```
+
+**Edge cases.**
+- **Flaky budgets get ignored.** If a timing gate fails one run in ten for no reason, people learn to re-run it, and it protects nothing. Use generous timing thresholds (catch 2× regressions, not 5%), run on dedicated hardware, and keep the strict checks deterministic.
+- **Compare against a baseline, not just an absolute line.** Store each main-branch result and flag a PR that is, say, 20% slower than the last few baselines, even if it's still under the absolute budget.
+- **Budgets need owners.** When a feature genuinely needs more time, raising the budget should be a visible, reviewed decision, not a silent edit.
+
+---
+
+## 6. Find the bottleneck before fixing anything 🎓
+
+"The system is slow" always means **one specific thing** is slow. Finding it is **identifying the bottleneck**. It sounds obvious, but engineers often skip it and jump straight to textbook fixes:
+- "Latency? Add caching."
+- "The DB must be slow; upgrade Postgres 16 to 18."
+- "The server's the problem; add more servers (horizontal scaling)."
+
+Sometimes that works by luck. More often you spend **days or weeks solving a problem you don't have**, and the real bottleneck is still there.
+
+### The lesson's story: a week of Redis for nothing
+1. `GET /products/:id` feels slow. Assumption: "the database is always the problem."
+2. A week is spent adding a **Redis cache** in front of it. It's deployed. **Still slow.**
+3. Finally, someone adds **timing measurements** around every step of the handler:
+
+| Step | Time |
+|---|---|
+| Database query | ~10 ms |
+| New Redis cache lookup | ~5 ms |
+| **Logging call to a remote service (e.g. Elasticsearch), awaited synchronously** | **~500 ms** |
+
+The database was never the problem. The request was **blocked waiting for a log write**. The fix is to log without blocking the response (concurrency, covered in the next lesson of the series).
+
+<Mermaid chart={`flowchart LR
+  R["GET /products/5<br/>~515 ms"] --> C["cache 5 ms"]
+  R --> D["DB 10 ms"]
+  R --> L["sync remote log 500 ms<br/>the real bottleneck"]
+  style L fill:#f87171,color:#000`} />
+
+Other non-obvious culprits the lesson lists: **JSON or XML serialization**, and a **huge response payload** whose network transfer dominates even though the code is fast.
+
+**Rule: never guess, always measure.**
+
+### 🔧 Going deeper: measuring a handler, and fixing the logger
+
+Step timings exposed as a `Server-Timing` header show up in the browser's DevTools network panel:
+
+```python title="timed_handler.py"
+import json
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+from fastapi import FastAPI, Response
+
+app = FastAPI()
+
+
+@contextmanager
+def timed(marks: list[str], name: str) -> Iterator[None]:
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        marks.append(f"{name};dur={(time.perf_counter() - t0) * 1000:.1f}")
+
+
+@app.get("/products/{product_id}")
+async def get_product(product_id: int) -> Response:
+    marks: list[str] = []
+    with timed(marks, "db"):
+        product = await repo.find_product(product_id)
+    with timed(marks, "serialize"):
+        body = json.dumps(product)
+    # e.g. db;dur=10.2, serialize;dur=0.4
+    return Response(body, media_type="application/json", headers={"Server-Timing": ", ".join(marks)})
+```
+
+The logger fix: **don't `await` a network call on the request path** (and don't call a blocking one, which is worse: a synchronous HTTP log handler in an `async def` endpoint stalls every request on that worker). Either write structured logs to stdout (e.g. with `structlog` or the standard `logging` module) and let an agent ship them, or buffer and flush in the background:
+
+```python title="buffered_logger.py"
+import asyncio
+from collections.abc import Awaitable, Callable
+
+
+class BufferedLogger:
+    def __init__(self, send: Callable[[list[dict]], Awaitable[None]],
+                 max_batch: int = 500, flush_s: float = 1.0) -> None:
+        self._send = send
+        self._buf: list[dict] = []
+        self._max_batch = max_batch
+        self._flush_s = flush_s
+        self._tasks: set[asyncio.Task] = set()  # keep references so tasks aren't garbage-collected
+
+    def start(self) -> None:  # call from the app's lifespan startup
+        self._spawn(self._flush_forever())
+
+    def log(self, entry: dict) -> None:  # O(1), no I/O on the request path
+        self._buf.append(entry)
+        if len(self._buf) >= self._max_batch:
+            self._spawn(self.flush())
+
+    async def flush(self) -> None:
+        if not self._buf:
+            return
+        batch, self._buf = self._buf, []
+        try:
+            await self._send(batch)
+        except Exception:
+            if len(self._buf) < 10_000:  # bounded retry, never unbounded memory
+                self._buf[:0] = batch
+
+    async def _flush_forever(self) -> None:
+        while True:
+            await asyncio.sleep(self._flush_s)
+            await self.flush()
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+```
+
+For ordinary `logging` calls, the standard library has the same pattern built in: `logging.handlers.QueueHandler` only puts the record on a queue, and a `QueueListener` thread does the slow I/O.
+
+Edge cases: flush in the lifespan shutdown before exit (uvicorn turns `SIGTERM` into a graceful shutdown that runs it); cap the buffer so a dead logging backend can't eat all memory; accept that a crash may lose the last second of logs (or use a local agent if you can't).
+
+---
+
+## 7. Payload size and serialization cost ➕
+
+The lesson lists JSON serialization and huge response payloads as hidden bottlenecks; this section shows why bytes and serialization cost real time, and what to do about them. (Compression itself is covered in [HTTP: compression](/docs/backend-first-principles/05-http) and pagination in [REST API design](/docs/backend-first-principles/11-rest-api-design), so they are only linked here.)
+
+<Mermaid chart={`flowchart LR
+  A["DB rows"] --> B["build objects<br/>allocation, GC"]
+  B --> C["json.dumps / model serialization<br/>CPU, blocks the event loop"]
+  C --> D["compress<br/>CPU"]
+  D --> E["network transfer<br/>bytes / bandwidth<br/>+ slow-start round trips"]
+  E --> F["client JSON.parse<br/>CPU on the phone"]`} />
+
+#### 7.1 Why bytes cost time on the wire ➕
+
+**Problem.** An endpoint that is fast on your laptop is slow for real users, and the trace shows almost no server time.
+
+**Why it happens.** Transfer time is not just size ÷ bandwidth; TCP also ramps up slowly.
+- **Bandwidth:** a 2 MB JSON response to a phone on a 10 Mbit/s connection takes 2 × 8 ÷ 10 = **1.6 s** of pure transfer.
+- **Slow start:** a new TCP connection may send only about 10 segments (roughly 14.6 KB) in its first round trip (RFC 6928's initial window), then roughly doubles each round trip. To deliver 2 MB, 14.6 KB × (2ᵏ − 1) must reach 2,000 KB, so k ≈ 8 round trips. At 100 ms RTT, that's about **800 ms** even on a fast link.
+- **The client pays again:** the browser or phone has to parse the JSON before it can render anything, on a CPU much slower than your server's.
+
+So for far-away or mobile users, response size often matters more than server code. Compressing the response (gzip or Brotli) reduces the bytes, but not the CPU work on either end.
+
+#### 7.2 Serialization is CPU work that blocks the event loop ➕
+
+**Problem.** Under load, P99 rises for **every** endpoint, though only one endpoint returns big responses.
+
+**Why it happens.** `json.dumps` and `json.loads` (and Pydantic's serialization of a response model) are synchronous CPU work. In an `async def` FastAPI endpoint they run on the worker's single event-loop thread, so while one big response is being serialized, no other request on that worker makes progress (the event loop is explained in [Concurrency and parallelism](/docs/backend-first-principles/23-concurrency-parallelism)). Moving it to a plain `def` endpoint (which FastAPI runs in a threadpool) doesn't buy much: on the standard CPython build the GIL lets only one thread run Python code at a time, so the serializing thread still competes with the event loop. A measurement on my machine (CPython 3.14, standard build, stdlib `json`): a list of 10,000 product dicts, about 4 MB of JSON, took about **16 ms to dump** and **16 ms to load**. Do the utilization maths from section 4: at 30 such responses per second, that's about 0.5 s of CPU per second, **50% of the worker's core** spent on JSON alone, before compression or business logic. Every other request on that worker queues behind it.
+
+**Mechanism, in order of payoff.**
+1. **Send less** (section 7.3). Half the bytes is half the serialization, compression and transfer.
+2. **Schema-based serialization.** Declare a Pydantic response model (`response_model=` or the endpoint's return type), and FastAPI serializes the response through it with pydantic-core, which is written in Rust. Its second benefit matters as much: attributes not in the model are **dropped**, so a new `password_hash` column can't leak into a response by accident. For big payloads of plain dicts, a fast encoder such as `orjson` is another option; measure it on your own data.
+3. **Move very large work off the request path**: stream it (section 7.4), or generate it in a background job and hand back a download link ([Task queues](/docs/backend-first-principles/14-task-queues-background-jobs)).
+
+```python title="product_route.py (FastAPI)"
+from fastapi import FastAPI
+from pydantic import BaseModel, ConfigDict
+
+app = FastAPI()
+
+
+class ProductOut(BaseModel):  # only these fields are serialized
+    model_config = ConfigDict(from_attributes=True)  # read them from an ORM object's attributes
+
+    id: str
+    name: str
+    price_cents: int
+
+
+@app.get("/products/{product_id}", response_model=ProductOut)
+async def get_product(product_id: str):
+    return await repo.find_product(product_id)  # extra attributes (password_hash...) never leave
+```
+
+**Edge cases.**
+- Measure before switching serializers: validating every item of a large list through a model costs CPU too, and for big read-only payloads a plain encoder over dicts may be as fast or faster.
+- `json.dumps` raises `TypeError` on `datetime`, `Decimal` and `UUID`, and a Python `int` above 2⁵³ silently loses precision when a JavaScript client parses it; a response model forces you to decide these representations explicitly ([Serialization](/docs/backend-first-principles/07-serialization-deserialization)).
+
+#### 7.3 Send less: field selection and response shaping ➕
+
+**Problem.** The handler returns whole rows (`SELECT *`, or an ORM entity with every relation loaded) though the UI shows three fields. The 100-column `departments` table from section 11.2 is the extreme case.
+
+**Mechanism.**
+- **Select only what you return.** `SELECT id, name` instead of `SELECT *` cuts the bytes read from the DB, sent over the DB connection, held in memory and serialized. In SQLAlchemy, select the columns you need (`select(Post.id, Post.title)`) or use `load_only(...)`, instead of loading whole entities with every relationship.
+- **Map to a response DTO** on purpose, instead of returning the database entity. It also stops internal columns from leaking.
+- **Let clients ask for less** where it pays: sparse fieldsets (`?fields=id,name`), separate summary and detail endpoints, or GraphQL field selection.
+- **Cap list sizes** and paginate (see [REST API design](/docs/backend-first-principles/11-rest-api-design) for offset vs cursor pagination).
+
+```python
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+# ❌ ~40 columns, plus the full author row, for a list that shows 3 fields
+posts = (await session.scalars(
+    select(Post).options(selectinload(Post.author)).limit(20)
+)).all()
+
+# ✅ exactly what the card renders
+cards = (await session.execute(
+    select(Post.id, Post.title, User.name.label("author_name"))
+    .join(User, User.id == Post.author_id)
+    .limit(20)
+)).all()
+```
+
+**Edge case.** Field selection reduces the value of an HTTP or CDN cache when every client asks for a different field set, because each combination becomes its own cache key. Offer a few fixed shapes rather than arbitrary combinations on cacheable endpoints.
+
+#### 7.4 Stream large responses instead of buffering them ➕
+
+**Problem.** A CSV or JSON export of 500,000 rows. Loading all rows, building one giant string and sending it uses hundreds of MB of memory per request (two concurrent exports can crash the process), and the client sees nothing until the whole thing is ready.
+
+**Mechanism.** Read rows from Postgres in batches through a server-side cursor, turn each batch into lines, and yield them from an async generator into a `StreamingResponse`. Memory stays constant, the first bytes leave within milliseconds, and you get **backpressure** for free: the generator only advances after the previous chunk was handed to the server, and uvicorn applies flow control on the socket, so if the client reads slowly, `send()` waits and the loop stops pulling rows from the database.
+
+```python title="export_route.py"
+import json
+from datetime import datetime
+
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from sqlalchemy import text
+
+app = FastAPI()
+
+EXPORT_SQL = text(
+    "SELECT id, user_id, total_cents, created_at FROM orders "
+    "WHERE created_at >= :since ORDER BY id"
+)
+
+
+@app.get("/exports/orders.ndjson")
+async def export_orders(since: datetime) -> StreamingResponse:
+    async def lines():
+        async with engine.connect() as conn:  # holds one pool connection for the whole export
+            result = await conn.stream(EXPORT_SQL, {"since": since},
+                                       execution_options={"yield_per": 1000})  # 1,000 rows in memory at a time
+            async for rows in result.partitions():
+                yield "".join(json.dumps(dict(row._mapping), default=str) + "\n" for row in rows)
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson")  # backpressure end to end
+```
+
+**Edge cases.**
+- **The status code is gone once streaming starts.** If the query fails halfway, you've already sent `200`. Formats with a natural end help: write a final `{"done":true}` line, or abort the connection so the client sees a truncated response instead of a "complete" partial one.
+- **A stream holds a pool connection** for its whole duration. Long exports should use a separate pool, or a background job that writes to object storage.
+- Each line is still serialized on the worker's event loop; with many concurrent exports, run them in a background worker or a separate service.
+
+---
+
+## 8. Profiling and flame graphs 🎓
+
+- **Profiling** measures **where the application spends its time**. A profiler attaches to the running process, samples what's executing, and records which functions run and for how long.
+- The raw output (thousands of functions with fractions of time) is overwhelming, so we use **flame graphs**:
+  - **Width** = time. Wide boxes are where the time goes.
+  - **Stacking** = calls. A function called by another sits on top of it.
+- The first time you look at one, you'll be surprised: you expect "complex business logic", and find **JSON serialization**; you expect "DB queries", and find **an external API called in a loop**.
+
+### The limit: profilers see CPU, most backends wait on I/O
+- **CPU-bound** work uses CPU cycles (computation). CPU profilers are good at this.
+- **I/O-bound** work is **waiting**: DB queries, file access, external API calls, queues. While waiting, the CPU is idle, so a CPU profiler shows little.
+- In typical SaaS backends, performance problems are **mostly I/O-bound** (unless you do image processing, ML or heavy matrix maths). So you need another tool.
+
+🔧 Python commands (`cProfile` is in the standard library and adds overhead to every call; `py-spy` samples a running process from the outside, so it's safe to point at production):
+
+```bash
+python -m cProfile -o app.prof -m uvicorn app.main:app   # deterministic profile; browse it with snakeviz app.prof
+py-spy record -o flame.svg --pid 12345                    # sample a running worker, write an interactive flame graph
+py-spy top --pid 12345                                    # live "top" view of the hottest functions
+py-spy dump --pid 12345                                   # what every thread is doing right now (stuck workers)
+```
+
+---
+
+## 9. Memory and garbage collection in Python ➕
+
+A CPU profile shows where your code spends time. It doesn't show the time the runtime spends **cleaning up after** your code, and a memory leak usually shows up as rising latency long before it shows up as a crash.
+
+<Mermaid chart={`flowchart LR
+  N["new objects"] --> RC["reference counting<br/>freed the moment the<br/>last reference goes"]
+  N --> CY["container objects<br/>tracked by the cycle collector"]
+  CY -->|"allocation count passes threshold"| G["gc pass: interpreter paused<br/>longer with more tracked objects"]
+  G -->|"memory keeps growing"| T["bigger and slower collections<br/>latency spikes"]
+  T --> K["container memory limit<br/>OOM kill, exit 137"]`} />
+
+#### 9.1 How CPython's memory management turns allocation into latency ➕
+
+**Problem.** P99 has periodic spikes that line up with nothing in your traces. The handler, the database and the downstream calls are all fast.
+
+**Why it happens (first principles).** CPython frees memory in two ways.
+- **Reference counting:** every object counts the references to it, and is freed the moment the count drops to zero. Most request garbage (a parsed body, intermediate lists, the strings built for a response) dies this way, immediately. It's cheap per object, but not free: dropping the last reference to a list of 500,000 dicts frees all of them right then, on the request that happened to drop it.
+- **The cycle collector (`gc` module):** objects that reference each other (a parent and child pointing at each other, an exception holding a traceback holding the frame that holds the exception) never reach a count of zero. A generational collector finds them. It runs when the number of new container objects (lists, dicts, class instances) passes a threshold, and while it runs the interpreter is paused: on the standard build it holds the GIL, so no other thread runs Python code. Full collections walk **every tracked object**, so a big heap of long-lived objects (large caches, ORM identity maps) makes each one slower.
+
+So **allocation rate** becomes latency: more container objects per request means more frequent collections, and more objects living longer means more work in each full collection. Each pause is added to every request in flight on that worker at that moment, which is exactly the tail.
+
+**Mechanism: measure it, then allocate less.**
+
+```python title="gc_metrics.py"
+import gc
+import time
+
+from prometheus_client import Histogram
+
+GC_PAUSE = Histogram(
+    "python_gc_pause_seconds", "Cycle collector pause duration",
+    ["generation"], buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25],
+)
+_started = 0.0
+
+
+def _on_gc(phase: str, info: dict) -> None:  # called by the interpreter around every collection
+    global _started
+    if phase == "start":
+        _started = time.perf_counter()
+    else:  # "stop"
+        GC_PAUSE.labels(generation=str(info["generation"])).observe(time.perf_counter() - _started)
+
+
+gc.callbacks.append(_on_gc)
+```
+
+(`prometheus_client`'s default collectors already export `python_gc_collections_total` and `process_resident_memory_bytes`, but not pause durations.)
+
+Ways to reduce GC work, cheapest first: return smaller responses (section 7); avoid building big intermediate lists (a chain of list comprehensions over 100,000 rows creates one list per step, where generator expressions create none); stream instead of buffering; keep in-process caches small and bounded; and call `gc.freeze()` once startup is done, which moves everything allocated so far (imported modules, config, warmed caches) into a permanent generation that later collections skip.
+
+**Edge case: the thresholds.** `gc.set_threshold()` raises the allocation count that triggers a collection, so collections happen less often but each has more to do, and memory held by garbage cycles lives longer. Some large services go further and disable the automatic collector (Instagram wrote about doing it), which only works if the code creates very few cycles. Test any change under load before keeping it.
+
+#### 9.2 Memory limits in containers: workers × RSS ➕
+
+**Problem.** A pod restarts every few hours with exit code **137** and no Python traceback. Python raises `MemoryError` only when an allocation itself fails, which on Linux with memory overcommit is rare; usually the kernel gets there first.
+
+**Why it happens.** Two facts combine:
+1. **Python has no heap cap.** Unlike the JVM or V8, CPython has no setting like "use at most 1.5 GB"; a process grows until something outside it says no. And memory it frees often isn't returned to the OS: the small-object allocator (pymalloc) can only release a block of memory (an arena) once every object in it is gone, so after a burst RSS tends to stay near its high-water mark.
+2. **The container's memory limit** (the cgroup) counts **every process** in it: the gunicorn master plus each worker, and each worker is a full interpreter with its own imports, caches, connection pools and in-flight requests. Forked workers start out sharing the parent's pages, but reference counting writes to objects, so shared pages gradually get copied into each worker. When the total crosses the limit, the kernel kills a process instantly: exit 137, no log.
+
+That makes the worker count a memory decision as well as a CPU one: 4 workers at 450 MB each is 1.8 GB before the master and any spike, too much for a 2 GiB pod.
+
+**Mechanism.** Measure peak RSS per worker under load (section 5.3), then choose `workers × peak RSS + master` at or below about 80–90% of the container limit. Recycle workers periodically so slow growth and fragmentation can't accumulate forever: gunicorn's `--max-requests` restarts a worker after that many requests, and `--max-requests-jitter` keeps all workers from restarting at once.
+
+```yaml title="deployment.yaml (excerpt)"
+containers:
+  - name: api
+    image: registry.example.com/api:1.42.0
+    command: ["gunicorn", "app.main:app", "-k", "uvicorn_worker.UvicornWorker",
+              "--workers", "3",                      # 3 × ~500 MiB peak RSS fits a 2 GiB limit
+              "--max-requests", "2000", "--max-requests-jitter", "200"]
+    env:
+      - name: MALLOC_ARENA_MAX
+        value: "2"                                   # fewer glibc arenas: less fragmentation with threads
+    resources:
+      requests: { memory: "2Gi", cpu: "2" }
+      limits:   { memory: "2Gi" }
+```
+
+Uvicorn on its own also accepts `--workers N`; gunicorn is used here for request-count recycling.
+
+```python
+# verify what the container allows, and what this worker uses (Linux, cgroup v2)
+import resource
+from pathlib import Path
+
+limit = Path("/sys/fs/cgroup/memory.max").read_text().strip()             # bytes, or "max"
+peak_rss_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024   # Linux reports KiB
+print(f"container limit: {limit}, this worker's peak RSS: {peak_rss_mib:.0f} MiB")
+```
+
+**Edge cases.**
+- An app that handles large uploads, images or NumPy arrays keeps most of its memory in a few big buffers per request; budget each worker for its concurrency times the largest request it may hold, which usually means fewer workers, not more.
+- **Recycling hides leaks.** If memory grows without bound, `--max-requests` keeps the fleet alive, but the leak is still there and each worker restart costs a cold start; find it (section 9.3).
+- **Requests equal to limits** for memory (as above) avoid the pod being scheduled on a node that can't actually give it the memory it will use.
+
+#### 9.3 Finding memory leaks ➕
+
+**Problem.** Memory grows slowly under steady traffic, GC time grows with it, P99 creeps up over days, and a restart "fixes" it. The soak test from section 5.3 is where this usually shows up first.
+
+**Why leaks happen in a garbage-collected language.** Memory is freed only when nothing points to an object. A leak is an object that something still references by accident:
+- an **unbounded module-level dict or cache** keyed by user or request ID, including `functools.lru_cache(maxsize=None)` (always bound it, with a TTL, as in section 13);
+- **callbacks or listeners appended per request** to a long-lived list or registry and never removed;
+- **asyncio tasks that never finish** (a forgotten `while True`, a wait on an event nobody sets), holding everything their coroutines reference;
+- **global lists** used for "debugging" or metrics that keep every entry;
+- **stored exceptions**: a saved exception keeps its traceback, which keeps every frame and every local variable on it alive.
+
+**Mechanism: compare tracemalloc snapshots.** The standard library's `tracemalloc` records where each live block of memory was allocated. One snapshot tells you little; the **difference** between snapshots taken under the same load tells you which lines keep allocating memory that never goes away.
+
+```python title="tracemalloc_on_signal.py"
+import asyncio
+import signal
+import tracemalloc
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+_baseline: tracemalloc.Snapshot | None = None
+
+
+def _snapshot() -> None:
+    global _baseline
+    snap = tracemalloc.take_snapshot()
+    if _baseline is None:
+        _baseline = snap
+        print("tracemalloc baseline taken")
+        return
+    for stat in snap.compare_to(_baseline, "traceback")[:10]:  # biggest growth first
+        print(stat)
+        print("\n".join(stat.traceback.format()))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    tracemalloc.start(25)  # keep 25 frames per allocation; enable it only while hunting
+    # kubectl exec ... -- kill -USR2 <worker pid>   (Unix only)
+    asyncio.get_running_loop().add_signal_handler(signal.SIGUSR2, _snapshot)
+    yield
+```
+
+1. Start the app, warm it up, send the signal once: baseline.
+2. Run steady load for 10–30 minutes, send it again. Stop the load, wait a minute, send it once more.
+3. Read the top entries: the file and line (with the call stack) that allocated the memory that kept growing. `tracemalloc` tells you **where** objects were created, not **who** keeps them alive; to follow the retainers, use `gc.get_referrers()` or `objgraph.show_backrefs()` on one of the growing objects.
+
+**Edge cases.**
+- `tracemalloc` slows every allocation down noticeably and stores its own traces in memory. Enable it on one instance, taken out of rotation (fail readiness), not on the whole fleet.
+- It sees only memory allocated through Python's allocators. Memory a C extension allocates directly (some image, compression or database drivers) is invisible to it; `memray` tracks native allocations too and can produce memory flame graphs.
+- Not all growth is a leak: a cache warming up, or the allocator keeping memory after a burst, levels off. A leak keeps growing under **constant** load.
+
+#### 9.4 Memory metrics worth alerting on ➕
+
+**Problem.** "Memory is at 80%" says little: CPython's allocator and the C allocator keep freed memory for reuse, so RSS rarely drops.
+
+**Mechanism.** Export the breakdown, and alert on trends, not snapshots of a single moment.
+
+| Metric | Meaning | What to watch |
+|---|---|---|
+| RSS (`process_resident_memory_bytes`) | everything the OS counts for one process | the **sum over all workers** against the container limit |
+| `sys.getallocatedblocks()` | memory blocks the interpreter currently has allocated | cheap and always on; its **lower envelope** rising under constant load means a leak |
+| `len(gc.get_objects())` | container objects tracked by the cycle collector | steady growth under constant load; also drives GC pause length |
+| `tracemalloc.get_traced_memory()` | current and peak bytes traced (only while tracing) | during a leak hunt, which code paths grow |
+
+Pair them with **GC pause time** (section 9.1) and **event-loop lag**. If GC time per minute rises while traffic is flat, memory is heading for the container limit.
+
+---
+
+## 10. Distributed tracing 🎓
+
+**Tracing** follows one request through the system and records when it entered each component and how long each step took: the handler, each DB query, each external call. It's part of **observability**.
+
+With tracing in place you see facts like: `GET /products/5` spent **2 ms in your code** and **800 ms in a database query**. Now you know exactly what to fix.
+
+<Mermaid chart={`flowchart TD
+  T["trace: GET /products/5<br/>total 810 ms"] --> S1["span: handler + business logic<br/>2 ms"]
+  T --> S2["span: postgres SELECT product<br/>800 ms"]
+  T --> S3["span: JSON serialize<br/>6 ms"]
+  style S2 fill:#f87171,color:#000`} />
+
+### 🔧 Going deeper: OpenTelemetry in Python/FastAPI
+
+```python title="tracing.py (or zero-code: opentelemetry-instrument uvicorn app.main:app)"
+from fastapi import FastAPI
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.redis import RedisInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+
+def setup_tracing(app: FastAPI, engine: AsyncEngine) -> None:  # call once per worker process, at startup
+    provider = TracerProvider(resource=Resource.create({"service.name": "catalog-api"}))
+    provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint="http://otel-collector:4318/v1/traces"))
+    )
+    trace.set_tracer_provider(provider)
+    # FastAPI routes, SQL queries, outgoing httpx calls and Redis commands get spans for free
+    FastAPIInstrumentor.instrument_app(app)
+    SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine)
+    HTTPXClientInstrumentor().instrument()
+    RedisInstrumentor().instrument()
+```
+
+```python
+# a manual span around something auto-instrumentation can't see
+from opentelemetry import trace
+
+tracer = trace.get_tracer("catalog")
+
+
+async def invoice_html(order) -> str:
+    with tracer.start_as_current_span("render-invoice"):
+        return await render_invoice(order)
+```
+
+The trace context travels between services in the W3C `traceparent` header, so one trace can span the API, a queue and a worker.
+
+---
+
+## 11. Databases: the usual suspects 🎓
+
+Databases are often the bottleneck, for good reasons. They do the hard work: **durable** writes to disk that survive crashes, **consistency** under concurrent reads and writes (locking and more), and complex queries over millions or billions of rows. That takes time. Before blaming the database, check three low-hanging fruits.
+
+### 11.1 The N+1 query problem
+
+**Problem.** A blog homepage shows 20 posts, each with its author's name. The list endpoint doesn't include authors, so the code fetches the list, then loops and fetches each author: **1 + 20 = 21 calls**. For 100 posts it's 101; for 1,000 it's 1,001. **Calls grow linearly with the number of items.**
+
+**Why it hurts (first principles).** Every query pays a fixed overhead regardless of how little it returns:
+- a network round trip from the app server to the DB,
+- a TCP connection setup, if you don't pool connections (section 11.3),
+- the DB **parsing** and **planning** the query, then executing it and sending results back.
+
+At an excellent **5 ms per query**, 1,000 queries = **5,000 ms**. A 5-second spinner, just from round trips.
+
+<Mermaid chart={`flowchart LR
+  subgraph Bad["N+1: 1 + N round trips"]
+    direction TB
+    A1["SELECT posts"] --> A2["SELECT author 1"] --> A3["SELECT author 2"] --> A4["... author N"]
+  end
+  subgraph Good["Bulk: 2 round trips, or 1 JOIN"]
+    direction TB
+    B1["SELECT posts"] --> B2["SELECT users WHERE id = ANY(author_ids)"]
+  end`} />
+
+**Where it really lives.** The front-end example makes it intuitive, but the classic N+1 is **in the server**: to the database, your backend *is* the client. ORMs make it easy to write by accident, because a loop over awaited ORM calls looks like ordinary code while each line silently becomes a SQL query.
+
+**Mechanism that fixes it.** Fetch in bulk: collect all the IDs and get them in **one** query, or use a **JOIN**. Then it's always **2 queries (or 1)**, whether you show 20 posts or 1,000. Every ORM has a primitive for this:
+
+| ORM | Bulk / eager loading |
+|---|---|
+| SQLAlchemy | `selectinload` (a second `IN` query), `joinedload` (a JOIN); `lazy="raise"` forbids accidental lazy loads |
+| Django | `select_related` (foreign keys), `prefetch_related` (many-to-many and reverse) |
+| Rails | `includes` |
+| TypeORM | `leftJoinAndSelect` |
+| Prisma | `include` / `select` on relations |
+| Drizzle | `with` in relational queries, or explicit joins |
+
+The lesson's tip: **turn on SQL logging during development** so you see the queries your ORM actually runs.
+
+🔧 Implementation:
+
+```python title="n_plus_one.py"
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.orm import selectinload
+
+latest = select(Post).order_by(Post.created_at.desc()).limit(20)
+
+# ❌ N+1: one query per post
+# (async SQLAlchemy won't even let you touch p.author lazily: it raises MissingGreenlet,
+#  so the N+1 has to be written out like this, where it's easy to spot)
+posts = (await session.scalars(latest)).all()
+authors_by_post = {p.id: await session.get(User, p.author_id) for p in posts}
+
+# ✅ eager load: selectinload runs 2 queries total (posts, then users WHERE id IN (...))
+posts_with_authors = (await session.scalars(latest.options(selectinload(Post.author)))).all()
+
+# ✅ raw SQL: one round trip
+rows = (await session.execute(text(
+    """SELECT p.id, p.title, u.name AS author_name
+         FROM posts p JOIN users u ON u.id = p.author_id
+        ORDER BY p.created_at DESC LIMIT 20"""
+))).all()
+
+# ✅ batch by IDs (what a DataLoader does in GraphQL resolvers)
+ids = list({p.author_id for p in posts})
+authors = (await session.execute(select(User.id, User.name).where(User.id.in_(ids)))).all()
+
+# see what the ORM really does: log every SQL statement
+engine_with_logs = create_async_engine(DATABASE_URL, echo=True)
+```
+
+🔧 Edge cases: a huge `IN` list (thousands of IDs) is better paged; a JOIN on a one-to-many relation repeats parent columns per child row (fine for small fan-out, wasteful for large); in GraphQL (e.g. Strawberry), use a **DataLoader** to batch per request.
+
+### 11.2 Indexes
+
+**Problem: the library without a catalogue.** A library holds a million books with no catalogue. A reader asks for every book by John Green. The only option is to walk every shelf and check every book: days of work. And the next reader with the same request makes you do it all again.
+
+In a database, walking every row and checking the condition is a **sequential scan** (full table scan). It doesn't take days, but on a big table it can take **1–2 seconds or more**, which is slow by modern standards.
+
+**Mechanism: an index is the catalogue.** Usually a **B-tree** (hash indexes exist for other cases). It keeps a **sorted copy of a column's values**, each with a **pointer to its row**. Searching sorted data takes about log(n) steps instead of n, then the DB jumps straight to the matching rows. The lesson's ballpark: finding one author's books in a million rows drops from about **4 s** to **under 100 ms** (around 40 ms).
+
+<Mermaid chart={`flowchart TD
+  Q["WHERE author_id = 3"] --> R["B-tree root"]
+  R -->|"1 to 500k"| I1["inner page"]
+  R -->|"500k+"| I2["inner page"]
+  I1 --> L1["leaf: author_id 3<br/>pointers to rows 17, 942, 88013"]
+  L1 --> H["heap table rows"]
+  S["Without index"] --> SS["Seq Scan: read all 1,000,000 rows"]`} />
+
+**Indexes are not free.** Two costs:
+1. **Space.** The sorted values plus pointers are stored on disk and in memory, and grow with the table.
+2. **Write amplification (the bigger problem).** Every `INSERT`, `UPDATE` or `DELETE` on the table must also update **every index** on it, so they stay in sync for reads. Index every column "for speed" and **all your writes slow down significantly**.
+
+**Strategy (the lesson's approach):**
+- The **primary key** is already indexed (Postgres does this automatically).
+- Index **obvious** access paths when you create the table, e.g. `books.author_id`, because "all books by an author" is clearly a core query.
+- For everything else, **wait for evidence**: look at traces, find the hot endpoint and the slow query (e.g. lookups by ISBN doing a sequential scan), then add that index.
+- 🔧 Postgres indexes the primary key and `UNIQUE` columns, **not foreign keys**. Add FK indexes yourself; they also make `JOIN`s and `ON DELETE CASCADE` fast.
+
+**Composite indexes.** If you often filter by `user_id` **and** `created_at`, one index on `(user_id, created_at)` beats two separate ones. **Column order matters**: the index works for queries on `user_id` alone or on both, but **not** for `created_at` alone, because the index is sorted by `user_id` first. (🔧 This is the **leftmost-prefix** rule.)
+
+**Covering indexes.** A `departments` table has 100 columns, but the UI only needs `id` and `name`. If the index contains every column the query needs, the DB answers **from the index alone** and never touches the table. The cost is a bigger index, so be selective.
+
+**How to know what to index: `EXPLAIN ANALYZE`.** Prefix the slow query (found via tracing) with it. The DB runs the query and shows the real plan: which table it started from, the join order, which indexes it used, and where it did a **Seq Scan**. Add the index, run it again, and confirm it now says **Index Scan** and is faster.
+
+🔧 Implementation:
+
+```sql title="indexes.sql"
+-- 1. find the problem
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM books WHERE author_id = 3;
+-- Seq Scan on books  (actual time=0.031..412.775 rows=12 loops=1)
+--   Filter: (author_id = 3)
+--   Rows Removed by Filter: 999988
+
+-- 2. build the index without locking writes on a live table
+CREATE INDEX CONCURRENTLY idx_books_author_id ON books (author_id);
+
+-- 3. verify
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM books WHERE author_id = 3;
+-- Index Scan using idx_books_author_id on books  (actual time=0.028..0.061 rows=12 loops=1)
+
+-- composite: serves "WHERE user_id = ? ORDER BY created_at DESC LIMIT 20" with no sort step
+CREATE INDEX CONCURRENTLY idx_orders_user_created ON orders (user_id, created_at DESC);
+
+-- covering: name is the key, id rides along as payload, enabling an Index Only Scan
+CREATE INDEX CONCURRENTLY idx_departments_name ON departments (name) INCLUDE (id);
+SELECT id, name FROM departments WHERE name = 'Sales';
+```
+
+🔧 Edge cases:
+- An **index-only scan** still checks Postgres's **visibility map**; on a table with many recent changes it may have to visit the heap anyway (run `VACUUM` regularly).
+- The planner may **ignore** an index on low-selectivity columns (e.g. a boolean where 90% of rows match): a seq scan is genuinely cheaper there. Consider a **partial index** (`WHERE status = 'PENDING'`).
+- A function on the column (`WHERE lower(email) = ...`) can't use a plain index; create an expression index on `lower(email)`.
+- Find unused indexes (pure write cost) with `pg_stat_user_indexes` where `idx_scan = 0`.
+
+### 11.3 The cost of connections
+
+**Problem.** Locally, DB connections feel free. At scale, they're expensive. Opening one involves:
+1. A **TCP three-way handshake** (SYN, SYN-ACK, ACK).
+2. **TLS negotiation** for encryption.
+3. **Authentication**.
+4. Setting up **session state**.
+5. The DB **allocating memory** for the connection (several MB). 🔧 In Postgres, each connection is a whole OS process.
+
+If you **open a connection per query and close it afterwards**, you pay all of that on **every request** (latency). And you hit the second problem: **databases cap connections**, typically a few hundred depending on size (🔧 the Postgres default `max_connections` is 100). A traffic spike handling thousands of concurrent requests will **exhaust the limit** and the database starts refusing or falling over.
+
+**Mechanism: a connection pool.** A middleman keeps a **set of already-open connections**. A request **borrows** one, runs its query, and **returns** it. The pool keeps it open (for a configurable idle time) for the next borrower. This removes the setup cost and **caps** how many connections you ever open.
+
+<Mermaid chart={`flowchart LR
+  subgraph Internal["Internal pools: limit multiplies with instances"]
+    direction TB
+    S1["server 1<br/>pool 150"] --> DB1[("Postgres<br/>limit 300")]
+    S2["server 2<br/>pool 150"] --> DB1
+    S3["server 3<br/>pool 150"] --> DB1
+  end
+  subgraph External["External pooler: one shared cap"]
+    direction TB
+    T1["server 1"] --> PB["PgBouncer<br/>~250 server connections"]
+    T2["server 2"] --> PB
+    T3["server 3"] --> PB
+    PB --> DB2[("Postgres<br/>limit 300")]
+  end`} />
+
+**Internal vs external pooling:**
+- **Internal pooling:** the database **driver** or ORM keeps the pool inside your app process. Simple, and standard in modern drivers (SQLAlchemy's engine has one built in). **The problem appears with horizontal scaling.** Each instance has its own pool; in Python, each **worker process** does (4 uvicorn workers per instance means 4 pools per instance). Say each allows **150** connections, and the autoscaler goes from 1 to 3 instances during a spike: up to **450** connections against a DB that allows **300**. The next spike pushes past 300, and the DB is exhausted.
+- **External pooling:** one pooler **outside** the app, such as **PgBouncer** (a lightweight, open-source Postgres pooler), holds e.g. 250–300 real connections. Every instance connects to it, so however many instances the autoscaler adds, the DB sees **one bounded pool**. Production setups with traffic spikes usually prefer this.
+
+🔧 Implementation (SQLAlchemy 2.x async):
+
+```python title="db.py"
+import os
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+engine = create_async_engine(
+    os.environ["DATABASE_URL"],  # postgresql+asyncpg://...; point at PgBouncer (:6432) in production
+    pool_size=20,       # per worker process; budget: instances × workers × pool_size ≤ DB limit − admin reserve
+    max_overflow=0,     # hard cap: never open extra connections beyond pool_size
+    pool_timeout=2,     # fail fast (seconds) instead of queueing forever when the pool is exhausted
+    pool_recycle=1800,  # replace connections older than 30 min
+    pool_pre_ping=True, # detect connections the server or a proxy already closed
+)
+
+
+# single query: borrow + return automatically
+async def find_user(user_id: int):
+    async with engine.connect() as conn:
+        result = await conn.execute(text("SELECT * FROM users WHERE id = :id"), {"id": user_id})
+        return result.first()
+
+
+# transaction: hold ONE connection for the whole transaction; always give it back
+async def transfer(from_id: int, to_id: int, amount: int) -> None:
+    async with engine.begin() as conn:  # BEGIN; COMMIT on success, ROLLBACK if the block raises
+        await conn.execute(text("UPDATE accounts SET balance = balance - :a WHERE id = :id"),
+                           {"a": amount, "id": from_id})
+        await conn.execute(text("UPDATE accounts SET balance = balance + :a WHERE id = :id"),
+                           {"a": amount, "id": to_id})
+    # leaving the block returns the connection; a leaked one is a permanently lost pool slot
+```
+
+```ini title="pgbouncer.ini"
+[databases]
+app = host=10.0.0.5 port=5432 dbname=app
+
+[pgbouncer]
+listen_port = 6432
+pool_mode = transaction     ; a server connection is held only for the duration of a transaction
+max_client_conn = 5000      ; app-side connections PgBouncer accepts
+default_pool_size = 50      ; real Postgres connections per database/user pair
+```
+
+🔧 Edge cases:
+- **Transaction pooling** breaks session-level features: `SET`/`RESET`, `LISTEN`, session advisory locks, `WITH HOLD` cursors and (in older setups) prepared statements. Check that your driver or ORM is configured for it: asyncpg caches prepared statements by default, so either pass `prepared_statement_cache_size=0` in the SQLAlchemy URL or use PgBouncer 1.21+ with `max_prepared_statements` set.
+- **Bigger pools aren't faster.** Use Little's law (section 3): if queries take 5 ms and you run 2,000/s, only about 10 connections are busy. Past the DB's CPU core count, more connections mostly add contention.
+
+---
+
+## 12. Connection reuse to HTTP downstreams ➕
+
+The handshake costs from section 11.3 are not specific to databases: every call your backend makes to another service or a third-party API pays them too, unless the connection is reused. (Keep-alive on the **server** side, including the load-balancer 502 bug, is covered in [HTTP: persistent connections](/docs/backend-first-principles/05-http); this section is about your backend acting as the **client**.)
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Your API
+  participant P as Payments API (80 ms away)
+  Note over A,P: New connection for every call
+  A->>P: TCP SYN
+  P-->>A: SYN-ACK (1 RTT)
+  A->>P: TLS 1.3 ClientHello
+  P-->>A: ServerHello, Finished (1 RTT)
+  A->>P: POST /charges
+  P-->>A: 200 (1 RTT)
+  Note over A,P: Reused keep-alive connection
+  A->>P: POST /charges
+  P-->>A: 200 (1 RTT only)`} />
+
+#### 12.1 What a fresh HTTPS connection costs ➕
+
+**Problem.** A call to a provider that answers in 20 ms of its own time takes 250 ms from your server.
+
+**Why it happens.** Before the first byte of the request, a new connection needs a DNS lookup (often cached), a **TCP handshake (1 round trip)** and a **TLS handshake** (1 round trip with TLS 1.3, 2 with TLS 1.2). Then the request itself takes a round trip. With the provider 80 ms away:
+
+> new connection: 80 (TCP) + 80 (TLS 1.3) + 80 (request) = **240 ms**
+> reused connection: **80 ms**
+
+Plus the TLS handshake's public-key cryptography costs CPU on both sides, and every new connection starts in TCP slow start (section 7.1). For a handler that makes three downstream calls, connection reuse is the difference between about 720 ms and 240 ms.
+
+**Mechanism.** Keep connections open after a response and reuse them for the next request to the same host: a **connection pool for HTTP**, the same idea as the database pool.
+
+#### 12.2 Python's defaults: `requests` and `httpx` ➕
+
+**Problem.** Whether you reuse connections depends on which client you use and how it was constructed, and the defaults differ.
+
+**The facts:**
+- **Module-level `requests.get()` and `httpx.get()`** build a throwaway client for each call: a new connection (and TLS handshake) every time.
+- **A `requests.Session`** reuses connections through urllib3 pools, keeping **10 connections per host** by default. When all 10 are busy it doesn't wait: it opens extra connections and throws them away after use (logging "Connection pool is full, discarding connection"), so under a spike there's effectively no cap, and the overflow gets no reuse. It's also blocking, so it doesn't belong in `async def` code.
+- **An `httpx.Client` or `httpx.AsyncClient`** pools by default: at most **100** connections in total, **20** idle ones kept for reuse, idle connections closed after **5 s**. A request beyond the cap waits for a free connection, up to the `pool` timeout (5 s by default, like the other timeouts).
+
+**Mechanism: configure one shared, bounded client per downstream, created once at startup.**
+
+```python title="http_clients.py"
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # one client per downstream per worker process, reused by every request
+    async with httpx.AsyncClient(
+        base_url="https://payments.example.com",
+        limits=httpx.Limits(
+            max_connections=100,           # cap concurrent connections: a bulkhead, not unlimited
+            max_keepalive_connections=20,  # idle connections kept for reuse
+            keepalive_expiry=4.0,          # close idle sockets before typical server timeouts (s)
+        ),
+        timeout=httpx.Timeout(2.0, connect=1.0, pool=0.5),  # pool: max wait for a free connection
+    ) as payments:
+        app.state.payments = payments
+        yield  # the client (and its connections) is closed at shutdown
+
+
+app = FastAPI(lifespan=lifespan)
+```
+
+**Edge case.** Creating a client (an `httpx.AsyncClient`, a `requests.Session`, an SDK instance) **per request**, for example with `async with httpx.AsyncClient()` inside the handler, throws the pool away every time. Create them once at startup, like the database pool.
+
+#### 12.3 The idle-timeout race with downstreams ➕
+
+**Problem.** A small percentage of downstream calls fail with `httpx.RemoteProtocolError: Server disconnected without sending a response` or `ConnectionResetError`, randomly, mostly after quiet periods.
+
+**Why it happens.** It's the client-side mirror of the 502 bug in the HTTP lesson. Your client keeps an idle connection for, say, 15 s. The downstream server closes idle connections after 5 s. At second 6 your client picks the "idle" connection from its pool and writes a request into a socket the server has just closed. The server answers with a TCP reset.
+
+**Mechanism.**
+- Keep the **client's** idle timeout **shorter** than the server's: set httpx's `keepalive_expiry` explicitly below the downstream's documented idle timeout, with a safety margin.
+- **Retry once on a reset of a reused connection** (`httpx.AsyncHTTPTransport(retries=1)` only retries failed connection attempts, not a request written into a dead socket, so this retry is yours to write), but only for idempotent requests, or ones with an idempotency key ([HTTP: idempotency](/docs/backend-first-principles/05-http)). A `POST /charges` without a key may already have been processed.
+
+#### 12.4 Sizing the outbound pool, and the load-balancing catch ➕
+
+**Problem.** What should `max_connections` be? Too low and requests queue inside your process; too high and you get back the unbounded behaviour.
+
+**Mechanism: Little's law again.** At 300 downstream calls per second and 200 ms per call, about 300 × 0.2 = **60 connections** are busy on average. A cap of 1.5–2× that (90–120) absorbs bursts. The cap is per client, so per worker process: 4 workers with a cap of 30 each give the instance 120. Requests beyond the cap wait in the client's queue, which turns the pool into a **bulkhead**: a slow downstream can only take up its own connections, not every request in the process (see [Error handling: bulkheads](/docs/backend-first-principles/16-error-handling-fault-tolerance)). Put a timeout on every call so that queue can't grow forever.
+
+**Edge case: long-lived connections defeat connection-level load balancing.** If the downstream sits behind an L4 (TCP) load balancer, or is a Kubernetes Service reached through its ClusterIP, the balancing happens **per connection**, not per request. Your pooled connections stay pinned to the pods that existed when they were opened; when the downstream scales from 3 to 10 pods, the 7 new ones get almost no traffic from you. Fixes: an L7 (HTTP-aware) load balancer or service mesh that balances per request, or a **maximum connection lifetime** on the client (httpx has no such setting, so close and recreate the client every few minutes) so connections get spread over the new pods. HTTP/2 makes this sharper, because one connection then carries all your requests.
+
+---
+
+## 13. Caching 🎓
+
+By now queries are optimized, indexes added and pooling configured, and the database is **still** the bottleneck. The next step is caching (the series has a dedicated caching lesson; this is the performance view).
+
+**Idea:** store the result of an expensive operation and reuse it. Check the cache first; on a hit, skip the work. The lesson's numbers: a complex query path of **800 ms** becomes about **50 ms** from the cache.
+
+<Mermaid chart={`flowchart LR
+  R["request"] --> L1{"local in-process cache?"}
+  L1 -->|hit| OUT["response"]
+  L1 -->|miss| L2{"Redis / Valkey?"}
+  L2 -->|hit| P["optionally promote hot key to local"] --> OUT
+  L2 -->|miss| DB[("Postgres<br/>complex query 800 ms")]
+  DB --> W["write to Redis with TTL"] --> OUT`} />
+
+### 13.1 Cache invalidation
+"There are only two hard things in computer science: cache invalidation and naming things." It's hard because data is cached at **many layers** (servers, reverse proxies, CDNs, browsers), and when the source changes, every copy must stop being served. Two techniques:
+
+| | Time-based (TTL) | Event-based |
+|---|---|---|
+| How | Entry expires after e.g. 5–10 min; the next read goes to the source | On every write to the source, the same code deletes (or updates) the cache entry |
+| Pro | Automatic; can't forget | Exact: fresh data right after a change, no guessing |
+| Con | Choosing the TTL is hard; it depends on access patterns per endpoint; data can be stale until expiry | **Every** write path must remember to invalidate; miss one and you serve stale data |
+
+🔧 In practice, combine them: event-based invalidation **plus** a TTL as a safety net for the write path someone forgot.
+
+### 13.2 Where the cache lives
+- **Local cache:** a map in the server's own memory. Very fast (the lesson says about 2–3 ms, depending on payload and serialization; 🔧 an in-process map lookup is really microseconds, the cost is mostly serialization). **Problem:** with 10 instances there are 10 separate caches that **disagree**: a write on one server invalidates only that server's copy.
+- **Distributed cache:** an external service like **Redis**, **Memcached** or **Valkey** (the modern open-source Redis fork). All instances share one cache, so it's consistent. **Cost:** a network round trip per lookup (the lesson says it can reach tens of ms; 🔧 inside one data centre, a Redis `GET` is usually under a millisecond to a few ms).
+- **Tiered caching:** a small **local** cache for the **hottest** keys (chosen by recency, LRU, or frequency, LFU), backed by Redis. Check local, then Redis, then the DB. After a Redis hit, decide whether the key is hot enough to keep locally.
+
+### 13.3 Caching patterns
+
+<Mermaid chart={`sequenceDiagram
+  participant A as App
+  participant C as Cache
+  participant D as DB
+  Note over A,D: Cache-aside (lazy loading)
+  A->>C: GET user:2
+  C-->>A: miss
+  A->>D: SELECT
+  A->>C: SET user:2 (TTL)
+  Note over A,D: Write-through
+  A->>D: UPDATE
+  A->>C: SET new value (both before replying)
+  Note over A,D: Write-behind
+  A->>C: SET new value, reply at once
+  C-->>D: async flush later (risk: lost if it fails)`} />
+
+| Pattern | Read | Write | Trade-off |
+|---|---|---|---|
+| **Cache-aside** (lazy loading) | Check cache; on miss, query DB, store, return | Update DB, **delete** the cache entry | Most common and intuitive; first read after a change is a miss |
+| **Write-through** | Always a hit | Update DB **and** cache before replying | Few misses; writes take a few ms longer |
+| **Write-behind** | Hit | Update cache, reply, write DB **asynchronously** | Fastest writes; if the DB write fails, cache and DB **disagree** (or data is lost) |
+
+### 13.4 Cache hit rate
+**Hit rate** = the fraction of requests served from the cache. **90%** is very good: only 10% go to the database. Around **20%** means something's wrong with your caching strategy. What drives it:
+1. **TTL.** Longer TTL means more hits, but more staleness. A 7-day TTL largely defeats the point of having one.
+2. **Cache size.** More memory holds more keys, so more hits.
+3. **Access patterns.** If you don't know which endpoints are hot and when, you'll cache the wrong things. Hit rate reflects how well you understand your users.
+
+🔧 Why hit rate is the number that matters:
+
+> effective latency = hit rate × cache latency + (1 − hit rate) × miss latency
+> at 90%: 0.9 × 5 + 0.1 × 800 = **84.5 ms**. At 50%: 0.5 × 5 + 0.5 × 800 = **402.5 ms**
+
+The DB load also drops by the hit rate: 90% hits means the database sees **10%** of the traffic.
+
+### 🔧 Going deeper: cache-aside with Redis, tiering and stampede protection
+
+```python title="user_cache.py"
+import asyncio
+import json
+import os
+import random
+
+import redis.asyncio as redis
+from cachetools import TTLCache
+
+r = redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+local: TTLCache[str, dict] = TTLCache(maxsize=5_000, ttl=5)  # tiny, short-lived hot tier
+inflight: dict[str, asyncio.Task[dict | None]] = {}          # single-flight per worker process
+
+
+def key(user_id: int) -> str:
+    return f"user:{user_id}:profile:v1"  # version the key format so a schema change can't read old shapes
+
+
+async def _load(user_id: int, k: str) -> dict | None:
+    try:
+        user = await db.get_user(user_id)
+        if user is not None:
+            ttl = 300 + random.randrange(60)  # jitter: keys don't all expire together
+            await r.set(k, json.dumps(user), ex=ttl)
+        return user
+    finally:
+        inflight.pop(k, None)
+
+
+async def get_profile(user_id: int) -> dict | None:
+    k = key(user_id)
+    if (hit := local.get(k)) is not None:
+        return hit
+
+    if (cached := await r.get(k)) is not None:
+        value = json.loads(cached)
+        local[k] = value
+        return value
+
+    # stampede protection: 1,000 concurrent misses for one key → 1 DB query in this process
+    task = inflight.get(k)
+    if task is None:
+        task = inflight[k] = asyncio.create_task(_load(user_id, k))
+    return await asyncio.shield(task)  # one caller giving up doesn't cancel the shared load
+
+
+async def update_name(user_id: int, name: str) -> None:
+    await db.update_user_name(user_id, name)  # 1. commit to the source of truth
+    await r.delete(key(user_id))              # 2. THEN invalidate (event-based)
+    local.pop(key(user_id), None)             #    other workers' local copies expire in ≤ 5 s
+```
+
+Edge cases:
+- **Invalidate after the commit**, not before. Deleting first lets a concurrent reader refill the cache with the old value before your write commits.
+- The **local tier is stale** on other worker processes and instances until its TTL (with 4 uvicorn workers, one machine already holds 4 separate local caches). Keep that TTL short, or broadcast invalidations (Redis pub/sub) if seconds matter.
+- **Negative caching:** cache "not found" briefly too, or a flood of requests for a missing ID hits the DB every time.
+
+---
+
+## 14. Vertical vs horizontal scaling 🎓
+
+As traffic grows, servers run out of capacity. There are two fundamental ways to get more.
+
+<Mermaid chart={`flowchart LR
+  subgraph V["Vertical: scale up"]
+    direction TB
+    v1["2 cores, 4 GB"] --> v2["8 cores, 32 GB"] --> v3["biggest instance<br/>hard ceiling"]
+  end
+  subgraph H["Horizontal: scale out"]
+    direction TB
+    LB["load balancer"] --> h1["server"]
+    LB --> h2["server"]
+    LB --> h3["server"]
+    LB --> h4["... add more"]
+  end`} />
+
+### 14.1 Vertical scaling (scaling up)
+Replace the server with a bigger one:
+- **CPU:** more cores (2, 4, 8...).
+- **Memory (RAM):** 2 GB → 4 → 8 → 16 → 32...
+- **Storage:** more capacity (30 GB → 300 GB → 1 TB), and faster media (SSD, NVMe).
+- **Network card:** 10 Gbps class NICs for more traffic.
+
+**Why it's attractive:**
+- **Simplicity.** The architecture and code don't change. No statelessness work, no new components.
+- **Straightforward capacity maths.** Twice the cores handles roughly twice the requests; twice the RAM can cache roughly twice the data locally.
+- **Economics.** One machine twice as powerful often costs less than two half-size machines, and you avoid the **operational overhead** of many machines: security, backups, maintenance, load balancers, distributed state.
+
+**Why not everyone does it: hard limits.**
+1. **A ceiling.** However much you pay, there's a largest machine your cloud offers. When you outgrow it, there's nowhere left to go.
+2. **Single point of failure.** One powerful server crashes (a bad dependency, anything) and the whole product is down, say for 2 hours. Standby servers and automatic failover help, but one machine is still one failure domain.
+3. **No geographic distribution.** The server is in the US and 40% of users are in India. Those 40% always pay the extra network latency, and a bigger machine can't fix the speed of light.
+
+### 14.2 Horizontal scaling (scaling out)
+Add **more instances of the same server** and have them share the traffic. Medium-sized machines instead of one giant one.
+
+**The theoretical advantages** (the lesson stresses "theoretical"):
+- **Linear capacity:** one server handles 1,000 req/s, so five handle **5,000 req/s**. A campaign coming? Add instances. No hard ceiling.
+- **Redundancy:** one instance dies, and the others absorb its traffic. Service continues.
+- **Geography:** put instances in several regions and route each user to the nearest one, cutting latency.
+
+**The cost: complexity.** Exactly what vertical scaling avoids. New questions appear immediately:
+1. **How is traffic split?** You need a **load balancer**, a new component in the stack, and you must choose its **algorithm**.
+2. **How do servers stay in sync?** A user changes their name via server 1; how does server 2 know?
+3. **What if the network between servers fails?** They may start making **conflicting decisions**.
+4. **How do you detect a dead instance**, stop routing to it, and know when to send traffic again after it recovers?
+
+All of these have known answers, but every answer is complex and involves trade-offs. That's the nature of **distributed systems**: they **don't remove problems, they swap one set of problems for another**. Sometimes the new set is easier to live with, sometimes the original set is. Choosing which set you'd rather deal with is the real engineering decision.
+
+🔧 Why the gains are "theoretical": the 5× only holds while instances share **nothing** that saturates. They all still hit the same database, cache and pooler (section 11.3), so the shared component becomes the next bottleneck. Coordination between nodes also costs something, so real scaling curves bend below linear. That's why Part 2 starts with **statelessness** and **database scaling**.
+
+---
+
+## 15. Scalability laws and capacity planning ➕
+
+Section 14.2 says horizontal scaling is linear only in theory. Two simple formulas say how far below linear you land, and a little arithmetic turns a load-test result into an instance count.
+
+<Mermaid chart={`flowchart LR
+  LT["load test<br/>one instance: 400 req/s at SLO"] --> FIT["test at 1, 2, 4, 8 instances<br/>fit Amdahl / USL"]
+  FIT --> FC["forecast peak<br/>average x peak factor x growth"]
+  FC --> N["instances = peak / (per-instance x target utilization)"]
+  N --> R["add redundancy<br/>survive one zone down"]
+  R --> D["check shared dependencies<br/>DB connections, DB QPS, cache"]`} />
+
+#### 15.1 Amdahl's law: the serial part caps the speedup ➕
+
+**Problem.** You go from 10 to 20 instances and throughput rises by 15%, not 100%.
+
+**Why it happens.** Some part of the work doesn't spread across instances: every write goes to one primary database, a global lock or counter, a single-leader queue, a sequential migration step. Amdahl's law says that if a fraction **p** of the work can be parallelized and **1 − p** can't, the speedup with N workers is
+
+> S(N) = 1 ÷ ((1 − p) + p ÷ N), and it can never exceed 1 ÷ (1 − p)
+
+| Serial fraction (1 − p) | S(10) | S(100) | Limit as N grows |
+|---|---|---|---|
+| 1% | 9.2× | 50× | 100× |
+| 5% | 6.9× | 16.8× | 20× |
+| 10% | 5.3× | 9.2× | 10× |
+
+With just 5% serial work, 100 instances give under 17×, and no number of instances gives more than 20×.
+
+**Mechanism.** Find the serial part and shrink it, instead of adding instances: move writes off the single primary (caching, batching, sharding in [Part 2](/docs/backend-first-principles/22-scaling-performance-part-2)), replace global locks with per-key ones, partition the single queue.
+
+#### 15.2 The Universal Scalability Law: why more nodes can mean less throughput ➕
+
+**Problem.** Amdahl predicts that adding nodes never hurts; it only stops helping. In real clusters, throughput sometimes **falls** after a point.
+
+**Why it happens.** Neil Gunther's **Universal Scalability Law (USL)** adds a second cost. Relative capacity with N nodes is
+
+> C(N) = N ÷ (1 + α(N − 1) + βN(N − 1))
+
+- **α (contention):** waiting for a shared resource, the Amdahl part. It grows linearly with N.
+- **β (coherency, or crosstalk):** the cost of nodes keeping each other consistent: cache invalidation broadcasts, distributed locks, cluster membership chatter, every node talking to every other node. With N nodes there are about N² pairs, so this term grows **quadratically** and eventually wins.
+
+Setting the derivative to zero gives the peak at **N\* = √((1 − α) ÷ β)**. Example with α = 0.03 and β = 0.0005:
+
+| Nodes N | C(N) | Efficiency per node |
+|---|---|---|
+| 10 | 7.6× | 76% |
+| 44 (the peak) | 13.6× | 31% |
+| 100 | 11.2× | 11% |
+
+Going from 44 to 100 nodes costs more money **and** loses throughput.
+
+**Mechanism: measure α and β, then attack the right one.** Run the same load test (section 5.3) at 1, 2, 4 and 8 instances, record the maximum throughput that still meets the SLO, and fit the curve. A large α means a shared bottleneck (usually the database). A non-zero β means cross-node chatter; look for anything every node does with every other node.
+
+```python title="usl_fit.py (a coarse grid search is enough for a few data points)"
+import math
+
+data = [(1, 400), (2, 770), (4, 1430), (8, 2420)]  # (instances, max req/s at SLO)
+
+
+def usl(n: int, a: float, b: float) -> float:
+    return n / (1 + a * (n - 1) + b * n * (n - 1))
+
+
+def error(a: float, b: float) -> float:
+    x1 = data[0][1]
+    return sum((x1 * usl(n, a, b) - x) ** 2 for n, x in data)
+
+
+grid = ((i / 1000, j / 20_000) for i in range(201) for j in range(201))  # a: 0..0.2, b: 0..0.01
+a, b = min(grid, key=lambda ab: error(*ab))
+
+peak = math.sqrt((1 - a) / b) if b > 0 else math.inf
+print(f"alpha={a:.3f} beta={b:.5f}, peak at about {round(peak)} instances")
+```
+
+**Edge cases.**
+- The fit is only trustworthy **near the measured range**. Extrapolating from 8 to 200 instances is a guess; confirm with a test at the target size before you depend on it.
+- α and β belong to an **architecture**, not to the app forever. Adding a cache or a pooler changes them; re-measure after big changes.
+- The USL works for threads in one process as well as nodes in a cluster; the same shape explains why a Postgres server gets slower with too many active connections (section 11.3).
+
+#### 15.3 Capacity planning: from a load test to an instance count ➕
+
+**Problem.** "How many instances do we need for the launch?" answered by gut feeling is either an outage or a wasted budget.
+
+**Mechanism: a short chain of multiplications, each with a reason.**
+1. **Per-instance capacity** from the load test: the highest rate that still meets the SLO, e.g. **400 req/s** at P99 under 300 ms (section 5.3). Not the maximum rate the instance survived.
+2. **Peak demand:** average traffic × peak factor × growth. If the average is 2,000 req/s, the busiest minute in the last 90 days was 3× the average, and you expect 20% growth over the planning period: 2,000 × 3 × 1.2 = **7,200 req/s**.
+3. **Target utilization** for headroom (section 4), e.g. 70%: 7,200 ÷ (400 × 0.7) = 25.7, so **26 instances**.
+4. **Redundancy:** to survive losing one of three availability zones, the remaining two must carry the peak: 13 per zone × 3 zones = **39 instances**.
+5. **Check every shared dependency** at that size, because the bottleneck moves (section 14.2):
+   - DB connections: 39 instances × a pool of 10 = 390, above a 300 limit, so you need an external pooler (section 11.3).
+   - DB queries: 7,200 req/s × 3 queries per request × 10% cache misses (a 90% hit rate, section 13.4) = 2,160 queries/s. At 5 ms each, Little's law gives about 11 busy connections, which is fine.
+
+```python title="capacity.py"
+import math
+
+
+def plan(*, avg_rps: float, peak_factor: float, growth: float,
+         per_instance_rps: float, target_util: float, zones: int) -> dict:
+    peak = avg_rps * peak_factor * (1 + growth)
+    needed = math.ceil(peak / (per_instance_rps * target_util))
+    per_zone = math.ceil(needed / (zones - 1))  # survive one zone down
+    return {"peak": peak, "needed": needed, "total": per_zone * zones}
+
+
+print(plan(avg_rps=2000, peak_factor=3, growth=0.2, per_instance_rps=400, target_util=0.7, zones=3))
+# {'peak': 7200.0, 'needed': 26, 'total': 39}
+```
+
+**Edge cases.**
+- **Take the peak factor from per-minute data**, not hourly averages; an hourly average smooths away the bursts that actually hurt.
+- **Autoscaling doesn't remove the need for this.** New instances take seconds to minutes to become ready (Part 2), so the **minimum** replica count must handle the ramp until they arrive.
+- **The per-instance number expires.** Re-run the load test after major releases, dependency upgrades or instance-type changes; the CI budgets in section 5.5 tell you when it has drifted.
+- **Instances beyond the USL peak** (section 15.2) don't add capacity; if the plan needs more than that, the architecture has to change, not the instance count.
+
+---
+
+## 16. 🔧 Key takeaways (Part 1)
+
+The video doesn't end with a recap (it continues straight into Part 2), so here is a summary.
+
+| Idea | The number or rule to remember |
+|---|---|
+| Latency is a distribution | Report P50 / P95 / P99, never just the average |
+| Throughput and latency are linked | Little's law: concurrency = throughput × latency |
+| Utilization | Latency grows like `1 ÷ (1 − ρ)`; keep 20–40% headroom for bursts |
+| ➕ Load testing | Open model (arrival rate) for internet traffic; correct for coordinated omission; capacity = highest rate that meets the SLO |
+| ➕ Performance budgets | Fail CI on regressions; prefer deterministic budgets (query count, response size) over noisy timings |
+| Bottlenecks | Measure first: timing, profiler (CPU), tracing (I/O) |
+| ➕ Payloads | Bytes cost transfer time and slow-start round trips; `json.dumps` blocks the worker's event loop; send less, stream big exports |
+| ➕ Memory and GC | Allocation rate becomes tail latency; keep workers × peak RSS below the container limit; find leaks by diffing tracemalloc snapshots |
+| N+1 | Turn 1 + N round trips into 2 (or 1 JOIN) |
+| Indexes | Speed up reads, slow down every write; add them based on `EXPLAIN ANALYZE` |
+| Connections | Pool them; with many instances, put an external pooler in front of Postgres |
+| ➕ HTTP downstreams | Reuse connections (one shared `httpx.AsyncClient` per downstream, never `httpx.get()` per call); cap connections per host; client idle timeout below the server's |
+| Caching | Hit rate decides the benefit; invalidation decides the correctness |
+| Scaling | Vertical first for simplicity; horizontal for limits, redundancy and geography, paid for in complexity |
+| ➕ Scalability laws | Amdahl: serial fraction caps speedup at `1 ÷ (1 − p)`; USL: crosstalk makes throughput fall past `√((1 − α) ÷ β)` nodes |
+| ➕ Capacity planning | peak = average × peak factor × growth; instances = peak ÷ (per-instance capacity × target utilization), plus zone redundancy |
+
+---
+
+## Interview questions
+
+1. **Why are averages misleading for latency?** Latency is long-tailed. 99% at 50 ms plus 1% at 5 s averages about 100 ms, hiding 10,000 slow requests per million. Use percentiles.
+2. **What does "P99 = 2 s" mean?** 99% of requests finish within 2 s; the slowest 1% take longer.
+3. **Why focus on P95/P99 rather than P50?** The tail holds the most complex workflows (payments, checkouts) and often the most valuable users; with fan-out, a backend's P99 becomes a common user experience.
+4. **State Little's law and use it.** L = λW. At 1,000 req/s and 200 ms, 200 requests are in flight; 2,000 queries/s at 5 ms needs about 10 busy DB connections.
+5. **Why does latency explode near 100% utilization?** Waiting time grows like 1 ÷ (1 − utilization): at 90% busy, requests take about 10× the service time; at 99%, about 100×. Bursts push you there, so keep headroom.
+6. **A cache didn't fix a slow endpoint. What went wrong?** The bottleneck was guessed, not measured. In the lesson's example, a synchronous remote log call took 500 ms while the DB took 10 ms.
+7. **Profiling vs tracing?** A profiler samples CPU time per function (flame graphs), which is good for CPU-bound work. Tracing records time per component for one request, which catches the I/O waits that dominate typical backends.
+8. **What is the N+1 problem and the fix?** One query for N items, then one query per item. Fix it with eager loading or JOINs, or `WHERE id = ANY(...)`: 2 queries regardless of N.
+9. **What do indexes cost?** Storage, and extra work on every insert, update and delete, because each index must be updated. Add them based on evidence.
+10. **A composite index on (user_id, created_at): which queries use it?** Filters on user_id, or on user_id plus created_at. Not created_at alone (leftmost prefix).
+11. **What is a covering index?** One that holds every column a query needs, so the DB answers from the index without reading the table (index-only scan).
+12. **Why use an external pooler like PgBouncer?** Internal pools multiply with instance count (3 × 150 = 450 against a 300 limit); an external pooler enforces one shared cap.
+13. **Cache-aside vs write-through vs write-behind?** Lazy fill plus delete on write; update cache and DB synchronously; update cache now and the DB later (fast but risks inconsistency).
+14. **What affects cache hit rate?** TTL (longer means more hits but staler data), cache size, and how well you understand access patterns.
+15. **Give three limits of vertical scaling.** A hardware ceiling, a single point of failure, and no geographic distribution.
+16. **Why is horizontal scaling's linear gain only theoretical?** Shared dependencies (the DB, cache, pooler) and coordination costs saturate; distributed systems trade problems rather than removing them.
+17. ➕ **Closed vs open load-test models: which hides the knee?** The closed model. Its arrival rate is N ÷ (W + Z), so when the server slows down the test sends less. An open model sets the arrival rate, like real internet traffic.
+18. ➕ **What is coordinated omission?** A load generator that waits for slow responses doesn't send the requests it should have sent during a stall, so the slowest samples are never recorded. A 2 s freeze can show up as P99 = 1 ms instead of about 1 s. Measure from the intended send time (wrk2, autocannon with a rate, k6 arrival-rate executors).
+19. ➕ **How do you stop performance regressions in CI?** Budgets per critical path: a short fixed-rate k6 run whose failed thresholds exit non-zero, plus deterministic checks such as query count and response size per request.
+20. ➕ **Why can a big JSON response slow down other endpoints in a FastAPI worker?** `json.dumps` (or response-model serialization) is synchronous CPU work on the worker's event loop; while it runs, every other request on that worker waits, and the GIL means a threadpool doesn't really help. Send less, use response models for small hot responses, stream exports.
+21. ➕ **A Python pod is killed with exit 137 and no traceback. Why?** The kernel's cgroup OOM killer: the summed RSS of all worker processes crossed the container limit. Python has no heap cap, so size `workers × peak RSS` below the limit, recycle workers with `--max-requests`, and investigate growth with tracemalloc.
+22. ➕ **How do you find a memory leak in Python?** Take tracemalloc snapshots before, during and after steady load, compare them to find the lines whose allocations keep growing, then follow the referrers of those objects (unbounded dicts and caches, per-request callbacks, tasks that never finish, global lists).
+23. ➕ **Why reuse connections to downstream HTTP APIs, and what's the catch?** A new HTTPS connection costs TCP plus TLS round trips (about 3 RTTs instead of 1). Module-level `requests.get()` and `httpx.get()` open a fresh connection per call, and a full `requests.Session` pool silently opens extra connections and discards them. Catches: idle-timeout races (keep the client's timeout shorter) and per-connection load balancing that ignores new downstream pods.
+24. ➕ **State Amdahl's law and the USL.** Amdahl: S(N) = 1 ÷ ((1 − p) + p ÷ N), capped at 1 ÷ (1 − p). USL: C(N) = N ÷ (1 + α(N − 1) + βN(N − 1)); the β (coherency) term grows with N², so throughput peaks at √((1 − α) ÷ β) nodes and then falls.
+25. ➕ **How many instances for a launch?** Per-instance capacity at the SLO from a load test; peak = average × peak factor × growth; divide by capacity × target utilization; add zone redundancy; then re-check the shared DB, pooler and cache at that size.
+
+## Sources
+
+- [Lesson video: Backend Scaling and Performance Engineering, Part 1 (Sriniously)](https://youtu.be/z7kt_p44rjs)
+- [Part 2 of this lesson](/docs/backend-first-principles/22-scaling-performance-part-2)
+- [Little's law (Wikipedia)](https://en.wikipedia.org/wiki/Little%27s_law)
+- [M/M/1 queue (Wikipedia)](https://en.wikipedia.org/wiki/M/M/1_queue)
+- [Dean & Barroso: The Tail at Scale (CACM)](https://cacm.acm.org/research/the-tail-at-scale/)
+- [Prometheus: histograms and summaries](https://prometheus.io/docs/practices/histograms/)
+- [OpenTelemetry: Python getting started](https://opentelemetry.io/docs/languages/python/getting-started/)
+- [Python: the cProfile profiler](https://docs.python.org/3/library/profile.html)
+- [py-spy (sampling profiler for Python)](https://github.com/benfred/py-spy)
+- [PostgreSQL: Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html)
+- [PostgreSQL: Multicolumn indexes](https://www.postgresql.org/docs/current/indexes-multicolumn.html)
+- [PostgreSQL: Index-only scans and covering indexes](https://www.postgresql.org/docs/current/indexes-index-only-scans.html)
+- [PostgreSQL: max_connections](https://www.postgresql.org/docs/current/runtime-config-connection.html)
+- [PgBouncer: features and pool modes](https://www.pgbouncer.org/features.html)
+- [SQLAlchemy: connection pooling](https://docs.sqlalchemy.org/en/20/core/pooling.html)
+- [SQLAlchemy: relationship loading techniques](https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html)
+- [Prisma: relation queries (include)](https://www.prisma.io/docs/orm/prisma-client/queries/relation-queries)
+- [Django: select_related and prefetch_related](https://docs.djangoproject.com/en/stable/ref/models/querysets/#select-related)
+- [Valkey project](https://valkey.io/)
+- ➕ [Grafana k6: open and closed models](https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/)
+- ➕ [Grafana k6: thresholds](https://grafana.com/docs/k6/latest/using-k6/thresholds/)
+- ➕ [wrk2 (constant-rate load generator, coordinated omission)](https://github.com/giltene/wrk2)
+- ➕ [autocannon: options, including overallRate and coordinated-omission correction](https://github.com/mcollina/autocannon)
+- ➕ [Locust documentation](https://docs.locust.io/en/stable/)
+- ➕ [RFC 6928: Increasing TCP's initial window](https://www.rfc-editor.org/rfc/rfc6928)
+- ➕ [FastAPI: response models](https://fastapi.tiangolo.com/tutorial/response-model/)
+- ➕ [SQLAlchemy: asyncio extension (streaming results)](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html)
+- ➕ [Python: gc module (callbacks, thresholds, freeze)](https://docs.python.org/3/library/gc.html)
+- ➕ [Instagram Engineering: Dismissing Python garbage collection at Instagram](https://instagram-engineering.com/dismissing-python-garbage-collection-at-instagram-4dca40b29172)
+- ➕ [Python: tracemalloc](https://docs.python.org/3/library/tracemalloc.html)
+- ➕ [memray memory profiler](https://bloomberg.github.io/memray/)
+- ➕ [Gunicorn settings: max_requests and max_requests_jitter](https://docs.gunicorn.org/en/stable/settings.html#max-requests)
+- ➕ [HTTPX: resource limits](https://www.python-httpx.org/advanced/resource-limits/)
+- ➕ [RFC 8446: TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446)
+- ➕ [Amdahl's law (Wikipedia)](https://en.wikipedia.org/wiki/Amdahl%27s_law)
+- ➕ [Gunther: How to quantify scalability (the USL)](https://www.perfdynamics.com/Manifesto/USLscalability.html)

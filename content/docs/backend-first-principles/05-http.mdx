@@ -1,0 +1,2737 @@
+---
+title: "Understanding HTTP for backend engineers"
+description: Statelessness, messages, headers, methods and idempotency, CORS, status codes, caching, content negotiation, compression, persistent connections, large payloads and TLS, at the engineering level.
+---
+
+<Callout type="info">
+  Notes for [Understanding HTTP for backend engineers](https://youtu.be/a3C1DMswClQ) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, RFC and MDN facts). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+Backend is huge, so the series focuses on what the **large majority (about 90%) of codebases** use. HTTP is the first such topic: the medium through which browsers and other clients send data to servers and get data back. Other protocols exist (WebSocket, gRPC...), but HTTP is the most widely used.
+
+<Mermaid chart={`flowchart LR
+  A["Statelessness +<br/>client-server"] --> B["Transport + versions"]
+  B --> C["Message anatomy"]
+  C --> D["Headers"]
+  D --> E["Methods + idempotency"]
+  E --> F["OPTIONS + CORS"]
+  F --> G["Status codes"]
+  G --> H["Caching"]
+  H --> I["Content negotiation<br/>+ compression"]
+  I --> J["Persistent connections"]
+  J --> K["Large requests/responses"]
+  K --> L["SSL / TLS / HTTPS"]`} />
+
+---
+
+## 1. The two core ideas of HTTP 🎓
+
+### Idea 1: statelessness
+
+**What it means:** the server keeps **no memory of past interactions**. Each request carries everything needed to process it (URL, method, headers...). After responding, the server forgets the request. The next request from the same client is a **new, unrelated event**.
+
+**Consequence: self-contained requests.** If the server must know who you are (e.g. to return your profile), **every** request has to include credentials such as a **cookie or token**.
+
+**Why it's designed this way (benefits):**
+- **Simplicity:** the server doesn't need to store session information, which would cost resources and complexity.
+- **Scalability:** any server can handle any request, so load can be spread across many servers. No single server owns a client's session.
+- **Resilience:** if a server crashes, there's no in-memory session to lose or restore.
+
+**But apps do need state** (logins, shopping carts). Developers add it **on top** of HTTP with **cookies, sessions or tokens** (covered later in the series).
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant C as Client
+  participant LB as Load balancer
+  participant S1 as Server 1
+  participant S2 as Server 2
+  C->>LB: GET /profile + Cookie or Bearer token
+  LB->>S1: forward
+  S1-->>C: 200 profile (S1 then forgets)
+  C->>LB: GET /orders + same token again
+  LB->>S2: forward (a different server is fine)
+  S2-->>C: 200 orders`} />
+
+🔧 **Where the state actually lives:** "stateless" refers to the **protocol and the app servers**. The state moves to either the **client** (a signed token such as a JWT, verified on every request) or a **shared store** (a session ID in a cookie, looked up in Redis or Postgres by any server). Keeping sessions in one server's memory breaks the scalability benefit, because the next request may land on another server.
+
+### Idea 2: the client-server model
+- The **client** (browser, mobile app, another server) **initiates** communication and supplies everything the server needs: URL, headers, body.
+- The **server** hosts resources (websites, APIs, files) and **waits** for requests. It processes each one and returns a response: a page, JSON, a file, an error message...
+- **Rule:** in HTTP, communication is **always initiated by the client**. The server only responds.
+
+🔧 That rule is why "server pushes data to the browser" needs a workaround: polling, Server-Sent Events (a long-lived response) or WebSockets (an upgraded connection). All of them start with a client request.
+
+### HTTP vs HTTPS
+For these notes, treat them as **interchangeable**. HTTPS is HTTP with **encryption and certificates (TLS)**. The principles are the same; the extra parts belong more to network engineering. Section 20 covers TLS briefly.
+
+---
+
+## 2. The transport underneath 🎓
+
+- **Problem:** before any message can be sent, client and server need a **connection mechanism**.
+- HTTP **doesn't strictly require** a connection-based transport. It requires a **reliable** one: messages must not be lost silently (at minimum, errors must be reported).
+- Of the two common internet transports, **TCP** (reliable, connection-based) and **UDP** (no delivery guarantee), TCP fits. So HTTP traditionally runs over **TCP**, which opens connections with a **three-way handshake**.
+
+### Where this sits: the OSI model
+- Backend engineers mostly work at **layer 7, the application layer**, where HTTP lives.
+- TCP handshakes, TLS encryption and so on belong to lower layers. They're good to know, but the lesson deliberately doesn't go down that rabbit hole.
+
+🔧 The handshake costs, which explain the version history below:
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: SYN
+  S-->>C: SYN-ACK
+  C->>S: ACK (1 round trip spent)
+  C->>S: TLS ClientHello
+  S-->>C: TLS ServerHello + certificate (TLS 1.3, 1 more round trip)
+  C->>S: GET /api/users (finally)
+  S-->>C: 200 OK`} />
+
+On a 100 ms round-trip link, that's about **200 ms before the first byte of the request** is even sent. Opening a new connection per request is expensive.
+
+---
+
+## 3. HTTP versions 🎓
+
+| Version | What it changed | Problem it solved |
+|---|---|---|
+| **1.0** | a **new connection per request** | (baseline) every request paid the full handshake |
+| **1.1** | **persistent connections**, chunked transfer encoding, better caching | reuse one TCP connection for many requests |
+| **2.0** | **multiplexing** (many requests and responses at once on one connection), **binary framing** instead of text, **header compression (HPACK)**, **server push** | one slow response no longer blocks others at the HTTP level; headers stop being resent in full |
+| **3.0** | built on **QUIC**, a transport over **UDP** instead of TCP | faster connection setup, lower latency, better behaviour under packet loss, multiplexing **without head-of-line blocking** |
+
+### 🔧 Head-of-line blocking, explained
+- In **HTTP/1.1**, a connection carries one response at a time. Browsers open about 6 connections per host to work around it.
+- **HTTP/2** interleaves many streams on **one TCP connection**. But TCP delivers bytes **strictly in order**: if one packet is lost, **every stream waits** for its retransmission, even streams whose data already arrived. That's TCP-level head-of-line blocking, which HTTP/2 still has.
+- **HTTP/3 / QUIC** implements streams **in the transport itself** (over UDP), so a lost packet only stalls the stream it belonged to.
+
+🔧 **Server push is effectively dead:** Chrome disabled HTTP/2 server push by default in **Chrome 106**, as it rarely improved performance. The recommended replacements are **`103 Early Hints`** and `<link rel="preload">`.
+
+**The practical takeaway (lesson):** client and server establish some kind of connection, and messages are sent and received over it. That's enough to work at the application level.
+
+---
+
+## 4. HTTP/2 and HTTP/3 in practice ➕
+
+The table above says what each version changed. In production, though, the version is picked **separately on every hop**, and that has direct consequences for how a Python backend is deployed, debugged and attacked.
+
+<Mermaid chart={`flowchart LR
+  B["Browser"] -->|"h3 over QUIC/UDP<br/>or h2 over TLS/TCP"| CDN["CDN / load balancer"]
+  CDN -->|"HTTP/1.1 keep-alive pool<br/>(or h2 for gRPC)"| NX["Nginx"]
+  NX -->|"HTTP/1.1"| APP["Python app<br/>uvicorn"]`} />
+
+#### How a connection picks HTTP/2: ALPN ➕
+
+- **Problem:** HTTP/1.1, HTTP/2 and HTTPS all share port 443. HTTP/2 is a binary protocol, so if the client starts speaking h2 and the server expects h1 text, the first byte is already garbage. The two sides must agree on a version **before** the first request byte.
+- **Why it can't be negotiated in HTTP itself:** an "upgrade" exchange in HTTP would cost a round trip and require speaking one version first.
+- **Mechanism:** **ALPN** (Application-Layer Protocol Negotiation, RFC 7301) puts the choice inside the TLS handshake that happens anyway. The ClientHello lists the protocols the client supports (`h2`, `http/1.1`); the server picks one in its reply. No extra round trip. Browsers only use HTTP/2 **over TLS**; the cleartext variant (`h2c`) exists, but browsers don't implement it.
+- **Implementation:** check what a server negotiates.
+
+```bash
+curl -sS -o /dev/null -w '%{http_version}\n' https://example.com          # 2 or 1.1 (or 3)
+openssl s_client -connect example.com:443 -servername example.com -alpn h2,http/1.1 </dev/null 2>/dev/null | grep -i alpn
+# ALPN protocol: h2
+```
+
+```python title="h2_server.py (uvicorn's opt-in HTTP/2, needs pip install zttp)"
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+
+app = FastAPI()
+
+
+@app.get("/", response_class=PlainTextResponse)
+async def version(request: Request) -> str:
+    return f"you spoke HTTP/{request.scope['http_version']}"     # "2" or "1.1"
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, port=8443, ssl_keyfile="key.pem", ssl_certfile="fullchain.pem",
+                http="zttp", http2=True)       # ALPN offers h2 and http/1.1; old clients still work
+```
+
+- **Edge cases:** ALPN is negotiated with **whoever terminates TLS**. If the load balancer terminates it, "we support HTTP/2" is a property of the LB, not of your app. And if a client doesn't send ALPN at all (some old libraries), it gets HTTP/1.1.
+
+#### Why your Python app usually speaks HTTP/1.1 to its proxy ➕
+
+- **Problem:** you enable HTTP/2 on the load balancer and expect your FastAPI app to receive HTTP/2. It doesn't, and that is normal.
+- **Why (first principles):** HTTP/2's wins (multiplexing, header compression, one connection instead of six) matter on the **long, high-latency, lossy** link between the user and the edge. Between the proxy and your app, the network is short and fast, and the proxy keeps a **pool of warm HTTP/1.1 keep-alive connections**, so there are no handshakes left to save. Also, Nginx's proxy module only speaks **HTTP/1.0 or 1.1** to upstreams, and uvicorn's default protocol implementations (`h11` and `httptools`) speak only HTTP/1.1; its HTTP/2 support is opt-in.
+- **Mechanism:** the proxy terminates h2 or h3, turns every stream into an ordinary HTTP/1.1 request, and sends it over a reused upstream connection.
+- **Implementation:** the one Nginx setting people miss. `proxy_http_version` **defaults to 1.0**, which means a new upstream connection per request:
+
+```nginx title="nginx upstream keep-alive"
+upstream app {
+    server 127.0.0.1:3000;
+    keepalive 32;                         # idle connections kept open per worker
+}
+server {
+    listen 443 ssl;
+    http2 on;                             # h2 toward clients (nginx 1.25.1+ syntax)
+    location / {
+        proxy_pass http://app;
+        proxy_http_version 1.1;           # default is 1.0: no keep-alive upstream
+        proxy_set_header Connection "";   # don't forward "Connection: close"
+    }
+}
+```
+
+- **Edge cases:** without upstream keep-alive, a busy proxy opens thousands of short connections, leaving sockets in `TIME_WAIT` and eventually running out of local ports. The keep-alive 502 bug in section 15 applies to this pool too.
+
+#### gRPC rides on HTTP/2 ➕
+
+- **Problem:** service-to-service calls want typed contracts, compact binary payloads and streaming in both directions.
+- **Mechanism:** gRPC maps every call onto **one HTTP/2 stream**: a `POST /package.Service/Method` with `content-type: application/grpc`, length-prefixed Protobuf messages in DATA frames, and the call's result in **trailers** (headers sent after the body: `grpc-status`, `grpc-message`).
+- **Why it needs HTTP/2:** trailers and full bidirectional streaming on a single request are first-class in HTTP/2. Browsers' `fetch` can't read trailers, which is why browsers need **gRPC-Web** through a translating proxy.
+- **Implementation:** what a unary call looks like on the wire (simplified):
+
+```http
+:method: POST
+:path: /orders.v1.OrderService/GetOrder
+content-type: application/grpc
+te: trailers
+
+(DATA: 1-byte compressed flag + 4-byte length + protobuf bytes)
+
+(trailers) grpc-status: 0
+```
+
+- **Edge cases:** an **L4 (TCP) load balancer** balances **connections**, not requests. A gRPC client keeps one long-lived HTTP/2 connection, so every call from that client lands on the same backend and new replicas get no traffic. Use an L7 balancer that understands HTTP/2 (Envoy, an ALB target group with the gRPC protocol version, Nginx `grpc_pass`) or client-side balancing. Any hop that downgrades to HTTP/1.1 breaks gRPC entirely.
+
+#### HTTP/3: Alt-Svc discovery and the UDP fallback ➕
+
+- **Problem:** HTTP/3 runs over QUIC on **UDP**, so it can't be negotiated inside a TCP connection's TLS handshake the way ALPN picks h2. How does a browser learn that UDP 443 is worth trying?
+- **Mechanism:** the server advertises it on a normal h1/h2 response with **`Alt-Svc: h3=":443"; ma=86400`** ("the same origin is also available over HTTP/3 on UDP 443, remember for a day"). The browser tries QUIC on later connections. A DNS **HTTPS record** (RFC 9460) can advertise `h3` before the first connection.
+- **Why fallback is built in:** many corporate networks block or throttle UDP 443. Browsers race or fall back to TCP, so h3 can only ever make things faster, never break them.
+- **Implementation:** in practice you let the CDN do h3. On your own Nginx (1.25+):
+
+```nginx
+server {
+    listen 443 quic reuseport;            # UDP
+    listen 443 ssl;                       # TCP stays: it's the fallback
+    http2 on;
+    add_header Alt-Svc 'h3=":443"; ma=86400';
+}
+```
+
+- **Edge cases:** the cloud firewall from lesson 3 must allow **UDP** 443, not just TCP. If it doesn't, nothing breaks visibly; clients just never use h3, which makes the mistake easy to miss. Load balancers in front must support UDP/QUIC too.
+
+#### The HTTP/2 Rapid Reset attack (CVE-2023-44487) ➕
+
+- **Problem:** in October 2023, attackers used one HTTP/2 feature to produce the largest DDoS attacks seen at the time (Google reported a peak of about **398 million requests per second**).
+- **Why it works (first principles):** HTTP/2 lets a client open a stream and **cancel it immediately** with a `RST_STREAM` frame. The cancelled stream no longer counts toward the server's concurrent-stream limit, but the server has already parsed the headers, allocated state and maybe dispatched the request upstream. Sending "open, cancel, open, cancel..." costs the client almost nothing per request and costs the server real work, without ever hitting the concurrency cap.
+- **Mechanism that solves it:** servers now **count resets per connection** and close abusive connections with `GOAWAY`. Node.js shipped the fix (a rate limit on `RST_STREAM` in its bundled nghttp2) in **18.18.2 and 20.8.1**; every other HTTP/2 implementation (Nginx, Envoy, Go, and Python HTTP/2 servers such as Hypercorn) needed its own fix.
+- **Implementation:** don't expose a self-managed HTTP/2 endpoint without keeping it patched; better, terminate h2 at a managed CDN or load balancer. If a Python service in your fleet terminates h2 itself (Hypercorn and Granian can; uvicorn speaks only HTTP/1.1), check the server and h2 library versions against their changelogs:
+
+```bash
+uv pip show hypercorn h2 granian | grep -E "^(Name|Version)"
+```
+
+- **Edge cases:** the general lesson is that **protocol features are attack surface**. Each new capability (streams, header compression, server push) adds a way to make the server do more work than the client. Keep the component that faces the internet narrow and patched.
+
+---
+
+## 5. Anatomy of an HTTP message 🎓
+
+A **request** is what the client sends; a **response** is what the server sends back. Both are text (in HTTP/1.1) with the same overall shape:
+
+```http title="request"
+POST /api/users HTTP/1.1
+Host: api.example.com
+User-Agent: Mozilla/5.0 ...
+Authorization: Bearer eyJhbGciOi...
+Content-Type: application/json
+Content-Length: 39
+Accept: application/json
+
+{"name":"Asha","email":"asha@site.com"}
+```
+
+```http title="response"
+HTTP/1.1 201 Created
+Date: Fri, 02 Oct 2026 10:00:00 GMT
+Content-Type: application/json
+Content-Length: 52
+Location: /api/users/42
+
+{"id":42,"name":"Asha","email":"asha@site.com"}
+```
+
+| Part | Request | Response |
+|---|---|---|
+| Start line | **method**, **resource URL**, **HTTP version** | **HTTP version**, **status code** + reason (`200 OK`) |
+| Headers | key-value metadata, including **Host** (the target domain) | key-value metadata |
+| Blank line | marks **the end of headers**, start of body | same |
+| Body | data the client sends (optional) | the resource or error (optional) |
+
+🔧 **See it raw yourself:**
+
+```bash
+curl -v https://api.example.com/users        # > lines are the request, < lines the response
+```
+
+🔧 **Edge case: how does the receiver know where the body ends?** Either `Content-Length` (exact byte count) or `Transfer-Encoding: chunked` (size-prefixed chunks, a zero-size chunk at the end). If both are present and a proxy and server disagree about which one wins, you get **request smuggling**, a real attack class. Never hand-craft these headers in your app; let the server library manage them.
+
+### URL anatomy and percent-encoding ➕
+
+The start line carries the request **target**, and many real bugs come from not knowing which part of a URL is which, which parts reach the server, and how each part is encoded.
+
+```text
+https://ana:pw@api.example.com:8443/v1/files/report%202026.pdf?q=caf%C3%A9&tag=a&tag=b#page=3
+```
+
+| Part | In the example | Reaches the server? | Notes |
+|---|---|---|---|
+| scheme | `https` | decides TCP port and TLS, not sent as text | |
+| userinfo | `ana:pw` | no: curl and httpx turn it into `Authorization: Basic`, the browser's `fetch` rejects URLs that contain it | never put credentials in URLs |
+| host, port | `api.example.com`, `8443` | as the **`Host` header** (and TLS SNI), not in the request line | host names are case-insensitive |
+| path | `/v1/files/report%202026.pdf` | yes, in the request line | case-sensitive by spec (RFC 3986) |
+| query | `q=caf%C3%A9&tag=a&tag=b` | yes, in the request line | logged by every proxy and CDN |
+| fragment | `page=3` (after `#`) | **never**, it stays in the browser | so the server can't route on it |
+
+On the wire, the request line holds only path and query (`GET /v1/files/report%202026.pdf?q=caf%C3%A9 HTTP/1.1`); the authority travels in `Host`.
+
+#### Percent-encoding: which characters and which function ➕
+
+- **Problem:** characters such as `/ ? # & = +` and spaces have **structural meaning** in a URL. A filename containing `&` or a search term containing `#` would split the URL in the wrong place.
+- **Mechanism:** data is **percent-encoded**: each byte of its **UTF-8** encoding becomes `%XX`. `é` is two bytes, so it becomes `%C3%A9`.
+- **Implementation:** pick the function by what you're encoding.
+
+```python
+from urllib.parse import quote, urlencode
+
+import httpx
+
+quote("a/b c&d", safe="")                    # 'a%2Fb%20c%26d'  one path segment or one query value
+quote("https://x.com/a b?q=1", safe=":/?&=") # 'https://x.com/a%20b?q=1'  keeps / ? & : whole URLs only
+urlencode({"q": "a b+c"})                    # 'q=a+b%2Bc'  form encoding: space becomes +
+
+url = httpx.URL("https://api.example.com/v1/search", params={"q": user_input})   # encodes correctly, whatever the input
+```
+
+- **Edge cases:**
+  - `+` means a space **only in the query string** (form encoding). In a path, `+` is a literal plus.
+  - **Double decoding** is a classic security bug: `%252e%252e%252f` decodes once to `%2e%2e%2f` and twice to `../`. If a proxy decodes once for its security check and the app decodes again, a path that looked safe becomes a traversal.
+  - An encoded slash (`%2F`) inside a path segment is decoded, rejected or kept by different proxies and frameworks. Avoid designing APIs that need it.
+
+#### Building outbound URLs safely ➕
+
+- **Problem:** `httpx.get(f"{BILLING}/customers/{id}")` with `id = "../admin/export"` calls a **different endpoint** of the internal service than you meant. This is path injection, a cousin of SSRF.
+- **Mechanism:** encode every user-supplied piece as a **single segment**, then parse the result and check it still points where you intended.
+
+```python title="outbound_url.py"
+from urllib.parse import quote, urlsplit
+
+BILLING = "https://billing.internal"
+
+
+def billing_url(customer_id: str) -> str:
+    url = f"{BILLING}/v1/customers/{quote(customer_id, safe='')}"   # '../admin' becomes '..%2Fadmin', one segment
+    parts = urlsplit(url)
+    if f"{parts.scheme}://{parts.netloc}" != BILLING:
+        raise ValueError("unexpected origin")
+    return url
+```
+
+- **Edge case:** `urljoin(base, user_input)` with `user_input = "//evil.com/x"` resolves to **`https://evil.com/x`**: a protocol-relative reference replaces the host. Never pass user input as the reference to resolve against a trusted base.
+
+### Exercise: an HTTP/1.1 server on a raw TCP socket ➕
+
+The quickest way to internalise message anatomy is to do the framing yourself: read bytes from a TCP socket, find the blank line, parse the head, read exactly `Content-Length` bytes of body and write a response by hand.
+
+```python title="raw_http.py (learning only, never production)"
+import asyncio
+import json
+
+MAX_HEAD = 16 * 1024
+MAX_BODY = 1024 * 1024
+REASON = {
+    200: "OK", 400: "Bad Request", 413: "Content Too Large",
+    431: "Request Header Fields Too Large", 501: "Not Implemented",
+}
+
+
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    buf = b""
+    try:
+        while chunk := await reader.read(64 * 1024):              # b"" means the client closed
+            buf += chunk
+            while True:                                           # one chunk may hold half a request, or two
+                end = buf.find(b"\r\n\r\n")                       # the blank line ends the head
+                if end == -1:
+                    if len(buf) > MAX_HEAD:
+                        return await reply(writer, 431, "headers too large", close=True)
+                    break                                         # wait for more bytes
+                request_line, *lines = buf[:end].decode("latin-1").split("\r\n")
+                try:
+                    method, target, version = request_line.split(" ")
+                except ValueError:
+                    return await reply(writer, 400, "bad request line", close=True)
+                headers: dict[str, str] = {}
+                for line in lines:
+                    name, _, value = line.partition(":")
+                    headers[name.strip().lower()] = value.strip()     # names are case-insensitive
+                if "transfer-encoding" in headers:
+                    return await reply(writer, 501, "chunked bodies not supported", close=True)
+                raw_length = headers.get("content-length", "0")
+                if not raw_length.isdigit():
+                    return await reply(writer, 400, "bad Content-Length", close=True)
+                length = int(raw_length)
+                if length > MAX_BODY:
+                    return await reply(writer, 413, "body too large", close=True)
+                if len(buf) < end + 4 + length:
+                    break                                         # body hasn't fully arrived yet
+
+                body = buf[end + 4 : end + 4 + length].decode("utf-8", errors="replace")
+                buf = buf[end + 4 + length :]                     # keep pipelined bytes for the next loop
+                close = version == "HTTP/1.0" or headers.get("connection", "").lower() == "close"
+                payload = {"method": method, "target": target, "headers": headers, "body": body}
+                await reply(writer, 200, json.dumps(payload), close=close)
+                if close:
+                    return
+    finally:
+        writer.close()
+
+
+async def reply(writer: asyncio.StreamWriter, status: int, body: str, close: bool) -> None:
+    data = body.encode("utf-8")
+    writer.write(
+        f"HTTP/1.1 {status} {REASON[status]}\r\n"
+        f"Content-Type: application/json; charset=utf-8\r\n"
+        f"Content-Length: {len(data)}\r\n"                       # bytes, not characters
+        f"Connection: {'close' if close else 'keep-alive'}\r\n\r\n".encode("latin-1")
+        + data
+    )
+    await writer.drain()                                          # wait if the client reads slowly
+
+
+async def main() -> None:
+    server = await asyncio.start_server(handle, "127.0.0.1", 8080)
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```bash
+curl -v localhost:8080/hello -d 'name=asha'
+# two pipelined requests in one TCP write: the loop answers both
+printf 'GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' | nc localhost 8080
+```
+
+What it teaches, and why real servers are much bigger:
+- **TCP is a byte stream, not a message stream.** One `reader.read()` can return a partial head, a whole request plus half of the next, or two pipelined requests. Every parser needs a buffer and a loop.
+- **Every unbounded buffer is a denial of service.** Without `MAX_HEAD`, a client that never sends the blank line grows `buf` forever; without `MAX_BODY`, one `Content-Length: 99999999999` does the same. Real servers cap the head, the body and the time (section 19).
+- **Framing is the security boundary.** Supporting chunked encoding correctly, rejecting conflicting `Content-Length` values and handling obsolete line folding are exactly where request smuggling bugs live. That is why in production you run behind a real server such as uvicorn (using the `h11` parser or `httptools`, which wraps Node's hardened `llhttp`), usually with Nginx in front.
+
+---
+
+## 6. Where the time goes: the request lifecycle and a timing toolkit ➕
+
+Once you can read a message, the next practical skill is answering "**which hop** made this request slow?". Every request pays a sequence of costs, and each tool below measures some of them.
+
+<Mermaid chart={`flowchart LR
+  D["DNS lookup<br/>0 ms cached<br/>20-100 ms cold"] --> T["TCP connect<br/>1 round trip"]
+  T --> S["TLS 1.3<br/>1 round trip"]
+  S --> P["CDN / LB / proxy<br/>about 1 ms each"]
+  P --> A["App: parse, auth,<br/>validation, logic"]
+  A --> DB["DB queries<br/>about 1-10 ms each"]
+  DB --> R["Response transfer<br/>size / bandwidth"]`} />
+
+Rough orders of magnitude for a client and server in the same region; across continents each round trip is 70 to 200 ms. On a **reused** connection the first three boxes disappear, which is why keep-alive (section 15) matters so much.
+
+#### `curl -w`: a per-phase timing breakdown ➕
+
+- **Problem:** "the API is slow" doesn't say whether the time went to DNS, the handshake, the server's work or the download.
+- **Mechanism:** curl records a timestamp at the end of each phase, measured **cumulatively from the start**, and `-w` prints them.
+
+```bash title="timing.sh"
+cat > curl-format.txt <<'EOF'
+   dns:       %{time_namelookup}s
+   connect:   %{time_connect}s
+   tls:       %{time_appconnect}s
+   ttfb:      %{time_starttransfer}s
+   total:     %{time_total}s
+   http:      %{http_version}  status %{http_code}  size %{size_download}B
+EOF
+curl -sS -o /dev/null -w @curl-format.txt https://api.example.com/v1/books
+```
+
+| Subtract | What it measures |
+|---|---|
+| `time_connect - time_namelookup` | TCP handshake, about one network round trip |
+| `time_appconnect - time_connect` | TLS handshake |
+| `time_starttransfer - time_appconnect` | sending the request plus **server processing**: the backend's share (TTFB) |
+| `time_total - time_starttransfer` | downloading the body |
+
+- **Edge cases:** the values are cumulative, so read differences, not raw numbers. `time_appconnect` is 0 for plain HTTP. One sample tells you little: the first run includes a cold DNS lookup. Loop it (`for i in $(seq 20); do curl ...; done`) and look at the spread.
+
+#### DevTools Timing tab and `Server-Timing` ➕
+
+- **Problem:** browsers add phases curl doesn't have, and the server's own time is a black box in "Waiting for server response".
+- **Mechanism:** the Network panel's **Timing** tab shows *Queueing* and *Stalled* (waiting for a free connection: HTTP/1.1 allows about 6 per host, and requests are prioritised), *DNS Lookup*, *Initial connection*, *SSL*, *Request sent*, *Waiting for server response* (TTFB) and *Content Download*. Your server can fill in the black box with a **`Server-Timing`** header, which DevTools displays in the same tab.
+
+```python title="server_timing.py"
+import time
+from collections.abc import Awaitable
+
+from fastapi import FastAPI, Request
+
+app = FastAPI()
+
+
+async def timed[T](request: Request, name: str, work: Awaitable[T]) -> T:
+    t0 = time.perf_counter()
+    try:
+        return await work
+    finally:
+        request.state.timings.append(f"{name};dur={(time.perf_counter() - t0) * 1000:.1f}")
+
+
+@app.middleware("http")
+async def server_timing(request: Request, call_next):
+    request.state.timings = []
+    response = await call_next(request)           # the handler has returned; headers not sent yet
+    user = getattr(request.state, "user", None)
+    if user is not None and user.is_staff and request.state.timings:
+        response.headers["Server-Timing"] = ", ".join(request.state.timings)
+    return response
+
+# in a handler: rows = await timed(request, "db", pool.fetch(sql, *args))
+# response header: Server-Timing: db;dur=41.3, render;dur=2.1
+```
+
+- **Edge cases:** long *Stalled* times usually mean too many parallel requests to one HTTP/1.1 origin, not a slow server. `Server-Timing` exposes internals (which queries you run and how long they take), so send it only to staff or in non-production. For cross-origin requests, the browser hides the details unless the server also sends `Timing-Allow-Origin`.
+
+#### HAR files: capturing a session to share ➕
+
+- **Problem:** the bug only reproduces on a customer's machine, and "it's slow" or "it fails sometimes" isn't something you can debug from a description.
+- **Mechanism:** a **HAR** (HTTP Archive) file is JSON describing every request in a session: URLs, headers, bodies, status codes and per-phase timings. The user exports it from the Network panel; you read it in DevTools (drag it in) or with `jq`:
+
+```bash
+jq -r '.log.entries[] | [.response.status, (.timings.wait|floor), .request.method, .request.url] | @tsv' session.har \
+  | sort -k2 -n -r | head        # slowest server waits first
+```
+
+- **Edge cases:** HAR files are **credentials**. In October 2023, attackers who broke into Okta's support system used session tokens from customer-uploaded HAR files to hijack sessions. Chromium-based browsers (Chrome 130+) now export **sanitized** HARs by default, without `Cookie`, `Set-Cookie` and `Authorization`, but tokens in **query strings**, request bodies and response bodies (PII) are still included. Ask for the minimum, store them like secrets and delete them after the investigation.
+
+#### `--resolve`, `--http2` and friends: testing one hop at a time ➕
+
+- **Problem:** you need to hit **one specific server** behind DNS and the CDN: a new box before the DNS cutover, a single replica, or the origin directly.
+- **Why `curl https://10.0.0.5/` doesn't work:** the TLS handshake then sends no proper SNI and the certificate doesn't match an IP, and the `Host` header is wrong, so the server picks the wrong virtual host.
+- **Mechanism:** `--resolve host:port:address` pins the name to an IP **inside curl only**, while SNI, certificate checks and `Host` stay correct.
+
+```bash
+curl -v --resolve api.example.com:443:203.0.113.10 https://api.example.com/healthz   # this exact server
+curl -v --connect-to api.example.com:443:origin.internal:443 https://api.example.com/ # different host:port
+curl -sS -o /dev/null -w '%{http_version}\n' --http2   https://api.example.com/        # force-try h2
+curl -sS -o /dev/null -w '%{http_version}\n' --http1.1 https://api.example.com/        # compare with h1
+curl --http3 https://api.example.com/                  # only if your curl build has HTTP/3 support
+```
+
+- **Edge cases:** `--resolve` matches the exact `host:port`, so a redirect to another host goes through normal DNS again. Avoid `-k` (skip certificate checks) while debugging, because it hides exactly the certificate problems you might be chasing (section 21).
+
+---
+
+## 7. HTTP headers 🎓
+
+### What they are
+**Key-value pairs** of metadata sent with a request or response.
+
+### Why a separate section? The parcel analogy
+When you send a parcel, the address, phone number, state and PIN code go **on the outside**, not inside the box. Everyone handling it along the way needs that information, and opening the box at every step to read it would make no sense.
+
+Headers are the outside of the parcel: proxies, load balancers, caches, the server and the browser can read **how to handle the message** without parsing the body.
+
+<Mermaid chart={`flowchart LR
+  C[Client] -->|"headers: Host, Authorization,<br/>Accept-Encoding"| P["Proxy / CDN"]
+  P -->|"reads Host to route<br/>reads Cache-Control to cache"| S[Server]
+  S -->|"reads Authorization, Accept<br/>body only parsed if needed"| H[Handler]`} />
+
+### The four categories 🎓
+
+| Category | Purpose | Examples |
+|---|---|---|
+| **Request headers** | tell the server about the client's environment, preferences and capabilities | `User-Agent` (browser, Postman, mobile app, another server), `Authorization` (e.g. a bearer token), `Accept` (JSON, text, HTML?) |
+| **General headers** | metadata about the message itself, in requests and responses | `Date`, `Cache-Control` (`no-cache`, `max-age`), `Connection` (keep-alive or close) |
+| **Representation headers** | how to interpret the **body** | `Content-Type` (media type), `Content-Length` (bytes), `Content-Encoding` (`gzip`, `deflate`), `ETag` (a unique identifier, mostly for caching) |
+| **Security headers** | control browser behaviour to prevent attacks | see below |
+
+**Security headers in the lesson:**
+
+| Header | Attack it prevents | Mechanism |
+|---|---|---|
+| `Strict-Transport-Security` (HSTS) | **protocol downgrade** to plain HTTP | browser remembers to use only HTTPS for this host |
+| `Content-Security-Policy` | **XSS** (cross-site scripting) | allow-list of sources for scripts, styles, images |
+| `X-Frame-Options` | **clickjacking** | forbids embedding the page in an `iframe` |
+| `X-Content-Type-Options: nosniff` | **MIME-type sniffing** | browser trusts `Content-Type` instead of guessing |
+| `Set-Cookie` with `HttpOnly`, `Secure` | cookie theft | `HttpOnly`: JavaScript can't read it. `Secure`: only sent over HTTPS |
+
+🔧 Node apps usually get these from the **Helmet** package. FastAPI has no built-in equivalent, so a small middleware that sets Helmet-like defaults explicitly is common (and easy to audit):
+
+```python title="main.py"
+from fastapi import FastAPI, Request, Response
+
+app = FastAPI()
+
+SECURITY_HEADERS = {                                   # roughly Helmet's defaults
+    "Content-Security-Policy": "default-src 'self'; frame-ancestors 'self'; object-src 'none'",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)       # a route can still set its own value
+    return response
+
+
+@app.post("/login")
+async def login(response: Response) -> dict:
+    session_id = await create_session()
+    response.set_cookie("sid", session_id, httponly=True, secure=True, samesite="lax", max_age=7 * 24 * 3600)
+    return {"ok": True}
+```
+
+### More security headers ➕
+
+The lesson's five headers are the core set; a few more control what the browser leaks and what other origins may do with your pages and resources. All of them matter mainly for responses a browser **renders or embeds** (HTML, images, scripts); a pure JSON API needs fewer of them, but the same middleware defaults apply to it.
+
+#### Referrer-Policy ➕
+
+- **Problem:** when a page loads an image or a user clicks a link, the browser sends the current page's URL in the `Referer` header. If that URL contains a secret (`/reset-password?token=...`, a share link), the third party receiving the request now has it.
+- **Mechanism:** `Referrer-Policy` limits what is sent. Browsers default to `strict-origin-when-cross-origin` (full URL same-origin, only the origin cross-origin, nothing on HTTPS to HTTP downgrades). Helmet, and the middleware above, set the stricter `no-referrer`.
+
+```python
+SECURITY_HEADERS["Referrer-Policy"] = "strict-origin-when-cross-origin"   # or keep 'no-referrer'
+```
+
+- **Edge cases:** the default still sends the **full URL to your own origin**, including your analytics and logs. Keep tokens out of URLs where possible, and after a token link lands, remove the token from the address bar (`history.replaceState`). `no-referrer` breaks analytics and some CSRF defences that check `Referer`.
+
+#### Permissions-Policy ➕
+
+- **Problem:** a compromised third-party script or an embedded iframe can ask for the camera, microphone, geolocation or payment APIs under your origin's name.
+- **Mechanism:** `Permissions-Policy` turns features off (or allow-lists origins) for the page **and every frame inside it**. Helmet does **not** set it by default, and neither does the middleware above until you add it.
+
+```python
+SECURITY_HEADERS["Permissions-Policy"] = "camera=(), microphone=(), geolocation=(), payment=(), usb=()"  # () = nobody
+```
+
+- **Edge cases:** the syntax differs from the older `Feature-Policy` header (now superseded). A frame needs both the parent's policy and its own `allow` attribute to use a feature.
+
+#### CSP `frame-ancestors` vs `X-Frame-Options` ➕
+
+- **Problem:** `X-Frame-Options` only knows `DENY` and `SAMEORIGIN`; its `ALLOW-FROM` form is obsolete and ignored by modern browsers. You can't say "only my partner's site may embed this widget".
+- **Mechanism:** the CSP directive **`frame-ancestors`** takes an allow-list and, when present, **supersedes** `X-Frame-Options` in modern browsers.
+
+```python
+SECURITY_HEADERS["Content-Security-Policy"] = (
+    "default-src 'self'; object-src 'none'; frame-ancestors 'self' https://partner.example.com"
+)
+SECURITY_HEADERS["X-Frame-Options"] = "SAMEORIGIN"     # kept for very old browsers
+```
+
+- **Edge cases:** `frame-ancestors` is **ignored in a `meta` tag**; it only works as a response header. Set it on every HTML response, including error pages, or an attacker frames the one page you forgot.
+
+#### CORP, COOP and COEP ➕
+
+- **Problem:** Spectre-class CPU side channels let a page read memory from its own process. If a malicious page can load **your** resource (an image, a JSON response used as a script) into its process, it may read the bytes. Separately, a page opened with `window.open` keeps a handle (`window.opener`) to its opener, which enables tab-nabbing and cross-window leaks.
+- **Mechanism:**
+  - **`Cross-Origin-Resource-Policy`** (on your resources): who may load this response at all (`same-origin`, `same-site`, `cross-origin`).
+  - **`Cross-Origin-Opener-Policy: same-origin`** (on your pages): put this document in its own browsing-context group, cutting the `window.opener` link to cross-origin windows.
+  - **`Cross-Origin-Embedder-Policy: require-corp`** (on your pages): this page may only load cross-origin resources that opt in via CORP or CORS. With COOP and COEP together the page becomes **cross-origin isolated**, which unlocks `SharedArrayBuffer` and precise timers.
+- **Implementation:** Helmet, like the middleware above, sets `Cross-Origin-Resource-Policy: same-origin` and `Cross-Origin-Opener-Policy: same-origin` by default. Loosen them deliberately where needed:
+
+```python
+from fastapi.staticfiles import StaticFiles
+
+app.mount("/avatars", StaticFiles(directory="avatars"), name="avatars")
+
+
+@app.middleware("http")                 # registered after security_headers, so it runs outside it and has the last word
+async def loosen_cross_origin(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/avatars/"):    # public assets served to other origins (avatars shown on app.example.com)
+        response.headers["Cross-Origin-Resource-Policy"] = "same-site"
+    elif path.startswith("/login"):     # pages that rely on OAuth or payment popups talking back via window.opener
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+    return response
+```
+
+- **Edge cases:** the most common surprise after adding these headers is **images or files from your API no longer loading** on your frontend's origin: that's CORP `same-origin`. COOP `same-origin` breaks popup-based sign-in flows that use `window.opener`. Turn on COEP only if you need cross-origin isolation, because every third-party embed must then opt in.
+
+#### The HSTS preload trap ➕
+
+- **Problem:** HSTS only protects a browser that has **already** seen the header once. The very first visit can still be downgraded.
+- **Mechanism:** the **HSTS preload list** is compiled into browsers. To be accepted, a domain must redirect HTTP to HTTPS and send `max-age` of at least **31536000** (one year) with **`includeSubDomains`** and **`preload`**.
+- **The trap:** `includeSubDomains` covers **every** subdomain, including the internal tool, the old status page or the device admin page that only works over HTTP. Once preloaded, those stop working in every browser, and removal "takes months" to reach users (hstspreload.org's own warning). Note that Helmet's default HSTS, copied in the middleware above, already includes `includeSubDomains`.
+- **Implementation:** ramp up instead of jumping straight to preload.
+
+```python
+# week 1: short max-age, no subdomains. Then raise it, then add includeSubDomains, then preload.
+SECURITY_HEADERS["Strict-Transport-Security"] = "max-age=300"
+# final:  "max-age=63072000; includeSubDomains; preload"
+```
+
+- **Edge cases:** browsers ignore HSTS received over plain HTTP, so it must be on the HTTPS responses. Inventory every subdomain (DNS zone, certificate transparency logs) before adding `includeSubDomains`.
+
+#### CRLF and header injection ➕
+
+- **Problem:** code that puts user input into a header (a redirect `Location`, a `Content-Disposition` filename, a cookie value) lets an attacker include `\r\n`. A CR LF ends the header line, so the attacker can **add headers** (a `Set-Cookie` for session fixation) or end the head and write a **body** (response splitting: XSS, cache poisoning).
+- **Mechanism:** never let CR or LF into a header value. Starlette doesn't check header values itself, but uvicorn refuses to send them: `h11` raises `LocalProtocolError: Illegal header value` (the `httptools` backend raises `RuntimeError: Invalid HTTP header value.`), and the client gets a dropped connection instead of an injected header. Starlette's `RedirectResponse` also percent-encodes the URL, so CR LF in a redirect target becomes `%0D%0A`. That's safe, but you should validate before it gets that far.
+- **Implementation:**
+
+```python title="safe_headers.py"
+import re
+from typing import Annotated
+from urllib.parse import quote
+
+from fastapi import FastAPI, Query
+from fastapi.responses import FileResponse, RedirectResponse
+
+app = FastAPI()
+SAFE_REDIRECTS = {"/dashboard", "/settings"}
+
+
+@app.get("/login/done")
+async def login_done(next_url: Annotated[str, Query(alias="next")] = "/dashboard"):
+    target = next_url if next_url in SAFE_REDIRECTS else "/dashboard"   # allow-list: also stops open redirects
+    return RedirectResponse(target, status_code=303)
+
+
+@app.get("/files/{file_id}/download")
+async def download(file_id: str):
+    file = await files.get(file_id)
+    ascii_name = re.sub(r'[^\x20-\x7e]|["\\]', "_", file.name)           # fallback for old clients
+    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(file.name, safe='')}"   # RFC 6266 / 8187
+    return FileResponse(file.path, headers={"Content-Disposition": disposition})
+```
+
+- **Edge cases:** proxies, other frameworks and hand-written raw responses (like the exercise in section 5) may not protect you. Non-ASCII characters in header values don't work either: Starlette encodes header values as Latin-1, so a name like `報告.pdf` raises `UnicodeEncodeError` (a 500), which is why filenames need the `filename*` encoding. (`FileResponse(path, filename=...)` builds both forms for you.) The same CR LF trick against **log files** (fake log lines) is prevented by structured JSON logging.
+
+### `charset` in Content-Type ➕
+
+- **Problem:** a body is bytes; text needs an encoding to turn back into characters. If the sender writes UTF-8 and the receiver decodes it as Latin-1, `José` becomes `JosÃ©` (mojibake).
+- **Mechanism:** for text types, the `charset` parameter says which encoding was used: `Content-Type: text/html; charset=utf-8`. **JSON is different:** RFC 8259 requires UTF-8 for JSON exchanged between systems and defines **no** `charset` parameter for `application/json`; adding one has no effect on compliant receivers. FastAPI's `JSONResponse` sends plain `application/json`, exactly what the RFC asks for (Express's `res.json()` adds `; charset=utf-8`, which is harmless).
+- **Implementation:** the real bug is usually on the **reading** side, when a multi-byte character is split across two TCP chunks:
+
+```python
+import codecs
+
+# ❌ decodes each chunk on its own: a 2-byte 'é' split across chunks raises UnicodeDecodeError
+#    (or becomes two garbage characters with errors="replace")
+text = ""
+async for chunk in request.stream():
+    text += chunk.decode("utf-8")
+
+# ✅ join the bytes first, decode once (await request.body() does the joining for you)
+text = b"".join([chunk async for chunk in request.stream()]).decode("utf-8")
+
+# ✅ or decode incrementally: the decoder holds back a partial character until the next chunk
+decoder = codecs.getincrementaldecoder("utf-8")()
+async for chunk in request.stream():
+    handle_text(decoder.decode(chunk))
+handle_text(decoder.decode(b"", final=True))
+```
+
+- **Edge cases:** `Content-Length` counts **bytes**, not characters: `len("é")` is 1, `len("é".encode())` is 2. Always send a charset for `text/html` and `text/plain`; without it, browsers guess, and guessing has historically enabled XSS (the UTF-7 attacks).
+
+### Two ideas behind headers 🎓
+
+**1. Extensibility.** You can add or customise headers **without changing the protocol**. Adding metadata can change the whole interaction:
+- security enhancements (`Strict-Transport-Security` forces secure connections),
+- **custom headers** for your own needs (e.g. `X-Custom-Header`; 🔧 common real ones are `X-Request-Id` and `Idempotency-Key`),
+- content negotiation (`Accept`, `Accept-Language`, `Accept-Encoding`).
+
+**2. Headers as a remote control.** They let the client send **instructions** that change how the server responds:
+- **Content negotiation:** `Accept: text/html` gets HTML, `Accept: application/json` gets JSON.
+- **Caching and expiry:** the server uses `Cache-Control` or `Expires` to say how long the client may cache a resource.
+- **Authentication:** the `Authorization` header drives access-control decisions.
+
+---
+
+## 8. HTTP methods 🎓
+
+### Why methods exist
+Methods state the **intent** of a request, so every request doesn't mean the same thing. That gives each action a clear meaning.
+
+| Method | Intent | Body? |
+|---|---|---|
+| `GET` | **fetch** data; must **not modify** anything on the server | no |
+| `POST` | **create** data | yes (how else would you send the data?) |
+| `PATCH` | **update part** of a resource (e.g. change just the name) | yes |
+| `PUT` | **replace** the resource **completely** with the body | yes |
+| `DELETE` | **delete** a resource | usually no |
+
+**PATCH vs PUT:** think of PATCH as **selective replacement** (only the sent fields change) and PUT as **complete replacement**. Many developers use PUT where they mean PATCH, which goes against the semantics. **Rule of thumb from the lesson: use PATCH unless you specifically need PUT.**
+
+🔧 What the difference means concretely:
+
+```http
+GET /users/42           → { "name": "Asha", "email": "a@x.com", "bio": "Hi" }
+
+PATCH /users/42  { "name": "Asha K" }
+                        → { "name": "Asha K", "email": "a@x.com", "bio": "Hi" }
+
+PUT /users/42    { "name": "Asha K" }
+                        → { "name": "Asha K" }        (email and bio are gone: full replacement)
+```
+
+### Idempotency 🎓
+**Idempotent** = calling it **many times has the same effect as calling it once**.
+
+| Method | Idempotent? | Why |
+|---|---|---|
+| `GET` | yes | fetching never changes the data, so every call gives the same result |
+| `PUT` | yes | replacing old data with the same new data N times leaves the same final state |
+| `DELETE` | yes | a resource can only be deleted once; after that, the state is the same (deleted) |
+| `POST` | **no** | submitting "create note" twice creates **two notes** |
+
+<Mermaid chart={`flowchart LR
+  subgraph PUTx3["PUT /notes/7 x3"]
+    direction TB
+    a1["state: note 7 = X"] --> a2["state: note 7 = X"] --> a3["state: note 7 = X"]
+  end
+  subgraph POSTx3["POST /notes x3"]
+    direction TB
+    b1["notes: 1"] --> b2["notes: 2"] --> b3["notes: 3"]
+  end`} />
+
+### 🔧 Going deeper: why idempotency matters, and fixing POST
+**Problem:** networks fail **after** the server did the work but **before** the client saw the response. The client can't tell "never arrived" from "done, reply lost". For idempotent methods, it simply **retries**. Proxies and HTTP clients do this automatically. For `POST`, a retry can mean **double payment** or a **duplicate order**.
+
+**Two definitions to keep apart (RFC 9110):**
+- **Safe** = read-only (`GET`, `HEAD`, `OPTIONS`). Safe methods are also idempotent.
+- **Idempotent** = repeatable with the same effect (safe methods + `PUT` + `DELETE`). Note that `DELETE` may return `204` the first time and `404` after, and still be idempotent: idempotency is about **server state**, not the response.
+- `PATCH` is **not guaranteed** idempotent (`{"op":"increment"}` isn't).
+
+**Mechanism to make POST safely retryable: an idempotency key.** The client generates a unique key per logical operation and sends it on every retry. The server stores the first result under that key and replays it:
+
+```python title="idempotency.py"
+# table: idempotency_keys(key text primary key, user_id, status int, body jsonb, created_at)
+import json
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+Work = Callable[[], Awaitable[tuple[int, Any]]]          # returns (status, body)
+
+
+async def with_idempotency(request: Request, user_id: int, work: Work) -> JSONResponse:
+    key = request.headers.get("Idempotency-Key")
+    if not key:
+        return JSONResponse({"error": "Idempotency-Key header required"}, status_code=400)
+
+    # claim the key atomically; only one request wins
+    claimed = await pool.fetchval(
+        "INSERT INTO idempotency_keys (key, user_id) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING RETURNING key",
+        key, user_id,
+    )
+
+    if claimed is None:
+        prev = await pool.fetchrow(
+            "SELECT status, body FROM idempotency_keys WHERE key = $1 AND user_id = $2", key, user_id
+        )
+        if prev is None or prev["status"] is None:
+            return JSONResponse({"error": "request with this key still in progress"}, status_code=409)
+        return JSONResponse(json.loads(prev["body"]), status_code=prev["status"])   # replay, don't redo
+
+    status, body = await work()
+    await pool.execute(
+        "UPDATE idempotency_keys SET status = $2, body = $3 WHERE key = $1", key, status, json.dumps(body)
+    )
+    return JSONResponse(body, status_code=status)
+```
+
+Here `pool` is an asyncpg connection pool. Edge cases: expire keys after a while (e.g. 24 h); if `work()` raises, delete the key so a retry can try again; scope keys per user so one user can't replay another's result.
+
+### Safe methods in practice ➕
+
+The 🔧 notes above define **safe** and **idempotent** as two separate properties. Idempotency is about retries; the "safe" half has consequences of its own that bite real backends.
+
+#### GET must not change state ➕
+
+- **Problem:** many things send GET requests **without a user deciding to**: browser prefetching, search crawlers, link-preview bots (Slack, Teams, WhatsApp unfurling a pasted link), corporate email scanners that open every link in an incoming mail, and caches. If `GET /unsubscribe?u=42` or `GET /magic-login?token=...` changes state, those bots unsubscribe users and **burn one-time login tokens** before the human clicks.
+- **Why:** RFC 9110 defines GET as **safe**: the client doesn't request, and isn't responsible for, any state change. Every tool above relies on that promise.
+- **Mechanism:** a GET may only **show** something. The state change goes behind a POST, which bots don't send.
+- **Implementation:** the confirm-page pattern for one-time links:
+
+```python title="magic_link.py"
+from html import escape
+from typing import Annotated
+
+from fastapi import FastAPI, Form
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+
+app = FastAPI()
+
+
+@app.get("/magic-login", response_class=HTMLResponse)
+async def magic_login_page(token: str = "") -> str:          # safe: just renders a button
+    return f"""<form method="post" action="/magic-login">
+    <input type="hidden" name="token" value="{escape(token)}">
+    <button>Sign in</button></form>"""
+
+
+@app.post("/magic-login")
+async def magic_login(token: Annotated[str, Form()]):
+    session = await consume_login_token(token)               # the one-time token is used up HERE
+    if session is None:
+        return PlainTextResponse("Link expired", status_code=400)
+    response = RedirectResponse("/", status_code=303)        # 303: the browser follows with a GET
+    response.set_cookie("sid", session.id, httponly=True, secure=True, samesite="lax")
+    return response
+```
+
+- **Edge cases:** "safe" still allows harmless side effects such as logging and metrics. There's also a **CSRF** angle: `SameSite=Lax` cookies **are** sent on top-level GET navigations from other sites, so a state-changing GET is open to CSRF even with Lax cookies. Keeping GET safe is part of the CSRF defence.
+
+#### HEAD ➕
+
+- **Problem:** link checkers, download managers and some caches want a resource's size, type or ETag **without** downloading it.
+- **Mechanism:** `HEAD` returns exactly the headers a GET would, with no body.
+- **Implementation:** FastAPI does **not** answer HEAD for a `@app.get` route: the request gets `405 Method Not Allowed` (plain Starlette routes and Express do answer it, by running the GET handler and discarding the body). `@app.api_route(path, methods=["GET", "HEAD"])` gives you that behaviour, but for an expensive GET (a report built from a heavy query) it does all the work for nothing. Register a cheap HEAD route instead:
+
+```python
+from fastapi import Response
+
+
+@app.head("/reports/{report_id}")
+async def report_head(report_id: str) -> Response:
+    meta = await reports.meta(report_id)                   # size + version only, no CSV generation
+    if meta is None:
+        return Response(status_code=404)
+    return Response(headers={"Content-Type": "text/csv", "Content-Length": str(meta.bytes),
+                             "ETag": f'"{meta.version}"'})
+
+
+@app.get("/reports/{report_id}")
+async def report(report_id: str):
+    return await stream_report(report_id)
+```
+
+- **Edge cases:** the headers must match what GET would send, or clients make wrong decisions (a download manager trusting a wrong `Content-Length`). A HEAD response never has a body, even if your code returns one; uvicorn drops it.
+
+#### GET with a body ➕
+
+- **Problem:** a search with dozens of filters doesn't fit comfortably in a query string, and URLs have length limits (section 19). Putting a JSON body on a GET is tempting.
+- **Why it's unreliable:** RFC 9110 says content in a GET has **no generally defined semantics** and may cause some implementations to **reject the request** (because a body on GET has been used for request smuggling). In practice, the browser's `fetch` throws a `TypeError` for a GET with a body, some proxies and CDNs drop the body, and caches key only on the URL, so two different bodies would share one cached answer.
+- **Mechanism (alternatives):**
+  1. `POST /books/search` with a JSON body. It works everywhere, but POST isn't cacheable by default and isn't automatically retried, so document it as safe and accept an `Idempotency-Key` if needed.
+  2. Create a saved search: `POST /searches` returns `201` with `Location: /searches/abc`, then `GET /searches/abc/results` is cacheable and shareable.
+  3. The **`QUERY`** method, an IETF draft for a safe, idempotent request **with** a body. Promising, but not yet supported widely enough to rely on.
+- **Implementation:**
+
+```python
+from pydantic import BaseModel, Field
+
+
+class Search(BaseModel):
+    authors: list[str] = Field(default_factory=list, max_length=50)
+    year_from: int | None = None
+    tags: list[str] = Field(default_factory=list, max_length=100)
+
+
+@app.post("/books/search")
+async def search_books(q: Search, response: Response):   # validation errors → 422 automatically
+    response.headers["Cache-Control"] = "no-store"
+    return await books.search(q)
+```
+
+- **Edge cases:** some well-known APIs (Elasticsearch's `_search`) accept GET with a body and also accept POST for the same thing. If you consume one, use the POST form from Python services and browsers.
+
+---
+
+## 9. OPTIONS and CORS 🎓
+
+### The problem CORS solves
+- Browsers enforce the **same-origin policy**: by default, a page may only make requests to **its own origin** (scheme + host + port).
+- **CORS** (Cross-Origin Resource Sharing) is the **browser-enforced** mechanism that lets a server **opt in**: it states which other origins may access its resources, and how.
+- Without CORS, a request from a web app on `example.com` to `api.another-example.com` is blocked by the browser.
+
+The **`OPTIONS`** method is rarely called by you directly. You see it in the Network tab as **preflight** requests, where the browser uses it to **ask the server about its capabilities** for a cross-origin request.
+
+There are two flows: **simple** and **preflighted**.
+
+### Flow 1: the simple request 🎓
+Frontend on `example.com`, API on `api.example.com`, a `GET` request:
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant JS as Page JS (example.com)
+  participant B as Browser
+  participant S as API (api.example.com)
+  JS->>B: fetch GET /data
+  B->>S: GET /data + Origin example.com (added automatically)
+  S->>S: Is this origin allowed by my policy?
+  alt allowed
+    S-->>B: 200 + Access-Control-Allow-Origin example.com (or *)
+    B-->>JS: response delivered
+  else not allowed
+    S-->>B: 200 without the CORS header
+    B-->>JS: blocked, CORS error in console
+  end`} />
+
+1. The browser **adds the `Origin` header** automatically.
+2. The method is a **simple** one (`GET`, `POST` or `HEAD`).
+3. The server checks `Origin` against its CORS policy. If allowed, it adds **`Access-Control-Allow-Origin`** with the client's origin, or `*` (all origins).
+4. The browser sees that the page's origin differs from the API's, so it checks for that header. If it matches (or is `*`), the response goes through to the JavaScript. If it's **missing**, the browser **blocks the response** and you get a **CORS error** in the console and Network tab.
+
+🔧 **Key insight:** in the simple flow the **request still reaches the server and runs**. CORS only stops the **JavaScript from reading the response**. That's why CORS is **not** a server-side security control: for state-changing requests, you still need authentication and CSRF protection.
+
+### Flow 2: the preflighted request 🎓
+**When does the browser preflight?** When the request is **cross-origin** and **at least one** of these is true:
+1. The method is **not** `GET`, `POST` or `HEAD` (e.g. `PUT`, `DELETE`).
+2. It has **non-simple headers**, e.g. `Authorization` or a custom header.
+3. Its `Content-Type` is **not** one of `application/x-www-form-urlencoded`, `multipart/form-data`, `text/plain`. **So `application/json` triggers a preflight**, which means most real API calls are preflighted.
+
+<Mermaid chart={`flowchart TD
+  A{"Cross-origin?"} -->|no| N["No CORS at all"]
+  A -->|yes| M{"Method GET, HEAD or POST?"}
+  M -->|no| PF["Preflight"]
+  M -->|yes| H{"Only safelisted headers?"}
+  H -->|"no (e.g. Authorization)"| PF
+  H -->|yes| CT{"Content-Type form-urlencoded,<br/>multipart/form-data or text/plain?"}
+  CT -->|"no (e.g. application/json)"| PF
+  CT -->|yes| SR["Simple request"]`} />
+
+**The preflight exchange:**
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser (example.com)
+  participant S as API (api.example.com)
+  B->>S: OPTIONS /users/42<br/>Origin example.com<br/>Access-Control-Request-Method PUT<br/>Access-Control-Request-Headers authorization, content-type
+  Note over B,S: no body, just a capability check
+  S-->>B: 204 No Content<br/>Access-Control-Allow-Origin example.com<br/>Access-Control-Allow-Methods PUT, DELETE<br/>Access-Control-Allow-Headers Authorization, Content-Type<br/>Access-Control-Max-Age 86400
+  Note over B: all checks pass, cache the result
+  B->>S: PUT /users/42 + Authorization + JSON body
+  S-->>B: 200 + Access-Control-Allow-Origin example.com`} />
+
+- **Request:** method `OPTIONS`, the target URL, `Host`, `Origin`, **`Access-Control-Request-Method`** ("do you support PUT on this route?") and **`Access-Control-Request-Headers`** ("do you accept the `Authorization` header?"). **No body.**
+- **Response** (if the server handles CORS; otherwise the browser blocks the real request): **`204 No Content`** (there's nothing to return; the information is in the headers) with four key headers:
+  1. `Access-Control-Allow-Origin`: the client's origin or `*`.
+  2. `Access-Control-Allow-Methods`: e.g. `PUT, DELETE`.
+  3. `Access-Control-Allow-Headers`: e.g. `Authorization`.
+  4. `Access-Control-Max-Age`: how long the browser may **cache this answer** (the lesson's example: 24 hours) so it doesn't preflight every request. That saves bandwidth for both sides.
+- The browser ticks off each condition, then sends the **original request**, and the server responds normally.
+
+### What the demo shows 🎓
+The demo uses **Burp Suite** (an HTTP interception tool popular with ethical hackers) to inspect the traffic. There's intentionally **no code**: the concepts don't depend on the server's language.
+- **Frontend** on `localhost:5173`, **API** on `localhost:3000`. **Different ports = different origins**, so it's cross-origin even on the same machine.
+- **Simple request:** the response contains `Access-Control-Allow-Origin` with the frontend's origin, so the data renders.
+- **Header removed** on the server (cache disabled in DevTools to force a fresh request): the browser **blocks** the response with a CORS error.
+- **Preflighted request** (CORS re-enabled): the Network tab shows `OPTIONS` **first**, then the real `PUT`. The `PUT` met **all three** preflight conditions (non-simple method, `Authorization` header, JSON body); any one would have been enough.
+  - The preflight response: `204`, allowed origin, `Access-Control-Allow-Methods: GET, POST, PUT, DELETE`, `Access-Control-Allow-Headers: Content-Type, Authorization`, `Content-Length: 0`.
+  - `Access-Control-Max-Age` is **0** in the demo so every request preflights, which makes testing easier.
+
+### 🔧 Going deeper: implementing CORS correctly in Python
+
+```python title="cors.py (FastAPI, no library)"
+from fastapi import FastAPI, Request, Response
+
+app = FastAPI()
+ALLOWED = {"https://app.example.com", "http://localhost:5173"}
+
+
+@app.middleware("http")
+async def cors(request: Request, call_next):
+    origin = request.headers.get("origin")
+    allowed = origin is not None and origin in ALLOWED
+
+    if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
+        response = Response(status_code=204)                   # answer the preflight, skip the handlers
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Max-Age"] = "7200"
+    else:
+        response = await call_next(request)
+
+    if allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin          # echo the specific origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"     # only if you use cookies
+    response.headers.append("Vary", "Origin")                  # the response differs per Origin
+    return response
+```
+
+In FastAPI the same is Starlette's built-in middleware: `app.add_middleware(CORSMiddleware, allow_origins=[...], allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"], allow_headers=["Content-Type", "Authorization"], max_age=7200)` (its `allow_methods` defaults to `GET` only).
+
+Edge cases (MDN):
+- **`*` doesn't work with credentials.** If the request sends cookies, the server must echo an **explicit origin**, not `*`.
+- **`Vary: Origin` is required** when you echo the origin dynamically. Otherwise a CDN may cache the response with one site's `Allow-Origin` and serve it to another, causing random CORS failures.
+- **Browsers cap `Max-Age`:** Firefox at **24 hours**, Chromium at **2 hours**. The default without the header is **5 seconds**.
+- **The preflight must succeed before auth.** If your auth middleware runs before CORS and rejects `OPTIONS` with 401 (preflights carry no `Authorization`), every call fails with a CORS error. Put CORS **first**.
+- **Never reflect any `Origin` blindly** together with `Allow-Credentials: true`. That lets any website make authenticated calls and read the responses.
+
+---
+
+## 10. Status codes 🎓
+
+### Why they exist
+- **Problem:** without them, a client would have to **guess** the outcome from the body ("if it worked I'd expect this structure, if it crashed maybe a null object..."). That's inconsistent and inefficient.
+- **Mechanism:** a **standardised 3-digit code** tells the client the result at a glance, so it can react, e.g. on **401** log the user out and ask them to sign in again, or on **400** ask the user to fix the form.
+- **Standardisation:** the codes are the same whether the server is in Python, Go, Rust, JavaScript or Ruby. Successful? 200. Created something? 201. A **universal language** for clients and servers.
+
+| First digit | Class |
+|---|---|
+| **1xx** | informational |
+| **2xx** | success |
+| **3xx** | redirection |
+| **4xx** | client error |
+| **5xx** | server error |
+
+### 1xx 🎓
+- **`100 Continue`**: the server has received the headers and the client may send the body. Used for **large uploads**: the client sends headers first (🔧 with `Expect: 100-continue`), and only sends the big body if the server accepts.
+- **`101 Switching Protocols`**: the server switches protocol at the client's request, e.g. **HTTP → WebSocket**.
+
+These are rare day to day. Focus on 2xx, 4xx and 5xx.
+
+### 2xx: success 🎓
+
+| Code | Meaning | Typical use |
+|---|---|---|
+| `200 OK` | success, here's the resource or the action's result | a successful `GET` |
+| `201 Created` | success, **a new resource was created** | `POST`, form submissions (🔧 add a `Location` header pointing to the new resource) |
+| `204 No Content` | success, **no body** | preflight responses, `DELETE` |
+
+### 3xx: redirection 🎓
+
+| Code | Meaning | Lesson's example |
+|---|---|---|
+| `301 Moved Permanently` | the resource has a **new URL for good**; use it from now on | `/user` renamed to `/person`; a 301 keeps old clients working |
+| `302 Found` | **temporary** redirect; keep using the original URL in future | redirect a route for a few hours during a campaign, then revert |
+| `304 Not Modified` | the resource hasn't changed since you last fetched it; use your cache | conditional `GET` with ETags (section 11) |
+
+🔧 **Method-preserving redirects:** 301 and 302 historically let clients change `POST` into `GET` on the redirect. If the method must be kept (e.g. a redirected `POST` upload), use **`307 Temporary Redirect`** or **`308 Permanent Redirect`**. Also note that browsers cache 301s aggressively, so a mistaken 301 is hard to undo.
+
+### 4xx: client errors 🎓
+As a backend engineer you'll deal with these most, because they describe something the **client** did.
+
+| Code | Meaning | When to return it |
+|---|---|---|
+| `400 Bad Request` | the request data is invalid or illogical | expected a number, got an array; expected an email, got a phone number |
+| `401 Unauthorized` | **not authenticated**: no valid credentials | JWT missing or expired |
+| `403 Forbidden` | authenticated, but **not allowed** | user A tries to delete user B's resource |
+| `404 Not Found` | resource doesn't exist (wrong URL or deleted) | the most famous code |
+| `405 Method Not Allowed` | the route exists, but not with this method | `PUT` on a route that only accepts `GET`/`POST`, often a frontend typo (PATCH vs PUT) |
+| `409 Conflict` | the request conflicts with current state | folder names must be unique and the name already exists |
+| `429 Too Many Requests` | rate limit exceeded | e.g. limit of 60 requests per second per client |
+
+🔧 Details from RFC 9110 / RFC 6585 that make these responses correct:
+- **401** should include a **`WWW-Authenticate`** header saying which scheme to use (e.g. `Bearer`).
+- **405** **must** include an **`Allow`** header listing the supported methods.
+- **429** (and 503) should include **`Retry-After`**, so well-behaved clients back off for the right time.
+- **403 vs 404 for hiding existence:** if even revealing that a resource exists is a leak (e.g. another user's private document), return **404** instead of 403.
+- 🔧 **`422 Unprocessable Content`** is common for "well-formed JSON, but fails validation"; many APIs use 400 for both. Pick one and be consistent.
+
+### 5xx: server errors 🎓
+
+| Code | Meaning | Who returns it |
+|---|---|---|
+| `500 Internal Server Error` | something unexpected broke (an unhandled exception) | your app; better than an empty response or a hanging request |
+| `501 Not Implemented` | the method or feature isn't supported (yet) | your app, to state the intention |
+| `502 Bad Gateway` | a **proxy** got an **invalid response** from the upstream server | proxies and load balancers (e.g. Nginx), not usually you |
+| `503 Service Unavailable` | temporarily unable to handle requests (high traffic, maintenance) | your app or infra; the client should retry later |
+| `504 Gateway Timeout` | the **upstream didn't respond in time** | the proxy, e.g. Nginx got no answer from your app |
+
+The lesson's claim: this set covers about **95%** of real use.
+
+### What the demo shows 🎓
+A frontend fires a batch of requests at a mock server. Each request is preceded by an `OPTIONS` **preflight** (cross-origin). The responses: `200 OK`, `201 Created`, `400` ("missing required data"), `401`, `403` ("you do not have access"), `404` ("the requested resource could not be found"), `409` ("resource already exists"), `500` and `503` ("please try again later"). Note that the **500 says only "Internal Server Error"**: it doesn't leak internal details to the client, **for security reasons**.
+
+### 🔧 Going deeper: mapping errors to codes in one place
+**Problem:** if every handler picks its own codes and bodies, clients get inconsistent errors, and unexpected exceptions leak stack traces.
+
+**Mechanism:** raise **typed exceptions** from the business logic and convert them in **one** place (FastAPI's exception handlers; in Express, an error middleware registered last).
+
+```python title="errors.py"
+import logging
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+log = logging.getLogger("app")
+app = FastAPI()
+
+
+class AppError(Exception):
+    def __init__(self, status: int, code: str, message: str, headers: dict[str, str] | None = None):
+        super().__init__(message)
+        self.status, self.code, self.message, self.headers = status, code, message, headers or {}
+
+
+def not_found(what: str) -> AppError: return AppError(404, "NOT_FOUND", f"{what} not found")
+def conflict(msg: str) -> AppError:   return AppError(409, "CONFLICT", msg)
+def forbidden() -> AppError:          return AppError(403, "FORBIDDEN", "You do not have access")
+def too_many(sec: int) -> AppError:   return AppError(429, "RATE_LIMITED", "Too many requests", {"Retry-After": str(sec)})
+
+
+@app.exception_handler(AppError)
+async def app_error(request: Request, err: AppError) -> JSONResponse:
+    return JSONResponse({"error": {"code": err.code, "message": err.message}},
+                        status_code=err.status, headers=err.headers)
+
+
+@app.exception_handler(Exception)                       # anything unexpected
+async def unhandled(request: Request, err: Exception) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", None)
+    log.exception("unhandled error", extra={"request_id": request_id})       # full detail in logs only
+    return JSONResponse({"error": {"code": "INTERNAL", "message": "Internal Server Error",
+                                   "requestId": request_id}}, status_code=500)
+```
+
+Folder-uniqueness (409) done right: rely on a **unique constraint**, not a "check then insert" (two concurrent requests can both pass the check):
+
+```python
+import asyncpg
+
+try:
+    await pool.execute("INSERT INTO folders (owner_id, name) VALUES ($1, $2)", user_id, name)
+except asyncpg.UniqueViolationError:                    # Postgres SQLSTATE 23505
+    raise conflict("A folder with that name already exists")
+```
+
+### Status codes beyond the lesson's set ➕
+
+The lesson's list covers most day-to-day responses. These six come up as soon as a backend does asynchronous work, serves files, retires endpoints or runs behind Nginx under load, and each one changes how clients should behave.
+
+#### 202 Accepted + Location for async work ➕
+
+- **Problem:** some requests take minutes (exports, video processing, "delete all my data"). Holding the HTTP request open that long hits every proxy timeout on the way (section 19).
+- **Mechanism:** `202 Accepted` means "the request is valid and queued; it hasn't been done yet". By convention the response points to a **status resource** with `Location`, and the client polls it. RFC 9110 says the 202 representation should describe the current status and point to a status monitor.
+
+```python title="exports.py"
+from fastapi import Request, Response
+from fastapi.responses import JSONResponse, RedirectResponse
+
+# export_queue: a thin wrapper over your task queue (arq, Celery, ...)
+
+
+@app.post("/exports", status_code=202)
+async def create_export(request: Request, response: Response, user: CurrentUser):
+    job = await export_queue.enqueue("export", user_id=user.id,
+                                     job_id=request.headers.get("Idempotency-Key"))
+    response.headers["Location"] = f"/exports/{job.id}"
+    response.headers["Retry-After"] = "5"
+    return {"id": job.id, "status": "queued"}
+
+
+@app.get("/exports/{job_id}")
+async def export_status(job_id: str, user: CurrentUser):
+    job = await export_queue.get_job(job_id)
+    if job is None or job.data["user_id"] != user.id:
+        return Response(status_code=404)
+    state = await job.state()                                    # queued, running, completed, failed
+    if state == "completed":
+        return RedirectResponse(job.result["download_url"], status_code=303)   # 303: GET the result
+    return JSONResponse({"id": job.id, "status": state}, headers={"Retry-After": "5"})
+```
+
+- **Edge cases:** 202 is **non-committal**: the job can still fail, so the status resource needs a `failed` state with a reason. `Retry-After` paces polling. Make the submit idempotent (here the `Idempotency-Key` becomes the job ID), or a retried POST starts two exports. For the queue itself, see [Task queues](/docs/backend-first-principles/14-task-queues-background-jobs).
+
+#### 206 Partial Content ➕
+
+- **Problem:** resuming a broken download, seeking in a video or downloading a big file in parallel pieces all need **part** of a resource.
+- **Mechanism:** the server advertises `Accept-Ranges: bytes`; the client sends `Range: bytes=1000000-1999999`; the server replies **`206 Partial Content`** with `Content-Range: bytes 1000000-1999999/52428800`. A range outside the file gets **`416 Range Not Satisfiable`**.
+- **Implementation:** Starlette's `FileResponse` and `StaticFiles` (both usable from FastAPI) handle ranges for you. Object storage does too; see [Object storage part 2](/docs/backend-first-principles/object-storage-part-2) for the range-request deep dive.
+- **Edge cases:** if the file changes between two range requests, a client could stitch together pieces of two versions. Clients prevent that with `If-Range: "etag"` (send the range only if the ETag still matches, otherwise the whole new file), which needs a **strong** ETag.
+
+#### 410 Gone ➕
+
+- **Problem:** `404` can mean "typo", "never existed" or "deleted". For a retired API version or a deliberately removed resource, clients and crawlers should stop asking.
+- **Mechanism:** `410 Gone` says the removal is **intentional and permanent**. RFC 9110 makes it heuristically cacheable, and search engines drop such URLs faster.
+
+```python
+@app.api_route("/api/v1/{rest:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def v1_gone(rest: str) -> JSONResponse:
+    return JSONResponse({"error": "API v1 was removed on 2027-06-30", "successor": "/api/v2"}, status_code=410)
+```
+
+- **Edge cases:** for one user's deleted private data, 410 **confirms the resource existed**, which can leak information; use 404 there. The versioning workflow that ends in 410 is in [Routing](/docs/backend-first-principles/06-routing).
+
+#### 415 Unsupported Media Type ➕
+
+- **Problem:** a client sends XML, a form post or forgets `Content-Type`. FastAPI only decodes the body as JSON when the `Content-Type` says JSON; otherwise it hands the raw bytes to Pydantic, and the client gets a confusing `422` ("Input should be a valid dictionary or object to extract fields from") that doesn't mention the real problem.
+- **Mechanism:** reject a body you can't interpret with **`415`**, which tells the client exactly what's wrong.
+
+```python
+@app.middleware("http")
+async def require_json(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH"}:
+        has_body = request.headers.get("content-length", "0") != "0" or "transfer-encoding" in request.headers
+        media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if has_body and media_type != "application/json":
+            return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
+    return await call_next(request)
+```
+
+- **Edge cases:** splitting on `;` handles parameters such as `; charset=utf-8`. Requiring `application/json` has a security bonus: cross-origin JSON requests always need a CORS **preflight** (section 9), while a form post (`text/plain`, `application/x-www-form-urlencoded`) doesn't, so accepting only JSON removes a CSRF path.
+
+#### 499: the client gave up (Nginx) ➕
+
+- **Problem:** your Nginx logs show `499` but your app logs show successful `200`s for the same requests.
+- **Mechanism:** 499 is **Nginx-specific** and never sent on the wire: Nginx logs it when the **client closed the connection** before the response was ready (the user navigated away, or the client's timeout was shorter than your processing). Your app kept working on a request nobody was waiting for.
+- **Implementation:** uvicorn doesn't cancel your handler when the client leaves; it only reports the disconnect to whoever calls `receive()`. Detect it and cancel the work yourself:
+
+```python title="abort_on_close.py"
+import asyncio
+from collections.abc import Awaitable
+
+from fastapi import Request, Response
+
+
+class ClientGone(Exception):
+    pass
+
+
+async def cancel_on_disconnect[T](request: Request, work: Awaitable[T]) -> T:
+    task = asyncio.ensure_future(work)
+    while not task.done():
+        if await request.is_disconnected():          # closed before we finished
+            task.cancel()                            # CancelledError is raised inside the awaited call
+            raise ClientGone
+        await asyncio.wait({task}, timeout=0.25)
+    return task.result()
+
+
+@app.exception_handler(ClientGone)
+async def client_gone(request: Request, exc: ClientGone) -> Response:
+    return Response(status_code=499)                 # Nginx's convention; only your access log sees it
+
+
+@app.get("/search")
+async def search(request: Request, q: str):
+    upstream = await cancel_on_disconnect(request, http.get(search_url(q)))   # cancelled with the client
+    return upstream.json()
+```
+
+- **Edge cases:** cancelling stops **reads** cleanly, but a write that already committed **did happen** even though the client saw an error. The client will probably retry, which is why writes need idempotency (section 8). A spike in 499s usually means **p99 latency exceeded the client's timeout**; see the timeout-alignment rule in section 19. For Postgres, a `statement_timeout` bounds query time even when a cancelled task doesn't manage to cancel the query on the server.
+
+#### 503 + Retry-After vs 500 ➕
+
+- **Problem:** both mean "server-side failure", but clients should react in opposite ways.
+- **Mechanism:**
+  - **500**: a bug. Retrying the same request will most likely fail the same way; don't retry automatically.
+  - **503**: **temporary** inability (overload, maintenance, a dependency is down). Retry later, ideally after `Retry-After` (seconds, or an HTTP date).
+- **Implementation:** load shedding. When the server is saturated, a fast 503 is far better than letting every request queue up and time out:
+
+```python title="load_shed.py"
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+
+class LoadShed:                                      # pure ASGI: counts until the response is fully sent
+    def __init__(self, app: ASGIApp, max_in_flight: int = 200) -> None:
+        self.app, self.max_in_flight, self.in_flight = app, max_in_flight, 0
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        if self.in_flight >= self.max_in_flight:
+            busy = JSONResponse({"error": "Server busy, retry shortly"}, status_code=503,
+                                headers={"Retry-After": "2"})        # costs microseconds
+            return await busy(scope, receive, send)
+        self.in_flight += 1                          # one event loop thread: no lock needed
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.in_flight -= 1
+
+
+app.add_middleware(LoadShed, max_in_flight=200)
+```
+
+- **Edge cases:** a **health check** that returns 503 makes the load balancer remove the instance, which is what you want during shutdown but not when a shared dependency is down (every instance goes unhealthy at once). Don't map bugs to 503 to "encourage retries": that multiplies load on an already failing system. **429** is "you, specifically, slow down"; **503** is "everyone, slow down". CDNs can serve stale content on 5xx with `stale-if-error` (section 11).
+
+---
+
+## 11. HTTP caching 🎓
+
+### What it is and why
+Store copies of responses and **reuse** them, so the client doesn't download unchanged data again. Benefits: **faster loads**, **less bandwidth**, **lower server load**.
+
+### What the demo shows 🎓
+**First request:** `GET /api/resource`. The response (`200` with a body) includes three headers:
+
+| Header | Meaning |
+|---|---|
+| `Cache-Control: max-age=10` | cache this response for at most **10 seconds** |
+| `ETag: "3141"` | an identifier for this **version** of the resource; normally a **hash of the response** (a random number in the demo) |
+| `Last-Modified: <date>` | when the resource last changed |
+
+**Second request (fetch again):** the browser sends **conditional** headers:
+- `If-None-Match: "3141"`: "send the resource only if its ETag is no longer this one",
+- `If-Modified-Since: <date>`: "...or if it changed after this date".
+
+The server checks them, sees **nothing changed**, and replies **`304 Not Modified`** with **no body**. The browser uses its cached copy.
+
+**After an update:** the demo uses a `POST` to update the resource (ideally `PATCH`/`PUT`). The server returns `200` and a **new ETag** (`"2943"`). The next `GET` still sends the **old** ETag (`3141`); it doesn't match, so the server returns **`200` with the new body** and the new ETag. A fetch after that sends `2943`, which matches, so it's **`304`** again.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser cache
+  participant S as Server
+  B->>S: GET /api/resource
+  S-->>B: 200 + body + ETag 3141 + Last-Modified + max-age=10
+  B->>S: GET + If-None-Match 3141
+  S-->>B: 304 Not Modified (no body, reuse cache)
+  Note over S: resource updated, ETag becomes 2943
+  B->>S: GET + If-None-Match 3141
+  S-->>B: 200 + new body + ETag 2943
+  B->>S: GET + If-None-Match 2943
+  S-->>B: 304 Not Modified`} />
+
+### The lesson's opinion
+- In production this gets complicated: the server must **manage ETags correctly**. Forget to change one after an update and clients keep using **stale data**.
+- Client-side caching libraries such as **React Query** give the client full control over when to use cached data and when to refetch (at what interval, etc.). The author considers that **a better solution** than traditional HTTP caching for app data, while HTTP caching is fine for **simple** use cases.
+
+### 🔧 Going deeper: how to make ETags impossible to forget
+**Problem:** a hand-maintained version number goes stale when someone forgets to bump it.
+
+**Mechanism:** derive the ETag **from the response bytes**, so it changes automatically whenever the content changes. FastAPI doesn't do this for JSON responses (Starlette adds ETags only to `FileResponse` and `StaticFiles`; Express does it for every `res.send`/`res.json`). Done by hand:
+
+```python title="etag.py"
+import base64
+import hashlib
+import json
+
+from fastapi import Request, Response
+
+
+@app.get("/api/resource")
+async def get_resource(request: Request) -> Response:
+    body = json.dumps(await load_resource()).encode()
+    digest = base64.urlsafe_b64encode(hashlib.sha1(body).digest()).rstrip(b"=").decode()
+    headers = {
+        "ETag": f'"{digest}"',                                         # content-derived
+        "Cache-Control": "private, max-age=0, must-revalidate",        # always revalidate, cheaply
+    }
+    if request.headers.get("if-none-match") == headers["ETag"]:
+        return Response(status_code=304, headers=headers)              # no body sent
+    return Response(body, media_type="application/json", headers=headers)
+```
+
+Note: this saves **bandwidth**, not **server work**, because the response is still built to hash it. To save work too, use a stored version: e.g. a `version` or `updated_at` column bumped **by the same UPDATE statement** that changes the row, and compare it before loading the full data.
+
+🔧 **`Cache-Control` directives you'll actually use:**
+
+| Directive | Meaning |
+|---|---|
+| `max-age=N` | fresh for N seconds; no request at all during that time |
+| `no-cache` | **may** store, but **must revalidate** (ETag check) before every use. It does *not* mean "don't cache" |
+| `no-store` | never store anywhere (sensitive data) |
+| `private` | only the user's browser may cache; shared caches and CDNs may not (per-user data) |
+| `public`, `s-maxage=N` | shared caches (CDNs) may store it; `s-maxage` applies to them |
+| `immutable` | will never change; skip revalidation (content-hashed static files) |
+
+🔧 **Strong vs weak ETags:** `"abc"` means byte-for-byte identical; `W/"abc"` means semantically equivalent (e.g. same data, different compression). Weak ETags are fine for `If-None-Match`; range requests need strong ones.
+
+🔧 **Edge case: `Last-Modified` has 1-second resolution.** Two updates in the same second look identical. When both are present, servers should prefer `If-None-Match`.
+
+### Shared caches and CDNs ➕
+
+Everything above happens in **one user's browser cache**. A CDN or a reverse-proxy cache sits between **all** users and your server and is shared by them, which changes what is safe to cache and how things go wrong. (Server-side application caching with Redis is its own lesson: [Caching](/docs/backend-first-principles/13-caching).)
+
+<Mermaid chart={`flowchart LR
+  U1["User A browser<br/>private cache"] --> CDN["CDN edge<br/>shared cache"]
+  U2["User B browser<br/>private cache"] --> CDN
+  CDN -->|"miss or revalidation"| O["Origin: your app"]`} />
+
+#### Private vs shared: who may store what ➕
+
+- **Problem:** a response cached at the CDN is served to **the next person** who asks for the same URL. If it contained user A's data, user B now sees it.
+- **Mechanism (RFC 9111):** `private` means only the user's own cache may store it; `public` and `s-maxage` explicitly allow shared caches. There is one built-in safety net: a shared cache must not reuse a response to a request that carried an **`Authorization`** header unless the response explicitly allows it (`public`, `s-maxage` or `must-revalidate`).
+- **The gap in that safety net:** it covers `Authorization`, **not cookies**. With cookie sessions, a personalised `GET /me` is just a URL to the CDN. Marking it `private` (or `no-store`) is your job.
+
+```python
+@app.get("/api/catalog")                                    # same for everyone
+async def get_catalog(response: Response):
+    response.headers["Cache-Control"] = "public, max-age=60, s-maxage=300"
+    return catalog
+
+
+@app.get("/api/me")                                         # per user, cookie-authenticated
+async def get_me(response: Response, user: Annotated[User, Depends(require_auth)]):
+    response.headers["Cache-Control"] = "private, no-cache"   # browser may keep it, CDN never
+    return user
+```
+
+- **Edge cases:** never let a shared cache store a response with **`Set-Cookie`**: depending on the CDN's configuration, it can hand one user's fresh session cookie to everyone. Configure the CDN to bypass the cache when `Set-Cookie` is present, and don't set cookies on cacheable routes.
+
+#### The cache key ➕
+
+- **Problem:** the cache must decide when two requests are "the same". Too coarse, and users get the wrong variant; too fine, and nothing is ever a hit.
+- **Mechanism:** by default the key is roughly **method + host + path + query string** (each CDN documents its exact default). `Vary` adds request headers to the key: `Vary: Accept-Encoding` stores a gzip and a Brotli copy.
+- **Implementation:** keep the key small and canonical:
+  - vary only on what really changes the response (`Accept-Encoding`, sometimes `Accept-Language`), never on `User-Agent` or `Cookie`, which make almost every request unique;
+  - in the CDN's cache-key settings, sort query parameters and drop tracking parameters such as `utm_*` and `fbclid`, so `?a=1&b=2` and `?b=2&a=1&utm_source=x` share one entry.
+- **Edge cases:** `Vary: Origin` (from the CORS section) multiplies entries by the number of origins, which is fine for a handful of known origins. A response that varies on something **not** in the key is the root cause of cache poisoning, below.
+
+#### Age and how stale a response really is ➕
+
+- **Problem:** you set `max-age=60` but users see data several minutes old.
+- **Mechanism:** a shared cache adds an **`Age`** header saying how many seconds the response has spent in caches. A browser receiving `Cache-Control: max-age=60` with `Age: 50` treats it as fresh for only **10** more seconds. But `s-maxage=300` lets the CDN keep serving it for 5 minutes, and the browser can then add its own `max-age` on top: worst-case staleness is roughly `s-maxage + max-age`.
+- **Implementation:** inspect it from outside:
+
+```bash
+curl -sI https://www.example.com/api/catalog | grep -iE '^(age|cache-control|x-cache|cf-cache-status|etag):'
+# age: 187   cf-cache-status: HIT   (the hit/miss header name is CDN-specific)
+```
+
+- **Edge cases:** to change data **now**, don't wait for TTLs: purge the CDN by URL or tag on write, or use content-addressed URLs (`app.3f9a1c.js`) with `immutable` so new content gets a new key.
+
+#### stale-while-revalidate and stale-if-error ➕
+
+- **Problem:** at the moment an entry expires, the next user waits for the origin (a latency spike), and when many entries expire together, the origin gets a burst. When the origin is down, expired entries turn into errors.
+- **Mechanism (RFC 5861):**
+  - `stale-while-revalidate=N`: for N seconds after expiry, serve the stale copy **immediately** and refresh it in the background.
+  - `stale-if-error=N`: for N seconds after expiry, if the origin errors (5xx or unreachable), serve the stale copy instead of the error.
+
+```python
+response.headers["Cache-Control"] = "public, max-age=30, s-maxage=60, stale-while-revalidate=120, stale-if-error=86400"
+```
+
+- **Edge cases:** support differs: major CDNs honour both, browsers support `stale-while-revalidate` but `stale-if-error` is not reliably implemented in browsers. Only use them for data where "a little stale" is acceptable (catalogues, public profiles), never for balances or permissions.
+
+#### Cache poisoning via unkeyed headers ➕
+
+- **Problem:** the app uses a request header that is **not part of the cache key** to build the response. Classic case: building absolute URLs from `X-Forwarded-Host`. An attacker sends `X-Forwarded-Host: evil.example`, your page comes back with `<script src="https://evil.example/app.js">`, the CDN caches it under the normal URL, and **every** visitor gets the attacker's script.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Attacker
+  participant C as CDN cache
+  participant O as Origin
+  participant V as Victim
+  A->>C: GET / + X-Forwarded-Host evil.example
+  C->>O: miss, forward (header not in cache key)
+  O-->>C: HTML with script from evil.example
+  C-->>A: cached under key GET /
+  V->>C: GET /
+  C-->>V: HIT, poisoned HTML`} />
+
+- **Mechanism:** never let unkeyed input shape a cacheable response. Take the public base URL from **configuration**, and strip `X-Forwarded-*` headers at the edge unless your own proxies set them.
+
+```python
+# ❌ base = f"{request.url.scheme}://{request.headers.get('x-forwarded-host') or request.headers['host']}"
+# ❌ request.base_url and request.url_for(...) are built from the Host header too
+# ✅
+BASE_URL = settings.public_base_url     # e.g. https://www.example.com, validated at startup (pydantic-settings)
+```
+
+- **Edge cases:** the same bug class includes unkeyed **query parameters** that some CDNs exclude from the key, and **web cache deception** (a CDN caching `/account/settings/x.css` as a static file even though the app served the private settings page for it). Test by sending odd headers to a cache-busted URL and checking whether they appear in the response.
+
+---
+
+## 12. Conditional writes: If-Match and 412 ➕
+
+Caching used ETags so clients can skip re-downloading. The **same validator**, sent on a **write**, stops two clients from silently overwriting each other. (The REST lesson mentions this briefly; here is the full mechanism: [REST API design](/docs/backend-first-principles/11-rest-api-design).)
+
+#### The lost-update problem ➕
+
+- **Problem:** Alice and Bob both open document 7 (version 4). Alice changes the title and saves. Bob, still looking at version 4, changes the body and saves. Bob's request carries the **old title**, so Alice's change disappears. Nobody gets an error.
+- **Why (first principles):** HTTP is stateless. Each client edits a **copy** that goes stale the moment someone else writes, and the server has no idea which version the client based its change on, so the last write wins.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Alice
+  participant S as Server
+  participant B as Bob
+  A->>S: GET /docs/7
+  S-->>A: 200 + ETag 4
+  B->>S: GET /docs/7
+  S-->>B: 200 + ETag 4
+  A->>S: PUT /docs/7 + If-Match 4
+  S-->>A: 200 + ETag 5
+  B->>S: PUT /docs/7 + If-Match 4
+  S-->>B: 412 Precondition Failed, current is 5
+  Note over B: reload, merge, retry with If-Match 5`} />
+
+#### If-Match → 412 Precondition Failed ➕
+
+- **Mechanism:** the client sends back the ETag it based its edit on: `If-Match: "4"`. The server applies the write **only if the current ETag still equals it** (strong comparison); otherwise it returns **`412 Precondition Failed`** and changes nothing. This is **optimistic concurrency**: no locks are held while users think; conflicts are detected at write time.
+- **Implementation:** the check and the write must be **one atomic statement**. A `SELECT` followed by an `UPDATE` has a race between them; a version check inside the `UPDATE ... WHERE` doesn't:
+
+```python title="docs_routes.py (FastAPI + asyncpg)"
+import re
+from typing import Annotated
+
+from fastapi import FastAPI, Header, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+app = FastAPI()
+STRONG_ETAG = re.compile(r'^"(\d+)"$')                          # our ETags are strong: "<version>"
+
+
+def etag_of(version: int) -> str:
+    return f'"{version}"'
+
+
+class DocPatch(BaseModel):
+    title: str | None = None
+    body: str | None = None
+
+
+@app.patch("/api/docs/{doc_id}")
+async def patch_doc(doc_id: int, patch: DocPatch,
+                    if_match: Annotated[str | None, Header()] = None) -> Response:
+    if if_match is None:
+        return JSONResponse({"error": "If-Match header required"}, status_code=428)    # see 428 below
+    m = STRONG_ETAG.match(if_match.strip())
+    if m is None:
+        return JSONResponse({"error": "ETag does not match"}, status_code=412)         # W/"..." or garbage
+
+    row = await pool.fetchrow(
+        """UPDATE docs SET title = COALESCE($3, title), body = COALESCE($4, body),
+                  version = version + 1, updated_at = now()
+            WHERE id = $1 AND version = $2
+        RETURNING id, title, body, version""",
+        doc_id, int(m[1]), patch.title, patch.body,
+    )
+
+    if row is None:                                             # either it doesn't exist or the version moved on
+        current = await pool.fetchval("SELECT version FROM docs WHERE id = $1", doc_id)
+        if current is None:
+            return Response(status_code=404)
+        return JSONResponse({"error": "Document changed since you loaded it", "currentVersion": current},
+                            status_code=412, headers={"ETag": etag_of(current)})
+    return JSONResponse(dict(row), headers={"ETag": etag_of(row["version"])})
+```
+
+Two related forms: **`If-Match: *`** means "only if it exists at all", and **`If-None-Match: *`** on a `PUT` means "only if it does **not** exist yet", which makes create-if-absent safe when two clients race to create the same resource (the loser gets 412).
+
+#### 428 Precondition Required ➕
+
+- **Problem:** optimistic concurrency only works if clients **send** `If-Match`. One old client that doesn't brings the lost update back.
+- **Mechanism:** RFC 6585's **`428 Precondition Required`** tells the client "this resource requires a conditional request". The handler above returns it when `If-Match` is missing, so skipping the check is impossible.
+- **Edge cases:** introducing 428 on an existing API is a **breaking change** for clients that never sent `If-Match`. Roll it out like any breaking change: log unconditional writes per client first, then enforce (or enforce only on a new API version).
+
+#### Failure modes and design choices ➕
+
+- **Weak ETags never satisfy `If-Match`.** It uses strong comparison, so `W/"4"` can't match. Watch out for proxies: **Nginx turns strong ETags into weak ones when it gzips a response**, after which every conditional write from a browser fails with 412. Either derive write ETags from a version the client reads from the body, or keep compression from rewriting them.
+- **Derive the ETag from the stored version, not from the response bytes.** A hash of the JSON changes whenever field order, formatting or an unrelated computed field changes, causing spurious 412s.
+- **Give clients something to do with a 412.** Return the current ETag (as above), and in the UI reload, show what changed and let the user re-apply their edit. For fields that can be merged automatically (counters, sets), prefer atomic operations (`UPDATE ... SET likes = likes + 1`) over read-modify-write.
+- **`DELETE` deserves `If-Match` too**: deleting a document someone updated a second ago is also a lost update.
+
+---
+
+## 13. Content negotiation 🎓
+
+### What it is
+A mechanism by which client and server **agree on the best format** for the data. The client states its preferences; the server responds with a match, or a **fallback** if it can't.
+
+| Type | Request header | Example |
+|---|---|---|
+| **Media type** | `Accept` | `application/json`, `application/xml` |
+| **Language** | `Accept-Language` | `en`, `es` |
+| **Encoding** | `Accept-Encoding` | `gzip`, `deflate`, `br`, `zstd` |
+
+### What the demo shows 🎓
+- **Default:** English + JSON + gzip. The request carries `Accept-Language: en`, `Accept: application/json`, and the browser's `Accept-Encoding: gzip, deflate, br, zstd`. The response is JSON in English.
+- **Switch to Spanish:** only `Accept-Language` changes, and the server responds **in Spanish**.
+- **Switch to XML** (still Spanish): `Accept: application/xml`, and the response is **XML in Spanish**.
+- **Benefit:** the client states its preferences and the server adapts, which makes the client's life easier.
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: GET /greeting<br/>Accept application/xml<br/>Accept-Language es
+  S->>S: pick best match per header
+  S-->>C: 200<br/>Content-Type application/xml<br/>Content-Language es<br/>Vary Accept, Accept-Language`} />
+
+### 🔧 Going deeper: implementing it
+Preferences can carry **quality weights**: `Accept-Language: es;q=1.0, en;q=0.5`. Express has `req.accepts` / `req.acceptsLanguages` for this; FastAPI has no built-in helper, so either use a library (such as `python-mimeparse`) or write one small q-value parser and reuse it, as below. Don't scatter ad-hoc string checks across handlers.
+
+```python title="negotiate.py"
+from collections.abc import Callable
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+
+app = FastAPI()
+MESSAGES = {"en": "Hello", "es": "Hola"}
+
+
+def preferences(header: str | None) -> list[str]:
+    """'es;q=1.0, en;q=0.5' -> ['es', 'en'], highest q first, q=0 dropped."""
+    prefs = []
+    for item in (header or "*").split(","):
+        value, *params = [part.strip() for part in item.split(";")]
+        q = 1.0
+        for param in params:
+            if param.startswith("q="):
+                try:
+                    q = float(param[2:])
+                except ValueError:
+                    q = 0.0
+        if value and q > 0:
+            prefs.append((q, value.lower()))
+    return [value for q, value in sorted(prefs, key=lambda p: p[0], reverse=True)]   # stable: ties keep order
+
+
+def pick(header: str | None, offers: list[str], matches: Callable[[str, str], bool]) -> str | None:
+    for wanted in preferences(header):
+        for offer in offers:
+            if matches(wanted, offer):
+                return offer
+    return None
+
+
+def media_matches(wanted: str, offer: str) -> bool:
+    return wanted in ("*", "*/*", offer) or (wanted.endswith("/*") and offer.startswith(wanted[:-1]))
+
+
+def language_matches(wanted: str, offer: str) -> bool:
+    return wanted in ("*", offer) or wanted.startswith(offer + "-")          # es-MX accepts es
+
+
+@app.get("/greeting")
+async def greeting(request: Request) -> Response:
+    lang = pick(request.headers.get("accept-language"), ["en", "es"], language_matches) or "en"   # fallback: en
+    media = pick(request.headers.get("accept"), ["application/json", "application/xml"], media_matches)
+    headers = {"Vary": "Accept, Accept-Language", "Content-Language": lang}                    # tell caches
+
+    if media == "application/json":
+        return JSONResponse({"message": MESSAGES[lang]}, headers=headers)
+    if media == "application/xml":
+        return Response(f"<greeting>{MESSAGES[lang]}</greeting>", media_type="application/xml", headers=headers)
+    return PlainTextResponse("Not Acceptable", status_code=406, headers=headers)              # no format matches
+```
+
+- **`406 Not Acceptable`** is the standard answer when nothing matches (many APIs instead fall back to JSON).
+- **`Vary`** is essential: without it, a CDN might cache the Spanish XML and serve it to an English JSON client.
+
+---
+
+## 14. HTTP compression 🎓
+
+Compression falls under the same umbrella: the encoding part of content negotiation.
+
+### What the demo shows 🎓
+The JSON response is replaced with a large file of **11,000 entries**.
+- **With compression** (server uses gzip because the client sent `Accept-Encoding: gzip`, and the response says `Content-Encoding: gzip`): about **3.8 MB** transferred.
+- **Compression disabled:** the same file is about **26 MB**.
+
+That's roughly a **7x** difference. Multiply by every client and it's a huge amount of bandwidth. The browser **decompresses** transparently and gets exactly the same data.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: GET /big.json + Accept-Encoding gzip, br
+  S->>S: compress body with gzip
+  S-->>B: 200 + Content-Encoding gzip + Vary Accept-Encoding<br/>about 3.8 MB on the wire
+  B->>B: decompress, JS sees the original 26 MB JSON`} />
+
+### 🔧 Going deeper: where and how to compress
+- **Why JSON compresses so well:** it repeats the same keys and structure thousands of times, and gzip/Brotli replace repeats with short back-references.
+- **Where:** usually at the **reverse proxy or CDN** (Nginx `gzip on;`, or the CDN's settings), so app CPU is spent on business logic. In FastAPI, Starlette's `GZipMiddleware` does it in-process:
+
+```python
+from fastapi.middleware.gzip import GZipMiddleware
+
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)   # skip tiny bodies: headers + CPU cost more than they save
+```
+
+- **Don't recompress** already-compressed formats (JPEG, PNG, MP4, ZIP); it wastes CPU for no gain. `GZipMiddleware` already skips those content types (and `text/event-stream`) by default.
+- **Brotli (`br`)** usually compresses text better than gzip; great for **static assets compressed ahead of time**. For dynamic responses, gzip at a moderate level is a good CPU/size trade-off.
+- **Security edge case:** compressing responses that mix **secrets** (e.g. CSRF tokens) with **attacker-controlled input** over HTTPS enables the **BREACH** attack. Keep secrets out of compressed, reflected responses, or disable compression for those.
+
+---
+
+## 15. Persistent connections 🎓
+
+### The problem
+In **HTTP 1.0**, every request-response cycle needed its **own connection**. Opening and closing TCP connections is **slow and resource-intensive** (section 2).
+
+### The mechanism
+**HTTP 1.1** introduced **persistent connections**: one TCP connection is **reused** for many requests and responses, until one side decides to close it.
+
+Key points:
+1. In HTTP 1.1, connections are **persistent by default**. You don't do anything; they stay open unless explicitly closed. Fewer connections means lower latency and fewer resources.
+2. The **`Connection: keep-alive`** header can still be sent to explicitly ask the server to keep it open, and the `Keep-Alive` header can add options: a **`timeout`** (how long an idle connection stays open) and **`max`** (how many requests before closing).
+3. **`Connection: close`** closes the connection after the response. That was HTTP 1.0's default, and it can still be forced in 1.1.
+
+You usually won't touch these; the defaults work.
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: HTTP 1.0
+  C->>S: handshake, GET /a, close
+  C->>S: handshake, GET /b, close
+  Note over C,S: HTTP 1.1 keep-alive
+  C->>S: handshake once
+  C->>S: GET /a
+  S-->>C: 200
+  C->>S: GET /b (same connection)
+  S-->>C: 200
+  Note over C,S: idle timeout, then close`} />
+
+### 🔧 Going deeper: the keep-alive 502 bug behind a load balancer
+**Problem:** your app sits behind a load balancer (e.g. AWS ALB) that keeps idle connections to your app open and reuses them. **Uvicorn's default `timeout_keep_alive` is 5 seconds** (Node's `server.keepAliveTimeout` is also 5 s); an ALB's default idle timeout is **60 seconds**. Uvicorn closes an idle connection at 5 s; the ALB, believing it's still open, sends the next request on it at the same moment and gets a reset. The user sees an **intermittent 502** that never shows up in your app logs.
+
+**Fix:** the **upstream** (your app) must keep connections open **longer** than the proxy:
+
+```python title="main.py"
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=3000,
+                timeout_keep_alive=65)   # seconds; > ALB idle timeout (60 s). CLI: --timeout-keep-alive 65
+```
+
+🔧 Note: `Connection` and `Keep-Alive` are **HTTP/1.x-only**. HTTP/2 and HTTP/3 forbid connection-specific headers (Safari refuses responses that contain them), so don't set them manually.
+
+---
+
+## 16. Proxies and forwarded headers ➕
+
+The keep-alive bug above is one symptom of a bigger fact: in production your app almost never talks to the client directly. The TCP peer is a load balancer, so **everything the app knows about the client** (its IP, whether it used HTTPS, which host name it typed) comes from headers that a proxy wrote, or that an attacker wrote and a proxy passed along.
+
+<Mermaid chart={`flowchart LR
+  C["Client 203.0.113.7<br/>may send its own fake<br/>X-Forwarded-For"] --> LB["Load balancer 10.0.1.5<br/>appends client IP"]
+  LB --> NX["Nginx 127.0.0.1<br/>appends LB IP"]
+  NX --> APP["App sees TCP peer 127.0.0.1<br/>reads X-Forwarded-For<br/>from the right"]`} />
+
+#### X-Forwarded-For, -Proto and -Host ➕
+
+- **Problem:** after TLS termination at the proxy, the app sees the **proxy's** IP, plain `http`, and possibly an internal host name. Rate limiting, audit logs, redirects to `https://...` and absolute URLs are all wrong.
+- **Mechanism:** each proxy adds what it saw:
+  - `X-Forwarded-For: 203.0.113.7, 10.0.1.5`: a list, **each proxy appends** the address it received the connection from;
+  - `X-Forwarded-Proto: https`: the scheme the client used;
+  - `X-Forwarded-Host: api.example.com`: the original `Host`.
+- **The key insight:** the list is only trustworthy **from the right**. Entries appended by your own proxies are facts; anything to their left was supplied by the client and can say anything.
+- **Implementation:** Nginx's usual `$proxy_add_x_forwarded_for` **appends** to whatever the client sent. If Nginx is the first hop facing the internet, overwrite instead:
+
+```nginx
+# Nginx is the edge: discard anything the client claimed
+proxy_set_header X-Forwarded-For   $remote_addr;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host  $host;
+# Nginx behind a trusted LB: append, and let the app count hops
+# proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+
+- **Edge cases:** a client can send the header several times; servers join repeated headers into one comma-separated list, so the parsing rule ("count from the right") still holds.
+
+#### The standard `Forwarded` header ➕
+
+- **Problem:** the `X-Forwarded-*` family was never standardised, and each header is separate, so a hop could update one and not the others.
+- **Mechanism:** RFC 7239 defines one header with all fields per hop: `Forwarded: for=203.0.113.7;proto=https;host=api.example.com, for=10.0.1.5`. IPv6 addresses are quoted and bracketed (`for="[2001:db8::1]"`), and a proxy may use obfuscated identifiers instead of real IPs.
+- **Implementation:** most stacks, including uvicorn's proxy-headers support (and Express's `trust proxy`), still read **`X-Forwarded-For`**, not `Forwarded`. If your edge emits `Forwarded`, either have it also emit `X-Forwarded-*` or parse it yourself with the same right-to-left rule.
+- **Edge case:** when both are present and disagree, an attacker is often controlling one of them. Have the edge strip whichever family you don't use.
+
+#### Uvicorn's proxy headers, configured exactly ➕
+
+- **Problem:** if the TCP peer isn't trusted, uvicorn ignores the forwarded headers: `request.client.host` is the proxy's IP and `request.url.scheme` is `http`. With `forwarded_allow_ips="*"`, uvicorn trusts **every** hop, so `request.client.host` becomes the **leftmost** address: whatever the client typed.
+- **Mechanism:** uvicorn's `ProxyHeadersMiddleware` (on by default, `proxy_headers=True`) only reads `X-Forwarded-For` and `X-Forwarded-Proto` when the TCP peer is in `forwarded_allow_ips` (default `127.0.0.1`, or the `FORWARDED_ALLOW_IPS` environment variable). It then walks `X-Forwarded-For` **from right to left**, skipping addresses it trusts; the first untrusted one is the client. You define "trusted" as a list of proxy addresses or networks; unlike Express's `trust proxy`, there is no hop-count setting.
+
+```python title="main.py"
+import uvicorn
+
+uvicorn.run("app:app", port=3000,
+            proxy_headers=True,                     # the default
+            forwarded_allow_ips="127.0.0.1")        # the default: exactly one proxy (Nginx) on this host
+# forwarded_allow_ips="10.0.0.0/8"                  # trust by network: the LB and proxies in the VPC
+# forwarded_allow_ips="127.0.0.1,10.0.1.5"          # trust by address: robust when hop count varies
+# forwarded_allow_ips="*"                           # ❌ trusts everything: request.client.host is client-controlled
+# CLI: uvicorn app:app --forwarded-allow-ips 10.0.0.0/8
+```
+
+With it set correctly, `request.client.host` and `request.url.scheme` (and therefore `request.url`) use the forwarded values. Uvicorn does **not** apply `X-Forwarded-Host`; `request.url.hostname` still comes from `Host`.
+
+- **Edge cases:** the right value changes when the **infrastructure** changes. Put a CDN in front of the ALB and, with only the ALB's network trusted, `request.client.host` now returns the CDN's IP, so every user shares one rate-limit bucket. Some CDNs send their own client-IP header (e.g. Cloudflare's `CF-Connecting-IP`); trust it only if the origin accepts connections **exclusively** from that CDN's IP ranges.
+
+#### Spoofed client IPs: what breaks, and a test for it ➕
+
+- **Problem:** if `request.client.host` can be spoofed, everything keyed on IP breaks: rate limits (rotate a fake IP per request), brute-force lockouts, audit logs ("the attacker came from 127.0.0.1"), geo rules, and admin routes allow-listed to an office IP (`X-Forwarded-For: <office IP>`).
+- **Mechanism:** test the exact behaviour of your stack, end to end, through the real proxies.
+
+```bash
+# from outside, through the real edge: request.client.host in the app logs must be YOUR address, not 1.2.3.4
+curl -s -H 'X-Forwarded-For: 1.2.3.4' https://api.example.com/debug/whoami
+```
+
+```python title="test_trust_proxy.py (pytest + TestClient, simulating one trusted proxy)"
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+app = FastAPI()
+
+@app.get("/debug/whoami")
+async def whoami(request: Request):
+    return {"ip": request.client.host}
+
+# TestClient connects as host "testclient": trust it as our one proxy, like uvicorn's --forwarded-allow-ips
+client = TestClient(ProxyHeadersMiddleware(app, trusted_hosts=["testclient"]))
+
+
+def test_ignores_client_supplied_x_forwarded_for():
+    res = client.get("/debug/whoami",
+                     headers={"X-Forwarded-For": "1.2.3.4, 198.51.100.9"})  # 1.2.3.4 is forged; 198.51.100.9 was appended by our proxy
+    assert res.json()["ip"] == "198.51.100.9"
+```
+
+- **Edge cases:** IP-based controls are **weak** by nature (NAT puts thousands of users behind one IP; attackers rent many IPs). Use them as one signal, never as the only authentication for an admin route.
+
+#### Host-header attacks: password-reset poisoning ➕
+
+- **Problem:** the app builds an absolute link from the request: `link = f"https://{request.headers['host']}/reset?token={token}"` (or `request.url_for("reset")`, which uses the same header). An attacker requests a password reset **for the victim's email** with `Host: evil.example` (or `X-Forwarded-Host: evil.example`). The victim receives a genuine email from you containing `https://evil.example/reset?token=...`. One click, and the attacker has a valid reset token.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Attacker
+  participant S as Your app
+  participant V as Victim inbox
+  A->>S: POST /forgot-password email=victim + Host evil.example
+  S->>V: email with link to evil.example/reset?token=abc
+  V->>A: victim clicks, token arrives at evil.example
+  A->>S: POST /reset token=abc, new password`} />
+
+- **Mechanism:** the request's `Host` is **user input**. Build links from a **configured** base URL, and make the edge reject unknown hosts before they reach the app.
+
+```python
+link = f"{settings.public_base_url}/reset?{urlencode({'token': token})}"   # never from the request
+```
+
+```nginx
+server {                                     # catch-all for any Host you don't serve
+    listen 443 ssl default_server;
+    ssl_reject_handshake on;                 # nginx 1.19.4+: refuse TLS for unknown names
+}
+server {                                     # plain HTTP equivalent
+    listen 80 default_server;
+    return 444;                              # nginx: close the connection without a response
+}
+```
+
+- **Edge cases:** the same untrusted `Host` also feeds **cache poisoning** (section 11), routing to internal virtual hosts on shared proxies, and open redirects built from `request.url.hostname`. Uvicorn ignores `X-Forwarded-Host`, but code (or middleware) that reads it, like Express's `req.hostname` with `trust proxy` enabled, re-opens the hole whenever a proxy passes the client's value through. Starlette's `TrustedHostMiddleware(allowed_hosts=[...])` is a second line of defence in the app.
+
+---
+
+## 17. The backend as an HTTP client ➕
+
+So far the backend has been the **server**. But almost every backend is also an HTTP **client**: it calls payment providers, email APIs, object storage and other internal services. Every rule above applies in reverse, and the defaults of Python's HTTP clients (`requests`, `httpx`) are tuned for scripts, not for servers under load. (Retry policies, backoff and circuit breakers are covered in [Error handling and fault tolerance](/docs/backend-first-principles/16-error-handling-fault-tolerance); this section is about the HTTP mechanics underneath.)
+
+#### Timeouts on every call ➕
+
+- **Problem:** `requests` has **no timeout at all** unless you pass one. `httpx` defaults to 5 s, but **per phase** (connect, each read, each write, waiting for a pooled connection), with **no overall deadline**. If a provider hangs, every request of yours that calls it hangs (forever with `requests`), holding memory, a socket and maybe a DB transaction. Requests pile up, and **your** service fails because **theirs** is slow.
+- **Why:** a client can't tell "slow" from "never answering" without a deadline. Only a timeout turns an unbounded wait into a fast, handleable error.
+- **Mechanism:** give every outbound call a deadline **shorter than your own request budget** (section 19), and cancel it when your client disconnects.
+- **Implementation:**
+
+```python title="http_client.py"
+import asyncio
+from typing import Any
+
+import httpx
+
+
+class UpstreamError(Exception):
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(f"upstream returned {status}")
+        self.status, self.body = status, body
+
+
+client = httpx.AsyncClient(                      # one shared client per process
+    timeout=httpx.Timeout(connect=2.0,           # TCP + TLS handshake
+                          read=5.0,              # max gap between received bytes (not a total limit)
+                          write=5.0,
+                          pool=1.0),             # waiting for a free pooled connection
+    headers={"accept": "application/json"},
+)
+
+
+async def get_json(url: str, timeout_s: float = 3.0) -> Any:
+    async with asyncio.timeout(timeout_s):       # total deadline: connect + headers + body
+        res = await client.get(url)
+        if res.is_error:
+            raise UpstreamError(res.status_code, res.text)
+        return res.json()
+
+# if the caller's own client leaves, wrap the call: await cancel_on_disconnect(request, get_json(url))
+```
+
+- **Edge cases:** the total deadline raises the built-in **`TimeoutError`**, httpx's phase timeouts raise `httpx.ConnectTimeout`, `ReadTimeout` or `PoolTimeout`, and a cancellation because your own client left is `asyncio.CancelledError`; log them differently. httpx's `read` timeout is an **idle** timeout, so a server trickling one byte every 4 s never trips it; only the total deadline does. A timeout does **not** cancel the work on the other side: the payment may still go through, which is why retries need idempotency.
+
+#### Connection reuse with a keep-alive agent ➕
+
+- **Problem:** a new connection per call pays DNS, TCP and TLS every time (section 2): tens of milliseconds and real CPU for the TLS handshake. At high rates, closed connections pile up in `TIME_WAIT` and can exhaust local ports.
+- **Mechanism:** a **connection pool** keeps idle connections to each origin open and reuses them. An `httpx.Client` / `AsyncClient` (or a `requests.Session`) pools connections for as long as you **reuse the same object**. Module-level `httpx.get()` and `requests.get()` build a fresh client, and so a fresh connection, on every call; so does code that creates a client per request.
+- **Implementation:**
+
+```python
+from contextlib import asynccontextmanager
+
+import httpx
+import requests
+from fastapi import FastAPI
+from requests.adapters import HTTPAdapter
+
+# httpx: one long-lived client (= one pool) per upstream, with explicit limits
+payments = httpx.AsyncClient(
+    base_url="https://api.payments.example",
+    limits=httpx.Limits(max_connections=50,          # beyond this, requests wait for a slot (pool timeout)
+                        max_keepalive_connections=20,
+                        keepalive_expiry=4.0),       # idle seconds before a pooled connection is dropped
+    timeout=httpx.Timeout(5.0, connect=2.0),
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await payments.aclose()                          # close pooled connections on shutdown
+
+app = FastAPI(lifespan=lifespan)
+
+# in a handler: await payments.post("/v1/charges", json=charge, headers={"Idempotency-Key": key})
+
+# requests (sync code, older SDKs): reuse a Session and size its pool explicitly
+session = requests.Session()
+session.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=50, pool_block=True))
+```
+
+- **Edge cases:**
+  - This is the **mirror image** of the 502 bug in section 15: if the upstream closes idle connections after 5 s and your pool keeps them for 10 s, you'll reuse a dead socket and get a reset (httpx: `RemoteProtocolError: Server disconnected without sending a response.` or `ReadError`). Keep the client's idle timeout (`keepalive_expiry`) **shorter** than the server's.
+  - httpx caps a client at 100 connections by default. `requests` keeps 10 per host, but with `pool_block=False` (its default) it opens extra, throwaway connections beyond that under load, so a traffic spike can still open unlimited connections and take down a fragile upstream. Set a limit you mean; requests then queue in the pool.
+  - Long-lived pooled connections don't notice **DNS changes**; after a failover, the old IP keeps getting traffic until connections are recycled.
+
+#### Which failures are retryable ➕
+
+- **Problem:** retrying everything doubles payments; retrying nothing turns every transient blip into a user-facing error.
+- **Mechanism:** the deciding question is **"could the server have started processing?"** If the request provably never arrived, a retry is always safe. If it might have arrived, only retry methods that are **idempotent** or carry an **`Idempotency-Key`** (section 8).
+
+| Failure | Did the request reach the server? | Retry |
+|---|---|---|
+| DNS failure (`socket.gaierror`: `EAI_NONAME`, `EAI_AGAIN`) | no | `EAI_AGAIN` (temporary) yes; `EAI_NONAME` usually a config bug |
+| `ECONNREFUSED`, connect timeout | no, no connection was made | yes, any method |
+| `ECONNRESET` on a **reused** idle socket, before any response byte | probably not, but not provable | idempotent or keyed requests only |
+| `ECONNRESET` / timeout while waiting for the response | **maybe**, the server may have done the work | idempotent or keyed requests only |
+| `429`, `503` | reached, rejected before processing | yes, after `Retry-After` |
+| `502`, `504` | the proxy reached the server, which may have processed it | idempotent or keyed requests only |
+| `500` | reached, it failed | usually no: it's a bug and will fail again |
+| other `4xx` | reached, rejected | no: fix the request |
+
+- **Implementation:**
+
+```python title="retryable.py"
+import socket
+import ssl
+
+import httpx
+
+MAYBE_SENT = (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError,
+              httpx.WriteTimeout, httpx.WriteError, TimeoutError)
+
+
+def root_os_error(err: BaseException | None) -> OSError | None:
+    found = None
+    while err is not None:                       # httpx wraps the socket error: see __cause__ / __context__
+        if isinstance(err, OSError):
+            found = err                          # keep going: the innermost one is the most specific
+        err = err.__cause__ or err.__context__
+    return found
+
+
+def can_retry(err: BaseException, *, idempotent: bool) -> bool:
+    if isinstance(err, UpstreamError):
+        if err.status in (429, 503):
+            return True
+        if err.status in (502, 504):
+            return idempotent
+        return False
+    if isinstance(err, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return True                              # no request bytes were sent
+    if isinstance(err, httpx.ConnectError):
+        cause = root_os_error(err)
+        if isinstance(cause, socket.gaierror):
+            return cause.errno == socket.EAI_AGAIN   # temporary DNS failure; EAI_NONAME is a config bug
+        if isinstance(cause, ssl.SSLError):
+            return False                         # certificate problems don't fix themselves
+        return True                              # ECONNREFUSED and friends: no connection was made
+    if isinstance(err, MAYBE_SENT):
+        return idempotent                        # the server may have started processing
+    return False
+```
+
+- **Edge cases:** retry in **one layer** only: if the SDK, your code and the service mesh each retry 3 times, one failure becomes 27 attempts. Count retries against your total deadline, not per attempt.
+
+#### `ECONNRESET` vs `ETIMEDOUT` vs a 5xx: reading the error ➕
+
+- **Problem:** "the call failed" isn't actionable. The error type tells you **which hop** to look at.
+- **Mechanism (what each means at the TCP level):**
+  - **`ECONNREFUSED`** (Python: `ConnectionRefusedError`, wrapped in `httpx.ConnectError`): the host answered the SYN with a RST: the machine is up but **nothing listens on that port** (app crashed, wrong port).
+  - **`ETIMEDOUT`** (or a connect timeout, `httpx.ConnectTimeout`): **no answer at all**. Packets are being dropped: a firewall or security group (lesson 3), a wrong IP, a dead host.
+  - **`ECONNRESET`** (Python: `ConnectionResetError`; httpx: `ReadError`, or `RemoteProtocolError: Server disconnected without sending a response.`): a connection existed and the peer **reset** or closed it: the process died mid-request, an LB or NAT idle timeout killed it, or you reused a socket the server had just closed.
+  - **A 5xx** is a complete HTTP response: the network path is fine and **some HTTP server answered**. Check whether it came from the upstream app or a proxy in front of it (502/504 usually from the proxy).
+- **Implementation:** log enough to tell them apart:
+
+```python
+try:
+    return await get_json(url)
+except Exception as err:
+    log.warning("upstream call failed", extra={
+        "upstream": httpx.URL(url).host,
+        "error": type(err).__name__,             # ConnectError, ReadTimeout, TimeoutError, UpstreamError
+        "cause": repr(root_os_error(err)),       # ConnectionRefusedError(...), gaierror(...), None
+        "status": getattr(err, "status", None),  # set by UpstreamError for HTTP errors
+    })
+    raise
+```
+
+- **Edge cases:** httpx connects through anyio, which tries a host's IPv6 and IPv4 addresses in parallel ("happy eyeballs"), so a connect failure can surface as **`OSError: All connection attempts failed`** with the per-address error chained underneath; follow `__cause__` / `__context__` (as `root_os_error` does). Bursts of `ECONNRESET` exactly at an idle interval (every ~5 s, every 60 s) almost always mean mismatched keep-alive timeouts, not a flaky network.
+
+---
+
+## 18. Handling large requests and responses 🎓
+
+### Large requests: `multipart/form-data` 🎓
+**The demo:** select a picture and upload it. The request:
+- `POST` with a `Content-Length`,
+- **`Content-Type: multipart/form-data; boundary=----WebKitFormBoundary...`**.
+
+**The boundary** is a delimiter string that separates the **parts** of the body. Searching the body for it, you find it **before** the file's binary data and again **at the end**. The server reads the parts, gets the file and responds with some details to confirm the upload. The lesson's guidance: **use multipart requests to send files** to the server.
+
+🔧 **A precise note on what "parts" means:** in `multipart/form-data`, each part is **one form field** (a text field, or one whole file), **not** a fragment of the file. The whole body still travels in **one HTTP request**; TCP splits it into packets underneath. The boundary exists so binary data and text fields can sit in one body without needing to escape anything. A raw body looks like this:
+
+```http
+POST /upload HTTP/1.1
+Content-Type: multipart/form-data; boundary=----X7f
+Content-Length: 48213
+
+------X7f
+Content-Disposition: form-data; name="title"
+
+Holiday photo
+------X7f
+Content-Disposition: form-data; name="file"; filename="beach.jpg"
+Content-Type: image/jpeg
+
+(binary JPEG bytes...)
+------X7f--
+```
+
+(The final boundary ends with `--`.) Splitting one large file into separately uploaded chunks is a different technique: **multipart upload** in object storage, covered in the object storage lessons.
+
+🔧 **Implementation: stream it, and cap it.** Don't buffer uploads in memory; stream them and enforce limits so one request can't exhaust RAM or disk:
+
+```python title="upload.py (FastAPI + Starlette's multipart parser)"
+from fastapi import FastAPI, HTTPException, Request
+from starlette.datastructures import UploadFile                 # what request.form() returns
+
+app = FastAPI()
+MAX_FILE = 10 * 1024 * 1024                                     # 10 MB
+ALLOWED = {"image/jpeg", "image/png"}
+
+
+@app.post("/upload", status_code=201)
+async def upload(request: Request):
+    if int(request.headers.get("content-length", 0)) > MAX_FILE + 64 * 1024:   # file + form overhead
+        raise HTTPException(413, "file too large (max 10 MB)")  # rejected before reading the body
+    async with request.form(max_files=1, max_fields=10) as form:  # file parts over 1 MB spill to a temp file, not RAM
+        file = form.get("file")
+        if not isinstance(file, UploadFile) or file.content_type not in ALLOWED:
+            raise HTTPException(400, "file required (jpeg or png)")
+        return {"name": file.filename, "size": file.size}
+# note: content_type comes from the client; check the magic bytes before trusting it.
+# a chunked body has no Content-Length: the byte-counting middleware in section 19 caps that case.
+```
+
+### Large responses: streaming in chunks 🎓
+**The demo:** a large text file on the server is **streamed** to the client. Clicking "stream data" shows chunks arriving **continuously**, each appended on screen until the whole file is built.
+- The request is a normal `GET`.
+- The response headers that matter:
+  - **`Content-Type: text/event-stream`**: the data will arrive as a stream of **events**,
+  - **`Connection: keep-alive`**: keep the connection open until everything is sent.
+- The client keeps **appending** each chunk to rebuild the file.
+
+🔧 **Precise version:** two related mechanisms are at work here.
+- **Chunked transfer encoding** (HTTP/1.1) lets **any** response be sent in pieces when the total size isn't known up front (`Transfer-Encoding: chunked`). With Starlette's `StreamingResponse`, each piece your generator yields is sent as one chunk; uvicorn adds `Transfer-Encoding: chunked` because there's no `Content-Length`.
+- **Server-Sent Events** (`text/event-stream`) is a **format on top of** a long-lived streamed response: lines of `data: ...` separated by blank lines, read in the browser by `EventSource`, which also **reconnects automatically**.
+
+```python title="stream.py"
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
+import anyio
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+
+# 1. plain chunked download: constant memory, whatever the file size
+async def read_file(path: str, chunk_size: int = 64 * 1024) -> AsyncIterator[bytes]:
+    async with await anyio.open_file(path, "rb") as f:
+        while chunk := await f.read(chunk_size):
+            yield chunk                                         # paused while the socket's buffer is full
+
+
+@app.get("/big.txt")
+async def big_file() -> StreamingResponse:
+    return StreamingResponse(read_file("./big.txt"), media_type="text/plain")
+
+
+# 2. Server-Sent Events: a stream of messages
+@app.get("/events")
+async def events(request: Request) -> StreamingResponse:
+    async def stream() -> AsyncIterator[str]:
+        i = 0
+        while not await request.is_disconnected():             # stop work when the client goes away
+            i += 1
+            yield f"id: {i}\ndata: {json.dumps({'chunk': i})}\n\n"
+            await asyncio.sleep(1)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+```
+
+**Why streaming matters (backpressure):** if you read a 2 GB file into memory and return it, or produce data faster than a slow client can receive, all of it sits **in memory**. With a generator, uvicorn's `send()` waits (`await`) while the socket's write buffer is full, so the generator isn't asked for the next chunk until the buffer drains, and Starlette stops iterating when the client disconnects. (For a file on disk, `FileResponse` does the same chunked reading for you, plus `Range` support.) Also, for SSE through **Nginx**, disable proxy buffering for that route (`proxy_buffering off;` or the `X-Accel-Buffering: no` header), or events arrive in bursts.
+
+---
+
+## 19. Limits and timeouts as protection ➕
+
+The upload limits above protect one route. The same idea applies to **every** part of every request: each part a client controls (body, headers, URL, and how slowly it sends them) needs a ceiling, because each unbounded part lets one client use up memory or connections meant for everyone. These limits exist at several hops, and they need to agree.
+
+| What | Status when exceeded | Uvicorn default | Nginx default | FastAPI default |
+|---|---|---|---|---|
+| body size | `413 Content Too Large` | no limit | `client_max_body_size 1m` | no limit (`await request.body()` reads it all) |
+| header size | `431 Request Header Fields Too Large` | `h11`: 16 KiB for a head still arriving (`h11_max_incomplete_event_size`), answered with 400 or a dropped connection; `httptools`: no practical limit (a 3 MB head was accepted in testing) | `large_client_header_buffers 4 8k` (one line over 8k: 400) | same as Uvicorn |
+| URL length | `414 URI Too Long` | no separate setting (see below) | request line over 8k: 414 | same as Uvicorn |
+| time to send headers | `408 Request Timeout` | none | `client_header_timeout 60s` | same as Uvicorn |
+| time to send whole request | `408 Request Timeout` | none | `client_body_timeout 60s` (between reads) | same as Uvicorn |
+
+Uvicorn's `--http auto` (the default) picks `httptools` when it is installed, as it is with `uvicorn[standard]`, so in a typical deployment the only header and time limits are the ones in front of the app.
+
+#### Body size → 413 ➕
+
+- **Problem:** a JSON parser must hold the whole body in memory before parsing it. A 2 GB "JSON" body, or a thousand 50 MB ones in parallel, exhausts the process.
+- **Mechanism:** count bytes **as they arrive** and abort past a limit with **`413`** (RFC 9110 renamed it from "Payload Too Large" to "Content Too Large"). Neither uvicorn nor FastAPI does this for you, so wrap the ASGI `receive` callable and count there: that works whether the client sends `Content-Length` or a chunked body, so lying about the length doesn't help.
+- **Implementation:** a small global limit, raised only on the routes that need it, and a JSON error:
+
+```python title="limits.py"
+from fastapi import FastAPI, HTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+DEFAULT_LIMIT = 100 * 1024                                    # 100 KB for everything else
+ROUTE_LIMITS = {"/api/imports": 5 * 1024 * 1024}              # raised only where needed
+
+
+class BodyLimit:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        limit = ROUTE_LIMITS.get(scope["path"], DEFAULT_LIMIT)
+        received = 0
+
+        async def counted_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            received += len(message.get("body", b""))         # counts bytes as they arrive
+            if received > limit:
+                raise HTTPException(413, f"Body exceeds {limit} bytes")   # becomes a JSON 413
+            return message
+
+        await self.app(scope, counted_receive, send)
+
+
+app = FastAPI()
+app.add_middleware(BodyLimit)
+# malformed JSON is already a 422 with "type": "json_invalid"; no extra handler needed
+```
+
+- **Edge cases:** the **smallest limit on the path wins**. If the app allows 5 MB but Nginx still has its 1 MB default, users get Nginx's HTML 413 page and your app never logs anything. Set `client_max_body_size` per `location` to match. For really large files, skip the backend entirely and upload to object storage with presigned URLs ([Object storage part 1](/docs/backend-first-principles/24-object-storage-part-1)).
+
+#### Header size → 431 ➕
+
+- **Problem:** headers are parsed before your code runs, so the server must buffer them. Without a cap, one client sends megabytes of headers.
+- **Mechanism:** the server caps the size of the head and rejects anything larger, ideally with **`431`**. Node does this at 16 KiB, Nginx per line at 8k. Uvicorn is weak here: with `h11` it gives up on a head that is still arriving after 16 KiB (`--h11-max-incomplete-event-size`) with a generic 400 or a dropped connection, and with `httptools` (the default when installed) there is no practical cap at all. So the real header limit for a uvicorn app is the one set by **Nginx or the load balancer in front of it**.
+- **The usual cause in real life:** **cookie bloat**. Analytics and A/B-testing cookies set on the parent domain (`.example.com`), or a large JWT stored in a cookie, are sent with **every** request to every subdomain. One day a user's cookies cross the proxy's limit and that user, only that user, gets 400s or 431s on everything.
+- **Implementation:** keep session cookies small (an opaque session ID, not a JWT with every permission), and scope cookies to the narrowest domain and path. Requests over the limit never reach your app (only the proxy's logs and uvicorn's "Invalid HTTP request received." warning show them), so also log the ones **approaching** it:
+
+```python
+import logging
+
+log = logging.getLogger("app")
+COOKIE_WARN_BYTES = 6 * 1024                 # well below Nginx's 8k per header line
+
+
+@app.middleware("http")
+async def warn_cookie_bloat(request: Request, call_next):
+    size = len(request.headers.get("cookie", ""))
+    if size > COOKIE_WARN_BYTES:
+        log.warning("large Cookie header (%d bytes), likely cookie bloat", size)
+    return await call_next(request)
+```
+
+- **Edge cases:** each hop has its own limit (CDN, LB, Nginx, app server). A request that passes one hop's limit can still fail the next one's. Raising the limit treats the symptom; shrinking the cookies fixes it.
+
+#### URL length → 414 ➕
+
+- **Problem:** long URLs come from filters packed into query strings, or from attackers probing parsers.
+- **Mechanism:** RFC 9110 recommends that senders and recipients support URIs of **at least 8000 octets**; beyond that, nothing is guaranteed, and a server answers **`414 URI Too Long`**. Nginx returns 414 when the request line doesn't fit in one of its 8k header buffers. Uvicorn has no separate URL setting; with `h11` a very long request line counts against the same 16 KiB budget as the headers (so expect a 400, not a 414), and with `httptools` nothing stops it.
+- **Implementation:** keep URLs well under 8000 bytes. When a query naturally grows beyond that (hundreds of IDs, complex filters), switch to `POST /search` or a saved-search resource (section 8, "GET with a body").
+- **Edge cases:** CDNs and API gateways often have **lower** limits than your servers, and URLs end up in logs, analytics and `Referer` headers, so long URLs also mean large logs and potential data leaks.
+
+#### Slow clients: headersTimeout, requestTimeout and slowloris ➕
+
+- **Problem:** **slowloris** opens many connections and sends the headers one byte at a time, a few seconds apart, never finishing. Each request is "in progress", so the server keeps every socket open. In a process-per-connection server (Gunicorn's sync workers, for example) that exhausts the workers within seconds; in an asyncio server such as uvicorn it costs a socket, a file descriptor and buffers each, all from a single cheap client.
+- **Why size limits don't help:** the attacker sends very **little**; it's the **time** that is unbounded.
+- **Mechanism:** deadlines on receiving the request: Node has `headersTimeout` (60 s) and `requestTimeout` (300 s), Nginx has `client_header_timeout` and `client_body_timeout`, and they answer `408`. **Uvicorn has neither**: no deadline for the head and none for the body (`timeout_keep_alive` only applies to idle connections **between** requests). What it does have is `limit_concurrency`: once that many connections or requests are open, every new request gets a fast `503`. That caps the work in progress, but it doesn't close the slow connections, so against slowloris it only turns a hang into 503s.
+- **Implementation:** don't expose uvicorn directly to the internet. Behind Nginx you're largely protected, because Nginx enforces the timeouts above and **buffers the whole request** (`proxy_request_buffering on` by default) before it opens an upstream connection, so slow clients tie up cheap Nginx connections instead of your app.
+
+```python title="main.py"
+import uvicorn
+
+uvicorn.run(
+    "app:app", host="127.0.0.1", port=3000,  # listen on loopback only: Nginx faces the internet
+    limit_concurrency=1000,                  # beyond this many open connections or tasks, requests get a fast 503
+    timeout_keep_alive=65,                   # behind an ALB instead, keep section 15's value
+    http="h11",                              # if you need uvicorn's 16 KiB cap on incomplete heads
+)
+# head and body deadlines (408) come from Nginx: client_header_timeout, client_body_timeout
+```
+
+- **Edge cases:** a low body timeout at the proxy also kills **legitimate slow uploads** from mobile networks, so raise it only in the `location` blocks that accept uploads. Large uploads belong on direct-to-storage uploads anyway. Remember that body-time limits don't cover **responses**: a slow reader on a big download is handled by streaming with backpressure (section 18), not by these timeouts.
+
+#### The timeout-alignment rule ➕
+
+- **Problem:** every hop has its own timeouts. When they're set independently, you get wasted work (the DB keeps running a query whose caller gave up long ago) and misleading errors (a 504 from the LB while your logs show a `200` a few seconds later).
+- **Mechanism, the rule:** **request timeouts shrink as you go deeper**: each layer must give up **before** the layer above it does, so it can still return a meaningful error. **Idle (keep-alive) timeouts grow as you go deeper**: the upstream keeps idle connections open longer than the downstream that reuses them (the 502 bug).
+
+<Mermaid chart={`flowchart LR
+  C["Client<br/>30 s"] --> CDN["CDN origin timeout<br/>30 s"]
+  CDN --> NX["Nginx proxy_read_timeout<br/>25 s"]
+  NX --> APP["App request budget<br/>20 s"]
+  APP --> HTTP["Outbound httpx call<br/>3 s x 2 attempts"]
+  APP --> DB["Postgres statement_timeout<br/>5 s"]`} />
+
+- **Implementation:** set each value explicitly, in one place, and enforce an app-level budget:
+
+```python title="timeouts.py"
+import asyncio
+
+import asyncpg
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+
+async def create_pool() -> asyncpg.Pool:
+    return await asyncpg.create_pool(settings.database_url,
+                                     server_settings={"statement_timeout": "5000"})   # ms, enforced by Postgres
+
+
+class RequestBudget:
+    def __init__(self, app: ASGIApp, seconds: float = 20.0) -> None:
+        self.app, self.seconds = app, seconds        # answer before Nginx's 25 s gives a bare 504
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            async with asyncio.timeout(self.seconds):    # cancels the handler too, not just the response
+                await self.app(scope, receive, tracking_send)
+        except TimeoutError:
+            if started:
+                raise                                # headers already sent: all we can do is drop the connection
+            busy = JSONResponse({"error": "Request timed out"}, status_code=503, headers={"Retry-After": "1"})
+            await busy(scope, receive, send)
+
+
+app.add_middleware(RequestBudget, seconds=20.0)
+```
+
+- **Edge cases:** **retries multiply time**: 3 attempts of 3 s plus backoff must still fit inside the 20 s budget. If an inner timeout is **longer** than an outer one, the outer layer returns an error while the inner one keeps going and may **commit**: the user sees a failure for a write that actually happened. Long-running work doesn't fit any request timeout and belongs in a background job (202, section 10).
+
+---
+
+## 20. SSL, TLS and HTTPS 🎓
+
+You rarely work with these directly, but should know what they are.
+
+| Term | What it is |
+|---|---|
+| **SSL** | the **original** protocol for securing client-server communication. Encrypts data so passwords or card numbers can't be intercepted. Now **outdated** because of security vulnerabilities, and replaced by TLS |
+| **TLS** | the **modern, more secure successor**. Encrypts data **in transit** against interception and tampering. Uses **certificates** to **authenticate the server** and set up an encrypted connection. Updated regularly; the current recommended version is **TLS 1.3** |
+| **HTTPS** | **HTTP over TLS** (originally over SSL). When you visit an HTTPS site, TLS encrypts the traffic between browser and server, protecting credentials and other sensitive data |
+
+<Mermaid chart={`flowchart LR
+  A["HTTP message"] --> T["TLS layer<br/>encrypt + integrity check"]
+  T --> TCP["TCP"]
+  TCP --> NET["Network (attacker sees only ciphertext)"]
+  CERT["Server certificate<br/>signed by a CA"] -. "proves server identity" .-> T`} />
+
+🔧 **What TLS actually guarantees:**
+- **Confidentiality** (encryption): eavesdroppers see only ciphertext.
+- **Integrity**: tampering is detected.
+- **Authentication**: the certificate, signed by a trusted CA and matching the host name, proves you're talking to the real server and not a man in the middle.
+- It does **not** hide **which host** you connect to (the IP is visible, and the name usually is too, through SNI), and it doesn't protect data once it's on the server.
+
+🔧 **Practical setup:** terminate TLS at the reverse proxy or load balancer (Let's Encrypt via Certbot, or a managed certificate), redirect HTTP to HTTPS with a **301**, then add **HSTS** so browsers never try plain HTTP again.
+
+---
+
+## 21. TLS for backend engineers: handshake, chains, mTLS and expiry ➕
+
+The section above says what TLS guarantees. Backend engineers end up debugging its **mechanics**: why a handshake costs what it costs, why a certificate works in Chrome but not in Python, how services authenticate each other, and why certificates still take whole sites down.
+
+#### The TLS 1.3 handshake, step by step ➕
+
+- **Problem:** before encrypting, client and server must agree on keys **over a network an attacker can read**, and the client must verify it's talking to the real server.
+- **Mechanism:** TLS 1.3 does it in **one round trip** (TLS 1.2 needed two):
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: ClientHello with versions, cipher suites, key share, SNI api.example.com, ALPN h2
+  S-->>C: ServerHello with chosen suite + key share
+  Note over C,S: both derive the same secret from the two key shares (ECDHE)
+  S-->>C: encrypted certificate chain, CertificateVerify signature, Finished
+  C->>C: verify chain to a trusted root, host name, signature
+  C->>S: encrypted Finished + first HTTP request
+  S-->>C: HTTP response`} />
+
+1. The client sends its **key share** right away, guessing the key-exchange group, which is what saves the round trip.
+2. Both sides compute the shared secret with **ephemeral (EC)DHE**, so every connection gets fresh keys: stealing the server's private key later doesn't decrypt recorded traffic (**forward secrecy**, mandatory in TLS 1.3).
+3. The server's private key is used only to **sign** the handshake (`CertificateVerify`), proving it owns the certificate.
+- **Implementation:** inspect a real handshake:
+
+```bash
+openssl s_client -connect api.example.com:443 -servername api.example.com -tls1_3 -alpn h2 </dev/null 2>/dev/null \
+  | grep -E 'Protocol|Cipher|ALPN|Verify return code'
+```
+
+```python
+import socket
+import ssl
+
+ctx = ssl.create_default_context()                # verifies chain + host name; minimum TLS 1.2
+ctx.set_alpn_protocols(["h2", "http/1.1"])
+
+with socket.create_connection(("api.example.com", 443), timeout=5) as raw:
+    # server_hostname sets SNI; a bad chain raises ssl.SSLCertVerificationError right here
+    with ctx.wrap_socket(raw, server_hostname="api.example.com") as s:
+        print(s.version(), s.selected_alpn_protocol())   # TLSv1.3 h2
+```
+
+- **Edge cases:** without **SNI** the server can't know which certificate to present and sends its default one, causing a name mismatch (the reason `curl https://<ip>` fails; use `--resolve`, section 6). Python's `ssl.create_default_context()` already sets TLS 1.2 as the minimum; there's rarely a reason to accept anything older.
+
+#### 0-RTT and replay ➕
+
+- **Problem:** even one round trip hurts on mobile networks. TLS 1.3 lets a **resuming** client send application data in its very first flight ("early data", **0-RTT**).
+- **Why it's dangerous:** early data is encrypted but **not protected against replay**. An attacker who records the first flight can resend it, and the server can't tell the copy from the original. A replayed `POST /transfer` executes twice.
+- **Mechanism:** allow early data only for requests that are **safe to repeat** (safe methods). The TLS terminator marks such requests (Nginx forwards `$ssl_early_data`; several CDNs send `Early-Data: 1`), and the app answers anything non-idempotent with **`425 Too Early`** (RFC 8470), which makes the client retry after the full handshake.
+
+```python
+@app.middleware("http")
+async def reject_unsafe_early_data(request: Request, call_next):
+    early = request.headers.get("early-data") == "1"
+    if early and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        return Response(status_code=425)             # Too Early: retry after the full handshake
+    return await call_next(request)
+```
+
+```nginx
+ssl_early_data on;                               # off by default in nginx
+proxy_set_header Early-Data $ssl_early_data;     # "1" while the handshake is incomplete
+```
+
+- **Edge cases:** "safe" here means the GET really has no side effects (section 8). If you can't audit that, leave 0-RTT **off**; it's an optimisation, not a requirement.
+
+#### Certificate chains and the missing-intermediate bug ➕
+
+- **Problem:** the site works in Chrome, but `curl`, Python, Node, Java services or older Android devices fail to verify it (Python: `ssl.SSLCertVerificationError: certificate verify failed: unable to get local issuer certificate`; Node: "unable to verify the first certificate").
+- **Why (first principles):** clients trust a small set of **root** CAs. Roots don't sign site certificates directly; **intermediates** do. The server must send its **leaf certificate plus the intermediates**, so the client can build the chain up to a root it already has. Browsers often paper over a missing intermediate (they cache intermediates they've seen, or fetch them via the certificate's AIA URL). Most non-browser clients don't, so the bug hides until a backend or mobile client hits it.
+
+<Mermaid chart={`flowchart LR
+  L["Leaf: api.example.com<br/>sent by server"] -->|"signed by"| I["Intermediate CA<br/>must also be sent"]
+  I -->|"signed by"| R["Root CA<br/>already in client trust store"]`} />
+
+- **Implementation:** serve the full chain and check how many certificates the server actually presents:
+
+```nginx
+ssl_certificate     /etc/letsencrypt/live/api.example.com/fullchain.pem;   # leaf + intermediates, NOT cert.pem
+ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
+```
+
+```bash
+openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts </dev/null 2>/dev/null | grep -c 'BEGIN CERTIFICATE'
+# 1 means the intermediate is missing; 2 or more is expected
+```
+
+- **Edge cases:** never "fix" verification errors with `verify=False` (httpx, requests), `ssl.CERT_NONE` or `NODE_TLS_REJECT_UNAUTHORIZED=0`: that turns off server authentication completely and makes man-in-the-middle trivial. For an internal CA, trust it explicitly instead: `ssl.create_default_context(cafile="/path/ca.pem")` passed as httpx's `verify=`, or `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` (careful: those replace the default bundle rather than add to it). Chains also break when a **root** expires: when Let's Encrypt's old `DST Root CA X3` expired in September 2021, devices with outdated trust stores started failing even though the sites' own certificates were valid.
+
+#### mTLS for service-to-service authentication ➕
+
+- **Problem:** inside a VPC it's tempting to trust anything that can reach a service. But one compromised pod, or one leaked API key (a bearer secret that works from anywhere), then gives access to everything.
+- **Mechanism:** in **mutual TLS** the **client** also presents a certificate, and the server verifies it against an internal CA. The service's identity is proven cryptographically on every connection, and the private key never travels over the network.
+
+```python title="mtls_server.py (asyncio streams, so the peer certificate is easy to reach)"
+import asyncio
+import json
+import ssl
+
+ALLOWED_CLIENTS = {"orders-service", "billing-worker"}
+
+ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile="internal-ca.crt")  # trust only our CA for client certs
+ctx.load_cert_chain("server.crt", "server.key")
+ctx.verify_mode = ssl.CERT_REQUIRED                       # no valid client cert: the handshake fails
+
+
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    await reader.readuntil(b"\r\n\r\n")                   # request head (ignored in this sketch)
+    cert = writer.get_extra_info("peercert")              # already verified against internal-ca.crt
+    subject = dict(pair for rdn in cert["subject"] for pair in rdn)
+    cn = subject.get("commonName")
+    if cn in ALLOWED_CLIENTS:                             # authn by TLS, authz here
+        status, body = "200 OK", json.dumps({"hello": cn}).encode()
+    else:
+        status, body = "403 Forbidden", b""
+    writer.write(f"HTTP/1.1 {status}\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+    await writer.drain()
+    writer.close()
+
+
+async def main() -> None:
+    server = await asyncio.start_server(handle, "0.0.0.0", 8443, ssl=ctx)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+```
+
+```python title="mtls_client.py"
+import ssl
+
+import httpx
+
+ctx = ssl.create_default_context(cafile="internal-ca.crt")     # verify the server against our CA
+ctx.load_cert_chain("orders.crt", "orders.key")                # present our own certificate
+
+async with httpx.AsyncClient(verify=ctx, timeout=2.0) as client:
+    res = await client.get("https://inventory.internal:8443/stock")
+```
+
+Uvicorn can enforce client certificates too (`ssl_cert_reqs=ssl.CERT_REQUIRED`, `ssl_ca_certs="internal-ca.crt"`), but it doesn't pass the peer certificate into the ASGI scope, so per-service authorization is easier with a sidecar or proxy that forwards the verified identity.
+
+- **Edge cases:**
+  - **Rotation is the hard part.** Revocation (CRLs, OCSP) is unreliable, so internal setups use **short-lived** certificates renewed automatically. Service meshes (Istio, Linkerd) issue and rotate them and do mTLS transparently between sidecars.
+  - If a load balancer terminates TLS, your app never sees the client certificate. LBs that support mTLS forward it in a header (AWS ALB: `X-Amzn-Mtls-Clientcert`), and the app must make sure clients can't send that header themselves (the same trust rule as `X-Forwarded-For`, section 16).
+  - Authenticating the caller is not authorising it: still check **what** that service may do.
+
+#### Certificate-expiry monitoring ➕
+
+- **Problem:** an expired certificate is a **total** outage: every client refuses to connect, and there's no graceful degradation. It keeps happening even with automated renewal.
+- **Why renewals fail silently:** the ACME challenge breaks (port 80 closed by a new firewall rule, a DNS provider token expired), or renewal succeeds but the server is **never reloaded** and keeps serving the old certificate from memory. And external reminders are disappearing: **Let's Encrypt stopped sending expiry emails on 4 June 2025**.
+- **Why it's getting more important:** CA/Browser Forum ballot SC-081 shortens the maximum public certificate lifetime from 398 days to **200 days (from 15 March 2026), 100 days (15 March 2027) and 47 days (15 March 2029)**. Renewal becomes something that happens constantly, so it must be automated and **monitored**.
+- **Mechanism:** monitor the certificate **actually served**, from outside, for every host name and every load balancer, and alert well before expiry.
+
+```python title="check_certs.py (run from cron or CI, alert on non-zero exit)"
+import socket
+import ssl
+import sys
+from datetime import UTC, datetime
+
+from cryptography import x509                    # pip install cryptography
+
+HOSTS = ["api.example.com", "www.example.com", "admin.example.com"]
+WARN_DAYS = 21
+
+
+def days_left(host: str) -> int:
+    ctx = ssl.create_default_context()
+    with socket.create_connection((host, 443), timeout=5) as raw:
+        with ctx.wrap_socket(raw, server_hostname=host) as s:
+            chain = s.get_verified_chain()       # DER bytes: leaf, intermediates, root (Python 3.13+)
+    earliest = min(x509.load_der_x509_certificate(der).not_valid_after_utc
+                   for der in chain)             # intermediates expire too
+    return (earliest - datetime.now(UTC)).days
+
+
+failed = False
+for host in HOSTS:
+    try:
+        days = days_left(host)
+    except OSError as e:                         # includes ssl.SSLError and timeouts
+        print(host, e, file=sys.stderr)
+        days = -1
+    if days < WARN_DAYS:
+        failed = True
+        print(f"{host}: {days} days left", file=sys.stderr)
+sys.exit(1 if failed else 0)
+```
+
+```bash
+# certbot: reload nginx after every successful renewal, so the new cert is actually served
+certbot renew --deploy-hook "systemctl reload nginx"
+```
+
+- **Edge cases:** check **each** server behind a load balancer and each region (one stale instance serves an old certificate to a fraction of users). Internal mTLS certificates expire too, with even shorter lifetimes. Prometheus users get the same signal from the blackbox exporter's `probe_ssl_earliest_cert_expiry` metric.
+
+---
+
+## 22. Recap 🎓
+
+The lesson closes by saying this is what you need to know about HTTP to work on backend systems. If you can **picture the whole flow** and every component in it, you can understand and **debug most problems**. Rewatch sections until they're internalised.
+
+| Topic | Remember |
+|---|---|
+| Statelessness | each request is self-contained; state is added with cookies, sessions, tokens |
+| Client-server | the client always initiates |
+| Transport | reliable transport: TCP (QUIC over UDP for HTTP/3) |
+| Versions | 1.1 persistent, 2 multiplexed + binary + HPACK, 3 QUIC without TCP head-of-line blocking |
+| Messages | start line, headers, blank line, body |
+| Headers | the outside of the parcel: request, general, representation, security; extensible remote control |
+| Methods | intent; GET, PUT, DELETE idempotent, POST not; prefer PATCH over PUT |
+| CORS | simple vs preflighted (`OPTIONS`); the server opts in with `Access-Control-*` headers |
+| Status codes | 1xx info, 2xx success, 3xx redirect, 4xx client, 5xx server |
+| Caching | `Cache-Control`, `ETag` + `If-None-Match`, `Last-Modified` + `If-Modified-Since` → 304 |
+| Negotiation | `Accept`, `Accept-Language`, `Accept-Encoding` |
+| Compression | gzip: 26 MB → 3.8 MB in the demo |
+| Keep-alive | default in 1.1; reuse one TCP connection |
+| Large data | multipart with a boundary for uploads; streamed responses for downloads |
+| TLS | SSL's successor; HTTPS = HTTP over TLS |
+| ➕ h2/h3 in practice | ALPN picks h2 inside TLS; proxies speak HTTP/1.1 to the app; gRPC needs h2 end to end; h3 via `Alt-Svc`, falls back to TCP |
+| ➕ URLs | fragment never reaches the server; encode segments with `quote(segment, safe="")`; let `httpx.URL(..., params=...)` build query strings |
+| ➕ Timing | `curl -w` phases, DevTools Timing + `Server-Timing`, HAR files are secrets, `--resolve` to hit one server |
+| ➕ More headers | Referrer-Policy, Permissions-Policy, `frame-ancestors`, CORP/COOP/COEP, careful HSTS preload, no CR LF in headers, charset |
+| ➕ Safe methods | GET never changes state (bots follow links); cheap HEAD; no bodies on GET |
+| ➕ More status codes | 202 + Location, 206, 410, 415, 499, 503 + Retry-After vs 500 |
+| ➕ Shared caches | `private` for per-user data (cookies aren't protected), small cache key, `Age`, SWR / SIE, unkeyed-header poisoning |
+| ➕ Conditional writes | `If-Match` + version check in the UPDATE → 412; 428 to require it |
+| ➕ Proxies | read `X-Forwarded-For` from the right; exact `forwarded_allow_ips`; links from config, never from `Host` |
+| ➕ Outbound HTTP | deadline on every call, keep-alive pool with limits, retry only what can't double-apply |
+| ➕ Limits | 413 body, 431 headers, 414 URL, header/request timeouts; timeouts shrink inward, idle timeouts grow inward |
+| ➕ TLS mechanics | 1-RTT handshake, 0-RTT only for safe requests (425), send the full chain, mTLS between services, monitor expiry |
+
+---
+
+## Interview questions
+
+1. **What does "HTTP is stateless" mean, and how do logins work then?** **The server keeps no memory between requests, so each request carries its own credentials (cookie or token). State lives in a signed token or a shared session store any server can read.**
+2. **What changed in HTTP/1.1, 2 and 3?** **1.1: persistent connections and chunked encoding. 2: multiplexed binary streams on one connection plus HPACK header compression. 3: QUIC over UDP, removing TCP-level head-of-line blocking and speeding up connection setup.**
+3. **Why do headers exist separately from the body?** **So every hop (proxies, caches, the server, the browser) can read handling metadata without parsing the body, like the address written on a parcel.**
+4. **PUT vs PATCH?** **PUT replaces the whole resource with the body (idempotent). PATCH changes only the fields sent and isn't guaranteed idempotent.**
+5. **Which methods are idempotent, and why does it matter?** **GET, HEAD, OPTIONS, PUT, DELETE. Clients and proxies may retry them safely after a network failure. Make POST retryable with an idempotency key.**
+6. **When does the browser send a CORS preflight?** **For a cross-origin request with a non-simple method (e.g. PUT/DELETE), a non-safelisted header (e.g. Authorization), or a Content-Type outside form-urlencoded, multipart/form-data and text/plain, so any JSON request.**
+7. **Does CORS protect your server?** **No. It's enforced by browsers and only stops JavaScript from reading responses; simple requests still execute on the server. Use auth and CSRF protection.**
+8. **Why can't you use `Access-Control-Allow-Origin: *` with cookies, and why add `Vary: Origin`?** **Credentialed requests require an explicit origin. When you echo origins dynamically, `Vary: Origin` stops caches from serving one origin's CORS headers to another.**
+9. **401 vs 403?** **401: not authenticated (missing or invalid credentials). 403: authenticated but not permitted.**
+10. **502 vs 504?** **Both come from a proxy. 502: the upstream returned an invalid response or the connection failed. 504: the upstream didn't respond within the timeout.**
+11. **Walk through ETag revalidation.** **The server sends `ETag`; the client later sends `If-None-Match` with it; if the version still matches, the server returns 304 with no body and the client uses its cache, otherwise 200 with the new body and ETag.**
+12. **`no-cache` vs `no-store`?** **`no-cache` allows storing but requires revalidation before each use; `no-store` forbids storing at all.**
+13. **Why might an app behind an ALB return random 502s?** **The app's keep-alive timeout (uvicorn's default `timeout_keep_alive` is 5 s, like Node's) is shorter than the ALB's idle timeout (60 s), so the ALB reuses a connection the app just closed. Set the app's keep-alive timeout higher than the LB's.**
+14. **What is the multipart boundary for?** **It separates the parts (fields and files) of a `multipart/form-data` body so binary data can be sent without escaping.**
+15. **How do you send a 2 GB file without running out of memory?** **Stream it (`FileResponse`, or a `StreamingResponse` over an async generator that reads the file in chunks), which respects backpressure and sends chunks as the client can receive them.**
+16. ➕ **Your FastAPI app sits behind an HTTP/2 load balancer. Which HTTP version does it receive, and why is that fine?** **HTTP/1.1. The LB terminates h2 (negotiated with ALPN) and forwards over pooled keep-alive connections; h2's gains matter on the long client link, not the short LB-to-app hop. Make sure the proxy uses HTTP/1.1 keep-alive upstream (Nginx defaults to 1.0).**
+17. ➕ **Why can a gRPC service behind an L4 load balancer end up using only one replica?** **gRPC multiplexes all calls over one long-lived HTTP/2 connection, and an L4 balancer balances connections, not requests. Use an L7 balancer or client-side balancing.**
+18. ➕ **The API is slow for one customer. How do you find which hop is slow?** **`curl -w` with namelookup, connect, appconnect and starttransfer times; DevTools Timing (Stalled vs Waiting) plus a `Server-Timing` header; a sanitized HAR file; `--resolve` to hit individual servers.**
+19. ➕ **Why must a magic-login link not log the user in on GET?** **GET is safe by definition, so email scanners, link previews and prefetchers follow it and burn the one-time token. The GET renders a button; the POST consumes the token.**
+20. ➕ **How do you prevent lost updates in a REST API?** **Return an ETag derived from a version column; require `If-Match` on writes (428 if missing); do the check inside the `UPDATE ... WHERE version = $2`; return 412 if no row matched.**
+21. ➕ **Why is `Cache-Control: private` your responsibility with cookie sessions?** **RFC 9111 stops shared caches from reusing responses to requests with `Authorization`, but not with cookies. A personalised cookie-authenticated GET would otherwise be cached by the CDN and served to other users.**
+22. ➕ **What is web cache poisoning via an unkeyed header?** **The app builds a cacheable response from a header the cache doesn't key on (e.g. `X-Forwarded-Host`), so one attacker request stores a malicious variant that every user then receives.**
+23. ➕ **What does uvicorn's `--forwarded-allow-ips "*"` get wrong?** **It trusts every hop, so `request.client.host` becomes the leftmost `X-Forwarded-For` entry, which the client controls. List exactly your proxies' addresses or networks.**
+24. ➕ **How does password-reset poisoning work, and how do you prevent it?** **The attacker requests a reset for the victim with a forged `Host`; the app builds the link from it, so the victim's email points to the attacker's domain with a valid token. Build links from a configured base URL and reject unknown hosts at the proxy.**
+25. ➕ **Which outbound failures can you retry for a non-idempotent POST?** **Only those where the request provably never reached the server: DNS failures, connection refused, connect timeouts, and 429/503 rejections. After ECONNRESET or a response timeout, retry only with an idempotency key.**
+26. ➕ **What is slowloris and what stops it?** **Many connections sending headers extremely slowly to tie up the server. Header and request deadlines (Nginx's `client_header_timeout` and `client_body_timeout`, Node's `headersTimeout` and `requestTimeout`; uvicorn has none) and a buffering reverse proxy in front.**
+27. ➕ **State the timeout-alignment rule.** **Request timeouts shrink as you go deeper (client > proxy > app budget > DB and outbound calls), so each layer fails before its caller does; idle keep-alive timeouts grow as you go deeper.**
+28. ➕ **Why is TLS 1.3 0-RTT dangerous?** **Early data can be replayed by an attacker. Only accept it for safe, idempotent requests and answer others with 425 Too Early.**
+29. ➕ **A site works in Chrome, but Python clients fail with "certificate verify failed: unable to get local issuer certificate". Why?** **The server sends only the leaf certificate. Browsers fill in the missing intermediate themselves; Python's `ssl` (like Node and curl) doesn't. Serve the full chain (`fullchain.pem`).**
+30. ➕ **Why do certificate outages still happen with automated renewal, and what do you monitor?** **Renewals fail silently (broken challenge, server not reloaded) and lifetimes are shrinking toward 47 days. Monitor the certificate actually served on every host and instance, including intermediates, and alert weeks before expiry.**
+
+## Sources
+
+- [Lesson video: Understanding HTTP for backend engineers (Sriniously)](https://youtu.be/a3C1DMswClQ)
+- [RFC 9110: HTTP Semantics (methods, safe/idempotent, status codes, conditional requests, content negotiation)](https://www.rfc-editor.org/rfc/rfc9110.html)
+- [RFC 9111: HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111.html)
+- [RFC 9112: HTTP/1.1 (message syntax, persistence, chunked encoding)](https://www.rfc-editor.org/rfc/rfc9112.html)
+- [RFC 9113: HTTP/2](https://www.rfc-editor.org/rfc/rfc9113.html)
+- [RFC 9114: HTTP/3](https://www.rfc-editor.org/rfc/rfc9114.html)
+- [RFC 6585: Additional HTTP Status Codes (429)](https://www.rfc-editor.org/rfc/rfc6585.html)
+- [RFC 8446: TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html)
+- [MDN: Cross-Origin Resource Sharing (simple requests, preflight, credentials, Vary)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS)
+- [MDN: Access-Control-Max-Age (browser caps)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Access-Control-Max-Age)
+- [MDN: Keep-Alive header (HTTP/2 and HTTP/3 restrictions)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Keep-Alive)
+- [MDN: Cache-Control](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cache-Control)
+- [MDN: Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)
+- [Chrome: Removing HTTP/2 Server Push](https://developer.chrome.com/blog/removing-push)
+- [Node.js: http server.keepAliveTimeout and headersTimeout](https://nodejs.org/api/http.html#serverkeepalivetimeout)
+- [AWS: Application Load Balancer idle timeout](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html#connection-idle-timeout)
+- [Express: res.format, req.accepts, req.acceptsLanguages](https://expressjs.com/en/api.html)
+- [Uvicorn settings (timeout_keep_alive, proxy headers, limit_concurrency, h11 limits)](https://uvicorn.dev/settings/)
+- [Starlette: middleware (CORSMiddleware, GZipMiddleware, TrustedHostMiddleware)](https://www.starlette.io/middleware/)
+- [FastAPI: custom responses (StreamingResponse, FileResponse)](https://fastapi.tiangolo.com/advanced/custom-response/)
+- [Helmet](https://helmetjs.github.io/)
+- [OWASP: HTTP Request Smuggling](https://owasp.org/www-community/attacks/HTTP_Request_Smuggling)
+- [BREACH attack](https://www.breachattack.com/)
+- ➕ [RFC 3986: URI Generic Syntax (components, percent-encoding)](https://www.rfc-editor.org/rfc/rfc3986.html)
+- ➕ [RFC 7301: TLS Application-Layer Protocol Negotiation (ALPN)](https://www.rfc-editor.org/rfc/rfc7301.html)
+- ➕ [RFC 7838: HTTP Alternative Services (Alt-Svc)](https://www.rfc-editor.org/rfc/rfc7838.html)
+- ➕ [RFC 9460: SVCB and HTTPS DNS records](https://www.rfc-editor.org/rfc/rfc9460.html)
+- ➕ [gRPC over HTTP/2 protocol description](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)
+- ➕ [Google Cloud: How the HTTP/2 Rapid Reset DDoS attack works (CVE-2023-44487)](https://cloud.google.com/blog/products/identity-security/how-it-works-the-novel-http2-rapid-reset-ddos-attack)
+- ➕ [Node.js October 2023 security releases (HTTP/2 Rapid Reset fix)](https://nodejs.org/en/blog/vulnerability/october-2023-security-releases)
+- ➕ [Nginx: ngx_http_proxy_module (proxy_http_version, proxy_request_buffering)](https://nginx.org/en/docs/http/ngx_http_proxy_module.html)
+- ➕ [Nginx: ngx_http_core_module (client_max_body_size, large_client_header_buffers, client_header_timeout)](https://nginx.org/en/docs/http/ngx_http_core_module.html)
+- ➕ [Nginx: ngx_http_v3_module (QUIC and HTTP/3)](https://nginx.org/en/docs/http/ngx_http_v3_module.html)
+- ➕ [curl: --write-out variables, --resolve, --connect-to](https://curl.se/docs/manpage.html)
+- ➕ [Chrome DevTools: Network features reference (Timing tab, HAR export)](https://developer.chrome.com/docs/devtools/network/reference)
+- ➕ [Chromium change: HAR export sanitized by default](https://chromium.googlesource.com/devtools/devtools-frontend/+/acd96a60464188fbf7c4476ec883ec65bba3dfdf)
+- ➕ [BleepingComputer: Okta support system breach via HAR files](https://www.bleepingcomputer.com/news/security/okta-says-its-support-system-was-breached-using-stolen-credentials/)
+- ➕ [MDN: Server-Timing](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Server-Timing)
+- ➕ [MDN: Referrer-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Referrer-Policy)
+- ➕ [MDN: Permissions-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Permissions-Policy)
+- ➕ [MDN: CSP frame-ancestors](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/frame-ancestors)
+- ➕ [MDN: Cross-Origin-Opener-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cross-Origin-Opener-Policy), [Cross-Origin-Embedder-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cross-Origin-Embedder-Policy), [Cross-Origin-Resource-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Cross-Origin-Resource-Policy)
+- ➕ [Helmet defaults](https://helmet.js.org/)
+- ➕ [HSTS preload list: requirements and removal](https://hstspreload.org/)
+- ➕ [OWASP: CRLF Injection](https://owasp.org/www-community/vulnerabilities/CRLF_Injection)
+- ➕ [RFC 6266: Content-Disposition in HTTP](https://www.rfc-editor.org/rfc/rfc6266.html)
+- ➕ [RFC 8259: JSON (UTF-8, no charset parameter)](https://www.rfc-editor.org/rfc/rfc8259.html)
+- ➕ [RFC 5861: stale-while-revalidate and stale-if-error](https://www.rfc-editor.org/rfc/rfc5861.html)
+- ➕ [PortSwigger: Web cache poisoning](https://portswigger.net/web-security/web-cache-poisoning)
+- ➕ [PortSwigger: Password reset poisoning](https://portswigger.net/web-security/host-header/exploiting/password-reset-poisoning)
+- ➕ [RFC 7239: Forwarded HTTP Extension](https://www.rfc-editor.org/rfc/rfc7239.html)
+- ➕ [Express: Behind proxies (trust proxy)](https://expressjs.com/en/guide/behind-proxies.html)
+- ➕ [Express 5: app settings, app.get and HEAD, express.json limit](https://expressjs.com/en/5x/api/application/)
+- ➕ [HTTPX: timeouts](https://www.python-httpx.org/advanced/timeouts/) and [resource limits](https://www.python-httpx.org/advanced/resource-limits/)
+- ➕ [Node.js: http (globalAgent keep-alive since v19, maxHeaderSize, headersTimeout, requestTimeout)](https://nodejs.org/api/http.html)
+- ➕ [Python: asyncio.timeout](https://docs.python.org/3/library/asyncio-task.html#asyncio.timeout)
+- ➕ [AnyIO: connect_tcp (happy eyeballs)](https://anyio.readthedocs.io/en/stable/api.html#anyio.connect_tcp)
+- ➕ [AWS Builders' Library: Timeouts, retries and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)
+- ➕ [asyncpg: connection pools and server_settings](https://magicstack.github.io/asyncpg/current/api/index.html)
+- ➕ [RFC 6585: 428 and 431](https://www.rfc-editor.org/rfc/rfc6585.html)
+- ➕ [RFC 8470: Using Early Data in HTTP (425 Too Early)](https://www.rfc-editor.org/rfc/rfc8470.html)
+- ➕ [Nginx: ngx_http_ssl_module (ssl_early_data, ssl_reject_handshake)](https://nginx.org/en/docs/http/ngx_http_ssl_module.html)
+- ➕ [Python: ssl (create_default_context, get_verified_chain, client certificates)](https://docs.python.org/3/library/ssl.html)
+- ➕ [Let's Encrypt: DST Root CA X3 expiration (September 2021)](https://letsencrypt.org/docs/dst-root-ca-x3-expiration-september-2021/)
+- ➕ [Let's Encrypt: ending expiration notification emails](https://letsencrypt.org/2025/01/22/ending-expiration-emails/)
+- ➕ [CA/Browser Forum ballot SC-081v3: reducing certificate validity periods](https://cabforum.org/2025/04/11/ballot-sc081v3-introduce-schedule-of-reducing-validity-and-data-reuse-periods/)
+- ➕ [Prometheus blackbox exporter](https://github.com/prometheus/blackbox_exporter)

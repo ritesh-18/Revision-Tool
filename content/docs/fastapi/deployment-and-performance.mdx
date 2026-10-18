@@ -1,0 +1,923 @@
+---
+title: "Deployment and Performance"
+description: "Running FastAPI in production: fastapi run and uvicorn options, workers and processes, sizing, a multi-stage uv Dockerfile, reverse proxies and root_path, health checks, graceful shutdown, fast serialization, the common performance killers with measurements, benchmarking, observability with structured logs, OpenTelemetry and metrics, and free-threaded Python 3.14."
+---
+
+`fastapi dev` on your laptop and a service handling real traffic are the same code, but not the same process layout. In production you decide how many processes run, who terminates TLS, how the app learns it sits behind a proxy, how the orchestrator knows it's healthy, what happens to in-flight requests during a deploy, and how you'll find out why p99 latency doubled on Tuesday.
+
+This chapter goes through those decisions, and then measures the mistakes that make FastAPI apps slow. Measurements were taken on Windows with CPython 3.14.6 (the **free-threaded** build, more on that at the end), FastAPI 0.143.0, uvicorn 0.54.0, httpx 0.28.1 and SQLAlchemy 2.1.4, on a 16-core machine. Treat the absolute numbers as illustrative. The ratios are the point. For the language-agnostic background see [scaling and performance](/docs/backend-first-principles/21-scaling-performance-part-1) and [DevOps](/docs/backend-first-principles/31-devops).
+
+## The process model
+
+<Mermaid chart={`flowchart LR
+  C["Clients"] --> LB["Load balancer or reverse proxy<br/>TLS, HTTP/2, buffering, limits"]
+  LB --> P1["Container or VM 1"]
+  LB --> P2["Container or VM 2"]
+  subgraph P1
+    S1["uvicorn supervisor"] --> W1["worker process<br/>event loop + threadpool"]
+    S1 --> W2["worker process<br/>event loop + threadpool"]
+  end
+  subgraph P2
+    W3["uvicorn: single worker"]
+  end
+  W1 --> DB[("Postgres")]
+  W2 --> DB
+  W3 --> DB`} />
+
+Each **worker** is one OS process running one event loop (plus a threadpool for sync code). Inside one worker, concurrency comes from the event loop (`async def`) and the threadpool (`def`). Across workers, it comes from the OS scheduling processes on different CPU cores. On a standard CPython build with the GIL, a single worker can execute Python bytecode on only **one core at a time**, so using a multi-core machine means running several workers (or several containers). See [concurrency models and the GIL](/docs/python/concurrency-models-and-the-gil).
+
+## `fastapi run` and uvicorn
+
+FastAPI doesn't include a server. **Uvicorn** is the ASGI server that owns the socket, parses HTTP, and calls your app. There are two ways to start it.
+
+```bash
+# The FastAPI CLI (needs "fastapi[standard]"): production defaults
+fastapi run app/main.py --port 8000 --workers 4
+
+# Uvicorn directly: every knob available
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 \
+  --proxy-headers --forwarded-allow-ips "10.0.0.0/8" \
+  --timeout-graceful-shutdown 30 --timeout-keep-alive 5 --no-server-header
+```
+
+`fastapi run` is a thin wrapper around uvicorn that picks production-friendly defaults: it binds to `0.0.0.0` (all interfaces, which a container needs), has reload off, and enables `--proxy-headers`. `fastapi dev` is the same with `127.0.0.1` and auto-reload on. You can declare the app once in `pyproject.toml` and drop the path argument:
+
+```toml title="pyproject.toml"
+[tool.fastapi]
+entrypoint = "app.main:app"
+```
+
+The uvicorn options that matter in production:
+
+| Option | Default | What it controls |
+|---|---|---|
+| `--host` | `127.0.0.1` | interface to bind. In a container, `0.0.0.0`, otherwise nothing outside the container can connect |
+| `--workers N` | `$WEB_CONCURRENCY` or 1 | number of worker processes, managed by a supervisor process |
+| `--proxy-headers` / `--forwarded-allow-ips` | on, `127.0.0.1` | trust `X-Forwarded-For`/`-Proto` from these proxy IPs only |
+| `--root-path` | empty | the URL prefix a proxy strips before forwarding |
+| `--timeout-graceful-shutdown` | none | max seconds to wait for in-flight requests on shutdown |
+| `--timeout-keep-alive` | 5 | seconds before an idle keep-alive connection is closed. Behind a load balancer, keep this **longer** than the balancer's idle timeout for upstream connections. Otherwise the balancer may reuse a connection uvicorn just closed, and the client gets a sporadic 502 |
+| `--limit-concurrency` | none | above this many concurrent connections or tasks, answer 503 instead of queueing forever |
+| `--limit-max-requests` (+ `-jitter`) | none | restart a worker after N requests, a band-aid for slow memory leaks |
+| `--backlog` | 2048 | kernel queue of not-yet-accepted connections |
+| `--http`, `--loop` | `auto` | HTTP parser and event loop. `auto` uses `httptools` and `uvloop` when installed (uvloop isn't available on Windows) |
+| `--log-config`, `--no-access-log` | | logging setup. Many teams disable uvicorn's access log and emit their own structured one |
+
+## Workers and processes
+
+### Uvicorn `--workers` vs gunicorn with uvicorn workers
+
+```bash
+uvicorn perf_app:app --port 8771 --workers 2
+```
+
+```text title="Server log"
+INFO:     Uvicorn running on http://127.0.0.1:8771 (Press CTRL+C to quit)
+INFO:     Started parent process [18992]
+INFO:     Started server process [11272]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Started server process [21592]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+```
+
+Forty requests on fresh connections to an endpoint that returns `os.getpid()`:
+
+```text title="Output"
+{11272: 21, 21592: 19}
+```
+
+The **parent process** binds the socket once, then starts N children that all accept connections from that same socket. The kernel hands each new connection to one of them, which is why the split is roughly even but not exact. Each child runs the **lifespan separately**: every worker opens its own DB pool and its own HTTP clients. Nothing in memory is shared between workers (no shared cache, no shared WebSocket rooms, no shared rate-limit counters). Shared state has to live in Redis or the database.
+
+Uvicorn's supervisor also restarts children that die, restarts all workers on `SIGHUP`, and grows or shrinks the pool on `SIGTTIN`/`SIGTTOU`. That covers what people historically used **gunicorn** for. The older pattern is still common:
+
+```bash
+gunicorn app.main:app -k uvicorn_worker.UvicornWorker -w 4 -b 0.0.0.0:8000 --graceful-timeout 30
+```
+
+Here gunicorn is the process manager and each worker runs uvicorn's server. The worker class has moved to the separate `uvicorn-worker` package: the old `uvicorn.workers.UvicornWorker` still exists in uvicorn 0.54 but emits a deprecation warning. Gunicorn doesn't run on Windows. For new deployments, plain `uvicorn --workers` (or `fastapi run --workers`) is enough unless you need a gunicorn-specific feature.
+
+### Containers: one worker per container, or several?
+
+In Kubernetes (or ECS, Cloud Run, Nomad), the orchestrator already does what a process supervisor does: it runs N copies, restarts crashed ones, and load-balances between them. The usual recommendation there is **one uvicorn process per container** and scaling by replica count:
+
+- CPU and memory limits apply cleanly per process, and autoscaling works on simple metrics.
+- A crash or OOM kill takes out one worker, not a whole group.
+- Health checks map one-to-one to processes.
+
+Use `--workers N` when you deploy to a VM or a single big container, or on platforms that bill per container where packing several workers into one is cheaper.
+
+### How many workers?
+
+A worker is busy with Python in proportion to how much CPU your requests use. A starting point:
+
+- **Mostly I/O-bound async app** (waiting on DB, Redis, LLM APIs): **one worker per CPU core**. Each worker's event loop handles hundreds or thousands of concurrent requests while they wait. More workers than cores just adds context switching and memory.
+- **Mix with sync endpoints or some CPU work**: still about one per core, and watch the threadpool (below).
+- The old gunicorn formula `2 x cores + 1` comes from **sync WSGI** workers that each handle one request at a time. It is too many for async workers.
+- **Memory** is often the real limit: each worker loads the whole app (and any ML model it imports). Four workers each holding a 2 GB model need 8 GB. See [serving your own models](/docs/fastapi/serving-your-own-models).
+
+Then measure: load-test, watch CPU per worker and latency, and adjust. If CPU is low but latency is high, more workers won't help. Something is blocking or a pool is too small.
+
+## A production Dockerfile with uv
+
+A multi-stage build: the first stage installs dependencies with uv into a virtual environment, the second copies only that environment and the code into a slim image that runs as a non-root user. (Not built here, Docker wasn't part of this test setup. The structure follows uv's documented Docker patterns. See [packaging and environments](/docs/python/packaging-and-environments) for `uv.lock`.)
+
+```dockerfile title="Dockerfile"
+# syntax=docker/dockerfile:1
+
+############################
+# Stage 1: build the venv  #
+############################
+FROM python:3.14-slim AS builder
+
+# The uv binary, copied from its official image. Pin a version in real builds.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+WORKDIR /app
+
+# 1) Dependencies only. This layer is cached until pyproject.toml or uv.lock change.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-install-project --no-dev
+
+# 2) Then the application code.
+COPY . /app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev
+
+############################
+# Stage 2: runtime image   #
+############################
+FROM python:3.14-slim
+
+RUN groupadd --system app && useradd --system --gid app --no-create-home app
+
+WORKDIR /app
+COPY --from=builder --chown=app:app /app /app
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
+
+USER app
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=2)"]
+
+# Exec form: uvicorn is PID 1 and receives SIGTERM directly.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--forwarded-allow-ips", "*", \
+     "--timeout-graceful-shutdown", "25"]
+```
+
+Why each piece is there:
+
+- **Two stages.** The builder has uv and its cache. The runtime image has only Python, the `.venv` and your code, so it's smaller and has less to patch. Both stages use the same base image, so the venv's interpreter path (`/usr/local/bin/python3.14`) is valid in both.
+- **Dependencies before code.** Docker caches layers. Installing from `uv.lock` before `COPY . /app` means a code-only change reuses the dependency layer, and rebuilds take seconds.
+- **`--locked`** fails the build if `uv.lock` is out of date with `pyproject.toml`, so production gets exactly the versions you tested. `--no-dev` leaves out pytest and friends.
+- **`UV_COMPILE_BYTECODE=1`** precompiles `.pyc` files at build time, which speeds up container start. `UV_LINK_MODE=copy` avoids hardlink warnings across the cache mount.
+- **Non-root user.** If the app is compromised, the attacker doesn't get root inside the container. `--no-create-home` and no shell for a system user keep it minimal.
+- **`PYTHONUNBUFFERED=1`** so logs reach `docker logs` immediately instead of sitting in a buffer.
+- **Exec-form `CMD`** (a JSON array). With the shell form (`CMD uvicorn ...`), `/bin/sh` becomes PID 1 and doesn't forward `SIGTERM` to uvicorn, so graceful shutdown never happens and the container is killed after the timeout.
+- **`--forwarded-allow-ips "*"`** is only safe because the container is reachable **only** through the proxy or load balancer. If clients can reach it directly, list the proxy's addresses instead, or anyone can forge `X-Forwarded-For`.
+- Add a `.dockerignore` with `.venv`, `.git`, `__pycache__`, `.env` and tests, so they don't end up in the build context or the image.
+
+## Behind a reverse proxy
+
+In production a proxy usually sits in front of uvicorn: nginx, Traefik, Caddy, an AWS ALB, a Kubernetes ingress. It terminates TLS, speaks HTTP/2 to clients, buffers slow uploads, and routes paths to services. Two things break if the app doesn't know about it.
+
+### `--proxy-headers`: the real client IP and scheme
+
+The TCP connection uvicorn sees comes **from the proxy**, over plain HTTP. The proxy passes the original information in headers: `X-Forwarded-For` (client IP) and `X-Forwarded-Proto` (`https`). Uvicorn's `ProxyHeadersMiddleware`, enabled by `--proxy-headers`, rewrites the ASGI scope from those headers, but only when the connection comes from an address in `--forwarded-allow-ips`.
+
+```python
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+app = FastAPI()
+
+
+@app.get("/items/{item_id}", name="get_item")
+async def get_item(item_id: int, request: Request):
+    return {
+        "client_ip": request.client.host,
+        "scheme": request.url.scheme,
+        "self_url": str(request.url_for("get_item", item_id=item_id)),
+        "root_path": request.scope.get("root_path"),
+    }
+
+headers = {"X-Forwarded-For": "203.0.113.7", "X-Forwarded-Proto": "https", "Host": "api.example.com"}
+
+print("no proxy headers handling:")
+print(" ", TestClient(app).get("/items/1", headers=headers).json())
+
+trusted = ProxyHeadersMiddleware(app, trusted_hosts="*")
+print("with ProxyHeadersMiddleware (what --proxy-headers enables):")
+print(" ", TestClient(trusted).get("/items/1", headers=headers).json())
+
+print("with root_path='/api' (proxy strips /api before forwarding):")
+print(" ", TestClient(trusted, root_path="/api").get("/items/1", headers=headers).json())
+```
+
+```text title="Output"
+no proxy headers handling:
+  {'client_ip': 'testclient', 'scheme': 'http', 'self_url': 'http://api.example.com/items/1', 'root_path': ''}
+with ProxyHeadersMiddleware (what --proxy-headers enables):
+  {'client_ip': '203.0.113.7', 'scheme': 'https', 'self_url': 'https://api.example.com/items/1', 'root_path': ''}
+with root_path='/api' (proxy strips /api before forwarding):
+  {'client_ip': '203.0.113.7', 'scheme': 'https', 'self_url': 'https://api.example.com/api/items/1', 'root_path': '/api'}
+```
+
+Without proxy-header handling, every request appears to come from the proxy (so per-IP rate limits and audit logs are useless) and generated URLs say `http://` (so redirects downgrade users to HTTP, and `Secure` cookie logic misfires). With it, the app sees the real client and scheme.
+
+### `root_path`: serving under a path prefix
+
+If the proxy routes `https://example.com/api/...` to your app and **strips** `/api` before forwarding, the app receives `/items/1`. Routing works, but anything that builds URLs (redirects, `url_for`, the docs page loading `/openapi.json`) produces paths without `/api`, which 404 at the proxy. `--root-path /api` (or `FastAPI(root_path="/api")`) tells the app about the prefix. The last line above shows `url_for` producing `/api/items/1`. FastAPI also puts it in the OpenAPI document's `servers` list, so `/docs` calls the right URLs:
+
+```text title="Output"
+[{'url': '/api'}]
+True
+```
+
+(The first line is `openapi.json`'s `servers` under `root_path="/api"`. The second confirms the docs page loads `/api/openapi.json`.)
+
+If the proxy does **not** strip the prefix, don't use `root_path`. Mount your routes under the prefix instead (`include_router(..., prefix="/api")`).
+
+<Callout type="warn">
+Trusting forwarded headers from anyone is a security hole: a client can send `X-Forwarded-For: 10.0.0.1` and impersonate an internal IP. Only trust the proxy's addresses, and make sure your proxy **overwrites** (not appends to) the forwarded headers it receives from clients.
+</Callout>
+
+## Health checks
+
+Orchestrators ask two different questions, and they need two endpoints:
+
+- **Liveness** (`/livez`): "is this process stuck?" If it fails, the orchestrator **restarts** the container. It should only check that the event loop can answer. **Never** check the database here: a DB outage would make every replica fail liveness, and the orchestrator would restart all of them in a loop, which makes the outage worse.
+- **Readiness** (`/readyz`): "should this instance receive traffic right now?" If it fails, the instance is **removed from the load balancer** but not restarted. Check what a request needs: the DB answers, required config loaded, warm-up finished, not shutting down.
+- Some platforms add a **startup** probe for slow boots (loading a model), so liveness doesn't kill the app while it's still starting.
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Response, status
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.engine = create_async_engine("sqlite+aiosqlite:///health.db")
+    app.state.draining = False
+    yield
+    app.state.draining = True
+    await app.state.engine.dispose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/livez", include_in_schema=False)
+async def livez():
+    return {"status": "alive"}            # the process and event loop respond. Nothing else.
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz(response: Response):
+    checks = {}
+    try:
+        async with asyncio.timeout(1):
+            async with app.state.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        checks["db"] = "ok"
+    except Exception as exc:
+        checks["db"] = f"fail: {type(exc).__name__}"
+    ready = not app.state.draining and all(v == "ok" for v in checks.values())
+    if not ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {"ready": ready, "checks": checks}
+
+
+with TestClient(app) as c:
+    print(c.get("/livez").json())
+    r = c.get("/readyz"); print(r.status_code, r.json())
+    app.state.engine = create_async_engine("sqlite+aiosqlite:///no/such/dir/x.db")   # simulate DB outage
+    r = c.get("/readyz"); print(r.status_code, r.json())
+    print(c.get("/livez").status_code)
+```
+
+```text title="Output"
+{'status': 'alive'}
+200 {'ready': True, 'checks': {'db': 'ok'}}
+503 {'ready': False, 'checks': {'db': 'fail: OperationalError'}}
+200
+```
+
+During the simulated outage the instance is not ready (503, so it gets no traffic) but still alive (200, so it's not restarted). Keep health checks cheap and bounded: a probe that hangs for 30 seconds is worse than one that fails in 1. And exclude them from access logs and traces, or they'll drown everything else.
+
+## Graceful shutdown
+
+Every deploy, scale-down or node drain stops processes that are serving requests. **Graceful shutdown** means: stop accepting new work, finish what's in flight, release resources, then exit. The orchestrator starts it by sending `SIGTERM`, waits a grace period (30 s by default in Kubernetes), then sends `SIGKILL`. See [graceful shutdown](/docs/backend-first-principles/19-graceful-shutdown) for the general pattern.
+
+Uvicorn's signal handler sets `server.should_exit = True`. This script does the same by hand while a 2-second request is in flight:
+
+```python
+import asyncio, time
+from contextlib import asynccontextmanager
+
+import httpx
+import uvicorn
+from fastapi import FastAPI
+
+T0 = time.perf_counter()
+def log(msg): print(f"{time.perf_counter() - T0:5.2f}s {msg}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log("lifespan: startup (open pools)")
+    yield
+    log("lifespan: shutdown (close pools, flush telemetry)")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/slow")
+async def slow():
+    log("handler: started 2s of work")
+    await asyncio.sleep(2)
+    log("handler: finished")
+    return {"done": True}
+
+
+async def main():
+    config = uvicorn.Config(app, port=8772, log_level="warning", timeout_graceful_shutdown=10)
+    server = uvicorn.Server(config)
+    serve = asyncio.create_task(server.serve())
+    await asyncio.sleep(0.5)
+
+    async with httpx.AsyncClient() as client:
+        req = asyncio.create_task(client.get("http://127.0.0.1:8772/slow", timeout=10))
+        await asyncio.sleep(0.5)
+        log("SIGTERM arrives: server.should_exit = True")
+        server.should_exit = True                 # what uvicorn's signal handler does
+        await asyncio.sleep(0.2)
+        try:
+            await httpx.AsyncClient().get("http://127.0.0.1:8772/slow", timeout=1)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            log(f"new connection failed ({type(e).__name__}): listener already closed")
+        r = await req
+        log(f"in-flight request completed: {r.status_code} {r.json()}")
+    await serve
+    log("process exits")
+
+asyncio.run(main())
+```
+
+```text title="Output"
+ 0.02s lifespan: startup (open pools)
+ 0.57s handler: started 2s of work
+ 1.06s SIGTERM arrives: server.should_exit = True
+ 2.31s new connection failed (ConnectTimeout): listener already closed
+ 2.57s handler: finished
+ 2.57s in-flight request completed: 200 {'done': True}
+ 2.62s lifespan: shutdown (close pools, flush telemetry)
+ 2.62s process exits
+```
+
+The sequence uvicorn follows:
+
+1. **Close the listening socket**: new connections fail (on Windows the connect attempt times out, on Linux it's refused).
+2. **Close idle keep-alive connections**, and tell busy ones to close after their current response.
+3. **Wait for in-flight requests** to finish, up to `--timeout-graceful-shutdown` seconds. After that, remaining tasks are cancelled.
+4. **Run the lifespan shutdown**: close DB pools and HTTP clients, flush logs and traces.
+5. Exit.
+
+Things that still go wrong:
+
+- **The load balancer keeps sending traffic** for a few seconds after `SIGTERM`, because removing an endpoint propagates asynchronously. In Kubernetes, add a short `preStop` sleep (5 to 10 s) so the pod stays up until it's out of rotation, or flip readiness to 503 first (the `draining` flag above).
+- **Long-lived connections** (WebSockets, SSE, LLM streams) don't finish on their own. Track them and close them with a "reconnect" message during shutdown, and make clients reconnect gracefully.
+- **Background tasks** started with `BackgroundTasks` or `create_task` die with the process. Work that must survive a deploy belongs in a durable queue (see [agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs)).
+- **Grace period mismatch**: `--timeout-graceful-shutdown` must be shorter than the orchestrator's grace period, or the process is `SIGKILL`ed mid-cleanup.
+
+## Response serialization
+
+How FastAPI turns your return value into bytes changed in recent versions, and it is one of the cheapest performance wins.
+
+```python
+import time
+from datetime import datetime, timezone
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+
+class Item(BaseModel):
+    id: int
+    name: str
+    price: float
+    tags: list[str]
+    created: datetime
+
+
+NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+ITEMS = [Item(id=i, name=f"item {i}", price=i * 1.5, tags=["a", "b"], created=NOW) for i in range(5000)]
+
+app = FastAPI()
+
+
+@app.get("/untyped")
+async def untyped():
+    return ITEMS                    # no return type: jsonable_encoder walks every object
+
+
+@app.get("/typed")
+async def typed() -> list[Item]:
+    return ITEMS                    # return type: Pydantic serializes straight to JSON bytes
+
+
+@app.get("/as-dicts")
+async def as_dicts():
+    return [i.model_dump() for i in ITEMS]
+
+
+with TestClient(app) as c:
+    assert c.get("/typed").content == c.get("/untyped").content
+    for path in ["/untyped", "/as-dicts", "/typed"]:
+        c.get(path)
+        start = time.perf_counter()
+        for _ in range(20):
+            c.get(path)
+        print(f"{path:<10} {(time.perf_counter() - start) / 20 * 1000:.1f} ms per request")
+```
+
+```text title="Output"
+/untyped   49.8 ms per request
+/as-dicts  63.5 ms per request
+/typed     5.4 ms per request
+```
+
+Same bytes on the wire (the `assert` passed), about **9x** faster with a declared return type. The mechanism:
+
+- **Without a return type or `response_model`**, FastAPI runs `jsonable_encoder` over the result. That is a recursive **Python** function that visits every object, converts models to dicts, datetimes to strings and so on, and then `json.dumps` turns the result into text. Converting to dicts yourself first (`model_dump()`) doesn't help, it just adds a step.
+- **With a return type**, FastAPI builds a Pydantic `TypeAdapter` for it once, at startup, and serializes the value with `pydantic-core` straight to JSON **bytes**, in Rust, validating and filtering against the declared type in the same pass.
+
+That is why `ORJSONResponse` and `UJSONResponse` are **deprecated** in FastAPI 0.143: their whole point was a faster JSON encoder, and declaring the return type now gets you a fast Rust encoder plus validation and documentation. Declare return types on every endpoint. It's documentation, security (fields not in the model are filtered out) and speed at once.
+
+## The common performance killers
+
+### 1. Blocking calls inside `async def`
+
+An `async def` endpoint runs **on the event loop**. A blocking call inside it (`time.sleep`, `requests.get`, a sync DB driver, a big CPU loop, reading a large file) stops the loop, and every other request in that worker waits. Three endpoints, each "waiting" 0.1 s, hit with 20 concurrent requests on a real server:
+
+```python
+@app.get("/async-blocking")
+async def async_blocking():
+    time.sleep(0.1)              # blocks the event loop
+    return {"ok": True}
+
+
+@app.get("/sync-blocking")
+def sync_blocking():
+    time.sleep(0.1)              # runs in the threadpool
+    return {"ok": True}
+
+
+@app.get("/async-nonblocking")
+async def async_nonblocking():
+    await asyncio.sleep(0.1)     # yields to the loop
+    return {"ok": True}
+```
+
+```text title="Output (20 concurrent requests per endpoint, one worker)"
+20 concurrent /async-blocking      2.04s
+20 concurrent /sync-blocking       0.12s
+20 concurrent /async-nonblocking   0.13s
+```
+
+`/async-blocking` served the 20 requests **one after another**: 20 x 0.1 s = 2 s. A plain `def` endpoint did fine, because FastAPI runs sync endpoints in a threadpool. The rule:
+
+- `async def` only if everything slow inside it is `await`ed on an async library.
+- Otherwise use plain `def`, or move the blocking part out with `await run_in_threadpool(fn, ...)` / `asyncio.to_thread(fn, ...)`.
+- CPU-heavy work (image processing, large JSON parsing, model inference) belongs in a process pool or a separate service, not on the loop. See [asyncio](/docs/python/asyncio) for finding blocking calls with debug mode.
+
+The symptom in production is distinctive: **latency rises for all endpoints at once, while CPU looks low.**
+
+### 2. The threadpool is smaller than you think
+
+Sync endpoints and sync dependencies run in AnyIO's worker threads, and AnyIO allows **40** at a time by default:
+
+```python
+import asyncio, time
+import anyio.to_thread
+from fastapi.concurrency import run_in_threadpool
+
+
+async def run(n):
+    start = time.perf_counter()
+    await asyncio.gather(*(run_in_threadpool(time.sleep, 0.1) for _ in range(n)))
+    return time.perf_counter() - start
+
+
+async def main():
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    print("default threadpool tokens:", limiter.total_tokens)
+    print(f"100 blocking calls: {await run(100):.2f}s")
+    limiter.total_tokens = 100
+    print(f"100 blocking calls with 100 tokens: {await run(100):.2f}s")
+
+asyncio.run(main())
+```
+
+```text title="Output"
+default threadpool tokens: 40
+100 blocking calls: 0.33s
+100 blocking calls with 100 tokens: 0.12s
+```
+
+100 calls of 0.1 s ran in three waves (40 + 40 + 20). With a sync app under load, request 41 queues even though the CPU is idle. You can raise the limit in the lifespan (`anyio.to_thread.current_default_thread_limiter().total_tokens = 100`), but more threads mean more memory and, on a GIL build, more contention. The better fix for I/O-heavy endpoints is an async driver.
+
+### 3. Creating clients per request
+
+An HTTP client owns a **connection pool**. Creating one per request throws away the pool, so every call pays for a new TCP connection (and with HTTPS, a TLS handshake, which is often 50 to 150 ms to a remote API).
+
+```python
+import asyncio, time
+import httpx
+
+URL = "http://127.0.0.1:8770/hello"
+N = 200
+
+
+async def per_request():
+    for _ in range(N):
+        async with httpx.AsyncClient() as client:      # new pool, new TCP connection
+            await client.get(URL)
+
+
+async def shared(client: httpx.AsyncClient):
+    for _ in range(N):
+        await client.get(URL)                          # reuses a keep-alive connection
+
+
+async def main():
+    start = time.perf_counter()
+    await per_request()
+    t1 = time.perf_counter() - start
+
+    async with httpx.AsyncClient() as client:
+        start = time.perf_counter()
+        await shared(client)
+        t2 = time.perf_counter() - start
+
+    print(f"new client per request: {t1:.2f}s  ({t1 / N * 1000:.1f} ms/call)")
+    print(f"one shared client:      {t2:.2f}s  ({t2 / N * 1000:.1f} ms/call)")
+
+asyncio.run(main())
+```
+
+```text title="Output"
+new client per request: 2.61s  (13.0 ms/call)
+one shared client:      0.17s  (0.9 ms/call)
+```
+
+About **15x** slower per call, on localhost, without TLS. Against a real HTTPS API the gap is bigger. The same applies to Redis clients, DB engines, LLM SDK clients (`AsyncOpenAI()`, `AsyncAnthropic()`) and cloud SDK clients. Create them **once** in the lifespan, store them on `app.state`, and hand them out through a dependency (see [middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks)).
+
+### 4. A connection pool that's too small (or held too long)
+
+A DB pool has a fixed number of connections. A request that can't get one **waits**, and after `pool_timeout` it fails. Twenty concurrent "requests", each holding a connection for 0.2 s:
+
+```python
+import asyncio, time
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+
+async def handler(engine):
+    async with engine.connect() as conn:          # check out a pooled connection
+        await conn.execute(text("SELECT 1"))
+        await asyncio.sleep(0.2)                  # a slow query, or an API call made while holding it
+
+
+async def run(pool_size, timeout=30):
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///pool_demo.db",
+        pool_size=pool_size, max_overflow=0, pool_timeout=timeout,
+    )
+    start = time.perf_counter()
+    results = await asyncio.gather(*(handler(engine) for _ in range(20)), return_exceptions=True)
+    errors = [r for r in results if isinstance(r, Exception)]
+    print(f"{type(engine.pool).__name__} size={pool_size} timeout={timeout}: "
+          f"20 requests in {time.perf_counter() - start:.2f}s, {len(errors)} errors")
+    if errors:
+        print("  ", type(errors[0]).__module__, str(errors[0]).split(" (Background")[0])
+    await engine.dispose()
+
+
+async def main():
+    await run(pool_size=20)
+    await run(pool_size=2)
+    await run(pool_size=2, timeout=1)
+
+asyncio.run(main())
+```
+
+```text title="Output"
+AsyncAdaptedQueuePool size=20 timeout=30: 20 requests in 0.22s, 0 errors
+AsyncAdaptedQueuePool size=2 timeout=30: 20 requests in 2.13s, 0 errors
+AsyncAdaptedQueuePool size=2 timeout=1: 20 requests in 1.08s, 10 errors
+   sqlalchemy.exc QueuePool limit of size 2 overflow 0 reached, connection timed out, timeout 1.00
+```
+
+With two connections, the 20 requests queue in ten waves (2 s instead of 0.2 s). With a 1-second timeout, half of them fail. In production this looks like sudden 500s under load with `QueuePool limit ... reached` in the logs, while the database itself is mostly idle.
+
+Sizing rules of thumb:
+
+- **Total connections** = workers x replicas x (`pool_size` + `max_overflow`). It must stay under the database's `max_connections` (Postgres defaults to 100). Ten pods with four workers and a pool of 10 is already 400. That's why large deployments put **PgBouncer** in front of Postgres.
+- **Don't hold a connection while waiting on something else.** The `asyncio.sleep(0.2)` above stands for a common bug: calling an LLM API or another service inside an open transaction. Finish the DB work, release the connection, then make the slow call.
+- Set `pool_pre_ping=True` (or `pool_recycle`) so connections killed by a firewall or failover are detected instead of failing the next request.
+
+### 5. Others worth knowing
+
+- **Sync database drivers in async apps** (`psycopg2`, `pymysql` with a sync `Session` inside `async def`) are case 1 in disguise. Use `asyncpg`/`psycopg` async, or make the endpoints `def`.
+- **N+1 queries**: loading 100 orders and then each order's items separately. Use `selectinload`/`joinedload` (see [databases with SQLAlchemy](/docs/fastapi/databases-with-sqlalchemy)).
+- **Huge responses**: paginate, or stream (see [WebSockets and streaming](/docs/fastapi/websockets-and-streaming)).
+- **Heavy middleware**: `BaseHTTPMiddleware`-style middleware adds overhead per request, and anything that reads the full body breaks streaming. Write pure ASGI middleware for hot paths.
+- **Logging at DEBUG in production**, especially logging full request and response bodies.
+- **No timeouts on outgoing calls**: one slow upstream ties up connections, threads and pool slots until everything stalls. Every external call needs a timeout.
+
+## Quick benchmarking
+
+A benchmark answers one question: "at what load does latency degrade, and what runs out first?" A minimal workflow:
+
+1. Run the app the way production does: `uvicorn app.main:app --workers N --no-access-log`, not `fastapi dev` (reload and debug logging distort the numbers).
+2. Generate load from a **different machine or at least different cores**. A load generator competing for the same CPU measures itself. (The Python client used above with 20 concurrent requests is fine for showing ratios, but at higher concurrency it became the bottleneck.)
+3. Use a proper tool and look at **latency percentiles**, not only requests per second:
+
+```bash
+# oha (Rust): 30 s at 100 concurrent connections, latency histogram included
+oha -z 30s -c 100 http://127.0.0.1:8000/items/1
+
+# wrk: 4 threads, 100 connections, 30 s, print latency distribution
+wrk -t4 -c100 -d30s --latency http://127.0.0.1:8000/items/1
+
+# locust: scripted user flows in Python, with a web UI
+locust -f locustfile.py --host http://127.0.0.1:8000
+```
+
+4. While it runs, watch CPU per worker, event-loop lag, DB pool usage and the DB's own CPU. The resource that hits its limit first is your bottleneck.
+5. Profile the hot endpoint (`py-spy record -o profile.svg --pid <worker pid>` gives a flame graph of a running worker without restarting it).
+
+Benchmark the endpoints that matter (the ones with DB and upstream calls), not `/hello`. A hello-world benchmark tells you about uvicorn, not about your app.
+
+## Observability hooks
+
+When something is slow in production, you need three kinds of signals (see [logging, monitoring and observability](/docs/backend-first-principles/18-logging-monitoring-observability)): **logs** (what happened), **metrics** (how much, how often, how fast) and **traces** (where the time went within one request).
+
+### Structured logging with a request ID
+
+Logs are only useful if you can filter them. Emit JSON, one object per line, and put a **request ID** on every line logged during a request. A `ContextVar` carries the ID through every `await` without passing it around:
+
+```python
+import json, logging, sys, time, uuid
+from contextvars import ContextVar
+
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
+request_id: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "ts": round(record.created, 3),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "request_id": request_id.get(),
+        }
+        entry.update(getattr(record, "fields", {}))
+        return json.dumps(entry)
+
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
+logging.getLogger("httpx2").setLevel(logging.WARNING)   # quiet the test client
+log = logging.getLogger("shop")
+
+app = FastAPI()
+
+
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    token = request_id.set(rid)                  # visible to every log call in this request
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        log.info("request finished", extra={"fields": {
+            "method": request.method, "path": request.url.path,
+            "status": response.status_code,
+            "duration_ms": round((time.perf_counter() - start) * 1000, 2)}})
+        response.headers["x-request-id"] = rid
+        return response
+    finally:
+        request_id.reset(token)
+
+
+@app.post("/orders")
+async def create_order():
+    log.info("charging card", extra={"fields": {"amount_cents": 4200}})
+    return {"order_id": 17}
+
+
+with TestClient(app) as c:
+    r = c.post("/orders", headers={"x-request-id": "req-abc123"})
+    print("response header:", r.headers["x-request-id"])
+```
+
+```text title="Output"
+{"ts": 1791891533.001, "level": "INFO", "logger": "shop", "msg": "charging card", "request_id": "req-abc123", "amount_cents": 4200}
+{"ts": 1791891533.002, "level": "INFO", "logger": "shop", "msg": "request finished", "request_id": "req-abc123", "method": "POST", "path": "/orders", "status": 200, "duration_ms": 1.61}
+response header: req-abc123
+```
+
+The log line from inside the endpoint carries the request ID even though nothing passed it there. Reusing an incoming `X-Request-ID` (set by the proxy or the calling service) lets you follow one request across services, and returning it in the response lets a user quote it in a bug report. Libraries like `structlog` give you the same with less code. Never log secrets, tokens or full request bodies.
+
+### OpenTelemetry: FastAPI's native support
+
+FastAPI 0.143 has **built-in OpenTelemetry instrumentation**. Pass providers (or let it use the globally configured ones) and every request produces a server span with child spans for dependency resolution, the endpoint and serialization, plus standard HTTP metrics:
+
+```python
+from typing import Annotated
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+spans = InMemorySpanExporter()
+tracer_provider = TracerProvider()
+tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+reader = InMemoryMetricReader()
+meter_provider = MeterProvider(metric_readers=[reader])
+
+app = FastAPI(telemetry={"tracer_provider": tracer_provider, "meter_provider": meter_provider})
+
+
+async def get_db():
+    yield "db-session"
+
+
+@app.get("/items/{item_id}")
+async def read_item(item_id: int, db: Annotated[str, Depends(get_db)]):
+    return {"id": item_id}
+
+
+with TestClient(app) as c:
+    c.get("/items/1")
+    c.get("/items/2")
+    c.get("/items/oops")
+
+for s in spans.get_finished_spans()[:4]:
+    attrs = {k: v for k, v in s.attributes.items() if k in ("http.route", "http.response.status_code")}
+    parent = s.parent.span_id if s.parent else None
+    print(f"{s.name:<40} parent={'yes' if parent else 'no ':<3} {attrs}")
+
+for rm in reader.get_metrics_data().resource_metrics:
+    for sm in rm.scope_metrics:
+        for m in sm.metrics:
+            for dp in m.data.data_points:
+                a = dict(dp.attributes)
+                print(m.name, m.unit, a.get("http.route"), a.get("http.response.status_code"), "count=", getattr(dp, "count", None))
+```
+
+```text title="Output"
+fastapi.dependencies                     parent=yes {}
+fastapi.endpoint                         parent=yes {}
+fastapi.serialization                    parent=yes {}
+GET /items/{item_id}                     parent=no  {'http.route': '/items/{item_id}', 'http.response.status_code': 200}
+http.server.active_requests {request} None None count= None
+http.server.request.duration s /items/{item_id} 200 count= 2
+http.server.request.duration s /items/{item_id} 422 count= 1
+```
+
+The first request produced four spans: a root `GET /items/{item_id}` span and three children showing how long dependency resolution, the endpoint and serialization took. The metrics use the OpenTelemetry semantic conventions: `http.server.request.duration` is a histogram labelled by **route template** (`/items/{item_id}`, not `/items/1`, so the number of series stays bounded) and status code, which is exactly what you need for latency percentiles and error rates per endpoint.
+
+In production you don't use in-memory exporters. Install `fastapi[standard]` (which brings the SDK and OTLP exporters) and configure with environment variables:
+
+```bash
+FASTAPI_OTEL_AUTO_CONFIGURE=true
+OTEL_SERVICE_NAME=shop-api
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+```
+
+The data goes to an OpenTelemetry Collector, and from there to Jaeger, Tempo, Honeycomb, Datadog or whichever backend you use. To trace **into** your dependencies (SQL queries, outgoing httpx calls, Redis), add the matching instrumentation packages (`opentelemetry-instrumentation-sqlalchemy`, `-httpx`, `-redis`). The trace then shows the full waterfall of one slow request. On older FastAPI versions, the `opentelemetry-instrumentation-fastapi` package provides the server spans instead.
+
+### Prometheus metrics
+
+If your monitoring is Prometheus-based, there are two routes. Export the OpenTelemetry metrics above through the Collector's Prometheus exporter, or expose a `/metrics` endpoint directly with `prometheus_client` (not installed in this test environment, so this sketch wasn't run):
+
+```python
+from prometheus_client import Counter, Histogram, make_asgi_app
+
+REQUESTS = Counter("http_requests_total", "Requests", ["method", "route", "status"])
+LATENCY = Histogram("http_request_duration_seconds", "Latency", ["method", "route"])
+
+app.mount("/metrics", make_asgi_app())
+
+@app.middleware("http")
+async def prometheus_middleware(request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    template = route.path if route else "unmatched"     # never label by raw path
+    LATENCY.labels(request.method, template).observe(time.perf_counter() - start)
+    REQUESTS.labels(request.method, template, response.status_code).inc()
+    return response
+```
+
+Two traps specific to metrics: label by the **route template**, never by the raw path (user IDs in labels create millions of series and take down Prometheus), and with several workers each process has its own counters, so use `prometheus_client`'s multiprocess mode or OTLP push.
+
+<Callout type="warn" title="Route templates in FastAPI 0.143">
+Hand-rolled middleware like the sketch above reads `request.scope["route"].path`. In FastAPI 0.143 that path does **not** include a prefix added by `include_router(..., prefix=...)`: for a request to `/api/v1/users/5`, with `/api/v1` given at include time, it was `/users/{uid}`. The native telemetry computes the full template itself (its span was `GET /api/v1/users/{uid}` with `http.route` = `/api/v1/users/{uid}`). Prefer the native metrics, or keep prefixes on the `APIRouter` itself.
+</Callout>
+
+The four numbers to alert on for an API (the "golden signals"): request rate, error rate, latency percentiles (p50, p95, p99) and saturation (CPU, pool usage, event-loop lag).
+
+## Free-threaded Python 3.14
+
+Python 3.14 officially supports a **free-threaded build** (`python3.14t`), where the GIL is disabled and threads run Python code on several cores in parallel. The interpreter used for this whole chapter is one:
+
+```python
+import sys, sysconfig
+print(sys.version)
+print("GIL enabled:", sys._is_gil_enabled())
+print("Py_GIL_DISABLED:", sysconfig.get_config_var("Py_GIL_DISABLED"))
+```
+
+```text title="Output"
+3.14.6 free-threading build (main, Jul 23 2026, 14:45:40) [MSC v.1944 64 bit (AMD64)]
+GIL enabled: False
+Py_GIL_DISABLED: 1
+```
+
+What it means for FastAPI: **sync endpoints run in the threadpool**, so on a free-threaded build, CPU-bound `def` endpoints can actually use several cores inside one worker. Four CPU-bound calls through `run_in_threadpool`, with the GIL off and then forced back on with `PYTHON_GIL=1`:
+
+```text title="Output"
+GIL enabled: False | CPUs: 16
+1 call: 0.13s   4 calls in the threadpool: 0.19s   serial would be 0.52s
+GIL enabled: True | CPUs: 16
+1 call: 0.15s   4 calls in the threadpool: 0.67s   serial would be 0.60s
+```
+
+With the GIL, four threads take as long as running the calls one after another. Without it, they overlap. The caveats are real, though:
+
+- Single-threaded code is somewhat slower on the free-threaded build, and every C extension in your dependency tree must support it (otherwise the GIL is re-enabled at import, with a warning).
+- The **event loop is still one thread**. Free-threading doesn't make blocking calls inside `async def` acceptable.
+- Thread-safety bugs that the GIL used to hide (unsynchronised shared dicts, lazy globals) can now surface.
+
+For most I/O-bound APIs, multiple workers on the standard build remain the safe default. Free-threading is worth evaluating if you have CPU-heavy sync endpoints and want to avoid multiplying memory across processes. See [concurrency models and the GIL](/docs/python/concurrency-models-and-the-gil).
+
+## Traps
+
+- **Binding to `127.0.0.1` in a container**: the app runs but nothing can reach it. Use `0.0.0.0` (`fastapi run` does by default).
+- **Shell-form `CMD`** in the Dockerfile: `SIGTERM` goes to `/bin/sh`, not uvicorn, so there's no graceful shutdown.
+- **Running as root** in the container. Create and switch to a non-root user.
+- **`--forwarded-allow-ips "*"`** on an instance that clients can reach directly lets them forge their IP.
+- **Missing `root_path`** behind a prefix-stripping proxy: `/docs` loads the wrong `openapi.json` and redirects lose the prefix.
+- **Checking the DB in liveness probes**: a DB blip restarts every replica.
+- **Grace periods out of order**: the app's shutdown timeout must be shorter than the orchestrator's, and the load balancer needs a moment to drain.
+- **Too many workers** (`2 x cores + 1` is a sync-WSGI formula) wastes memory, and every worker multiplies DB connections.
+- **Blocking in `async def`**: all requests in the worker wait. 20 requests took 2.04 s instead of 0.13 s above.
+- **The 40-thread default** caps sync endpoints and dependencies.
+- **A new HTTP or SDK client per request**: 15x slower per call above, plus TLS handshakes in real life.
+- **Pool too small, or a connection held across slow calls**: queueing, then `QueuePool limit ... reached` errors.
+- **No return type**: you serialize through the slow `jsonable_encoder` path. Declare return types. `ORJSONResponse` is deprecated.
+- **Metrics labelled by raw path**: unbounded cardinality.
+- **Benchmarking `/hello` from the same machine**: you measure the load generator.
+
+## Key points
+
+- A worker is one process with one event loop and a threadpool. Scale across cores with more workers (or replicas). Each worker runs its own lifespan and has its own memory.
+- `fastapi run` is uvicorn with production defaults. In containers, prefer one worker per container and scale replicas. On VMs, use about one worker per core.
+- Build images in two stages with `uv sync --locked`, run as a non-root user, and use exec-form `CMD` so signals reach uvicorn.
+- Behind a proxy, enable proxy headers for trusted proxy IPs only, and set `root_path` when the proxy strips a prefix.
+- Liveness checks the process, readiness checks dependencies and draining.
+- Graceful shutdown: stop accepting, finish in-flight work within a timeout, run the lifespan shutdown. Long-lived streams and background work need extra care.
+- Declare return types: Pydantic serializes in Rust, about 9x faster than the untyped path here.
+- The usual killers are blocking the loop, the 40-thread pool, per-request clients, and undersized or misused connection pools.
+- Observe with structured JSON logs carrying a request ID, FastAPI's native OpenTelemetry spans and metrics, and per-route latency histograms.
+- Free-threaded 3.14 lets sync endpoints use several cores in one process, but the event loop is still single-threaded.

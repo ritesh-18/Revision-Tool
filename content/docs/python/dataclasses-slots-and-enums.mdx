@@ -1,0 +1,842 @@
+---
+title: "Dataclasses, __slots__ and Enums"
+description: "How @dataclass generates code for you, how __slots__ shrinks objects by replacing the instance dict with descriptors, and how Python enums work as singleton members of a class."
+---
+
+Three tools you will use in almost every Python backend: `@dataclass` for record-like classes, `__slots__` for lean objects, and `enum` for closed sets of values. All three are "just" ordinary Python features (a class decorator, a class attribute, a metaclass), and knowing how they work underneath explains every trap they have.
+
+<Callout type="info">
+  Every snippet on this page was run on **CPython 3.14.6** (64-bit, Windows). Memory numbers are from that build and will differ a little on other versions.
+</Callout>
+
+## `@dataclass`: a code generator, not a new kind of class
+
+### What it is
+
+`@dataclass` is a **class decorator**. It reads the class's type annotations, builds a list of fields, then **writes Python source code** for methods like `__init__`, `__repr__` and `__eq__`, compiles it with `exec`, and attaches the resulting functions to your class. The result is a completely normal class. There is no special base class and no runtime magic left behind.
+
+```python
+from dataclasses import dataclass
+import inspect
+
+@dataclass
+class User:
+    id: int
+    name: str
+    active: bool = True
+
+u = User(1, "Ada")
+print(u)
+print(u == User(1, "Ada"))
+print(User.__hash__)
+print(inspect.signature(User.__init__))
+print([m for m in ("__init__", "__repr__", "__eq__") if m in User.__dict__])
+print(User.__dataclass_fields__.keys())
+print(User.__match_args__)
+```
+
+```text title="Output"
+User(id=1, name='Ada', active=True)
+True
+None
+(self, id: int, name: str, active: bool = True) -> None
+['__init__', '__repr__', '__eq__']
+dict_keys(['id', 'name', 'active'])
+('id', 'name', 'active')
+```
+
+Things to notice:
+
+- The generated `__init__` has a real signature, so editors, `inspect` and type checkers understand it.
+- `User.__hash__` is `None`. Because the class defines `__eq__`, it became **unhashable** by default (more on this below).
+- `__match_args__` is generated too, so `match u: case User(id, name, _):` works positionally.
+- The metadata lives in `__dataclass_fields__`; use `dataclasses.fields(cls)` to read it.
+
+### How it works underneath
+
+You can see the `exec` step in action: the generated `__init__` has no source file.
+
+```python
+from dataclasses import dataclass, field, asdict, astuple, fields
+
+@dataclass
+class Address:
+    city: str
+
+@dataclass
+class User:
+    id: int
+    name: str
+    address: Address
+    tags: list[str] = field(default_factory=list)
+
+u = User("not-an-int", 42, Address("Pune"))   # no runtime type checking
+print(u)
+print(asdict(u))
+print(astuple(u))
+print([(f.name, f.type) for f in fields(User)])
+print(User.__init__.__code__.co_filename)
+
+@dataclass
+class Counter:
+    total = 0          # no annotation -> plain class attribute, not a field
+    step: int = 1
+print(Counter(), Counter.total, [f.name for f in fields(Counter)])
+```
+
+```text title="Output"
+User(id='not-an-int', name=42, address=Address(city='Pune'), tags=[])
+{'id': 'not-an-int', 'name': 42, 'address': {'city': 'Pune'}, 'tags': []}
+('not-an-int', 42, ('Pune',), [])
+[('id', <class 'int'>), ('name', <class 'str'>), ('address', <class '__main__.Address'>), ('tags', list[str])]
+<string>
+Counter(step=1) 0 ['step']
+```
+
+The decorator does roughly this:
+
+1. Walk the class's MRO in reverse and collect fields from every dataclass base, then add the fields from this class's `__annotations__` **in definition order**. Names without an annotation are ignored (that is why `total` is not a field).
+2. For each field, find its default: either the plain class attribute value or a `field(...)` object.
+3. Build source text like `def __init__(self, id, name, address, tags=_HAS_DEFAULT_FACTORY): self.id = id ...`, then `exec` it. That is why `co_filename` is `<string>`.
+4. Set the new methods on the class, unless you already wrote one yourself (your own `__repr__` always wins over the generated one).
+
+Two important consequences:
+
+- **Annotations are not enforced.** `User("not-an-int", 42, ...)` is accepted. A dataclass is a typed *shape*, not a validator. For validation at the boundary, use Pydantic (see [Pydantic and runtime validation](/docs/python/pydantic-and-runtime-validation)).
+- **No runtime cost beyond a normal class.** The generated `__init__` is the same bytecode you would have written by hand.
+
+`asdict()` recurses into nested dataclasses, lists, tuples and dicts and **deep copies** values, so it is handy for JSON serialization but not free on big objects.
+
+<Callout title="Coming from JS">
+  The closest TypeScript idea is a class with parameter properties, `constructor(public id: number, public name: string)`, plus a hand-written `equals()` and `toString()`. TS types vanish at compile time; Python annotations stay at runtime (you can read them via `fields()`), but nothing checks them unless you add a library. Also, JS has no value equality for objects: `{a: 1} === {a: 1}` is `false`, while two equal dataclass instances compare `==` as `True`.
+</Callout>
+
+### `field()` and the mutable default trap
+
+In a plain function, `def f(x=[])` shares one list across all calls (see [functions and arguments](/docs/python/functions-and-arguments)). Dataclasses would have the same bug, because the default is evaluated once when the class body runs. So the decorator refuses obviously mutable defaults outright:
+
+```python
+from dataclasses import dataclass, field
+try:
+    @dataclass
+    class Bad:
+        tags: list = []
+except ValueError as e:
+    print("ValueError:", e)
+
+@dataclass
+class Good:
+    tags: list[str] = field(default_factory=list)
+    secret: str = field(default="x", repr=False, compare=False)
+
+a, b = Good(), Good()
+a.tags.append("py")
+print(a, b)
+print(Good(secret="a") == Good(secret="b"))
+```
+
+```text title="Output"
+ValueError: mutable default <class 'list'> for field tags is not allowed: use default_factory
+Good(tags=['py']) Good(tags=[])
+True
+```
+
+`default_factory` is called **once per instance** inside the generated `__init__`. Other useful `field()` options:
+
+| Option | Effect |
+|---|---|
+| `default_factory=list` | fresh value per instance |
+| `repr=False` | hide from `__repr__` (passwords, tokens, huge blobs) |
+| `compare=False` | ignore in `__eq__` and ordering |
+| `hash=False` | ignore in the generated `__hash__` |
+| `init=False` | not a constructor parameter (set it in `__post_init__`) |
+| `kw_only=True` | this one field must be passed by keyword |
+| `metadata={...}` | free-form dict for your own tooling |
+| `doc="..."` | docstring for the field (new in 3.14) |
+
+<Callout type="warn">
+  The check only catches `list`, `dict` and `set` (technically: any default whose type is unhashable). A default like `datetime.now()` is not mutable but is still evaluated **once at class definition**, so every instance gets the same timestamp. Use `field(default_factory=datetime.now)`.
+</Callout>
+
+### `eq`, `frozen` and hashing
+
+The hashing rules follow one principle: **objects that compare equal must have equal hashes, and a hash must never change while the object is in a dict or set.**
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class A:  x: int
+@dataclass(eq=False)
+class B:  x: int
+@dataclass(unsafe_hash=True)
+class C:  x: int
+
+print(A(1) == A(1), A.__hash__)
+print(B(1) == B(1), B.__hash__ is object.__hash__)
+print(C(1) == C(1), hash(C(1)) == hash(C(1)))
+```
+
+```text title="Output"
+True None
+False True
+True True
+```
+
+- Default (`eq=True`, `frozen=False`): value equality, `__hash__` set to `None`. A mutable object whose hash depends on its fields would get lost inside a dict after you mutate it, so Python makes it unhashable.
+- `eq=False`: keeps identity equality and `object.__hash__`. Each instance is unique, like a JS object.
+- `frozen=True` (with `eq=True`): fields cannot be reassigned, so a field-based `__hash__` is safe and is generated.
+- `unsafe_hash=True`: generates a hash anyway. The name is a warning; only use it if you promise not to mutate.
+
+```python
+from dataclasses import dataclass, FrozenInstanceError, replace
+
+@dataclass(frozen=True)
+class Money:
+    amount: int
+    currency: str = "USD"
+
+m = Money(100)
+try:
+    m.amount = 5
+except FrozenInstanceError as e:
+    print(type(e).__name__, e)
+print(hash(m) == hash(Money(100)))
+print({m: "ok"}[Money(100)])
+print(replace(m, amount=250))
+object.__setattr__(m, "amount", 1)   # the escape hatch frozen itself uses
+print(m)
+
+@dataclass(frozen=True)
+class Box:
+    items: list
+b = Box([1])
+b.items.append(2)
+print(b)
+try:
+    hash(b)
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+FrozenInstanceError cannot assign to field 'amount'
+True
+ok
+Money(amount=250, currency='USD')
+Money(amount=1, currency='USD')
+Box(items=[1, 2])
+TypeError: unhashable type: 'list'
+```
+
+How `frozen` works: the decorator adds a `__setattr__` and `__delattr__` that always raise. The generated `__init__` itself sets fields with `object.__setattr__(self, ...)` to get around its own guard. Three traps follow from this:
+
+1. **Frozen is shallow.** `Box.items` cannot be rebound, but the list inside can still be mutated. Use tuples or `frozenset` for real immutability.
+2. **A frozen instance is only hashable if all its fields are.** `Box` is frozen but `hash(b)` fails because of the list.
+3. **It is a convention, not a security boundary.** `object.__setattr__` bypasses it. If you need to set a derived field in `__post_init__` of a frozen class, that is exactly the tool to use.
+
+To "modify" a frozen instance, use `dataclasses.replace()` (or the new `copy.replace()` from 3.13), which builds a new instance through `__init__`, so `__post_init__` validation runs again.
+
+<Callout title="Coming from JS">
+  `frozen=True` is like `Object.freeze(this)` at the end of the constructor: also shallow, and also only about rebinding properties. `replace(m, amount=250)` is the dataclass version of `{ ...m, amount: 250 }`, except that it goes through the constructor, so validation runs again.
+</Callout>
+
+### `order=True`
+
+`order=True` generates `__lt__`, `__le__`, `__gt__` and `__ge__`. They compare instances **as tuples of their fields, in definition order**, skipping fields with `compare=False`:
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass(order=True)
+class Version:
+    major: int
+    minor: int
+    patch: int = 0
+    label: str = field(default="", compare=False)
+
+vs = [Version(1, 10), Version(1, 2, 5), Version(0, 9, label="beta")]
+print(sorted(vs))
+print(Version(1, 2) < Version(1, 10))
+
+@dataclass(order=True)
+class Task:
+    sort_index: int = field(init=False, repr=False)
+    priority: str
+    title: str
+    def __post_init__(self):
+        self.sort_index = {"high": 0, "med": 1, "low": 2}[self.priority]
+
+print(sorted([Task("low", "a"), Task("high", "b"), Task("med", "c")]))
+try:
+    Version(1, 0) < (1, 0, 0)
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+[Version(major=0, minor=9, patch=0, label='beta'), Version(major=1, minor=2, patch=5, label=''), Version(major=1, minor=10, patch=0, label='')]
+True
+[Task(priority='high', title='b'), Task(priority='med', title='c'), Task(priority='low', title='a')]
+TypeError: '<' not supported between instances of 'Version' and 'tuple'
+```
+
+Field order *is* the sort key, so reordering fields silently changes sorting. The `sort_index` trick (a computed first field with `init=False`) is the standard way to sort by something other than declaration order. Comparisons with other types return `NotImplemented`, which becomes a `TypeError`.
+
+### `__post_init__` and `InitVar`: validation and derived fields
+
+The generated `__init__` calls `self.__post_init__()` at the end if you define it. That is where you normalise data, validate invariants and compute fields with `init=False`. `InitVar[T]` declares a constructor argument that is passed to `__post_init__` but is **not** stored as a field:
+
+```python
+from dataclasses import dataclass, field, InitVar
+
+@dataclass
+class Account:
+    email: str
+    password: InitVar[str]
+    password_hash: str = field(init=False, repr=False)
+    def __post_init__(self, password):
+        if "@" not in self.email:
+            raise ValueError(f"bad email: {self.email!r}")
+        self.email = self.email.lower()
+        self.password_hash = f"hash({password})"
+
+a = Account("ADA@Example.com", "s3cret")
+print(a, a.password_hash)
+try:
+    Account("nope", "x")
+except ValueError as e:
+    print("ValueError:", e)
+```
+
+```text title="Output"
+Account(email='ada@example.com') hash(s3cret)
+ValueError: bad email: 'nope'
+```
+
+If you subclass a dataclass that has `__post_init__`, remember to call `super().__post_init__()` yourself; the decorator does not chain them.
+
+### `kw_only` and the inheritance-with-defaults trap
+
+Python function parameters cannot put a required parameter after one with a default. Dataclass inheritance hits this constantly, because a child's fields are appended **after** the parent's:
+
+```python
+from dataclasses import dataclass, field, KW_ONLY
+
+@dataclass
+class Base:
+    id: int
+    created_by: str = "system"
+
+try:
+    @dataclass
+    class Child(Base):
+        name: str
+except TypeError as e:
+    print("TypeError:", e)
+
+@dataclass(kw_only=True)
+class Base2:
+    id: int
+    created_by: str = "system"
+
+@dataclass
+class Child2(Base2):
+    name: str
+
+print(Child2("x", id=1))
+
+@dataclass
+class Req:
+    path: str
+    _: KW_ONLY
+    timeout: float = 5.0
+    retries: int = 3
+print(Req("/health", retries=1))
+try:
+    Req("/health", 1.0)
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+TypeError: non-default argument 'name' follows default argument 'created_by'
+Child2(id=1, created_by='system', name='x')
+Req(path='/health', timeout=5.0, retries=1)
+TypeError: Req.__init__() takes 2 positional arguments but 3 were given
+```
+
+Fixes, from best to worst:
+
+- `kw_only=True` on the base (or on the whole class). Keyword-only fields are moved to the end of the `__init__` signature, so ordering no longer matters. This is the modern answer (3.10+).
+- The `_: KW_ONLY` sentinel: every field after it is keyword-only. Great for "options" fields, and it makes call sites self-documenting: `Req("/health", timeout=1.0)`.
+- Give every child field a default (works but weakens the API).
+
+Making config-like dataclasses keyword-only is a good habit anyway: positional calls with five arguments are a bug waiting to happen when someone reorders the fields.
+
+### `slots=True`
+
+`@dataclass(slots=True)` (3.10+) generates `__slots__` from the fields. Because `__slots__` must exist **when the class is created**, the decorator cannot just add it; it builds and returns a **brand new class**.
+
+```python
+from dataclasses import dataclass
+
+@dataclass(slots=True)
+class Point:
+    x: float
+    y: float
+
+p = Point(1.0, 2.0)
+print(Point.__slots__)
+print(hasattr(p, "__dict__"))
+try:
+    p.z = 3.0
+except AttributeError as e:
+    print("AttributeError:", e)
+print(type(Point.__dict__["x"]))
+```
+
+```text title="Output"
+('x', 'y')
+False
+AttributeError: 'Point' object has no attribute 'z' and no __dict__ for setting new attributes
+<class 'member_descriptor'>
+```
+
+Traps with `slots=True`:
+
+- **Zero-argument `super()` used to break.** Methods compiled in the original class captured the *old* class in their `__class__` cell, so `super()` raised `TypeError` up to 3.13 (gh-90562). On 3.14 the decorator patches that cell and it works; on older versions use `super(Point, self)`.
+- Passing keyword arguments to a base class `__init_subclass__` is not supported with `slots=True` (gh-91126).
+- No `__weakref__` slot unless you also pass `weakref_slot=True` (3.11+).
+- Class decorators applied *before* `@dataclass` (written below it) or registries that stored the class during its body see the original class object, not the returned one.
+- Do not read `cls.__slots__` to list fields (inherited slots are excluded since 3.11); use `fields()`.
+
+## `__slots__`: replacing the instance dict
+
+### What it is
+
+By default every instance carries a `__dict__` for its attributes, which is what lets you add any attribute at any time. Declaring `__slots__ = ("x", "y")` tells the type: "instances of this class have exactly these attributes". CPython then reserves a fixed array of pointer slots inside the object itself and creates **no `__dict__`**.
+
+### How it works: slots are descriptors
+
+When `type.__new__` sees `__slots__`, it does two things:
+
+1. Grows the C struct for instances by one pointer per slot name (stored at a fixed offset).
+2. Puts a **`member_descriptor`** on the class for each name. That descriptor's `__get__` reads the pointer at its offset; `__set__` writes it; `__delete__` clears it.
+
+So `s.x = 42` is literally `type(s).__dict__["x"].__set__(s, 42)`. Because `member_descriptor` defines `__set__`, it is a **data descriptor** and wins every lookup (see [descriptors and metaclasses](/docs/python/descriptors-and-metaclasses)).
+
+```python
+import weakref
+
+class Slotted:
+    __slots__ = ("x", "y")
+
+print(Slotted.__dict__["x"])
+print(type(Slotted.x).__mro__)
+s = Slotted()
+try:
+    s.x
+except AttributeError as e:
+    print("AttributeError:", e)
+Slotted.x.__set__(s, 42)      # exactly what s.x = 42 does
+print(Slotted.x.__get__(s, Slotted))
+try:
+    weakref.ref(s)
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+<member 'x' of 'Slotted' objects>
+(<class 'member_descriptor'>, <class 'object'>)
+AttributeError: 'Slotted' object has no attribute 'x'
+42
+TypeError: cannot create weak reference to 'Slotted' object
+```
+
+An unset slot holds a C `NULL`, which is why reading it raises `AttributeError` rather than returning `None`.
+
+### Memory: real numbers
+
+`sys.getsizeof` is misleading here: it reports only the object's own struct, not the dict, and on recent CPython simply *reading* `p.__dict__` creates a dict that did not exist before. `tracemalloc` measures what is actually allocated:
+
+```python
+import sys, tracemalloc
+
+class Plain:
+    def __init__(self):
+        self.x = self.y = self.z = None
+
+class Slotted:
+    __slots__ = ("x", "y", "z")
+    def __init__(self):
+        self.x = self.y = self.z = None
+
+N = 100_000
+def per_instance(cls, touch_dict=False):
+    holder = [None] * N            # pre-allocate so the list is not counted
+    tracemalloc.start()
+    for i in range(N):
+        o = cls()
+        if touch_dict:
+            o.__dict__             # forces a real dict to be created
+        holder[i] = o
+    current, _ = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return current / N
+
+print(sys.version.split()[0])
+print("Plain               :", round(per_instance(Plain)), "bytes")
+print("Plain + __dict__ used:", round(per_instance(Plain, True)), "bytes")
+print("Slotted             :", round(per_instance(Slotted)), "bytes")
+```
+
+```text title="Output"
+3.14.6
+Plain               : 96 bytes
+Plain + __dict__ used: 160 bytes
+Slotted             : 56 bytes
+```
+
+For three attributes on 3.14: **56 bytes with slots versus 96 without, and 160 once anything touches `__dict__`** (e.g. `vars(obj)`, some serializers, `copy`). Older guides quote much bigger savings (often 3x or more). That was true before 3.11–3.13, when CPython started storing attributes in "inline values" right after the object and only creating a real dict on demand. Slots still win, but the gap is smaller than it used to be. With a million small objects (parsed rows, graph nodes, tokens) 40–100 bytes each is still 40–100 MB.
+
+Attribute **access speed** is now almost the same thanks to the specializing interpreter (3.11+):
+
+```text title="Output"
+p 27.1 ns per read
+s 26.0 ns per read
+```
+
+(5 million reads of `obj.x` with `timeit`, best of 5, 3.14.6.) Use slots for memory, not speed.
+
+### What you lose
+
+```python
+import weakref
+
+class Parent:            # no __slots__ -> instances get a __dict__
+    pass
+class Child(Parent):
+    __slots__ = ("a",)
+c = Child()
+c.anything = 1           # works: the parent brought a __dict__ along
+print(c.__dict__)
+
+class WithRef:
+    __slots__ = ("x", "__weakref__")
+print(weakref.ref(WithRef()) is not None)
+
+try:
+    class Conflict:
+        __slots__ = ("x",)
+        x = 10
+except ValueError as e:
+    print("ValueError:", e)
+
+class A:
+    __slots__ = ("a",)
+class B:
+    __slots__ = ("b",)
+try:
+    class AB(A, B):
+        pass
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+{'anything': 1}
+True
+ValueError: 'x' in __slots__ conflicts with class variable
+TypeError: multiple bases have instance lay-out conflict
+```
+
+- **No dynamic attributes.** Monkey-patching an instance or adding ad-hoc fields fails.
+- **Slots only help if every class in the MRO uses them.** One base without `__slots__` adds a `__dict__` back. Subclasses must declare `__slots__ = ()` (or their new names) too.
+- **No weak references** unless you include `"__weakref__"`.
+- **No class-level defaults for slot names**, because the class attribute would overwrite the descriptor. Set defaults in `__init__` (dataclass `slots=True` handles this for you).
+- **Multiple inheritance:** two bases that both have non-empty slots cannot be combined (their C layouts collide). Keep mixins slot-free with `__slots__ = ()`.
+- **`functools.cached_property` does not work**, because it stores into `__dict__`.
+
+Use `__slots__` for classes with many instances and a fixed shape. Skip it for services, controllers and other classes you have a handful of.
+
+<Callout title="Coming from JS">
+  V8 already does something similar for you automatically: objects created by the same constructor share a "hidden class" (shape) and store properties in fixed offsets. Adding properties later causes a shape transition. Python makes this an explicit opt-in: `__slots__` is like promising the engine the shape will never change, and in exchange Python can drop the per-object dictionary. `Object.seal()` is the closest semantic match (no new properties, existing ones writable).
+</Callout>
+
+## `enum`: closed sets of named values
+
+### What it is
+
+An enum is a class whose members are **the only instances that will ever exist**. `Status.ACTIVE` is an object of type `Status`, created once when the class is defined.
+
+```python
+from enum import Enum
+
+class Status(Enum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    BANNED = "banned"
+
+print(Status.ACTIVE, repr(Status.ACTIVE))
+print(Status.ACTIVE.name, Status.ACTIVE.value)
+print(Status("banned"), Status["PENDING"])
+print(Status("active") is Status.ACTIVE)
+print(Status.ACTIVE == "active")
+print(list(Status))
+print(len(Status), "active" in Status, Status.ACTIVE in Status)
+print(type(Status.ACTIVE), isinstance(Status.ACTIVE, Status))
+try:
+    Status("deleted")
+except ValueError as e:
+    print("ValueError:", e)
+try:
+    Status.ACTIVE = "x"
+except AttributeError as e:
+    print("AttributeError:", e)
+try:
+    Status()
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+Status.ACTIVE <Status.ACTIVE: 'active'>
+ACTIVE active
+Status.BANNED Status.PENDING
+True
+False
+[<Status.PENDING: 'pending'>, <Status.ACTIVE: 'active'>, <Status.BANNED: 'banned'>]
+3 True True
+<enum 'Status'> True
+ValueError: 'deleted' is not a valid Status
+AttributeError: cannot reassign member 'ACTIVE'
+TypeError: EnumType.__call__() missing 1 required positional argument: 'value'
+```
+
+### How it works underneath
+
+`Enum`'s metaclass is `EnumType` (also known as `EnumMeta`). That metaclass is what makes the class behave so differently:
+
+- `__prepare__` returns a special namespace that records member names in order and rejects duplicate names.
+- After the body runs, `EnumType.__new__` turns each `NAME = value` into a **single instance** of the class and stores them in `_member_map_` (name to member) and `_value2member_map_` (value to member, for fast lookup).
+- `EnumType.__call__` is overridden, so `Status("active")` is a **lookup by value**, not construction. That is why it returns the existing object and why `Status()` with no value fails.
+- `EnumType` also defines `__iter__`, `__len__`, `__contains__` and `__getitem__`, which is why you can loop over the *class* and write `Status["PENDING"]`.
+
+Because members are singletons, `is` comparison is correct and fast, and they survive `copy.deepcopy` and `pickle` as the same object (pickling stores the class and member name). `"active" in Status` checks values (supported since 3.12).
+
+Notice `Status.ACTIVE == "active"` is **`False`**. A plain `Enum` member is not its value. This is deliberate type safety, and it is the most common enum surprise.
+
+### `IntEnum`, `StrEnum`, `auto`
+
+```python
+from enum import Enum, IntEnum, StrEnum, Flag, auto, unique
+import json
+
+class Role(StrEnum):
+    ADMIN = auto()
+    VIEWER = auto()
+
+print(Role.ADMIN, repr(Role.ADMIN), Role.ADMIN == "admin")
+print(f"role={Role.VIEWER}", Role.ADMIN.upper())
+print(json.dumps({"role": Role.ADMIN}))
+
+class HttpStatus(IntEnum):
+    OK = 200
+    NOT_FOUND = 404
+print(HttpStatus.OK == 200, HttpStatus.NOT_FOUND + 1, sorted([404, HttpStatus.OK]))
+
+class Color(Enum):
+    RED = auto()
+    GREEN = auto()
+print([c.value for c in Color])
+try:
+    json.dumps({"c": Color.RED})
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+admin <Role.ADMIN: 'admin'> True
+role=viewer ADMIN
+{"role": "admin"}
+True 405 [<HttpStatus.OK: 200>, 404]
+[1, 2]
+TypeError: Object of type Color is not JSON serializable
+```
+
+- **`StrEnum`** (3.11+): members are real `str` subclasses. They compare equal to strings, format as their value, and `json.dumps` handles them. `auto()` produces the lower-cased member name. This is usually what you want for API and database values.
+- **`IntEnum`**: members are real ints. Good for interop with C-style codes, but arithmetic quietly leaks out of the enum (`NOT_FOUND + 1` is just `405`).
+- **`auto()`** asks the class's `_generate_next_value_` for a value: 1, 2, 3 for `Enum`, the lowercase name for `StrEnum`, powers of two for `Flag`.
+- **Plain `Enum`** members are not JSON serializable; you serialize `.value` explicitly. That friction is the price of strictness.
+
+### `Flag`: combinable bit sets
+
+```python
+class Perm(Flag):
+    READ = auto()
+    WRITE = auto()
+    EXEC = auto()
+    RW = READ | WRITE
+
+p = Perm.READ | Perm.WRITE
+print(p, p.value, Perm.WRITE in p, Perm.EXEC in p)
+print(list(p), list(Perm))
+print(p is Perm.RW, bool(Perm(0)))
+```
+
+```text title="Output"
+Perm.RW 3 True False
+[<Perm.READ: 1>, <Perm.WRITE: 2>] [<Perm.READ: 1>, <Perm.WRITE: 2>, <Perm.EXEC: 4>]
+True False
+```
+
+Since 3.11, iterating a flag yields only its single-bit "canonical" members, and multi-bit aliases like `RW` are skipped when listing the class. Use `Flag` for permission sets and feature toggles stored in one integer column.
+
+### Aliases and `@unique`
+
+```python
+class Shape(Enum):
+    SQUARE = 1
+    QUAD = 1        # alias, not a new member
+print(list(Shape), Shape.QUAD is Shape.SQUARE, list(Shape.__members__))
+try:
+    @unique
+    class S2(Enum):
+        A = 1
+        B = 1
+except ValueError as e:
+    print("ValueError:", e)
+```
+
+```text title="Output"
+[<Shape.SQUARE: 1>] True ['SQUARE', 'QUAD']
+ValueError: duplicate values found in <enum 'S2'>: B -> A
+```
+
+A repeated value creates an **alias**, silently. Iteration skips aliases; `__members__` includes them. Put `@unique` on enums that map to database values so a copy-paste typo fails at import time.
+
+### Enums in a backend: behaviour on the members
+
+Enum members can carry methods and properties, which keeps state-machine rules next to the states:
+
+```python
+import copy, pickle
+from enum import StrEnum
+
+class OrderState(StrEnum):
+    DRAFT = "draft"
+    PAID = "paid"
+    SHIPPED = "shipped"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {OrderState.SHIPPED, OrderState.CANCELLED}
+
+    def can_move_to(self, nxt: "OrderState") -> bool:
+        return nxt in _TRANSITIONS[self]
+
+_TRANSITIONS = {
+    OrderState.DRAFT: {OrderState.PAID, OrderState.CANCELLED},
+    OrderState.PAID: {OrderState.SHIPPED, OrderState.CANCELLED},
+    OrderState.SHIPPED: set(),
+    OrderState.CANCELLED: set(),
+}
+
+s = OrderState("paid")             # parse from a request body / DB column
+print(s.is_terminal, s.can_move_to(OrderState.DRAFT), s.can_move_to(OrderState.SHIPPED))
+match s:
+    case OrderState.PAID:
+        print("ready to ship")
+    case _:
+        print("other")
+print(copy.deepcopy(s) is s, pickle.loads(pickle.dumps(s)) is s)
+```
+
+```text title="Output"
+False False True
+ready to ship
+True True
+```
+
+Practical guidance for APIs:
+
+- Parse at the edge with `OrderState(raw)` and catch `ValueError` to return a 422/400. Inside the app, pass the enum, never the raw string.
+- Prefer `StrEnum` for anything that crosses JSON or SQL; values stay readable in logs and the database.
+- Pydantic and FastAPI understand enums directly: a field typed `OrderState` validates input and documents the allowed values in OpenAPI.
+- Dotted names in `match` (`case OrderState.PAID`) are value patterns; a bare name like `case PAID` would be a capture pattern that matches anything.
+- Never persist the member **name** if you might rename it; persist the value.
+
+<Callout title="Coming from JS">
+  A TypeScript numeric `enum` compiles to a plain object with reverse mappings (`Dir[0] === "Up"`), and any number is assignable to it. A string enum compiles to a plain object of strings. A Python enum is a **real class with singleton instances**: you can `isinstance` check it, iterate it, attach methods, and invalid values raise at runtime. The TS idiom `type Role = "admin" | "viewer"` (a union of literals) corresponds to `Literal["admin", "viewer"]` in Python typing; `StrEnum` is the runtime-checked version that also gives you a namespace.
+</Callout>
+
+## Choosing a record type
+
+```python
+from typing import NamedTuple, TypedDict, NotRequired
+
+class PointNT(NamedTuple):
+    x: int
+    y: int = 0
+
+p = PointNT(1)
+x, y = p
+print(p, p[0], p == (1, 0), p._replace(y=5), p._asdict())
+
+class UserDict(TypedDict):
+    id: int
+    name: str
+    email: NotRequired[str]
+
+u: UserDict = {"id": 1, "name": "Ada"}
+print(type(u), u)
+bad: UserDict = {"id": "oops", "name": 3}   # type checker error, runtime silence
+print(bad)
+```
+
+```text title="Output"
+PointNT(x=1, y=0) 1 True PointNT(x=1, y=5) {'x': 1, 'y': 0}
+<class 'dict'> {'id': 1, 'name': 'Ada'}
+{'id': 'oops', 'name': 3}
+```
+
+| Tool | Runtime object | Mutable | Validates at runtime | Best for |
+|---|---|---|---|---|
+| `@dataclass` | your own class | yes (or `frozen`) | no | internal domain objects, DTOs between layers |
+| `NamedTuple` | a `tuple` subclass | no | no | small immutable records, unpacking, returning multiple values |
+| `TypedDict` | a plain `dict` | yes | no (static only) | typing JSON-shaped dicts you do not control, `**kwargs` |
+| attrs | your own class | yes (or frozen) | optional validators | what dataclasses grew out of; more features (validators, converters) |
+| Pydantic `BaseModel` | your own class | yes (configurable) | yes, with coercion | request/response bodies, settings, LLM structured output |
+
+Notes on the choices:
+
+- `NamedTuple` instances **are tuples**: `p == (1, 0)` is `True`, they index and unpack, and they cannot have fields added. That tuple equality is sometimes a bug (a `Point` equals a `Size` with the same numbers).
+- `TypedDict` is purely for the type checker; at runtime it is an ordinary `dict`. It is the right tool for describing a third-party JSON payload without copying it into objects.
+- **attrs** (`@define`) predates dataclasses and inspired them. It adds validators, converters and slots-by-default. Pick it if you want dataclass ergonomics plus light validation without Pydantic.
+- **Pydantic** parses and validates untrusted input. It is heavier per instance but is the standard at API boundaries. See [Pydantic and runtime validation](/docs/python/pydantic-and-runtime-validation).
+
+A common backend split: Pydantic models at the HTTP edge, frozen slotted dataclasses for domain objects inside, `TypedDict` for loosely-typed external JSON. For how these types interact with generics and static checkers, see [advanced typing](/docs/python/advanced-typing).
+
+## Interview questions
+
+1. **What does `@dataclass` actually do?** **It reads the class annotations, generates source code for `__init__`, `__repr__`, `__eq__` (and optionally ordering, hash, slots), `exec`s it and attaches the methods. The result is an ordinary class with no runtime type checking.**
+2. **Why is a default dataclass unhashable?** **Because `eq=True` defines value equality while the object stays mutable. A field-based hash could change after insertion into a dict or set, so `__hash__` is set to `None`. Use `frozen=True` (or `eq=False` for identity hashing).**
+3. **How do you give a dataclass field a list default?** **`field(default_factory=list)`. A bare `[]` raises `ValueError` because it would be shared by every instance.**
+4. **A child dataclass fails with "non-default argument follows default argument". Why and how do you fix it?** **Child fields are appended after the parent's, and the parent has defaults. Make the fields keyword-only with `kw_only=True` or the `KW_ONLY` sentinel.**
+5. **How are `__slots__` implemented?** **The type reserves fixed pointer slots inside each instance and puts a `member_descriptor` (a data descriptor) on the class per name. No per-instance `__dict__` is created.**
+6. **When does `__slots__` stop saving memory?** **When any class in the MRO lacks `__slots__`, which brings back `__dict__`. Also note that on 3.11+ the savings are smaller because ordinary objects store attributes inline until a dict is needed.**
+7. **Why is `Status.ACTIVE == "active"` false but `Role.ADMIN == "admin"` true?** **A plain `Enum` member is a distinct object, not its value. `StrEnum` members subclass `str`, so they compare and serialize as strings.**
+8. **How does `Status("active")` return an existing member instead of creating one?** **The metaclass `EnumType` overrides `__call__` to look the value up in `_value2member_map_`; members are created once at class definition and are singletons.**
+
+## Recap
+
+- `@dataclass` generates ordinary methods from annotations with `exec`. It does not validate types.
+- Use `field(default_factory=...)` for mutable or time-based defaults, `__post_init__` for normalisation and invariants, `InitVar` for constructor-only inputs.
+- `frozen=True` is shallow and enables hashing; `replace()` makes modified copies through `__init__`.
+- `order=True` compares field tuples in declaration order. `kw_only` fixes the inheritance-with-defaults error.
+- `__slots__` swaps the instance dict for fixed slots exposed through data descriptors. On 3.14 it saved 40 bytes per 3-attribute object (56 vs 96), more if the dict gets materialised. It costs dynamic attributes, weakrefs (unless requested) and mixin flexibility.
+- Enum members are singletons created by the `EnumType` metaclass. `Enum` is strict, `StrEnum` and `IntEnum` mix in the value type, `Flag` combines bits, `@unique` forbids aliases.
+- Pick dataclass for internal objects, `NamedTuple` for tuple-like records, `TypedDict` for typed dicts, Pydantic at untrusted boundaries.

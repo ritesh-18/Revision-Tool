@@ -1,0 +1,848 @@
+---
+title: "Streaming LLM responses"
+description: "Token streaming from the LLM to the browser: time-to-first-token, the SDK's streaming API as an async generator, FastAPI's native Server-Sent Events, event design, errors mid-stream, cancelling the upstream call when the client disconnects, keep-alive pings, proxy buffering, a fetch-based JS reader, and WebSocket chat."
+---
+
+A model generates its answer one token at a time. If your API waits for the last token before sending anything, the user stares at a spinner for the whole generation, often 5 to 30 seconds. If you **stream**, the first words appear in well under a second and the rest arrives as fast as the model writes it. Total time is the same. Perceived speed is completely different.
+
+This chapter builds a streaming chat endpoint step by step: from the SDK's stream, through an async generator, to Server-Sent Events in the browser, plus the parts that go wrong in production: errors after the response has started, clients that leave, proxies that buffer, and connections that go quiet. The transport theory (SSE vs WebSockets vs long polling) is in [real-time backends](/docs/backend-first-principles/26-real-time-backends), and FastAPI's general streaming machinery is in [WebSockets and streaming](/docs/fastapi/websockets-and-streaming). Here we apply them to LLMs.
+
+<Callout title="How the outputs on this page were produced">
+No paid API calls were made. Most demos use the `FakeLLM` from the [architecture chapter](/docs/fastapi/ai-backend-architecture#a-fake-that-behaves-like-the-real-thing), whose `stream()` sleeps between tokens like a real model. Timing demos ran against a **real Uvicorn server** on localhost, because `TestClient` collects a streamed body before you see it (see [Traps](#traps)). SDK behaviour was checked by running the real `AsyncAnthropic` client against a mock HTTP transport that emits Anthropic-format SSE.
+</Callout>
+
+## Why stream: time to first token
+
+Two endpoints, same fake model: 0.4 s before the first token, then 16 tokens at 0.1 s each.
+
+```python
+# chat_stream.py
+from typing import Annotated, AsyncIterator
+
+from fastapi import Depends, FastAPI, Request
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from pydantic import BaseModel, Field
+
+from llm import ChatMessage, FakeLLM, LLMClient, TextDelta, Usage
+
+app = FastAPI()
+app.state.llm = FakeLLM(
+    "Streaming lets the user read the first words while the model is still writing the rest.",
+    latency=0.4, token_delay=0.1,
+)
+
+
+def get_llm(request: Request) -> LLMClient:
+    return request.app.state.llm
+
+
+class ChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+
+
+@app.post("/chat/complete")
+async def chat_complete(body: ChatIn, llm: Annotated[LLMClient, Depends(get_llm)]):
+    out = await llm.complete([ChatMessage("user", body.message)])
+    return {"text": out.text}
+
+
+@app.post("/chat/stream", response_class=EventSourceResponse)
+async def chat_stream(
+    body: ChatIn, llm: Annotated[LLMClient, Depends(get_llm)]
+) -> AsyncIterator[ServerSentEvent]:
+    n = 0
+    try:
+        async for ev in llm.stream([ChatMessage("user", body.message)]):
+            if isinstance(ev, TextDelta):
+                n += 1
+                yield ServerSentEvent(event="token", id=str(n), data={"text": ev.text})
+            elif isinstance(ev, Usage):
+                yield ServerSentEvent(event="usage", data={"input_tokens": ev.input_tokens,
+                                                           "output_tokens": ev.output_tokens})
+    except Exception as exc:                       # the status line is already sent: report in-band
+        yield ServerSentEvent(event="error", data={"type": type(exc).__name__,
+                                                   "message": "The AI service failed mid-answer."})
+        return
+    yield ServerSentEvent(event="done", data={"tokens": n})
+```
+
+Measured against Uvicorn with `httpx`:
+
+```python
+import time, httpx
+
+with httpx.Client(base_url="http://127.0.0.1:8765", timeout=30) as client:
+    body = {"message": "Why stream?"}
+
+    start = time.perf_counter()
+    r = client.post("/chat/complete", json=body)
+    print(f"complete: first byte {time.perf_counter() - start:.2f}s, all done {time.perf_counter() - start:.2f}s")
+
+    start = time.perf_counter()
+    first = None
+    with client.stream("POST", "/chat/stream", json=body) as r:
+        for chunk in r.iter_text():
+            if first is None and "event: token" in chunk:
+                first = time.perf_counter() - start
+    print(f"stream:   first token {first:.2f}s, all done {time.perf_counter() - start:.2f}s")
+```
+
+```text title="Output (fake model, real Uvicorn server)"
+complete: first byte 2.05s, all done 2.05s
+stream:   first token 0.53s, all done 2.15s
+```
+
+Total time is nearly identical. Time to first token (TTFT) drops from 2 seconds to half a second, and with a real model and a long answer the gap is much bigger. TTFT is the latency number users actually feel, so it's the one to put on your dashboard for chat routes, next to total duration and tokens per second.
+
+Streaming has a second benefit for long outputs: the HTTP connection is never idle for minutes, so proxies are less likely to cut it. For the same reason the Anthropic SDK recommends streaming for any request with large `max_tokens`. It refuses non-streaming requests it estimates could run longer than about 10 minutes.
+
+## Server-Sent Events in one minute
+
+SSE is a plain HTTP response with `Content-Type: text/event-stream` that never finishes quickly. The body is a sequence of text events, each ending with a blank line:
+
+```text
+event: token
+data: {"text": "Hello "}
+id: 1
+
+: this line is a comment, used for keep-alive pings
+
+event: done
+data: {}
+
+```
+
+- `data:` is the payload. Several `data:` lines in one event are joined with newlines.
+- `event:` is the event type. Without it, the type is `message`.
+- `id:` lets a browser `EventSource` resume after a reconnect: it sends the last id back in a `Last-Event-ID` header.
+- Lines starting with `:` are comments. Clients ignore them, and they are useful as heartbeats.
+
+SSE fits LLM output well: one direction (server to client), text-based, works over plain HTTP/1.1 and HTTP/2, passes through most proxies, and needs no special server. When you need two-way traffic during a generation, for example a "stop" button that doesn't close the connection, use [WebSockets](#streaming-over-websockets-for-chat).
+
+## FastAPI's native SSE support
+
+FastAPI 0.143 has SSE built in, in the `fastapi.sse` module. You declare `response_class=EventSourceResponse` and write the endpoint as an **async generator** that yields events. That is the `chat_stream` endpoint above. What FastAPI does for you:
+
+- **Encoding.** Each yielded `ServerSentEvent` becomes the wire format. `data` is **always JSON-encoded**: a dict becomes a JSON object, and even a plain string gets quotes (`data="hi"` becomes `data: "hi"`). Use `raw_data=` for pre-formatted text. If you yield a plain dict or Pydantic model instead of a `ServerSentEvent`, it is JSON-encoded as the `data` of an unnamed event.
+- **Headers.** It sets `Cache-Control: no-cache` and `X-Accel-Buffering: no` (which tells Nginx not to buffer), and the media type `text/event-stream`.
+- **Keep-alive.** If your generator yields nothing for 15 seconds, FastAPI sends a `: ping` comment line. More on this [below](#heartbeats-and-keep-alive).
+- **Any HTTP method.** Browser `EventSource` only does GET, but a chat endpoint needs a POST body. FastAPI's SSE works with POST, and the frontend reads it with `fetch` ([below](#a-minimal-javascript-reader)).
+
+Here's the exact wire output of `/chat/stream`, plus two failure cases (explained in the next sections):
+
+```python
+from fastapi.testclient import TestClient
+from chat_stream import app, get_llm
+from llm import FakeLLM
+
+class BreaksMidStream(FakeLLM):
+    async def stream(self, messages, *, system=None, max_tokens=1024):
+        n = 0
+        async for ev in super().stream(messages, system=system, max_tokens=max_tokens):
+            yield ev
+            n += 1
+            if n == 2:
+                raise ConnectionError("upstream connection reset")
+
+with TestClient(app) as client:
+    app.dependency_overrides[get_llm] = lambda: FakeLLM("Hello there, Ada.")
+    r = client.post("/chat/stream", json={"message": "hi"})
+    print(r.status_code, r.headers["content-type"], r.headers["cache-control"], r.headers["x-accel-buffering"])
+    print(r.text)
+    print("-----")
+    app.dependency_overrides[get_llm] = lambda: BreaksMidStream("one two three four")
+    r = client.post("/chat/stream", json={"message": "hi"})
+    print(r.status_code)
+    print(r.text)
+    print("-----")
+    r = client.post("/chat/stream", json={"message": ""})
+    print(r.status_code, r.headers["content-type"], r.json()["detail"][0]["msg"])
+```
+
+```text title="Output"
+200 text/event-stream; charset=utf-8 no-cache no
+event: token
+data: {"text": "Hello "}
+id: 1
+
+event: token
+data: {"text": "there, "}
+id: 2
+
+event: token
+data: {"text": "Ada."}
+id: 3
+
+event: usage
+data: {"input_tokens": 1, "output_tokens": 3}
+
+event: done
+data: {"tokens": 3}
+
+
+-----
+200
+event: token
+data: {"text": "one "}
+id: 1
+
+event: token
+data: {"text": "two "}
+id: 2
+
+event: error
+data: {"type": "ConnectionError", "message": "The AI service failed mid-answer."}
+
+
+-----
+422 application/json String should have at least 1 character
+```
+
+<Callout title="On an older FastAPI: sse-starlette">
+Before `fastapi.sse` existed, the standard choice was the `sse-starlette` package. It works the same way, except that you **return** the response and yield dicts:
+
+```python
+from sse_starlette import EventSourceResponse
+
+@app.get("/legacy-stream")
+async def legacy_stream():
+    async def events():
+        async for ev in llm.stream([ChatMessage("user", "hi")]):
+            if isinstance(ev, TextDelta):
+                yield {"event": "token", "data": json.dumps({"text": ev.text})}
+        yield {"event": "done", "data": "{}"}
+    return EventSourceResponse(events(), ping=15)
+```
+
+On FastAPI 0.143 prefer the native version: it's documented in OpenAPI, validates `ServerSentEvent` fields, and handles keep-alive and cleanup inside FastAPI's own request lifecycle.
+</Callout>
+
+## From the SDK's stream to an async generator
+
+The Anthropic SDK exposes streaming as an async context manager. Inside it you can iterate either plain text or typed events:
+
+```python
+async with client.messages.stream(                # live API: no output shown
+    model="claude-opus-5-5",
+    max_tokens=4096,
+    system="You are a helpful assistant.",
+    messages=[{"role": "user", "content": "Explain SSE briefly."}],
+) as stream:
+    async for text in stream.text_stream:         # just the text deltas
+        print(text, end="", flush=True)
+    final = await stream.get_final_message()      # the full Message, with usage and stop_reason
+```
+
+Iterating `stream` itself, instead of `stream.text_stream`, gives every event. Against a mock transport that sends two text deltas, the real SDK yields:
+
+```text title="Output (real SDK, mock HTTP transport)"
+message_start ''
+content_block_start ''
+content_block_delta ''
+text 'Hel'
+content_block_delta ''
+text 'lo'
+content_block_stop ''
+message_delta ''
+message_stop ''
+final: end_turn 2
+```
+
+The raw API events (`message_start`, `content_block_delta`, `message_delta`, ...) are interleaved with convenience events the SDK adds, such as `text` with an accumulated `.text` attribute. `message_delta` carries the final `stop_reason` and output token count. `get_final_message()` gives you the assembled `Message`, which is the easiest way to read `usage` at the end.
+
+The [`AnthropicLLM` adapter](/docs/fastapi/ai-backend-architecture#the-real-adapter) turns this into the `LLMClient.stream()` shape your routes consume:
+
+```python
+async def stream(self, messages, *, system=None, max_tokens=1024):
+    async with self.client.messages.stream(**self._params(messages, system, max_tokens)) as s:
+        async for text in s.text_stream:
+            yield TextDelta(text)
+        final = await s.get_final_message()
+    yield Usage(final.usage.input_tokens, final.usage.output_tokens)
+```
+
+Three layers, each an async iterator feeding the next: **SDK stream → adapter generator → endpoint generator → FastAPI's SSE encoder**. Back-pressure flows naturally through them. If the client reads slowly, FastAPI waits to send, the endpoint generator waits at `yield`, and so on up the chain. And as the next sections show, **cancellation** flows through them too.
+
+## Designing the event format
+
+Don't just stream raw text. Give the client typed events with JSON payloads, so you can add information later without breaking parsers. The event set used in this chapter:
+
+| Event | Payload | When |
+|---|---|---|
+| `token` | `{"text": "..."}` plus an `id` | each text delta |
+| `usage` | `{"input_tokens": n, "output_tokens": n}` | once, after the last token |
+| `error` | `{"type": "...", "message": "..."}` | something failed after the response started. Last event |
+| `done` | `{"tokens": n}` or a final summary | normal end. Last event |
+
+Design rules that save pain later:
+
+- **Always end with exactly one terminal event**, `done` or `error`. A stream that simply stops is ambiguous: did the answer end, or did the connection drop? The next section shows why that matters.
+- **JSON in every `data` field.** Token text contains newlines, quotes and Unicode. JSON-encoding (which FastAPI does for `data=`) makes each event a single safe line.
+- **Version by adding events, not by changing them.** Old clients ignore event types they don't know. Later you might add `thinking` (reasoning progress), `tool_call` (the model is using a tool), `citation` (a source for RAG answers) or `title` (a conversation title).
+- **Don't put secrets or internals in `error`.** Send a stable `type` and a user-safe message. Log the real exception, with a request id, on the server.
+
+## Errors
+
+When the response is streaming, errors fall into two phases with very different rules.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant F as FastAPI
+  participant L as LLM
+  B->>F: POST /chat/stream
+  Note over F: Phase 1, before the first byte
+  F->>F: validate body, auth, rate limit (dependencies)
+  F-->>B: on failure, a normal 4xx or 5xx JSON response
+  F-->>B: 200 OK, text/event-stream (headers sent)
+  Note over F: Phase 2, status is fixed at 200
+  F->>L: stream
+  L-->>F: tokens
+  F-->>B: event token (many)
+  L--xF: error mid-stream
+  F-->>B: event error (in-band)`} />
+
+### Phase 1: fail before the stream starts
+
+Everything that can be checked up front should raise **before** the first byte: body validation, authentication, per-user limits, "does this conversation exist". In FastAPI that means **dependencies and parameters**, which run before the response starts. The last request in the wire demo above shows it: an empty message got a normal `422` with a JSON body, not an event stream.
+
+Don't raise `HTTPException` **inside** an SSE generator. FastAPI runs the generator in a producer task behind the streaming response, so an exception there can't turn into an error response any more. When we tried it on FastAPI 0.143, a generator that raised `HTTPException(404)` before its first `yield` produced a `200` with an **empty** event stream, not a 404. Put the check in a dependency instead:
+
+```python
+from fastapi import Depends, HTTPException
+
+async def load_conversation(cid: str, store: Store = Depends(get_store)) -> Conversation:
+    conv = await store.get(cid)
+    if conv is None:
+        raise HTTPException(404, "Unknown conversation")   # runs before the response starts
+    return conv
+
+@app.post("/conversations/{cid}/stream", response_class=EventSourceResponse)
+async def stream_reply(body: ChatIn, conv: Conversation = Depends(load_conversation)):
+    ...   # conv is guaranteed to exist here; stream as in chat_stream
+```
+
+### Phase 2: errors mid-stream travel in-band
+
+After the first event, the status line `200 OK` is already on the wire, so the only way to report a failure is another event. That's what the `try`/`except` in `chat_stream` does: the second wire demo shows two tokens followed by `event: error`.
+
+What if you don't catch it? Here is a generator that raises after three tokens, run under Uvicorn:
+
+```python
+@app.get("/naive", response_class=EventSourceResponse)
+async def naive():
+    for i in range(1, 4):
+        yield ServerSentEvent(event="token", data={"text": f"tok{i} "})
+        await asyncio.sleep(0.1)
+    raise ConnectionError("upstream connection reset")   # not caught
+```
+
+```text title="Output (client side, real Uvicorn server)"
+status: 200
+   event: token
+   data: {"text": "tok1 "}
+   event: token
+   data: {"text": "tok2 "}
+   event: token
+   data: {"text": "tok3 "}
+```
+
+The server logged a traceback. The client saw a `200` and a stream that just ended, with no exception and nothing to tell it apart from a complete answer. The user would see a truncated reply presented as finished. This is why the terminal `done` event matters: a client that hasn't received `done` (or `error`) must treat the answer as incomplete.
+
+One SDK-specific detail: if the provider fails **during** a stream (for example it becomes overloaded mid-answer), the HTTP status was already 200, so the SDK can't raise `OverloadedError`. It raises a generic `anthropic.APIStatusError` with `status_code == 200`, and the real error type is in `exc.body`:
+
+```text title="Output (real SDK, mock transport sending an error event mid-stream)"
+text: Hel
+text: lo
+mid-stream: APIStatusError 200 {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}}
+```
+
+So your mid-stream handler should catch `anthropic.APIError` broadly and read `exc.body` if it wants to tell overloads apart from other failures. Retrying is now your decision: you can't silently restart a stream the user has half read. Usually you send an `error` event with a "retry" hint and let the user resend.
+
+## Cancelling the upstream call when the client disconnects
+
+Users close tabs, press stop, lose signal. If your server keeps generating after the client is gone, you keep **paying for tokens nobody will read**, and you keep a provider connection and a concurrency slot busy. With an async stack done right, a disconnect cancels the whole chain automatically. Here's the proof.
+
+<Mermaid chart={`flowchart RL
+  B["Browser closes connection"] --> U["Uvicorn: http.disconnect"]
+  U --> F["FastAPI cancels the SSE task group"]
+  F --> E["Endpoint generator:<br/>CancelledError at its await"]
+  E --> A["Adapter: exits async with stream"]
+  A --> S["SDK closes the HTTP response"]
+  S --> P["Provider stops streaming to you"]`} />
+
+### Proof 1: the endpoint's upstream is cancelled
+
+An endpoint streams 100 tokens from a stand-in upstream that logs what happens to it. The client reads three token events and closes the connection.
+
+```python
+import asyncio, time
+import httpx
+from fastapi import FastAPI
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+
+log: list[str] = []
+T0 = time.perf_counter()
+def note(msg): log.append(f"{time.perf_counter() - T0:5.2f}s  {msg}")
+
+async def upstream_tokens(n: int):
+    """Stands in for the provider stream; logs what happens to it."""
+    sent = 0
+    try:
+        for i in range(n):
+            await asyncio.sleep(0.1)          # generation time per token
+            sent += 1
+            yield f"tok{i} "
+        note(f"upstream finished normally after {sent} tokens")
+    except BaseException as e:
+        note(f"upstream got {type(e).__name__} after {sent} tokens -> closing provider connection")
+        raise
+
+app = FastAPI()
+
+@app.get("/stream", response_class=EventSourceResponse)
+async def stream():
+    produced = 0
+    try:
+        async for tok in upstream_tokens(100):
+            produced += 1
+            yield ServerSentEvent(event="token", data={"text": tok})
+        yield ServerSentEvent(event="done", data={})
+    finally:
+        note(f"endpoint cleanup: record usage for {produced} tokens")
+
+# client, against a real Uvicorn server
+with httpx.Client(base_url="http://127.0.0.1:8767") as client:
+    with client.stream("GET", "/stream") as r:
+        seen = 0
+        for line in r.iter_lines():
+            if line.startswith("event: token"):
+                seen += 1
+                if seen == 3:
+                    note("client: read 3 tokens, closing the connection")
+                    break
+time.sleep(0.5)        # give the server a moment to notice
+print("\n".join(log))
+```
+
+```text title="Output (real Uvicorn server)"
+ 0.48s  client: read 3 tokens, closing the connection
+ 0.48s  upstream got CancelledError after 3 tokens -> closing provider connection
+ 0.48s  endpoint cleanup: record usage for 3 tokens
+```
+
+Within the same millisecond as the disconnect, the upstream generator received `CancelledError` and stopped at 3 tokens out of 100. Nothing in the endpoint checks `request.is_disconnected()`. Uvicorn reports the disconnect, Starlette's `StreamingResponse` notices it, and FastAPI cancels the task that drives your generator.
+
+### Proof 2: the SDK really closes the provider connection
+
+Does cancellation reach the actual HTTP stream to the provider? Here the real `AsyncAnthropic` client streams from a mock transport whose response body is a slow async generator, the "provider", which logs when its connection is closed. A consumer task reads through the `AnthropicLLM` adapter and is cancelled after about 0.18 s, which is exactly what FastAPI does to your endpoint on disconnect.
+
+```python
+import asyncio, json
+import httpx2
+from anthropic import AsyncAnthropic
+from llm import AnthropicLLM, ChatMessage, TextDelta
+
+log = []
+
+def sse(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+async def provider_body():
+    """What the 'provider' sends: a slow SSE stream of 50 text deltas."""
+    sent = 0
+    try:
+        yield sse("message_start", {"type": "message_start", "message": {
+            "id": "msg_mock", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 12, "output_tokens": 1}}})
+        yield sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                          "content_block": {"type": "text", "text": ""}})
+        for i in range(50):
+            await asyncio.sleep(0.05)
+            sent += 1
+            yield sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                              "delta": {"type": "text_delta", "text": f"w{i} "}})
+    finally:
+        log.append(f"provider side: connection closed after {sent} deltas")
+
+def handler(request):
+    return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=provider_body())
+
+async def consume(llm: AnthropicLLM):
+    async for ev in llm.stream([ChatMessage("user", "write a long essay")]):
+        if isinstance(ev, TextDelta):
+            log.append(f"consumer got {ev.text!r}")
+
+async def main():
+    client = AsyncAnthropic(api_key="test-key", http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+    llm = AnthropicLLM(client)
+    task = asyncio.create_task(consume(llm))
+    await asyncio.sleep(0.18)          # ~3 deltas in, the browser goes away...
+    task.cancel()                      # ...which is what FastAPI does to the endpoint
+    try:
+        await task
+    except asyncio.CancelledError:
+        log.append("consumer task cancelled")
+    await asyncio.sleep(0.2)
+    print("\n".join(log))
+
+asyncio.run(main())
+```
+
+```text title="Output (real SDK, mock HTTP transport)"
+consumer got 'w0 '
+consumer got 'w1 '
+provider side: connection closed after 2 deltas
+consumer task cancelled
+```
+
+The provider's body generator was closed after 2 of 50 deltas: the SDK's `async with ... stream` closed the HTTP response as the cancellation passed through it. Against the real API, closing the connection ends your stream. You're billed for the tokens generated up to that point, not for the rest of the answer.
+
+What breaks this chain:
+
+- **Swallowing `CancelledError`.** An `except BaseException:` (or a bare `except:`) that doesn't re-raise keeps the generator alive. `except Exception` is safe, because `CancelledError` is not an `Exception` subclass.
+- **Running the LLM call in a separate task you don't own.** If the endpoint does `asyncio.create_task(generate())` and reads from a queue, cancelling the endpoint doesn't cancel that task. Cancel it yourself in a `finally`, like the WebSocket example below does.
+- **Sync generators.** A plain `def` generator runs in a thread pool, and threads can't be cancelled. Keep streaming endpoints `async def`.
+
+### Cleanup that must survive cancellation
+
+You still have work to do after a disconnect: save the partial answer, record usage for the tokens you were billed for, release a budget reservation. But a `finally` block in a cancelled generator runs **inside a cancelled scope**. FastAPI drives SSE generators with AnyIO, whose cancellation is level-triggered: every `await` in that cleanup is cancelled again immediately.
+
+```python
+import anyio
+
+async def save_usage(tokens: int, label: str):
+    await asyncio.sleep(0.05)                     # e.g. an INSERT into the usage table
+    log.append(f"{label}: saved usage for {tokens} tokens")
+
+@app.get("/unshielded", response_class=EventSourceResponse)
+async def unshielded():
+    n = 0
+    try:
+        async for t in tokens():
+            n += 1
+            yield ServerSentEvent(event="token", data={"text": t})
+    finally:
+        try:
+            await save_usage(n, "unshielded")
+        except BaseException as e:
+            log.append(f"unshielded: save_usage interrupted by {type(e).__name__}")
+            raise
+
+@app.get("/shielded", response_class=EventSourceResponse)
+async def shielded():
+    n = 0
+    try:
+        async for t in tokens():
+            n += 1
+            yield ServerSentEvent(event="token", data={"text": t})
+    finally:
+        with anyio.CancelScope(shield=True):      # cleanup must finish even though we were cancelled
+            await save_usage(n, "shielded")
+```
+
+```text title="Output (client disconnects after 3 tokens on each route, real Uvicorn server)"
+unshielded: save_usage interrupted by CancelledError
+shielded: saved usage for 3 tokens
+```
+
+The unshielded `INSERT` never happened, which means unbilled usage and lost partial answers. Wrap awaited cleanup in `anyio.CancelScope(shield=True)`, and keep it short: a shielded block can't be interrupted, including at server shutdown. Synchronous cleanup (incrementing a counter, logging) needs no shield.
+
+## Heartbeats and keep-alive
+
+A reasoning model can think for 20 or 30 seconds before its first visible token. During that time the connection carries no bytes, and idle-timeout settings in load balancers, proxies, corporate firewalls and some mobile networks may close it. The fix is to send **something** periodically. A comment line (`: ping`) is perfect: every SSE client ignores it.
+
+FastAPI's native SSE does this for you: when the generator yields nothing for 15 seconds, it inserts `: ping`. To see it, the demo shortens the interval through a private module variable (don't do this in production code) and uses a fake model that "thinks" for a second:
+
+```python
+import time
+import fastapi.routing
+import httpx
+from chat_stream import app, get_llm
+from llm import FakeLLM
+
+fastapi.routing._PING_INTERVAL = 0.4        # private knob, default 15 s; shortened for the demo only
+
+app.dependency_overrides[get_llm] = lambda: FakeLLM("Done thinking.", latency=1.0, token_delay=0.05)
+with httpx.Client(base_url="http://127.0.0.1:8769") as client:   # Uvicorn serving `app`
+    start = time.perf_counter()
+    with client.stream("POST", "/chat/stream", json={"message": "hard question"}) as r:
+        for line in r.iter_lines():
+            if line:
+                print(f"{time.perf_counter() - start:4.2f}s  {line}")
+```
+
+```text title="Output (real Uvicorn server)"
+0.43s  : ping
+0.85s  : ping
+1.09s  event: token
+1.09s  data: {"text": "Done "}
+1.09s  id: 1
+1.16s  event: token
+1.16s  data: {"text": "thinking."}
+1.16s  id: 2
+1.16s  event: usage
+1.16s  data: {"input_tokens": 2, "output_tokens": 2}
+1.16s  event: done
+1.16s  data: {"tokens": 2}
+```
+
+Two pings kept the connection alive during the silent second. With the default 15 s interval, make sure every idle timeout on the path is **longer** than 15 s. Some managed load balancers default to 60 s, which is fine. Some proxies default to 30 s, which is fine too, but only because of the pings.
+
+Pings keep the connection alive but tell the user nothing. For long thinking phases, also consider a `status` event ("Thinking…", "Searching documents…") so the UI can show progress.
+
+## Proxy buffering
+
+A streaming endpoint can be perfectly correct and still deliver all of its tokens in one burst at the end, because something between you and the browser **buffers** the response:
+
+- **Nginx** buffers proxied responses by default. The `X-Accel-Buffering: no` header (FastAPI's SSE sets it) turns that off per response. You can also turn it off in the location block:
+
+```nginx
+location /chat/ {
+    proxy_pass http://app;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;          # or rely on X-Accel-Buffering: no from the app
+    proxy_cache off;
+    proxy_read_timeout 300s;      # longer than your longest stream and your ping interval
+}
+```
+
+- **Compression middleware** must not compress an event stream: compressors collect bytes before emitting a block. Starlette's `GZipMiddleware` excludes `text/event-stream` by default. Check any other compression layer, such as a CDN or a reverse proxy with gzip on.
+- **CDNs and API gateways** may buffer or impose their own response timeouts. Check their streaming support for the route.
+- **Your own middleware**: a `BaseHTTPMiddleware` that reads `response.body` to log it will consume the whole stream before passing it on. Use pure ASGI middleware for anything on a streaming route ([middleware chapter](/docs/fastapi/middleware-lifespan-and-background-tasks)).
+
+The quick test: `curl -N` (no buffering) against the public URL. If tokens appear one by one locally but in a single burst through the load balancer, something on the path buffers.
+
+## A minimal JavaScript reader
+
+Browsers have `EventSource`, but it only supports **GET** and can't send a JSON body or an `Authorization` header. A chat request is a POST with a body, so read the stream with `fetch` and parse SSE yourself. It takes about 40 lines:
+
+```js
+// chat-stream.js: read an SSE response from a POST request
+export async function streamChat(url, message, { onToken, onUsage, signal } = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ message }),
+    signal, // AbortController lets the user press "Stop"
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    let sep;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {   // one event ends at a blank line
+      const raw = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      let event = "message";
+      const dataLines = [];
+      for (const line of raw.split("\n")) {
+        if (line.startsWith(":")) continue;             // keep-alive comment
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+      }
+      if (dataLines.length === 0) continue;
+      const payload = JSON.parse(dataLines.join("\n"));
+      if (event === "token") onToken?.(payload.text);
+      else if (event === "usage") onUsage?.(payload);
+      else if (event === "error") throw new Error(payload.message);
+      else if (event === "done") return payload;
+    }
+  }
+  throw new Error("stream ended without a done event");  // connection dropped mid-answer
+}
+```
+
+The important details:
+
+- **Phase 1 errors arrive as normal responses**, so check `res.ok` first. A 422 or 503 has a JSON body, not an event stream.
+- **Network chunks don't line up with events.** One `read()` can return half an event or three events. Keep a buffer and only parse up to each blank line.
+- **No `done`, no success.** If the stream ends without `done`, the last line throws, so the UI can mark the answer as incomplete.
+- **Stop button**: `controller.abort()` closes the connection. The server then cancels the upstream call, as proved above.
+
+This exact module was run with Node 24 (which has the same `fetch` and streams APIs as browsers) against the `/chat/stream` endpoint on Uvicorn. The second run aborts after three tokens:
+
+```js
+import { streamChat } from "./chat-stream.js";
+const url = process.argv[2];
+let text = "";
+const done = await streamChat(url, "Why stream?", {
+  onToken: (t) => { text += t; },
+  onUsage: (u) => console.log("usage:", u),
+});
+console.log("text:", text);
+console.log("done:", done);
+const ctrl = new AbortController();
+let n = 0;
+try {
+  await streamChat(url, "Why stream?", { signal: ctrl.signal, onToken: () => { if (++n === 3) ctrl.abort(); } });
+} catch (e) { console.log("after 3 tokens:", e.name); }
+```
+
+```text title="Output (Node 24, fake model on a real Uvicorn server)"
+usage: { input_tokens: 2, output_tokens: 16 }
+text: Streaming lets the user read the first words while the model is still writing the rest.
+done: { tokens: 16 }
+after 3 tokens: AbortError
+```
+
+In a React or Vue app, `onToken` appends to the message state. Batch the UI updates per animation frame if tokens arrive faster than the screen redraws.
+
+## Streaming over WebSockets for chat
+
+SSE is one-way. A WebSocket is a single long-lived, two-way connection, which suits a chat UI that sends several messages, wants a "stop generating" control without dropping the connection, or receives server-initiated events. The cost: more moving parts (your own message protocol, connection lifecycle, auth on connect, no automatic reconnect). See [WebSockets and streaming](/docs/fastapi/websockets-and-streaming) for the basics.
+
+The key design point: **reading from the socket and generating must run concurrently**. If the endpoint awaits the whole generation inside its receive loop, it can't hear the "stop" message until the answer is finished. So each generation runs as a task, and the loop keeps reading:
+
+```python
+# ws_chat.py
+import asyncio
+from typing import Annotated, Literal
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+
+from llm import ChatMessage, FakeLLM, TextDelta, Usage
+
+
+class UserMessage(BaseModel):
+    type: Literal["message"]
+    text: str = Field(min_length=1, max_length=4000)
+
+
+class Stop(BaseModel):
+    type: Literal["stop"]
+
+
+ClientFrame = TypeAdapter(Annotated[UserMessage | Stop, Field(discriminator="type")])
+
+app = FastAPI()
+app.state.llm = FakeLLM(lambda msgs: f"Answer number {len(msgs) // 2 + 1}: " + "blah " * 12,
+                        token_delay=0.05)
+
+
+@app.websocket("/ws/chat")
+async def ws_chat(ws: WebSocket):
+    await ws.accept()
+    llm = ws.app.state.llm
+    history: list[ChatMessage] = []
+    current: asyncio.Task | None = None
+
+    async def generate(text: str) -> None:
+        history.append(ChatMessage("user", text))
+        parts: list[str] = []
+        try:
+            async for ev in llm.stream(list(history)):
+                if isinstance(ev, TextDelta):
+                    parts.append(ev.text)
+                    await ws.send_json({"type": "token", "text": ev.text})
+                elif isinstance(ev, Usage):
+                    await ws.send_json({"type": "done", "output_tokens": ev.output_tokens})
+        except asyncio.CancelledError:
+            await ws.send_json({"type": "stopped", "tokens": len(parts)})
+            raise
+        finally:
+            history.append(ChatMessage("assistant", "".join(parts)))   # keep partial answers too
+
+    try:
+        while True:                                   # the reader loop never blocks on generation
+            try:
+                frame = ClientFrame.validate_python(await ws.receive_json())
+            except ValidationError as e:
+                await ws.send_json({"type": "error", "message": e.errors()[0]["msg"]})
+                continue
+            if isinstance(frame, UserMessage):
+                if current and not current.done():
+                    await ws.send_json({"type": "error", "message": "still answering; send stop first"})
+                    continue
+                current = asyncio.create_task(generate(frame.text))
+            elif isinstance(frame, Stop) and current and not current.done():
+                current.cancel()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if current and not current.done():
+            current.cancel()                          # the user left: stop paying for tokens
+```
+
+```python
+from fastapi.testclient import TestClient
+from ws_chat import app
+
+with TestClient(app) as client, client.websocket_connect("/ws/chat") as ws:
+    ws.send_json({"type": "message", "text": "Tell me everything."})
+    for _ in range(3):
+        print(ws.receive_json())
+    ws.send_json({"type": "message", "text": "and another"})
+    print(ws.receive_json())                 # busy error (a token may arrive first)
+    ws.send_json({"type": "stop"})
+    while (msg := ws.receive_json())["type"] != "stopped":
+        pass
+    print(msg)
+    ws.send_json({"type": "message", "text": ""})
+    print(ws.receive_json())
+    ws.send_json({"type": "message", "text": "Shorter please."})
+    tokens = []
+    while (msg := ws.receive_json())["type"] == "token":
+        tokens.append(msg["text"])
+    print("".join(tokens).strip(), "|", msg)
+```
+
+```text title="Output (fake model; the 'stopped' count is timing-dependent)"
+{'type': 'token', 'text': 'Answer '}
+{'type': 'token', 'text': 'number '}
+{'type': 'token', 'text': '1: '}
+{'type': 'error', 'message': 'still answering; send stop first'}
+{'type': 'stopped', 'tokens': 3}
+{'type': 'error', 'message': 'String should have at least 1 character'}
+Answer number 2: blah blah blah blah blah blah blah blah blah blah blah blah | {'type': 'done', 'output_tokens': 15}
+```
+
+What the design handles:
+
+- **Validated frames.** A discriminated union (`type` decides the model) validates every incoming message. A bad frame gets an `error` reply instead of crashing the connection.
+- **One generation at a time**, so tokens from two answers never interleave. A second message while busy is rejected explicitly.
+- **Stop.** `current.cancel()` raises `CancelledError` inside `generate` at its current `await`, which closes the upstream stream exactly as in the SSE proofs. The partial answer is kept in history, so the second answer is "number 2".
+- **Disconnect.** The `finally` cancels a running generation. That task was created with `asyncio.create_task`, so nobody else would cancel it. Without this line, a user who closes the tab leaves the model generating, and you paying, until the answer is complete.
+- **Sending from two places.** Both the loop (errors) and the task (tokens) call `send_json`. That is safe here because each `send_json` is a single ASGI send, and asyncio runs one at a time. If you ever need multi-frame messages that must not interleave, put an `asyncio.Lock` around sends.
+
+In production, also authenticate during the handshake (a token in a query parameter or the first frame, since browsers can't set headers on WebSocket connections), load history from the database instead of keeping it per connection, and send periodic pings if your infrastructure has idle timeouts.
+
+| | SSE over POST | WebSocket |
+|---|---|---|
+| Direction | server to client | both |
+| Fits | one prompt, one streamed answer | multi-turn sessions, stop controls, server pushes |
+| Works through proxies, CDNs | almost always | usually, needs upgrade support |
+| Auth | normal headers and cookies | handshake only |
+| Reconnect | client logic (or `EventSource` for GET) | all your own |
+| Errors before streaming | normal HTTP status codes | an error frame, or a close code |
+
+For most chat UIs, SSE per message is simpler and enough. Reach for WebSockets when the client must talk **during** a generation.
+
+## Traps
+
+- **Raising `HTTPException` inside the stream generator.** The status is already 200. Validate and authorise in dependencies, which run before the response starts.
+- **No terminal event.** A stream that just stops looks like a finished answer. Always send `done` or `error`, and treat a missing one as failure on the client.
+- **Swallowing `CancelledError`.** It keeps the upstream generation, and your bill, running after the client has left. Catch `Exception`, not `BaseException`, or re-raise.
+- **Awaiting cleanup in a cancelled generator.** Under FastAPI's SSE, awaits in `finally` are cancelled again. Use `anyio.CancelScope(shield=True)` for the few awaits that must finish.
+- **Background tasks you don't cancel.** If you start generation with `create_task`, cancel it on disconnect yourself.
+- **Testing timing with `TestClient`.** In our runs, `TestClient` delivered all the streamed lines at once after the stream finished. Use it to check content and event order, and a real Uvicorn server plus `httpx` to measure TTFT or disconnect behaviour.
+- **Buffering on the path.** Nginx without `X-Accel-Buffering: no`, gzip at a proxy or CDN, or a `BaseHTTPMiddleware` that reads the body turn your stream into a single burst.
+- **Idle timeouts shorter than the thinking time.** Keep the ping interval below every idle timeout on the path.
+- **`EventSource` for chat.** It's GET-only with no custom headers. Use `fetch` with a stream reader for POST requests.
+- **Expecting typed SDK errors mid-stream.** After the 200, a provider failure arrives as a generic `APIStatusError` with `status_code == 200`. Read `exc.body` for the real error type.
+
+## Key points
+
+- Streaming doesn't make generation faster. It cuts time-to-first-token from the full generation time to well under a second, and that is what users notice.
+- FastAPI 0.143 has native SSE: `response_class=EventSourceResponse` plus an async generator that yields `ServerSentEvent`s. It sets no-cache and no-buffering headers and sends keep-alive pings after 15 idle seconds.
+- Chain async iterators: the SDK's `messages.stream()`, then your adapter, then the endpoint generator. Back-pressure and cancellation both flow through the chain.
+- Design typed JSON events (`token`, `usage`, `error`, `done`) and always end with exactly one terminal event.
+- Errors before the stream starts are normal HTTP responses from dependencies. Errors after it starts are `error` events.
+- A client disconnect cancels the endpoint, the adapter and the SDK's HTTP stream, which stops paying for tokens. Shield the cleanup that must still run.
+- Read POST-based SSE in the browser with `fetch` and a small parser. Use WebSockets when the client must send messages, like "stop", during a generation.

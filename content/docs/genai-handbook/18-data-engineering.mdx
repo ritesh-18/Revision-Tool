@@ -1,0 +1,702 @@
+---
+title: "18. Data Engineering for GenAI"
+description: "GenAI applications consume and produce data at scale. Documents flow in, embeddings flow out, conversations are logged, evaluations are recorded, drift..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth added to a topic the chapter already covers.
+  - ➕ **Beyond the handbook**: a topic the chapter does not cover, added because a GenAI engineer should know it.
+
+  ASCII diagrams have been redrawn as Mermaid diagrams.
+</Callout>
+
+## 18.1 Concept Explanation
+
+GenAI applications consume and produce data at scale. Documents flow in, embeddings flow out, conversations are logged, evaluations are recorded, drift metrics are computed. Underneath every shipped feature is a data pipeline.
+
+Data engineering for GenAI shares fundamentals with classical data engineering — ETL, streaming, warehouses, governance — but the unit of work shifts toward unstructured text, vectors, and event streams of user interactions. This chapter covers the patterns and tools that meet GenAI's specific needs.
+
+## 18.2 ETL vs ELT
+
+**ETL (Extract, Transform, Load).** Pull data, transform in a separate compute layer, load the transformed data into the destination. Classical pattern; still common for sensitive transformations.
+
+**ELT (Extract, Load, Transform).** Pull data, load raw into the warehouse, transform inside the warehouse. Modern default — warehouses are powerful and store is cheaper than compute.
+
+For GenAI: source documents are usually ingested raw, then transformed (parsed, chunked, embedded) as a separate stage. The transformation is so different from typical SQL that the boundary between ETL and ELT blurs. The principle remains: keep raw source data preserved, compute downstream artifacts from it.
+
+## 18.3 Streaming vs Batch
+
+**Batch.** Data processed on a schedule (nightly, hourly). Simple, cheap, latency in minutes-to-days.
+
+**Streaming.** Data processed as it arrives. Higher complexity, latency in milliseconds-to-seconds.
+
+GenAI ingestion is often batch (re-embed corpus nightly). User interaction logging is streaming (every chat message recorded). Many systems run both — batch for warehousing and analytics, streaming for real-time features and observability.
+
+## 18.4 Apache Kafka
+
+Kafka is the dominant distributed event streaming platform. Producers write events to topics; consumers read at their own pace; topics are partitioned and replicated for scale and durability.
+
+For GenAI:
+- Stream user interactions (chat messages, ratings, tool calls).
+- Stream model outputs for downstream eval and analytics.
+- Decouple ingestion services from embedding workers (producer writes new documents, embedding worker consumes and processes).
+- Feed observability and audit logs.
+
+Strengths: durable, ordered, replayable, battle-tested at scale. Weaknesses: operationally heavy, requires Zookeeper or KRaft mode, JVM-based.
+
+## 18.5 Redpanda
+
+Redpanda is a Kafka-compatible streaming platform written in C++. Drop-in replacement at the API level, much lighter operationally, often higher throughput per node.
+
+When to choose: new deployments where Kafka compatibility is important but ops cost is high. Existing Kafka deployments rarely migrate.
+
+## 18.6 NATS, RabbitMQ, Redis Streams
+
+Alternatives for lighter-weight messaging:
+
+- **NATS / NATS JetStream.** Lightweight, high-performance pub/sub with optional persistence. Strong for service-to-service eventing.
+- **RabbitMQ.** Mature message broker, strong on rich routing and queue semantics.
+- **Redis Streams.** Streaming on top of Redis, simple for small-to-medium scale.
+
+For GenAI, RabbitMQ and NATS often handle task queues (embedding jobs, agent steps), while Kafka handles event logs.
+
+## 18.7 Event-Driven Architecture
+
+In an event-driven architecture, services emit events when state changes; other services react. Loose coupling, scalability, easier evolution.
+
+For GenAI:
+- New document arrives → emit "document_ingested" → embedding worker reacts.
+- User submits feedback → emit "feedback_received" → eval pipeline updates.
+- Agent completes task → emit "task_completed" → analytics ingest.
+
+The discipline: well-defined event schemas, idempotent consumers, dead-letter queues for failures, schema registry for evolution.
+
+## 18.8 Change Data Capture (CDC)
+
+CDC captures row-level changes from a database and streams them as events. Useful for keeping vector indices in sync with source systems — when a document table changes, emit a CDC event and re-embed the affected document.
+
+Tools: Debezium (open-source CDC for many databases), Fivetran, Airbyte, AWS DMS.
+
+### CDC into a vector index, end to end 🔧
+
+The idea above is one sentence, but a CDC-to-embeddings pipeline has to cope with replays, deletes and reordering, so here is a concrete version with Postgres, Debezium, Kafka (consumed with aiokafka) and an arq embedding worker.
+
+#### Capturing changes from Postgres
+
+**Problem.** Polling a `documents` table for `updated_at > last_run` misses hard deletes and rows whose clock was wrong, and puts load on the primary.
+
+**Why it happens.** Polling looks at current state. CDC reads the database's write-ahead log, which records every committed change in commit order, including deletes.
+
+**Mechanism.** Debezium's Postgres connector reads logical replication (the built-in `pgoutput` plugin) and publishes one event per row change to a Kafka topic named `topic.prefix.schema.table`.
+
+```json
+{
+  "name": "docs-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "pg-primary",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/opt/secrets/pg.properties:password}",
+    "database.dbname": "app",
+    "topic.prefix": "app",
+    "table.include.list": "public.documents",
+    "slot.name": "debezium_docs",
+    "publication.autocreate.mode": "filtered",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
+```
+
+Each event value has `op` (`c` create, `u` update, `d` delete, `r` snapshot read), `before`, `after` and `source` metadata. On first start, Debezium snapshots the existing rows (as `r` events), so the same consumer handles the initial backfill and ongoing changes.
+
+#### An idempotent consumer
+
+**Problem.** Kafka delivers at least once, and a consumer restart replays events. Re-embedding on every replay wastes money, and processing an old update after a newer one can overwrite fresh vectors with stale ones.
+
+**Mechanism.** Hash the embeddable content. Skip work when the hash matches what is indexed. Use the hash in the job ID so duplicate jobs collapse. Store the source's LSN or `updated_at` with the vectors and refuse to write older versions.
+
+```python
+import asyncio
+import hashlib
+import json
+
+from aiokafka import AIOKafkaConsumer
+from arq import create_pool
+from arq.connections import RedisSettings
+
+
+async def main() -> None:
+    embed_queue = await create_pool(RedisSettings(host="redis"))
+    consumer = AIOKafkaConsumer(
+        "app.public.documents",
+        bootstrap_servers="kafka:9092",
+        group_id="doc-embedder",
+        auto_offset_reset="earliest",
+    )
+    await consumer.start()
+    try:
+        async for message in consumer:
+            if message.value is None:
+                continue  # tombstone that follows a delete
+            evt = json.loads(message.value)
+            lsn = str(evt["source"]["lsn"])
+            if evt["op"] == "d":
+                doc_id = evt["before"]["id"]
+                await embed_queue.enqueue_job(
+                    "delete_doc", doc_id=doc_id, lsn=lsn, _job_id=f"del_{doc_id}_{lsn}"
+                )
+                continue
+            doc = evt["after"]
+            content_hash = hashlib.sha256(f"{doc['title']}\n{doc['body']}".encode()).hexdigest()
+            # arq drops a job whose _job_id already exists. Retries with exponential
+            # backoff are configured on the worker side (max_tries=5, raise Retry(defer=...)).
+            await embed_queue.enqueue_job(
+                "upsert_doc",
+                doc_id=doc["id"],
+                hash=content_hash,
+                lsn=lsn,
+                acl=doc["acl"],
+                _job_id=f"up_{doc['id']}_{content_hash}",
+            )
+    finally:
+        await consumer.stop()
+
+
+asyncio.run(main())
+```
+
+The worker then compares `hash` with the stored hash for the document, re-chunks and re-embeds only on a change, and writes with a guard such as `WHERE indexed_lsn < $lsn` so an out-of-order older event cannot win.
+
+#### Edge cases and failure modes
+- **Replication slot growth.** If the connector is down, Postgres keeps WAL for the slot and the disk fills. Alert on slot lag (`pg_replication_slots`) and have a runbook to drop and resnapshot.
+- **Large documents.** Do not put the document body in the Kafka message if it is megabytes. Emit the ID and let the worker read the current row (which also makes stale events harmless).
+- **ACL changes.** A permission change with no content change must still update the vector metadata. Hash the ACL separately and handle "metadata-only" updates without re-embedding.
+- **Schema changes.** A renamed column breaks the consumer if it reads `after["body"]` and gets a `KeyError`, or silently if it uses `.get("body")` and gets `None`. Validate events against a schema and send failures to a dead-letter queue.
+
+## 18.9 Data Warehouses
+
+A data warehouse is a columnar database optimized for analytical queries. Modern warehouses also store vectors, JSON, and run ML inside.
+
+**Snowflake.** Cloud-native warehouse with strong ecosystem. Cortex provides LLM and vector capabilities inside the warehouse.
+
+**BigQuery.** GCP's serverless warehouse. ML and vector search integrated. Strong for analytics-heavy workloads.
+
+**Databricks.** Lakehouse architecture combining data lake and warehouse. Strong for ML, integrated with MLflow.
+
+**Redshift.** AWS warehouse. Mature, integrated with AWS ecosystem.
+
+**ClickHouse, DuckDB, StarRocks.** Open-source columnar engines for analytics, often used alongside cloud warehouses.
+
+For GenAI, the warehouse holds: interaction logs, eval results, cost metrics, training data, model usage analytics.
+
+## 18.10 Delta Lake, Iceberg, Hudi
+
+Open table formats turn object storage into ACID-compliant tables. They underpin lakehouse architectures.
+
+**Delta Lake.** Databricks-led; broadly compatible.
+
+**Apache Iceberg.** Vendor-neutral, fastest growing adoption.
+
+**Apache Hudi.** Strong on streaming and upserts.
+
+For GenAI: store raw documents, chunks, embeddings, and interaction logs as Iceberg/Delta tables on object storage. Query from any engine (Spark, Trino, Snowflake, DuckDB). Cheap, durable, query-engine-independent.
+
+## 18.11 The Modern Data Stack for GenAI
+
+<Mermaid chart={`flowchart TD
+  S["Sources<br/>(databases, APIs, files, user events)"] --> I["Ingest<br/>(Fivetran, Airbyte, Kafka, custom)"]
+  I --> L["Lake (S3 + Iceberg / Delta)<br/>raw layer"]
+  L --> T["Transform<br/>(dbt, Spark, SQL warehouses)"]
+  T --> W["Warehouse<br/>(Snowflake, BigQuery, Databricks)"]
+  subgraph SS["Specialized stores"]
+    V["Vector DB<br/>(Pinecone, Qdrant, pgvector)"]
+    F["Feature store / context store"]
+    E["Search engine<br/>(Elasticsearch, OpenSearch)"]
+  end
+  W --> SS
+  SS --> APP["Applications<br/>(chat, agents, search)"]`} />
+
+## 18.12 dbt — Transformation as Code
+
+dbt (data build tool) compiles modular SQL into transformation pipelines. Treat data transformations like code: version, test, document, deploy.
+
+For GenAI, dbt is the standard for transforming raw event data into analytics tables: per-day token consumption by model, eval scores by prompt version, user funnels through AI features.
+
+## 18.13 Data Quality and Testing
+
+Data quality issues silently destroy AI products. The same care applied to code tests must be applied to data.
+
+Tools and patterns:
+- **dbt tests** for inline assertions (unique, not null, accepted values, custom).
+- **Great Expectations, Soda** for expectation-driven data quality.
+- **Schema registries** for event payloads.
+- **Data contracts** between producers and consumers.
+
+For GenAI: assert that retrieved chunks have valid embeddings, that no PII has slipped into a public corpus, that eval scores are within historical bands.
+
+**🔧 Example checks.** The GenAI assertions above are plain SQL tests that can run as dbt singular tests (a query that returns failing rows) after every ingestion run:
+
+```sql
+-- tests/chunks_have_valid_embeddings.sql (pgvector; fails if any row is returned)
+SELECT c.id
+FROM chunks c
+WHERE c.embedding IS NULL
+   OR vector_dims(c.embedding) <> 1024          -- the current model's dimension
+   OR c.embedding_model <> 'embed-model@v3'     -- mixed models in one index
+   OR length(c.text) < 20                       -- parser produced near-empty chunks
+```
+
+The `embedding_model` check matters most: vectors from two embedding models live in different spaces, and mixing them in one index silently ruins similarity search (see [Chapter 8](/docs/genai-handbook/08-embeddings)).
+
+## 18.13a Synthetic Data Generation and Its Risks ➕
+
+Data quality also applies to data you generate rather than collect, and GenAI teams increasingly generate eval questions and fine-tuning examples with an LLM, which the chapter does not address.
+
+### Where synthetic data helps ➕
+
+**Problem.** A new RAG feature has no traffic yet, so there are no real questions to evaluate against. Fine-tuning needs thousands of examples that nobody has time to write.
+
+**Mechanism.** Generate questions from the corpus itself: for each sampled chunk, ask a strong model to write questions that the chunk answers, along with the answer and the supporting span. The chunk ID becomes the retrieval ground truth, which gives you recall@k for free.
+
+```python
+import json, random
+
+PROMPT = """You write test questions for a support assistant.
+From the passage, write {n} questions a real customer might ask that the passage answers.
+Vary phrasing and difficulty. Include one question that needs a detail from the passage's middle.
+Return JSON: [{{"question": str, "answer": str, "evidence": str}}]. "evidence" must be an exact quote.
+
+Passage:
+{passage}"""
+
+def synth_questions(chunks, llm, n_per_chunk=3, sample=500, seed=7):
+    random.seed(seed)
+    out = []
+    for chunk in random.sample(chunks, min(sample, len(chunks))):
+        items = json.loads(llm(PROMPT.format(n=n_per_chunk, passage=chunk["text"])))
+        for it in items:
+            if it["evidence"] not in chunk["text"]:   # drop hallucinated evidence
+                continue
+            out.append({**it, "gold_chunk_id": chunk["id"], "source": "synthetic"})
+    return out
+```
+
+### Risk: distribution mismatch ➕
+
+**Problem.** Synthetic questions reuse the corpus's vocabulary ("How do I configure SSO via SAML 2.0?"), while real users write "login with company account not working". Retrieval scores on synthetic sets are inflated.
+
+**Why it happens.** The generator sees the answer while writing the question, so lexical overlap is high and lexical retrieval (BM25) looks better than it is.
+
+**Mitigation.** Prompt for paraphrase and user-style language, generate some questions from chunk summaries rather than raw text, and replace synthetic cases with real traffic as soon as it exists. Always report synthetic and real scores separately.
+
+### Risk: model collapse and self-preference ➕
+
+**Problem.** Fine-tuning a model on outputs from itself or a similar model narrows its output distribution. Using the same model family to generate and judge data inflates scores.
+
+**Why it happens.** Generated data under-represents the tails of the true distribution. Each generation of training on generated data loses more of the tail (the "model collapse" effect described by Shumailov et al., 2024). Judges also tend to rate outputs in their own style higher.
+
+**Mitigation.** Mix synthetic with real human data rather than replacing it, deduplicate aggressively (18.15b), use a different model family for judging than for generating, and have humans review a random sample of every synthetic batch.
+
+### Edge cases ➕
+- **Licensing and terms.** Some model providers' terms restrict using outputs to train competing models. Check before using generated data for fine-tuning.
+- **Leaked PII.** Generators can invent realistic names, emails and account numbers, or copy real ones from the passage. Run the same PII scan (18.15c) on synthetic data.
+- **Label it.** Keep a `source = 'synthetic'` column forever, so later analysis can exclude it.
+
+## 18.14 Data Governance
+
+Governance covers: who owns each dataset, who can access what, how data is classified, how long it is retained, how access is audited.
+
+For GenAI specifically:
+- **Document provenance.** Track where every document in the RAG corpus came from.
+- **Access control on retrieval.** Users only see what they are authorized to see.
+- **Retention.** User conversations and uploads may be subject to deletion requests (GDPR).
+- **Audit logs.** Every access to sensitive data recorded.
+- **Lineage.** Trace any model output back through the data that produced it.
+
+Tools: Apache Atlas, DataHub, Unity Catalog (Databricks), Collibra, Alation.
+
+### Lineage for RAG answers 🔧
+
+The lineage bullet above ("trace any model output back through the data that produced it") needs a specific data model in RAG, because catalog tools track tables and jobs, not which chunk version supported which sentence.
+
+#### Recording what an answer used
+
+**Problem.** A customer disputes an answer from three weeks ago. The document it cited has since been edited twice, and the index rebuilt. You cannot show what the model actually saw.
+
+**Why it happens.** Chunks are derived artifacts that get replaced on every re-ingestion. If you only store chunk IDs, the ID now points at different text, or at nothing.
+
+**Mechanism.** Version documents and chunks immutably (new content means a new version row, never an update in place), and store, per answer, the exact chunk versions that were placed in the context and which ones were cited.
+
+```sql
+CREATE TABLE document_version (
+  doc_id       text NOT NULL,
+  version      int  NOT NULL,
+  source_uri   text NOT NULL,          -- e.g. confluence://SPACE/12345
+  content_hash text NOT NULL,
+  acl          jsonb NOT NULL,
+  ingested_at  timestamptz NOT NULL DEFAULT now(),
+  deleted_at   timestamptz,            -- set by deletion requests
+  PRIMARY KEY (doc_id, version)
+);
+
+CREATE TABLE chunk_version (
+  chunk_id        text PRIMARY KEY,    -- e.g. sha256(doc_id, version, offset)
+  doc_id          text NOT NULL,
+  doc_version     int  NOT NULL,
+  text            text,                -- nulled on deletion
+  embedding_model text NOT NULL,
+  parser_version  text NOT NULL,
+  FOREIGN KEY (doc_id, doc_version) REFERENCES document_version (doc_id, version)
+);
+
+CREATE TABLE answer_context (
+  trace_id   text NOT NULL,            -- the same ID as the trace and feedback (17.18)
+  chunk_id   text NOT NULL REFERENCES chunk_version (chunk_id),
+  rank       int  NOT NULL,
+  cited      boolean NOT NULL DEFAULT false,
+  PRIMARY KEY (trace_id, chunk_id)
+);
+```
+
+With this, "why did the bot say that?" is one join from `answer_context` to `document_version.source_uri`, and "which answers relied on this wrong page?" is the reverse join, which lets you notify or re-answer affected users.
+
+#### Lineage drives deletion
+
+**Problem.** A GDPR erasure request (Article 17) must remove a user's data from raw storage, chunks, vectors, caches, eval sets and logs. Without lineage, nobody knows where the derived copies are.
+
+**Mechanism.** Deletion walks the same graph: mark `document_version.deleted_at`, null the chunk text, delete the vectors by `doc_id` filter in the vector DB, purge semantic-cache entries whose context included those chunks (found through `answer_context`), and remove golden cases derived from the user's traffic. Keep the IDs and hashes (not the content) so the audit trail survives.
+
+#### Edge cases
+- **Vector DB deletes are not always immediate.** Many engines mark vectors as deleted and reclaim space at compaction. Check that a deleted vector can no longer be returned by a query, which is what matters for compliance, and document when physical removal happens.
+- **Backups.** Backups usually cannot be edited. The common approach is a documented retention window after which backups expire, plus re-applying deletions if a backup is ever restored.
+- **Storage cost.** Storing context per answer is cheap (IDs only), but keeping every chunk version forever is not. Garbage-collect chunk versions that are no longer indexed and not referenced by any answer inside your retention window.
+
+## 18.15 Data Pipelines for RAG
+
+<Mermaid chart={`flowchart TD
+  A["Sources<br/>(Confluence, SharePoint, S3, DBs)"] --> B["Connectors / sync"]
+  B --> C["Raw lake<br/>(with metadata: source, timestamp, ACL)"]
+  C --> D["Parsers<br/>(PDF, HTML, Office)"]
+  D --> E["Chunker<br/>(structure-aware)"]
+  E --> F["Enricher<br/>(summaries, tags, language detection)"]
+  F --> G["Embedder<br/>(batched, GPU)"]
+  G --> H["Vector DB + metadata store"]
+  H --> I["BM25 index (optional)"]
+  I --> J["Knowledge graph (optional)"]
+  J --> K["Refresh scheduler<br/>(incremental or full)"]`} />
+
+Every step needs monitoring: throughput, error rate, queue depth, end-to-end freshness.
+
+## 18.15a Document Parsing with Failure Handling ➕
+
+The pipeline above has a single "Parsers" box, but in practice parsing is where most RAG quality is lost and where most ingestion jobs fail, so it deserves its own design.
+
+### Why parsing is hard ➕
+
+**Problem.** Answers about pricing tables are wrong, and answers from scanned contracts are empty. Retrieval and the prompt are fine. The text that was embedded was garbage.
+
+**Why it happens.** PDF is a page-description format: it stores glyphs at coordinates, not paragraphs, reading order, or table cells. Multi-column layouts interleave when read naively, tables flatten into a stream of numbers with no headers, headers and footers repeat on every page, and scanned pages contain no text layer at all.
+
+**Mechanism.** Use a layout-aware parser that detects reading order and table structure (for example Docling, Unstructured, or a cloud document-AI service), run OCR only on pages with no text layer, and export to a structure-preserving format such as Markdown with tables, so the chunker (see [Chapter 10](/docs/genai-handbook/10-rag)) can split on headings and keep tables whole.
+
+### A parser stage that never silently fails ➕
+
+**Problem.** One corrupted file crashes the batch, or worse, a parser returns an empty string and an empty document is indexed as "success".
+
+**Mechanism.** Treat each document as its own unit with an explicit outcome: success, partial, or failure. Check output quality, not just exceptions. Quarantine failures with the reason, and keep the parser version on every output so you can re-parse when the parser improves.
+
+```python
+from docling.document_converter import DocumentConverter
+from docling.datamodel.base_models import ConversionStatus
+
+converter = DocumentConverter()
+PARSER_VERSION = "docling-2.x+cfg3"
+
+def parse(path: str, page_count_hint: int | None = None) -> dict:
+    result = converter.convert(path, raises_on_error=False, max_num_pages=500,
+                               max_file_size=50 * 1024 * 1024)
+    if result.status == ConversionStatus.FAILURE:
+        return {"status": "quarantined", "reason": [str(e) for e in result.errors]}
+    md = result.document.export_to_markdown()
+    # Quality gates: exceptions are not the only failure mode
+    chars_per_page = len(md) / max(1, page_count_hint or 1)
+    printable = sum(ch.isprintable() or ch.isspace() for ch in md) / max(1, len(md))
+    if chars_per_page < 200 or printable < 0.95:
+        return {"status": "quarantined", "reason": "low text yield or garbled encoding",
+                "markdown": md}
+    return {"status": "partial" if result.status == ConversionStatus.PARTIAL_SUCCESS else "ok",
+            "markdown": md, "parser_version": PARSER_VERSION}
+```
+
+Run parsing in a worker pool with a per-document timeout and memory limit (a single 2,000-page PDF can exhaust a worker), and send quarantined documents to a review queue with a dashboard of counts by reason.
+
+### Tables ➕
+
+**Problem.** A table chunked as flat text loses which number belongs to which column, so the model mixes up values.
+
+**Mechanism.** Keep each table as one unit in Markdown or HTML, with its caption and the nearest heading. For very large tables, split by rows and repeat the header row in every piece. Some teams also store a short LLM-written summary of the table as the text that gets embedded, and give the full table to the generator at answer time.
+
+### Edge cases ➕
+- **Encrypted or password-protected files** fail predictably. Detect them up front and report to the source owner rather than retrying.
+- **Hidden text.** White-on-white text, tiny fonts and off-page content are extracted like any other text. This is a known channel for indirect prompt injection (see [20.4](/docs/genai-handbook/20-security-for-genai#204-prompt-injection--indirect)). Some parsers expose font size and colour so you can drop invisible text.
+- **Parser upgrades change chunks.** A new parser version produces different text, so chunk IDs and embeddings change. Re-parse in the background, compare retrieval eval scores, then switch.
+
+## 18.15b Near-Duplicate Detection with MinHash ➕
+
+After parsing, enterprise corpora are full of copies (the same policy in three wikis, ten versions of a slide deck), and the chapter does not cover removing them.
+
+### Why duplicates hurt RAG ➕
+
+**Problem.** The top-5 retrieved chunks are five copies of the same paragraph, so the model gets one fact instead of five, and outdated copies compete with current ones.
+
+**Why it happens.** Near-duplicates have near-identical embeddings, so they occupy all top-k slots together. Exact hashing does not catch them because a changed date or footer changes the hash.
+
+### How MinHash works ➕
+
+**Mechanism.** Represent each document as a set of shingles (overlapping word n-grams). The similarity of two sets is the Jaccard index: the size of the intersection divided by the size of the union. MinHash applies many random hash functions and keeps the minimum per function. The probability that two documents share a minimum for one hash function equals their Jaccard similarity, so the fraction of matching minimums across 128 functions estimates it. Locality-sensitive hashing (LSH) then splits the signature into `b` bands of `r` rows and only compares documents that collide in at least one band. The probability of becoming a candidate pair is `1 - (1 - s^r)^b` for similarity `s`, an S-shaped curve that you tune to your threshold.
+
+```python
+import re
+from datasketch import MinHash, MinHashLSH
+
+def shingles(text: str, k: int = 5) -> set[str]:
+    words = re.findall(r"\w+", text.lower())
+    return {" ".join(words[i:i + k]) for i in range(max(1, len(words) - k + 1))}
+
+def signature(text: str, num_perm: int = 128) -> MinHash:
+    m = MinHash(num_perm=num_perm)
+    for sh in shingles(text):
+        m.update(sh.encode("utf8"))
+    return m
+
+def dedupe(docs: list[dict], threshold: float = 0.85) -> tuple[list[dict], dict[str, str]]:
+    lsh = MinHashLSH(threshold=threshold, num_perm=128)
+    kept, duplicate_of = [], {}
+    # Process the preferred copy first (most recent, most authoritative source)
+    for doc in sorted(docs, key=lambda d: d["updated_at"], reverse=True):
+        sig = signature(doc["text"])
+        matches = lsh.query(sig)
+        if matches:
+            duplicate_of[doc["id"]] = matches[0]
+            continue
+        lsh.insert(doc["id"], sig)
+        kept.append(doc)
+    return kept, duplicate_of
+```
+
+### Edge cases ➕
+- **Which copy wins.** Deduplication is a policy decision. Prefer the most recent or most authoritative source, and keep the `duplicate_of` mapping so ACLs still work: a user who may only see the dropped copy must still get an answer.
+- **Short texts.** Jaccard on a 20-word chunk is noisy. Deduplicate at document level, and use exact hashing for short boilerplate.
+- **Threshold choice.** Too low merges distinct versions that differ in one important number (a price change). Label a sample of candidate pairs and pick the threshold from the data.
+- **Scale.** LSH indexes fit in memory to millions of documents. Beyond that, use a distributed implementation (for example in Spark) or an LSH backend with external storage.
+
+## 18.15c PII Detection and Redaction Before Embedding ➕
+
+The chapter lists PII redaction as a security concern (18.20), but the decision of where in the pipeline to redact, and how, determines whether it works at all.
+
+### Why redact before embedding ➕
+
+**Problem.** A support-ticket corpus is embedded as-is. Months later, a user asks "what is Maria's phone number?" and the retriever happily returns it. Removing it now means finding and re-embedding every affected chunk.
+
+**Why it happens.** Embeddings and chunk text are copies of the source data. Anything sensitive that enters the index can be retrieved, cached, logged and shown. Embeddings are also not anonymous: research on embedding inversion has shown that a large part of the original text can be reconstructed from some embedding vectors, so "we only store vectors" is not a privacy control.
+
+**Mechanism.** Detect and redact in the transform stage, after parsing and before chunking. Keep the unredacted raw copy only in the access-controlled raw layer, so you can re-process when the redaction policy changes.
+
+```python
+import hashlib, hmac, os
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+
+analyzer = AnalyzerEngine()
+anonymizer = AnonymizerEngine()
+KEY = os.environ["PII_PSEUDONYM_KEY"].encode()
+
+def pseudonym(value: str) -> str:
+    # Same input -> same token, so "the customer" stays one entity across chunks
+    return "<PERSON_" + hmac.new(KEY, value.encode(), hashlib.sha256).hexdigest()[:8] + ">"
+
+ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "IBAN_CODE", "US_SSN"]
+
+def redact(text: str) -> str:
+    findings = analyzer.analyze(text=text, language="en", entities=ENTITIES, score_threshold=0.5)
+    return anonymizer.anonymize(
+        text=text,
+        analyzer_results=findings,
+        operators={
+            "PERSON": OperatorConfig("custom", {"lambda": pseudonym}),
+            "DEFAULT": OperatorConfig("replace", {"new_value": "<REDACTED>"}),
+        },
+    ).text
+```
+
+### Choosing what to redact ➕
+
+**Problem.** Redacting every name makes an HR-policy assistant useless ("contact `<REDACTED>` in payroll"), while redacting nothing leaks customer data.
+
+**Mechanism.** Decide per corpus with the data owner. Public-role contacts (the payroll team's shared mailbox) can stay. Customer identifiers in tickets should go. Pseudonymize instead of deleting when the relationship matters, so "the customer called twice" still makes sense.
+
+### Edge cases ➕
+- **Recall is never 100 percent.** NER-based detectors miss unusual names, non-English text and identifiers split across lines. Measure recall on a labelled sample of your own data, add custom recognizers for your formats (account IDs, internal ticket numbers), and keep access control on the index as the primary defence.
+- **Language.** Presidio's default models are English. Configure NLP models per language or route by detected language (the enricher already detects it).
+- **Images.** Text in screenshots and scanned forms passes through OCR. Redact after OCR, not before.
+- **Logs.** The same redaction must apply to prompts and completions you log (see [19.18](/docs/genai-handbook/19-monitoring-observability#1918-logging-discipline)).
+
+## 18.16 Real-Time vs Batch Embedding
+
+**Batch embedding.** Cheaper per unit. Use for large corpora and nightly refresh.
+
+**Real-time embedding.** Sub-second updates when a document changes. Use for high-freshness needs (live chat, monitoring dashboards).
+
+Most production systems use both: bulk batch for initial load, streaming for ongoing changes.
+
+### Incremental ingestion for sources without CDC 🔧
+
+CDC (18.8) covers databases, but most RAG sources are SaaS tools and file stores, where incremental ingestion needs its own mechanism.
+
+#### Detecting what changed
+
+**Problem.** A nightly full re-embed of 100k documents costs the same whether 10 or 10,000 changed, and takes hours.
+
+**Mechanism.** Use each connector's change cursor where one exists (a modified-since query, a delta token, S3 event notifications), and confirm with a content hash, because "modified" timestamps also change on metadata-only edits. Deletions need a separate path: either the API reports them, or you run a periodic full listing and diff the set of IDs.
+
+#### Re-embedding only changed chunks
+
+**Problem.** A one-line edit to a 200-page manual re-embeds all 400 chunks.
+
+**Mechanism.** Give chunks content-addressed IDs (a hash of the chunk text plus the chunking config). After re-chunking a changed document, compare the new ID set with the indexed one: embed only new IDs, delete only vanished IDs, and leave the rest alone. Structure-aware chunking (split on headings) keeps most chunk boundaries stable across small edits, which is what makes this pay off.
+
+```python
+import hashlib
+from collections.abc import Awaitable, Callable
+
+CHUNK_CFG = "md-headings-v2:800tok:100overlap"
+
+type Embedder = Callable[[list[str]], Awaitable[list[list[float]]]]
+
+
+def chunk_id(doc_id: str, text: str) -> str:
+    return hashlib.sha256(f"{doc_id}\n{CHUNK_CFG}\n{text}".encode()).hexdigest()[:32]
+
+
+async def sync_document(
+    doc_id: str, chunks: list[str], store: VectorStore, embed: Embedder
+) -> dict[str, int]:
+    next_chunks = {chunk_id(doc_id, t): t for t in chunks}
+    current = set(await store.list_chunk_ids(doc_id))
+    to_add = [(cid, t) for cid, t in next_chunks.items() if cid not in current]
+    to_delete = [cid for cid in current if cid not in next_chunks]
+    if to_add:
+        vectors = await embed([t for _, t in to_add])  # batched call
+        await store.upsert([
+            {"id": cid, "doc_id": doc_id, "text": t, "vector": v}
+            for (cid, t), v in zip(to_add, vectors, strict=True)
+        ])
+    if to_delete:
+        await store.delete(to_delete)
+    return {"added": len(to_add), "deleted": len(to_delete), "kept": len(next_chunks) - len(to_add)}
+```
+
+#### Edge cases
+- **Upsert before delete.** Adding new chunks before deleting old ones avoids a window where the document has no chunks at all. The cost is a short window with both versions, which is usually acceptable.
+- **Contextual chunk text.** If you prepend the document title or a summary to each chunk before embedding, a title change changes every chunk ID. That is correct behaviour, but expect full re-embeds on renames.
+- **Embedding model change.** Content hashes do not include the model, so a model migration needs a separate, versioned re-embedding job into a new index, followed by an eval comparison and a cutover (see [17.3](/docs/genai-handbook/17-mlops-for-genai#173-ml-pipelines)).
+
+## 18.17 Tool Comparison
+
+| Tool | Category | Strength | Weakness |
+|---|---|---|---|
+| Kafka | Streaming | Battle-tested, durable | Operationally heavy |
+| Redpanda | Streaming | Lighter ops | Less ecosystem |
+| Snowflake | Warehouse | Ecosystem, ergonomics | Cost at scale |
+| BigQuery | Warehouse | Serverless, ML | GCP-only |
+| Databricks | Lakehouse | ML-native | Cost complexity |
+| Iceberg | Table format | Vendor-neutral | Less mature than Delta |
+| dbt | Transformation | SQL-as-code | Not for streaming |
+| Airbyte | Ingest | Open source, many connectors | Some connectors immature |
+| Fivetran | Ingest | Managed, reliable | Cost |
+
+## 18.18 Tradeoffs
+
+| Choice | Win | Cost |
+|---|---|---|
+| Streaming-first | Freshness, real-time features | Complexity |
+| Batch-first | Simplicity, cost | Latency |
+| Cloud warehouse | Ergonomics, ecosystem | Cost |
+| Lakehouse | Open formats, flexibility | More tooling |
+| Managed ingest (Fivetran) | Hands-off | Subscription cost |
+| DIY connectors | Cheap, custom | Maintenance burden |
+
+## 18.19 Scaling Challenges
+
+- Embedding throughput at billion-document scale.
+- Schema evolution in long-running event streams.
+- Cross-region replication for global products.
+- Cost as data volume grows.
+- Compliance with retention and residency.
+
+## 18.20 Security Concerns
+
+- Encryption at rest and in transit.
+- Tenant isolation for multi-tenant SaaS.
+- Access control on warehouses and vector DBs.
+- PII detection and redaction in pipelines.
+- Audit logging for sensitive datasets.
+
+## 18.21 Cost Optimization
+
+- Tier hot/warm/cold storage.
+- Use spot for batch jobs.
+- Compress aggressively.
+- Right-size warehouse compute.
+- Cache query results.
+- Quantize vectors.
+
+## 18.22 Interview Questions
+
+- Compare ETL and ELT in the context of GenAI.
+- Walk through a CDC pipeline that keeps a vector index in sync.
+- When do you choose Kafka vs RabbitMQ?
+- Design a data governance model for an enterprise RAG.
+- How do you handle GDPR delete requests across a vector DB?
+- ➕ Why redact PII before embedding rather than at answer time? **Anything in the index can be retrieved, cached and logged, and embeddings can be partly inverted back to text. Redacting at the transform stage keeps it out of every derived copy, while the raw layer keeps the original under strict access control.**
+- ➕ How do you detect near-duplicate documents at scale? **MinHash signatures over word shingles estimate Jaccard similarity, and LSH banding limits comparisons to candidate pairs. Keep the preferred copy and a duplicate-of mapping so ACLs still work.**
+- ➕ A parser returns an empty string without raising. How should the pipeline react? **Treat it as a failure: check text yield per page and character quality, quarantine with a reason, and never index an empty or garbled document as success.**
+- ➕ How do you show what an answer was based on three weeks later? **Store immutable document and chunk versions and record, per trace, which chunk versions were in context and which were cited.**
+- ➕ What is the main risk of evaluating RAG on synthetic questions? **They reuse the corpus's wording, so lexical retrieval looks better than on real user phrasing. Report synthetic and real scores separately and replace synthetic cases with real traffic.**
+
+## 18.23 Hands-on Exercises
+
+1. Sketch the full data pipeline for a customer support knowledge base with 100k documents updated daily.
+2. Design the schema for an interactions table that captures every chat with cost, latency, and quality signals.
+3. Plan deletion handling: a user requests deletion; what must change across raw, warehouse, vector, and backups?
+
+## 18.24 Common Mistakes
+
+- Treating documents as immutable; failing to handle updates.
+- No schema registry; producers and consumers drift silently.
+- Skipping data quality tests; bad data poisons retrieval.
+- Conflating ingestion and embedding; one schedule does not fit both.
+- No retention policy; storage grows forever.
+
+## 18.25 Enterprise Best Practices
+
+Lakehouse with Iceberg or Delta from the start. dbt for transformations. Schema registry for streams. Data contracts between producer and consumer teams. Governance catalog. Per-dataset owner and SLA. Quarterly cost and quality reviews.
+
+## Sources
+
+- Debezium, [PostgreSQL connector documentation](https://debezium.io/documentation/reference/stable/connectors/postgresql.html) (`pgoutput`, `topic.prefix`, event `op` values, snapshots, replication slots), checked October 2026.
+- aiokafka, [Consumer documentation](https://aiokafka.readthedocs.io/en/stable/consumer.html) (consumer groups, `auto_offset_reset`, offset commits).
+- arq, [documentation](https://arq-docs.helpmanual.io/) (job uniqueness through a custom `_job_id`, retries with `Retry`).
+- pgvector, [README](https://github.com/pgvector/pgvector) (`vector_dims`).
+- Docling, [DocumentConverter reference](https://docling-project.github.io/docling/reference/document_converter/) (`raises_on_error`, `ConversionStatus`), checked October 2026.
+- datasketch, [MinHash LSH](https://ekzhu.com/datasketch/lsh.html).
+- Leskovec, Rajaraman, Ullman, [Mining of Massive Datasets, chapter 3](http://www.mmds.org/) (MinHash and LSH banding).
+- Microsoft Presidio, [documentation](https://microsoft.github.io/presidio/) (analyzer, anonymizer operators).
+- Morris et al., [Text Embeddings Reveal (Almost) As Much As Text](https://arxiv.org/abs/2310.06816), EMNLP 2023 (embedding inversion).
+- Shumailov et al., [AI models collapse when trained on recursively generated data](https://www.nature.com/articles/s41586-024-07566-y), Nature, 2024.
+- [GDPR Article 17](https://gdpr-info.eu/art-17-gdpr/), right to erasure.

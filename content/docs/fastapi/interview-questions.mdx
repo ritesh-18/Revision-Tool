@@ -1,0 +1,891 @@
+---
+title: "FastAPI Interview Questions"
+description: "Fifty-nine FastAPI interview questions with full answers: ASGI and fundamentals, validation, dependency injection, project structure, async and performance, databases, security, testing and deployment, and AI backends (streaming LLM output, slow LLM calls, rate limits, agent jobs, model serving), with verified outputs."
+---
+
+These questions go from "what is FastAPI made of" to "design the backend for an LLM product". Most of them hide one mechanism you are expected to name: ASGI, the dependency graph, the event loop, the threadpool, Pydantic's validation and serialization. The "what does this return" questions were all run, and their outputs are real.
+
+All outputs come from CPython 3.14.6, FastAPI 0.143.0, Pydantic 2.14.1, Starlette 1.8.0 and SQLAlchemy 2.1.4. Each answer links to the chapter that covers the topic in depth.
+
+## Fundamentals and ASGI
+
+### 1. What is FastAPI actually made of? **Easy**
+
+**Short answer:** FastAPI is a layer on top of **Starlette** (the ASGI toolkit: routing, requests, responses, middleware, WebSockets) and **Pydantic** (validation and serialization). FastAPI's own contribution is reading your function signatures and type hints to build validation, dependency injection and the OpenAPI document automatically.
+
+When you write `def get_item(item_id: int, q: str | None = None)`, FastAPI inspects the signature once at startup and builds a plan: `item_id` comes from the path and must be an int, `q` is an optional query string. Per request it executes that plan, calls your function, and serializes the return value with Pydantic. Uvicorn (or another ASGI server) owns the socket and the HTTP parsing. So a request passes through three projects: uvicorn parses it, Starlette routes it, FastAPI and Pydantic validate and call your code.
+
+**Likely follow-up:** "Could you use FastAPI without uvicorn?" Yes, any ASGI server works: Hypercorn, Granian, Daphne. And in tests no server is needed at all, because the app is just a callable. See [introduction and first app](/docs/fastapi/introduction-and-first-app).
+
+### 2. What is ASGI, and how is it different from WSGI? **Medium**
+
+**Short answer:** Both are interfaces between a Python web server and a Python app. WSGI is `app(environ, start_response) -> iterable` and is synchronous: one request occupies one thread until it returns. ASGI is `await app(scope, receive, send)`: an async callable that exchanges **messages** with the server, so it supports async I/O, streaming, WebSockets and lifespan events.
+
+The ASGI `scope` is a dict describing the connection (`type` is `http`, `websocket` or `lifespan`, plus path, headers and so on). `receive()` yields events such as `http.request` (body chunks) and `http.disconnect`. `send()` takes events such as `http.response.start` and `http.response.body`. Because the app can call `send` many times and `await` between them, a single worker can hold thousands of open connections. Middleware is just an ASGI app that wraps another ASGI app.
+
+**Likely follow-up:** "Is ASGI faster than WSGI?" Not per request. It's better at **concurrency** for I/O-bound work: while one request awaits the database, the same thread serves others. For CPU-bound work it doesn't help. See [ASGI and the request lifecycle](/docs/fastapi/asgi-and-the-request-lifecycle).
+
+### 3. What's the difference between a `def` and an `async def` endpoint? **Easy**
+
+**Short answer:** An `async def` endpoint runs directly **on the event loop**. A `def` endpoint runs in a **threadpool** (AnyIO worker threads), so blocking code inside it doesn't freeze the loop. The same rule applies to dependencies.
+
+Use `async def` only when everything slow inside is awaited on an async library (`httpx.AsyncClient`, `asyncpg`, async SQLAlchemy). Use `def` when you call blocking libraries (`requests`, a sync DB driver, file I/O, CPU work). The dangerous combination is `async def` plus a blocking call: the whole worker stops serving other requests while it runs.
+
+**Likely follow-up:** "So should I make everything `def` to be safe?" It's safe, but threads are limited (40 by default) and cost more memory than coroutines. For an I/O-heavy service, async libraries plus `async def` scale further. See question 26.
+
+### 4. What does this return? **Medium**
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: int):
+    return {"user_id": user_id}
+
+
+@app.get("/users/me")
+async def get_me():
+    return {"user": "current"}
+
+
+r = TestClient(app).get("/users/me")
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+422 {'detail': [{'type': 'int_parsing', 'loc': ['path', 'user_id'], 'msg': 'Input should be a valid integer, unable to parse string as an integer', 'input': 'me'}]}
+```
+
+**Short answer:** A 422. Routes are matched **in declaration order**, and `/users/{user_id}` matches `/users/me` first, with `user_id="me"`. Matching is done on the path pattern, not on types, so the route is selected and then validation fails on `int`.
+
+Fix it by declaring `/users/me` **before** `/users/{user_id}`. The general rule: specific paths before parameterized ones.
+
+**Likely follow-up:** "Would `user_id: str` change anything?" Yes, then `get_user` would return `{"user_id": "me"}` with a 200, and `get_me` would never be reached. That's worse, because nothing errors.
+
+### 5. How does FastAPI decide whether a parameter comes from the path, the query or the body? What does this return? **Medium**
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+
+
+class Item(BaseModel):
+    name: str
+    qty: int
+
+
+@app.post("/stores/{store_id}/items")
+async def add(store_id: int, item: Item, notify: bool = False, tags: list[str] | None = None):
+    return {"store_id": store_id, "item": item, "notify": notify, "tags": tags}
+
+
+c = TestClient(app)
+r = c.post("/stores/7/items?notify=yes", json={"name": "pen", "qty": "3"})
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+422 {'detail': [{'type': 'missing', 'loc': ['body', 'item'], 'msg': 'Field required', 'input': None}]}
+```
+
+**Short answer:** The rules: a name that appears in the path template is a **path** parameter. A parameter whose type is a Pydantic model is a **body** parameter. A singular scalar (`int`, `str`, `bool`...) is a **query** parameter. But a `list[str]` without an explicit `Query()` is treated as **body**, so here there are two body parameters, and with more than one, FastAPI expects them **embedded** by name: `{"item": {...}, "tags": [...]}`. The flat body doesn't have an `item` key, hence the 422.
+
+Mark the list as a query parameter and it works:
+
+```python
+from typing import Annotated
+from fastapi import Query
+
+@app.post("/stores/{store_id}/items")
+async def add(store_id: int, item: Item, notify: bool = False,
+              tags: Annotated[list[str] | None, Query()] = None):
+    return {"store_id": store_id, "item": item, "notify": notify, "tags": tags}
+
+r = c.post("/stores/7/items?notify=yes&tags=a&tags=b", json={"name": "pen", "qty": "3"})
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+200 {'store_id': 7, 'item': {'name': 'pen', 'qty': 3}, 'notify': True, 'tags': ['a', 'b']}
+```
+
+Note two lax conversions: `notify=yes` became `True`, and the JSON string `"3"` became the int `3`.
+
+**Likely follow-up:** "How do you force a single model to be embedded?" `Annotated[Item, Body(embed=True)]`. See [path, query and body parameters](/docs/fastapi/path-query-and-body-parameters).
+
+### 6. What happens when an endpoint returns a `set`, a `Decimal` or a database connection object? **Medium**
+
+```python
+from datetime import date
+from decimal import Decimal
+from uuid import UUID
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+@app.get("/odd")
+async def odd():
+    return {"tags": {"b"}, "price": Decimal("9.90"), "day": date(2026, 1, 2),
+            "id": UUID(int=1), "pair": (1, 2)}
+
+
+@app.get("/bad")
+async def bad():
+    return {"conn": object()}
+
+
+c = TestClient(app, raise_server_exceptions=False)
+print(c.get("/odd").json())
+r = c.get("/bad")
+print(r.status_code, r.text)
+```
+
+```text title="Output"
+{'tags': ['b'], 'price': 9.9, 'day': '2026-01-02', 'id': '00000000-0000-0000-0000-000000000001', 'pair': [1, 2]}
+500 Internal Server Error
+```
+
+**Short answer:** Without a declared return type, FastAPI passes the value through `jsonable_encoder`, which knows common types: sets and tuples become lists, dates become ISO strings, UUIDs become strings, and `Decimal` becomes a float (watch out: `9.90` lost its trailing zero, and floats can lose precision for money). Anything it doesn't know raises, and the client gets a 500.
+
+**Likely follow-up:** "How do you keep `Decimal` exact?" Declare a response model with a `Decimal` field: Pydantic serializes it as a string in JSON (returning `Price(price=Decimal("9.90"))` with `-> Price` produced `{"price":"9.90"}`), or you can choose the representation with a field serializer. See [responses, errors and status codes](/docs/fastapi/responses-errors-and-status-codes).
+
+### 7. In what order does middleware run? What does this print? **Medium**
+
+```python
+@app.middleware("http")
+async def first(request: Request, call_next):
+    print("A in")
+    response = await call_next(request)
+    print("A out")
+    return response
+
+
+@app.middleware("http")
+async def second(request: Request, call_next):
+    print("B in")
+    response = await call_next(request)
+    print("B out")
+    return response
+
+
+@app.post("/things")
+async def create():
+    print("endpoint")
+    return {"ok": True}
+
+
+r = TestClient(app).post("/things")
+print(r.status_code)
+```
+
+```text title="Output"
+B in
+A in
+endpoint
+A out
+B out
+200
+```
+
+**Short answer:** Middleware forms an onion. Each `@app.middleware` or `add_middleware` call wraps the **current** stack, so the **last one added is the outermost**: it sees the request first and the response last.
+
+And the status is **200**, not 201: FastAPI doesn't pick 201 for `POST` automatically. Set `status_code=201` on the decorator.
+
+**Likely follow-up:** "Where should CORS middleware go?" Outermost (added last), so that even error responses from inner layers get CORS headers and preflight requests are answered before auth runs. See [middleware, lifespan and background tasks](/docs/fastapi/middleware-lifespan-and-background-tasks).
+
+### 8. What is the lifespan, and why did it replace `@app.on_event("startup")`? **Easy**
+
+**Short answer:** The lifespan is an async context manager passed as `FastAPI(lifespan=...)`. Code before `yield` runs once at startup, code after it runs once at shutdown. It replaced the startup/shutdown event handlers because one function can share local variables between startup and shutdown, and `try`/`finally` guarantees cleanup.
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=10)
+    app.state.engine = create_async_engine(settings.db_url)
+    yield
+    await app.state.http.aclose()
+    await app.state.engine.dispose()
+```
+
+It runs **once per worker process**, triggered by the ASGI `lifespan` messages. Use it for anything expensive and shared: connection pools, HTTP clients, ML models, caches.
+
+**Likely follow-up:** "Does a mounted sub-application's lifespan run?" No, only the top-level app's (we verified this in [project structure](/docs/fastapi/project-structure-and-settings)).
+
+## Validation and Pydantic
+
+### 9. What does a validation error look like, and how do you change its format? **Easy**
+
+```text title="Output (from question 5, an invalid path, query and body at once)"
+422
+  int_parsing ['path', 'store_id'] Input should be a valid integer, unable to parse string as an integer
+  bool_parsing ['query', 'notify'] Input should be a valid boolean, unable to interpret input
+  missing ['body', 'item'] Field required
+```
+
+**Short answer:** FastAPI validates **all** inputs before calling the endpoint and collects every error, not just the first. Failures raise `RequestValidationError`, which the default handler turns into a 422 with a `detail` list. Each error has a `type`, a `loc` (where: `path`, `query`, `header`, `cookie` or `body`, then the field path), a `msg` and the `input`.
+
+To change the shape (for example to match a company-wide error envelope), register a handler:
+
+```python
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={
+        "error": "validation_failed",
+        "fields": [{"field": ".".join(map(str, e["loc"][1:])), "message": e["msg"]} for e in exc.errors()],
+    })
+```
+
+**Likely follow-up:** "Should validation errors echo the input back?" Be careful: the default includes `input`, which can contain passwords or tokens. Strip it in your handler for sensitive endpoints.
+
+### 10. What does this return? **Medium**
+
+```python
+class UserIn(BaseModel):
+    email: str
+    password: str
+
+
+class UserOut(BaseModel):
+    email: str
+
+
+@app.post("/users")
+async def create(user: UserIn) -> UserOut:
+    return user                     # a UserIn, with the password
+
+
+@app.post("/users-leaky")
+async def create_leaky(user: UserIn):
+    return user
+
+
+c = TestClient(app)
+body = {"email": "a@x.io", "password": "hunter2", "is_admin": True}
+print(c.post("/users", json=body).json())
+print(c.post("/users-leaky", json=body).json())
+```
+
+```text title="Output"
+{'email': 'a@x.io'}
+{'email': 'a@x.io', 'password': 'hunter2'}
+```
+
+**Short answer:** The declared return type (or `response_model`) is a **filter**: FastAPI serializes the returned object through `UserOut`, so only `email` survives. Without it, the full `UserIn`, password included, goes back to the client. Also notice `is_admin` was silently dropped on input: Pydantic models **ignore extra keys** by default.
+
+**Likely follow-up:** "When would you use `response_model=` instead of the return annotation?" When the function returns something that isn't an instance of the public type (an ORM object, a dict) and you don't want type checkers to complain, or when you need options like `response_model_exclude_none`. To reject unknown input keys, set `model_config = ConfigDict(extra="forbid")`.
+
+### 11. Is `name: str | None` an optional field? **Easy**
+
+**Short answer:** No. `str | None` means "may be `None`", not "may be omitted". Without a default, the field is still **required**: the client must send `"name": null` explicitly. Write `name: str | None = None` to make it optional.
+
+This is one of the most common Pydantic v2 surprises, because in Pydantic v1 `Optional[str]` implied a default of `None`. In FastAPI the same rule applies to query parameters: a parameter without a default is required.
+
+**Likely follow-up:** "How do you tell 'not sent' from 'sent as null' in a PATCH?" Use `model.model_dump(exclude_unset=True)`: it contains only the fields the client actually sent. See [Pydantic and runtime validation](/docs/python/pydantic-and-runtime-validation).
+
+### 12. Why did `"3"` become `3` in question 5, and when is that a problem? **Medium**
+
+**Short answer:** Pydantic runs in **lax mode** by default and coerces compatible input: numeric strings to numbers, `"yes"`/`"on"`/`1` to `True`. That's convenient for query strings, which are always strings. It's a problem when the type itself carries meaning: an API that should reject `"amount": "10"` from a buggy client, or IDs that must not be confused.
+
+Use strict types per field (`StrictInt`, `Annotated[int, Field(strict=True)]`) or `model_config = ConfigDict(strict=True)` on request models where you want exact JSON types. Note that strict mode on query parameters rejects even valid numbers, since they arrive as strings:
+
+```python
+@app.get("/s")
+def s(n: Annotated[int, Query(strict=True)]):
+    return n
+
+r = TestClient(app).get("/s?n=3")
+print(r.status_code, r.json())
+```
+
+```text title="Output"
+422 {'detail': [{'type': 'int_type', 'loc': ['query', 'n'], 'msg': 'Input should be a valid integer', 'input': '3'}]}
+```
+
+### 13. How do you validate something that depends on two fields? **Easy**
+
+**Short answer:** A `@model_validator(mode="after")` on the model, which runs after field validation and sees the whole object:
+
+```python
+class DateRange(BaseModel):
+    start: date
+    end: date
+
+    @model_validator(mode="after")
+    def check_order(self):
+        if self.end < self.start:
+            raise ValueError("end must not be before start")
+        return self
+```
+
+A `ValueError` raised inside a validator becomes a normal 422 error entry. Validation that needs I/O (does this email already exist?) does **not** belong in a validator: validators should be pure and fast. Put that in a dependency or the service layer and raise a 409.
+
+### 14. How does FastAPI generate the OpenAPI schema, and why do operation IDs matter? **Medium**
+
+**Short answer:** At first access of `/openapi.json` (or `app.openapi()`), FastAPI walks every route and converts the path, parameters, body model, return type, status codes and declared responses into an OpenAPI 3.1 document, using Pydantic's JSON Schema generation for the models. The result is cached on `app.openapi_schema`.
+
+Operation IDs become method names in generated clients. The default (`get_item_items__item_id__get`) is long and changes whenever a path changes, which breaks client code. Set `generate_unique_id_function` (for example `f"{route.tags[0]}-{route.name}"`) or `operation_id=` per route. See [project structure and settings](/docs/fastapi/project-structure-and-settings).
+
+## Dependency injection
+
+### 15. How does `Depends` work under the hood? **Medium**
+
+**Short answer:** At startup, FastAPI inspects each endpoint's signature recursively and builds a **dependency graph** (a tree of `Dependant` objects): each dependency's own parameters can be path/query/body parameters or further dependencies. Per request, it resolves the graph depth-first: it extracts and validates request data, calls each dependency (sync ones in the threadpool, async ones awaited), passes results down, and finally calls the endpoint.
+
+Within one request, a dependency's result is **cached by default**: if `get_db` appears in three places in the graph, it's called once and the value is shared. That's how a repository and a service in the same request end up sharing one DB session. Dependencies with `yield` additionally register their teardown on an exit stack. See [dependency injection](/docs/fastapi/dependency-injection).
+
+### 16. What does this print? **Hard**
+
+```python
+calls = []
+
+
+def get_db():
+    calls.append("get_db")
+    return "db"
+
+
+def get_repo(db: Annotated[str, Depends(get_db)]):
+    return f"repo({db})"
+
+
+@app.get("/cached")
+def cached(db: Annotated[str, Depends(get_db)], repo: Annotated[str, Depends(get_repo)]):
+    return {"db": db, "repo": repo}
+
+
+@app.get("/uncached")
+def uncached(db: Annotated[str, Depends(get_db, use_cache=False)], repo: Annotated[str, Depends(get_repo)]):
+    return {"db": db, "repo": repo}
+
+
+@app.get("/uncached-last")
+def uncached_last(repo: Annotated[str, Depends(get_repo)], db: Annotated[str, Depends(get_db, use_cache=False)]):
+    return {"db": db, "repo": repo}
+
+
+c = TestClient(app)
+c.get("/cached"); print("cached:", calls); calls.clear()
+c.get("/uncached"); print("uncached:", calls)
+calls.clear(); c.get("/uncached-last"); print("uncached-last:", calls)
+```
+
+```text title="Output"
+cached: ['get_db']
+uncached: ['get_db']
+uncached-last: ['get_db', 'get_db']
+```
+
+**Short answer:** `/cached` calls `get_db` once, as expected. The surprise is `/uncached`: `use_cache=False` means "don't **read** the cache for this occurrence", but the value it produces is still **stored**. Dependencies are resolved in parameter order, so the uncached `db` runs first and fills the cache, and `get_repo`'s cached `get_db` then reuses it. Swap the order (`/uncached-last`) and `get_repo` fills the cache first, the uncached one then runs again, and you get two calls.
+
+**Likely follow-up:** "When do you actually need `use_cache=False`?" Rarely: when a dependency must produce a fresh value at each use within one request, such as two independent transactions. Don't rely on parameter order for correctness. Make it explicit with two different dependency functions.
+
+### 17. In what order do `yield` dependencies clean up? What does this print? **Hard**
+
+```python
+def get_session():
+    print("session: open")
+    try:
+        yield "session"
+        print("session: commit")
+    except Exception as exc:
+        print("session: rollback because", type(exc).__name__)
+        raise
+    finally:
+        print("session: close")
+
+
+def get_user(session: Annotated[str, Depends(get_session)]):
+    print("user: loaded")
+    yield "alice"
+    print("user: cleanup")
+
+
+@app.get("/ok")
+def ok(user: Annotated[str, Depends(get_user)], tasks: BackgroundTasks):
+    tasks.add_task(print, "background task: runs after the response is sent")
+    print("endpoint: returning")
+    return {"user": user}
+
+
+@app.get("/fail")
+def fail(user: Annotated[str, Depends(get_user)]):
+    raise HTTPException(409, "conflict")
+
+
+c = TestClient(app)
+r = c.get("/ok"); print("client got", r.json())
+print("---")
+r = c.get("/fail"); print("client got", r.status_code, r.json())
+```
+
+```text title="Output"
+session: open
+user: loaded
+endpoint: returning
+background task: runs after the response is sent
+user: cleanup
+session: commit
+session: close
+client got {'user': 'alice'}
+---
+session: open
+user: loaded
+session: rollback because HTTPException
+session: close
+client got 409 {'detail': 'conflict'}
+```
+
+**Short answer:** Setup runs outer to inner (session, then user), and teardown runs in **reverse** (user, then session), like nested `with` blocks, because FastAPI enters each `yield` dependency on an `AsyncExitStack`. When the endpoint raises, the exception is **thrown into** each generator at its `yield`: `get_user` has no handler, so its "cleanup" line never runs and the exception propagates to `get_session`, which rolls back and closes. In this run the background task ran before the dependency teardown.
+
+**Likely follow-up:** "What if I need the cleanup to happen before the response is sent?" FastAPI 0.143 supports `Depends(dep, scope="function")`, which runs the exit code right after the endpoint returns, before the response goes out. The default `"request"` scope keeps the resource alive for the whole request, which streaming responses need.
+
+### 18. How do you replace a dependency in tests? **Easy**
+
+**Short answer:** `app.dependency_overrides[original] = replacement`. During resolution, FastAPI looks up each dependency callable in this dict and calls the replacement instead, with the replacement's own signature. It works at every level of the graph, so overriding `get_session` affects every repository and service that depends on it.
+
+```python
+app.dependency_overrides[get_current_user] = lambda: User(id=1, name="test")
+try:
+    ...  # run tests
+finally:
+    app.dependency_overrides.clear()
+```
+
+The key is the function object. Overrides don't reach code that calls the function directly instead of through `Depends`. Always clear the dict afterwards, since it lives on the app. See [testing](/docs/fastapi/testing).
+
+### 19. How do you apply a dependency to every route in a group, and what's the difference from a parameter dependency? **Easy**
+
+**Short answer:** `APIRouter(dependencies=[Depends(verify_api_key)])` (or the same on `include_router` or `FastAPI(...)`) runs the dependency for every route in that scope, before the endpoint. Its **return value is discarded**, so it's for guards and side effects: auth checks, feature flags, rate limits, setting context. When the endpoint needs the value (the current user), declare it as a parameter instead. Both can coexist, and thanks to per-request caching, a dependency that appears in both places still runs only once.
+
+### 20. Function dependencies or class dependencies? **Medium**
+
+**Short answer:** Any callable can be a dependency, including a class: `Depends(Paginator)` calls `Paginator(...)` with request parameters for its `__init__` arguments. It's handy for parameter bundles, but the usual recommendation is a function that returns the object, which keeps construction explicit and easy to override. For configurable dependencies, use a callable instance:
+
+```python
+class RequireRole:
+    def __init__(self, role: str):
+        self.role = role
+
+    def __call__(self, user: Annotated[User, Depends(get_current_user)]) -> User:
+        if self.role not in user.roles:
+            raise HTTPException(403)
+        return user
+
+AdminUser = Annotated[User, Depends(RequireRole("admin"))]
+```
+
+### 21. Why is `Annotated[..., Depends(...)]` preferred over `param = Depends(...)`? **Easy**
+
+**Short answer:** With the old default-value style, `def f(user: User = Depends(get_user))`, the default value is a `Depends` object, so the function's signature lies: calling `f()` from a test or a script passes a `Depends` instance as the user. With `Annotated[User, Depends(get_user)]`, the metadata lives in the type annotation, the function stays a normal Python function, and you can name the alias once and reuse it everywhere:
+
+```python
+CurrentUser = Annotated[User, Depends(get_current_user)]
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+@router.get("/me")
+async def me(user: CurrentUser, session: SessionDep) -> UserOut: ...
+```
+
+The same applies to `Query`, `Path`, `Header` and `Body`.
+
+## Project structure and configuration
+
+### 22. How do you structure a FastAPI project that has outgrown one file? **Medium**
+
+**Short answer:** Split by **feature** (`users/`, `orders/`, each with `router.py`, `schemas.py`, `service.py`, `repository.py`, `models.py`) plus a `core/` package for config, DB setup and security. Each feature exposes an `APIRouter` with its own prefix, tags and guard dependencies, and an app factory (`create_app()`) includes them. Inside a feature, calls flow one way: router (HTTP: status codes, `HTTPException`) to service (business rules, raising domain exceptions) to repository (queries). Everything is wired with `Depends`, so tests can replace any layer. A by-layer layout (`routers/`, `services/`...) works for small apps but spreads every feature across many folders. See [project structure and settings](/docs/fastapi/project-structure-and-settings).
+
+### 23. How do you manage configuration and secrets? **Medium**
+
+**Short answer:** A `pydantic-settings` `BaseSettings` class: fields map to environment variables (with an optional prefix and a `.env` file for development), values are validated at startup, nested models use a delimiter like `APP_DB__POOL_SIZE`, and secrets are typed `SecretStr` so they print as `**********` in logs and tracebacks. Expose it through a cached dependency:
+
+```python
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+```
+
+The cache makes it one parse per process, the dependency makes it overridable in tests, and building it at startup means a missing variable fails the deploy immediately ("Field required") instead of at the first request that needs it. Precedence: init arguments, then environment variables, then `.env`, then secrets files, then defaults.
+
+### 24. Should services raise `HTTPException`? **Easy**
+
+**Short answer:** No. `HTTPException` couples business logic to HTTP: the same service called from a CLI, a queue worker or a test would raise web errors. Raise domain exceptions (`EmailTaken`, `OrderNotFound`) in services, and translate them at the edge, either in the router with `try`/`except` or once for the whole app with `@app.exception_handler(EmailTaken)` returning a 409. That keeps the mapping from domain errors to status codes in one place.
+
+### 25. How would you version a public API? **Medium**
+
+**Short answer:** URL prefix (`/api/v1`, `/api/v2`) is the boring, visible default: easy to route, cache, log and test with curl. In FastAPI, either include versioned routers in one app (`include_router(users_v1, prefix="/api/v1")`, one OpenAPI document) or mount a separate `FastAPI()` per version (`app.mount("/v2", v2)`, separate docs, but mounted apps' lifespans don't run). Version the **contract**: v1 and v2 handlers usually call the same service with different response models. Prefer additive changes that need no new version, mark old operations `deprecated=True`, and announce a sunset date.
+
+## Async and performance
+
+### 26. Your `async def` endpoint calls `requests.get()`. What happens under load? **Medium**
+
+**Short answer:** Every request in that worker waits. `requests` blocks the thread, and in an `async def` endpoint that thread is the event loop thread, so no other coroutine runs until the call returns. We measured 20 concurrent requests to an `async def` endpoint containing `time.sleep(0.1)`: they took **2.04 s** (served one by one). The same code in a `def` endpoint took **0.12 s**, and with `await asyncio.sleep(0.1)` **0.13 s**.
+
+The symptom is latency rising on **all** endpoints at once with low CPU. Fixes: use an async client (`httpx.AsyncClient`), make the endpoint `def`, or wrap the call in `await asyncio.to_thread(...)`. See [deployment and performance](/docs/fastapi/deployment-and-performance) and [asyncio](/docs/python/asyncio).
+
+### 27. How many sync endpoints can run at the same time in one worker? **Medium**
+
+**Short answer:** 40 by default. Sync endpoints and sync dependencies run through AnyIO's thread limiter, whose default capacity is 40 tokens. The 41st concurrent sync call waits for a free thread. We measured 100 blocking 0.1 s calls taking 0.33 s (three waves) with the default, and 0.12 s after raising the limit to 100:
+
+```python
+limiter = anyio.to_thread.current_default_thread_limiter()
+limiter.total_tokens = 100      # e.g. in the lifespan
+```
+
+Raising it trades memory (each thread has a stack) and, on a GIL build, contention, for throughput. If most of your work is I/O, async libraries are the better fix.
+
+### 28. How do you run CPU-heavy work (image resizing, PDF parsing, model inference) in FastAPI? **Medium**
+
+**Short answer:** Not on the event loop. Options, from lightest to heaviest:
+
+1. A `def` endpoint or `run_in_threadpool`: fine if the work releases the GIL (NumPy, many C extensions, I/O), or on the free-threaded 3.14 build. On a GIL build, pure-Python CPU work in threads doesn't run in parallel.
+2. A `ProcessPoolExecutor` created in the lifespan, used with `await loop.run_in_executor(pool, fn, *args)`: true parallelism, at the cost of pickling arguments and results.
+3. A task queue (Celery, arq, Dramatiq) with separate worker processes, when the work takes seconds or longer: return `202 Accepted` with a job ID.
+4. A separate model or compute service for heavy ML (see [serving your own models](/docs/fastapi/serving-your-own-models)).
+
+### 29. When does a `BackgroundTasks` task run, and when should you not use it? **Medium**
+
+**Short answer:** After the response has been sent, in the same worker process, as part of the same ASGI request cycle (you saw it in question 17). It's good for small, best-effort follow-ups: sending a notification email, writing an audit log, invalidating a cache.
+
+Don't use it for work that must not be lost or that takes long: it runs in the web process, so a deploy, crash or OOM kill loses it silently, there are no retries, and a long task occupies the worker (a sync task holds a threadpool thread). Use a durable queue for that. See [agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs).
+
+### 30. How many uvicorn workers should you run? **Medium**
+
+**Short answer:** For an async, I/O-bound app, start with **one worker per CPU core** (or one worker per container, scaled by replicas). Each worker is a separate process with its own event loop, memory, lifespan and DB pool. The `2 x cores + 1` formula is for synchronous WSGI workers, which handle one request at a time, and is too many for async workers.
+
+Then measure: if CPU is saturated, add cores or replicas. If CPU is low but latency is high, more workers won't help: look for blocking calls, a small threadpool or an exhausted connection pool. And remember total DB connections = workers x replicas x pool size.
+
+### 31. Two independent awaits take 300 ms and 200 ms. How do you make the endpoint take about 300 ms instead of 500 ms? **Easy**
+
+**Short answer:** Run them concurrently instead of one after the other:
+
+```python
+async with asyncio.TaskGroup() as tg:
+    user_task = tg.create_task(fetch_user(user_id))
+    orders_task = tg.create_task(fetch_orders(user_id))
+user, orders = user_task.result(), orders_task.result()
+```
+
+`TaskGroup` (or `asyncio.gather`) starts both, and the total time is the slower of the two. `TaskGroup` also cancels the sibling if one fails. Careful with a shared `AsyncSession`: one session can't run two queries concurrently, so concurrent DB queries need separate sessions.
+
+### 32. Why is declaring a return type faster? **Medium**
+
+**Short answer:** Without a return type, FastAPI runs `jsonable_encoder`, a recursive Python function, over the whole result and then `json.dumps`. With a return type (or `response_model`), FastAPI builds a Pydantic `TypeAdapter` once at startup and serializes straight to JSON bytes in Rust (pydantic-core). In our measurement, 5000 items took **49.8 ms** untyped and **5.4 ms** typed, with identical bytes. That's why `ORJSONResponse` and `UJSONResponse` are deprecated in FastAPI 0.143: the typed path is already fast, and it also validates and filters the output.
+
+## Databases
+
+### 33. How do you give each request its own database session? **Easy**
+
+**Short answer:** A `yield` dependency that opens a session from a sessionmaker created once at startup:
+
+```python
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:
+        yield session
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+```
+
+The engine (and its connection pool) is shared by the whole process. The session is per request, and the `async with` guarantees it is closed even if the endpoint raises. Per-request caching means every dependency in one request receives the same session, so they share one transaction. See [databases with SQLAlchemy](/docs/fastapi/databases-with-sqlalchemy).
+
+### 34. What happens here, and why? **Hard**
+
+```python
+async with Session() as s:
+    author = await s.scalar(select(Author))
+    try:
+        print([b.title for b in author.books])          # lazy-loaded relationship
+    except Exception as e:
+        print(type(e).__name__)
+        print(str(e).splitlines()[0][:160])
+
+async with Session() as s:
+    author = await s.scalar(select(Author).options(selectinload(Author.books)))
+    print([b.title for b in author.books])
+```
+
+```text title="Output"
+StatementError
+(sqlalchemy.exc.MissingGreenlet) greenlet_spawn has not been called; can't call await_() here. Was IO attempted in an unexpected place?
+['Notes']
+```
+
+**Short answer:** Accessing `author.books` triggers a **lazy load**, which is a database query hidden inside an attribute access. In async SQLAlchemy, I/O has to be awaited, and a plain attribute access can't `await`, so SQLAlchemy raises `MissingGreenlet`. The fix is to load what you need **up front** with an eager loader (`selectinload`, `joinedload`), or use `await author.awaitable_attrs.books`, or set `lazy="raise"` on relationships so mistakes fail loudly in development.
+
+**Likely follow-up:** "Why `expire_on_commit=False`?" After a commit, SQLAlchemy expires loaded attributes by default, and touching one afterwards triggers a refresh query, the same problem. Disabling it keeps the loaded values usable after commit, for example when building the response.
+
+### 35. What is the N+1 problem? **Easy**
+
+**Short answer:** One query to load N parent rows, then one more query per row to load a relationship: N+1 queries where 2 would do. With 100 orders that's 101 round-trips, and latency grows with the data. In async SQLAlchemy lazy loading fails outright (question 34), which at least makes it visible. Fix it with `selectinload` (a second `SELECT ... WHERE id IN (...)`, best for collections) or `joinedload` (a JOIN, best for many-to-one). Watch the SQL log (`echo=True`) or a trace to catch it.
+
+### 36. Requests start failing with "QueuePool limit of size 5 overflow 10 reached, connection timed out". What's going on? **Medium**
+
+**Short answer:** Every connection in the pool is checked out, and requests waited longer than `pool_timeout` for one. Either the pool is too small for the concurrency, or connections are **held too long**: a slow query, a missing index, or (very commonly) an HTTP or LLM call made while a session holds a connection. We reproduced it with a pool of 2 and 20 concurrent requests each holding a connection for 0.2 s: with a 1-second timeout, 10 of the 20 failed with exactly this error.
+
+Fixes: release connections before slow external calls, add indexes, size `pool_size` + `max_overflow` per worker for your concurrency while keeping workers x replicas x pool under the database's `max_connections`, and put PgBouncer in front of Postgres when there are many replicas.
+
+### 37. How do you manage schema changes? **Easy**
+
+**Short answer:** With migrations (Alembic for SQLAlchemy), not `Base.metadata.create_all()`. `create_all` only creates missing tables. It never alters columns, and it doesn't record what's been applied. Alembic generates versioned migration scripts (`alembic revision --autogenerate`), you review them, and the deploy pipeline runs `alembic upgrade head` once, **before** the new code starts, not from every worker's lifespan. For zero-downtime deploys, make changes backward-compatible (expand, migrate data, then contract in a later release).
+
+## Security
+
+### 38. What does `OAuth2PasswordBearer` actually do? What does this return? **Medium**
+
+```python
+oauth2 = OAuth2PasswordBearer(tokenUrl="/token")
+
+
+@app.get("/me")
+async def me(token: Annotated[str, Depends(oauth2)]):
+    return {"token": token}
+
+
+c = TestClient(app)
+r = c.get("/me"); print(r.status_code, r.headers.get("www-authenticate"), r.json())
+r = c.get("/me", headers={"Authorization": "Bearer anything.at.all"}); print(r.status_code, r.json())
+```
+
+```text title="Output"
+401 Bearer {'detail': 'Not authenticated'}
+200 {'token': 'anything.at.all'}
+```
+
+**Short answer:** Much less than the name suggests. It's a dependency that reads the `Authorization` header and returns the string after `Bearer `, or raises 401 with `WWW-Authenticate: Bearer` when it's missing. It does **not** verify anything: `anything.at.all` was accepted. It also documents the security scheme in OpenAPI so `/docs` shows the Authorize button.
+
+Verification is your job, in a dependency built on top of it: decode the JWT, check signature, expiry, issuer and audience, load the user, and raise 401 on any failure. See [authentication and security](/docs/fastapi/authentication-and-security).
+
+### 39. JWT or server-side sessions? **Medium**
+
+**Short answer:** It depends on revocation and clients.
+
+- **Server-side sessions** (random ID in an `HttpOnly`, `Secure`, `SameSite` cookie, data in Redis or the DB): easy to revoke (delete the row), small cookie, natural for browser apps on one domain. Cost: a lookup per request.
+- **JWTs** (signed, self-contained): no lookup, which suits multiple services and mobile or third-party clients. Cost: you can't revoke one before it expires without a denylist, which brings the lookup back.
+
+A common compromise: short-lived access JWTs (5 to 15 minutes) plus a refresh token stored server-side and rotated on use. For browsers, store tokens in `HttpOnly` cookies rather than `localStorage`, where any XSS can read them.
+
+### 40. How should passwords be stored? **Easy**
+
+**Short answer:** Hashed with a slow, salted, memory-hard algorithm: **Argon2id** (or bcrypt). Never plain SHA-256: it's designed to be fast, which is exactly what an attacker with a GPU wants. Libraries like `pwdlib` (or `passlib`) handle salt generation and encode the parameters in the stored hash, so you can raise the cost later and rehash on next login. Compare hashes with the library's verify function (constant time), return the same error for "no such user" and "wrong password", and rate-limit login attempts.
+
+### 41. You configured CORS to allow only `https://app.example.com`. What happens on a `DELETE` from another origin? **Hard**
+
+```python
+app.add_middleware(CORSMiddleware, allow_origins=["https://app.example.com"],
+                   allow_methods=["*"], allow_headers=["*"], allow_credentials=True)
+
+
+@app.delete("/items/1")
+async def delete_item():
+    print("  endpoint ran!")
+    return {"deleted": True}
+
+
+c = TestClient(app)
+pre = {"Origin": "https://evil.example", "Access-Control-Request-Method": "DELETE"}
+r = c.options("/items/1", headers=pre)
+print("preflight from evil:", r.status_code, r.text)
+r = c.delete("/items/1", headers={"Origin": "https://evil.example"})
+print("direct DELETE from evil:", r.status_code, r.json(), "ACAO:", r.headers.get("access-control-allow-origin"))
+r = c.delete("/items/1", headers={"Origin": "https://app.example.com"})
+print("from allowed origin: ACAO:", r.headers.get("access-control-allow-origin"))
+```
+
+```text title="Output"
+preflight from evil: 400 Disallowed CORS origin
+  endpoint ran!
+direct DELETE from evil: 200 {'deleted': True} ACAO: None
+  endpoint ran!
+from allowed origin: ACAO: https://app.example.com
+```
+
+**Short answer:** CORS is enforced by **browsers**, not by the server. The middleware answers the preflight with a 400, so a browser won't send the `DELETE`. But a request sent anyway (curl, a script, a server) **still runs the endpoint**: the middleware only omits the `Access-Control-Allow-Origin` header, which tells a browser not to expose the response to the page. CORS protects users' browsers from other sites reading your API's responses with their credentials. It is not authentication or authorization. Every endpoint still needs real auth, plus CSRF protection if you authenticate with cookies.
+
+**Likely follow-up:** "Why can't you combine `allow_origins=['*']` with credentials?" The CORS spec forbids a wildcard origin on credentialed requests, because it would let any site make authenticated reads. List origins explicitly.
+
+### 42. How would you rate-limit a FastAPI API? **Medium**
+
+**Short answer:** Count requests per key (user ID, API key, or IP for anonymous traffic) in a store **shared by all workers**, usually Redis, using a fixed window, sliding window or token bucket, and return **429** with a `Retry-After` header when the limit is hit. In-memory counters don't work with several workers or replicas, because each process counts separately. Implement it as a dependency (per route) or middleware (global), or use a library like `slowapi` with a Redis backend. Put coarse IP-based limits at the edge (proxy, API gateway, WAF), and fine-grained per-user and per-plan limits in the app, where you know who the user is.
+
+### 43. Is `include_in_schema=False` or disabling `/docs` a security measure? **Easy**
+
+**Short answer:** No. Hiding a route from OpenAPI removes it from the documentation, but it still answers requests (we checked: the hidden route returned 200). Disabling `docs_url` in production is reasonable hygiene for a private API, but security comes from authentication, authorization, network policy (internal routes on a separate port or service) and rate limits, never from obscurity.
+
+## Testing and deployment
+
+### 44. How does `TestClient` call your app without a server? **Medium**
+
+**Short answer:** It's an httpx-style client with a custom **transport**. Instead of opening a socket, the transport converts the request into an ASGI `scope`, calls `await app(scope, receive, send)` and assembles the response from the `send` messages. Since the test function is synchronous, it runs the app on an event loop in a background thread through an anyio **blocking portal**. Server exceptions are re-raised in the test by default (`raise_server_exceptions=True`). For async tests, `httpx.AsyncClient(transport=ASGITransport(app=app))` does the same on the test's own loop. See [testing](/docs/fastapi/testing).
+
+### 45. Your test sets `app.state.db_pool` in the lifespan, but the endpoint says it doesn't exist. Why? **Medium**
+
+**Short answer:** The lifespan didn't run. `TestClient(app)` used without `with` sends no lifespan events, and `httpx.AsyncClient` with `ASGITransport` never sends them. Use `with TestClient(app) as client:` (which runs startup on enter and shutdown on exit, and also keeps a single event loop for all requests), or enter the lifespan yourself (`async with lifespan(app): ...`) or use `asgi-lifespan` in async tests.
+
+### 46. How do you keep tests isolated when the app commits to the database? **Hard**
+
+**Short answer:** Run each test inside an outer transaction and roll it back at the end. Open a connection, `begin()` a transaction, and bind the test's `AsyncSession` to that connection with `join_transaction_mode="create_savepoint"`. The app's `commit()` then only releases a SAVEPOINT, and the final rollback discards everything. Override `get_session` to yield that session. It's much faster than recreating tables. On SQLite, the driver skips `BEGIN` by default, so the rollback silently does nothing unless you take over transaction control (we hit exactly that failure). Better still, test against the same database as production.
+
+### 47. What do `--proxy-headers` and `root_path` fix? **Medium**
+
+**Short answer:** Behind a reverse proxy, the TCP peer is the proxy and the inner hop is plain HTTP, so without help the app sees the proxy's IP and `http://`. `--proxy-headers` makes uvicorn rewrite the client address and scheme from `X-Forwarded-For` and `X-Forwarded-Proto`, but only for connections from `--forwarded-allow-ips` (otherwise any client could spoof its IP). `root_path` tells the app it's served under a prefix that the proxy strips (for example `/api`), so `url_for`, redirects and the `/docs` page generate correct URLs. See [deployment and performance](/docs/fastapi/deployment-and-performance).
+
+### 48. What happens to in-flight requests during a deploy? **Medium**
+
+**Short answer:** With graceful shutdown, they finish. On `SIGTERM`, uvicorn closes the listening socket, closes idle connections, waits for in-flight requests (up to `--timeout-graceful-shutdown`), runs the lifespan shutdown, and exits. We verified a 2-second request started before the signal completed with a 200, while new connections were refused. What still needs care: the load balancer may route new requests for a few seconds after `SIGTERM` (add a `preStop` delay or fail readiness first), long-lived WebSockets and SSE streams must be closed deliberately, `BackgroundTasks` die with the process, and the app's timeout must be shorter than the orchestrator's grace period. See [graceful shutdown](/docs/backend-first-principles/19-graceful-shutdown).
+
+### 49. How do you authenticate a WebSocket from a browser? **Medium**
+
+**Short answer:** The browser's `WebSocket` API can't set an `Authorization` header, so the credential has to travel another way: a session cookie (then validate the `Origin` header, since browsers don't apply CORS to WebSockets), a **short-lived single-use ticket** in the query string obtained from an authenticated HTTP endpoint (not the long-lived JWT, which would end up in access logs), or a first message containing the token with a short deadline. Authenticate in a dependency **before** `accept()` and raise `WebSocketException(code=1008)` to refuse. Under `TestClient` that shows up as a `WebSocketDisconnect` with code 1008, but a real browser sees the handshake rejected with **HTTP 403**, which is what our uvicorn test logged. Then authorize each message, and re-check long-lived sessions when the token would have expired.
+
+### 50. What's the difference between liveness and readiness checks? **Easy**
+
+**Short answer:** **Liveness** asks "is the process stuck?" and failing it gets the container **restarted**, so it should only check that the app responds, never the database. **Readiness** asks "should this instance receive traffic?" and failing it **removes the instance from the load balancer** without a restart, so it checks dependencies (DB, cache) and whether the instance is draining. If liveness checked the DB, a database blip would restart every replica at once.
+
+## AI backends
+
+### 51. How do you stream an LLM's answer to a browser with FastAPI? **Medium**
+
+**Short answer:** Server-Sent Events. The client `POST`s the prompt, the endpoint opens a streaming request to the LLM provider, and forwards each token as an SSE event as soon as it arrives. FastAPI 0.143 has native SSE (this sketch uses the Anthropic SDK and needs an API key, so it wasn't run here):
+
+```python
+from collections.abc import AsyncIterable
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+
+@app.post("/chat", response_class=EventSourceResponse)
+async def chat(req: ChatRequest, llm: LLMDep) -> AsyncIterable[ServerSentEvent]:
+    async with llm.messages.stream(model=MODEL, max_tokens=1024,
+                                   messages=req.messages) as stream:
+        async for text in stream.text_stream:
+            yield ServerSentEvent(data={"delta": text}, event="token")
+    yield ServerSentEvent(data={"done": True}, event="end")
+```
+
+`EventSourceResponse` sets `text/event-stream`, `Cache-Control: no-cache` and `X-Accel-Buffering: no` (so nginx doesn't buffer the stream), JSON-encodes `data`, and sends keep-alive comments when idle. Because the browser's `EventSource` only supports `GET`, chat UIs typically read the stream with `fetch()`. Send an explicit end or error event, since a stream that just stops is ambiguous. See [streaming LLM responses](/docs/fastapi/streaming-llm-responses) and [WebSockets and streaming](/docs/fastapi/websockets-and-streaming).
+
+**Likely follow-up:** "Why SSE and not WebSockets?" Token streaming is one-directional per request. SSE is plain HTTP, so auth, logging, proxies and load balancers work unchanged, and reconnection is built in. WebSockets earn their cost for truly bidirectional sessions such as voice.
+
+### 52. The user closes the tab halfway through a long LLM answer. What happens on the server? **Hard**
+
+**Short answer:** With an async streaming generator, Starlette notices the `http.disconnect` and **cancels** the streaming task: your generator receives `CancelledError` at its current `await`. We verified this: a client that read three events and hung up produced "cancelled after 3 events" and then the `finally` block ran. So:
+
+- put cleanup in `finally`: close the upstream stream (which stops token generation and billing), record usage, release locks;
+- **re-raise** `CancelledError`, never swallow it;
+- don't use sync generators for this: we saw one simply stop being iterated without its `finally` ever running.
+
+For a **non-streaming** endpoint, nothing cancels the work when the client leaves: the handler keeps running and its response is discarded. Check `await request.is_disconnected()` between expensive steps (we saw it stop a 50-step loop at step 5).
+
+### 53. LLM calls take 5 to 60 seconds. How do you keep the API healthy? **Hard**
+
+**Short answer:** Treat the LLM as a slow, flaky, rate-limited dependency:
+
+1. **Async all the way**: a single shared `AsyncAnthropic`/`AsyncOpenAI`/`httpx.AsyncClient` created in the lifespan, so thousands of waiting calls cost almost nothing. Never a sync SDK client inside `async def`.
+2. **Timeouts** on every call (connect and read), shorter than your own request timeout and the proxy's.
+3. **Retries with exponential backoff and jitter**, only for retryable errors (429, 5xx, timeouts), honouring `Retry-After`, with a cap on attempts.
+4. **Concurrency limits** per provider (a semaphore, see question 54) so a traffic spike doesn't turn into a wall of 429s.
+5. **Stream** so the user sees progress immediately.
+6. **Move long work out of the request**: for multi-step or agentic work, return `202 Accepted` with a job ID and run it in a queue worker (question 56).
+7. **Don't hold DB connections** while waiting on the model.
+8. **Cache** identical requests where correctness allows, and use provider prompt caching for long shared prefixes.
+
+See [calling LLM APIs](/docs/fastapi/calling-llm-apis).
+
+### 54. What does this print, and why would you use it? **Medium**
+
+```python
+import asyncio, time
+
+LLM_SLOTS = asyncio.Semaphore(3)          # provider allows 3 concurrent requests
+T0 = time.perf_counter()
+
+
+async def call_llm(i):
+    async with LLM_SLOTS:
+        start = time.perf_counter() - T0
+        await asyncio.sleep(1)            # pretend the model takes 1 s
+        return f"req{i} started at {start:.1f}s"
+
+
+async def main():
+    results = await asyncio.gather(*(call_llm(i) for i in range(7)))
+    print("\n".join(results))
+    print(f"total {time.perf_counter() - T0:.1f}s")
+
+asyncio.run(main())
+```
+
+```text title="Output"
+req0 started at 0.0s
+req1 started at 0.0s
+req2 started at 0.0s
+req3 started at 1.0s
+req4 started at 1.0s
+req5 started at 1.0s
+req6 started at 2.0s
+total 3.0s
+```
+
+**Short answer:** A semaphore with 3 slots lets at most three calls run at once. The rest wait their turn, so seven calls run in three waves. In an LLM backend, a module-level (per-worker) semaphore around the provider call caps outbound concurrency, which keeps you under the provider's concurrency limits and protects your own workers. Remember it's **per process**: with 4 workers, the effective limit is 12. For a global limit across workers and replicas, use a shared limiter in Redis. Add a timeout on acquiring the slot so requests fail fast with 503 instead of queueing forever.
+
+### 55. How do you rate-limit users of an LLM feature? **Medium**
+
+**Short answer:** Requests per minute aren't enough, because one request can cost 100 tokens or 100,000. Limit on **cost**:
+
+- a request-rate limit per user or API key (token bucket in Redis), returning 429 with `Retry-After`;
+- a **token budget** per user per day or month: estimate input tokens before the call (reject if over budget), and record actual usage from the provider's response afterwards (in the stream's `finally`, so aborted streams are billed too);
+- caps on `max_tokens` and input size per request;
+- separate limits per plan, enforced in a dependency that knows the user.
+
+And on the outbound side, handle the **provider's** 429s with backoff, and limit your own concurrency (question 54). See [production AI concerns](/docs/fastapi/production-ai-concerns).
+
+### 56. An agent run takes several minutes and calls many tools. How do you structure that in FastAPI? **Hard**
+
+**Short answer:** Not inside the HTTP request. The request creates a **job** and returns immediately:
+
+1. `POST /runs` validates input, stores a `run` row with status `queued`, enqueues a task (arq, Celery, or a Redis/Postgres-backed queue), and returns `202 Accepted` with the run ID.
+2. A separate **worker process** picks it up, executes the agent loop (LLM call, tool calls, repeat), writes each step and status change to the database, and publishes progress events (Redis pub/sub or Streams).
+3. The client follows progress via `GET /runs/{id}` (polling) or `GET /runs/{id}/events` (SSE, resumable with `Last-Event-ID` because steps are stored), and can `POST /runs/{id}/cancel`, which sets a flag the worker checks between steps.
+
+Why: requests get cut by proxies after 60 to 100 seconds, deploys kill in-flight work, `BackgroundTasks` has no retries or persistence, and agents need **idempotent, checkpointed steps** so a retried job doesn't send the same email twice. See [agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs).
+
+### 57. How do you get reliable structured output from an LLM in a FastAPI service? **Medium**
+
+**Short answer:** Define the expected shape as a Pydantic model, ask for it through the provider's structured-output or tool-calling feature (passing the model's JSON Schema), and **validate** the result with `Model.model_validate_json(...)`. On `ValidationError`, retry with the validation errors fed back to the model, a bounded number of times, then fail with a clear error. Never trust LLM output as if it were validated input: treat it like any external data, and if it drives actions (tool calls, SQL, URLs), check permissions and arguments just as you would for a user request. See [structured outputs and tool calling](/docs/fastapi/structured-outputs-and-tool-calling).
+
+### 58. How would you serve your own ML model behind FastAPI? **Hard**
+
+**Short answer:** Load the model **once per worker** in the lifespan (never per request), and keep inference off the event loop:
+
+- Inference is CPU or GPU work. Run it in a thread (`run_in_threadpool`, fine when the framework releases the GIL, as PyTorch and ONNX Runtime do), in a process pool, or in a dedicated inference server.
+- Each worker holds its own copy of the model in memory, so workers x model size must fit in RAM or VRAM. That usually means **few workers** per GPU and scaling with replicas.
+- **Batch** requests: collect requests for a few milliseconds and run them as one batch. GPUs are far more efficient on batches.
+- For large models, put a specialised server (vLLM, TGI, Triton, Ray Serve) behind your FastAPI app, and keep FastAPI as the API layer for auth, validation, rate limits, streaming and logging.
+- Add a **startup or readiness probe** that only passes after the model is loaded and warmed up.
+
+See [serving your own models](/docs/fastapi/serving-your-own-models) and [AI backend architecture](/docs/fastapi/ai-backend-architecture).
+
+### 59. A chat feature uses WebSockets and works locally, but in production with four workers, users in the same room miss each other's messages. Why? **Medium**
+
+**Short answer:** The connection manager is a dict of sockets **in one process's memory**. With four workers, each user's socket lives in whichever worker accepted it, and a broadcast only reaches sockets in the same process. Fix it with a shared message bus: each worker publishes incoming messages to Redis pub/sub (or NATS, Postgres `LISTEN/NOTIFY`), subscribes to the rooms it has members in, and delivers to its **local** sockets. Pub/sub doesn't persist messages, so store chat history separately and let clients fetch what they missed on reconnect. Sticky sessions don't solve it. See [WebSockets and streaming](/docs/fastapi/websockets-and-streaming).
+
+## Quick-fire recap
+
+- FastAPI = Starlette (ASGI, routing) + Pydantic (validation, serialization) + signature introspection.
+- Routes match in declaration order. Specific paths go before parameterized ones.
+- `async def` runs on the loop, `def` in a 40-thread pool. Blocking inside `async def` stalls the worker.
+- Return types filter, document and speed up responses. Extra input keys are ignored unless you forbid them.
+- Dependencies form a per-request graph with caching. `yield` dependencies tear down in reverse order and see the endpoint's exception.
+- Lazy loading fails in async SQLAlchemy: load eagerly. Don't hold connections across slow calls.
+- `OAuth2PasswordBearer` only extracts a token. CORS is enforced by browsers, not by your server.
+- `dependency_overrides`, `with TestClient(app)`, and rollback-per-test are the core of a FastAPI test suite.
+- In production: proxy headers from trusted IPs, liveness vs readiness, graceful shutdown, about one worker per core.
+- For AI backends: stream with SSE, cancel on disconnect, bound concurrency, budget tokens, and move long agent runs into durable jobs.

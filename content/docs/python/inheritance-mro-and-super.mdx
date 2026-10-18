@@ -1,0 +1,900 @@
+---
+title: "Inheritance, MRO and super()"
+description: "Single and multiple inheritance in Python, the C3 linearisation worked by hand, how super() really follows the MRO, cooperative multiple inheritance, mixins, and when to prefer composition."
+---
+
+Python supports **multiple inheritance**, which JavaScript and TypeScript do not. That one fact changes a lot: method lookup can no longer walk a simple chain of parents, so Python computes a single ordered list of classes for every class, the **MRO** (method resolution order), using an algorithm called **C3 linearisation**. `super()` then means "the next class in that list", which is often *not* the parent you see in the source. Get this right and mixins, cooperative `__init__` methods and framework class hierarchies (Django class-based views, DRF, SQLAlchemy) stop being mysterious.
+
+<Callout title="Version note">
+  Every snippet on this page was run with **CPython 3.14.6**. The C3 algorithm and `super()` semantics described here have been stable since Python 2.3 and 3.0 respectively.
+</Callout>
+
+## Single inheritance
+
+### What it is
+
+`class Dog(Animal)` creates a class whose **bases** are `(Animal,)`. Anything not found on `Dog` is looked up on `Animal`, then on `object` (the root of every class).
+
+### How it works underneath
+
+At class creation time CPython computes `Dog.__mro__`, a tuple of classes in lookup order. Inheritance does **not** copy methods into the subclass: `Dog.__dict__` only holds what `Dog` itself defines. Attribute lookup walks `__mro__` at access time (with a per-type cache that is invalidated when any class in the chain is modified).
+
+```python
+class Animal:
+    def __init__(self, name):
+        self.name = name
+    def speak(self):
+        return f"{self.name} makes a sound"
+    def describe(self):
+        return f"I am {self.name}. {self.speak()}"
+
+class Dog(Animal):
+    def speak(self):                       # override
+        return f"{self.name} barks"
+
+d = Dog("Rex")
+print(d.describe())                        # base method calls overridden speak
+print(Dog.__bases__, Dog.__mro__)
+print("speak" in Dog.__dict__, "describe" in Dog.__dict__)
+```
+
+```text title="Output"
+I am Rex. Rex barks
+(<class '__main__.Animal'>,) (<class '__main__.Dog'>, <class '__main__.Animal'>, <class 'object'>)
+True False
+```
+
+`describe` lives on `Animal`, but `self.speak()` inside it is looked up on `self`, which is a `Dog`, so the override wins. Every method in Python is "virtual"; there is no `final` or `sealed` at runtime (`typing.final` is only a hint for type checkers).
+
+### Overriding vs extending
+
+**Overriding** replaces the parent's method. **Extending** overrides and then calls the parent's version via `super()`, adding behaviour before or after.
+
+```python
+class Animal:
+    def __init__(self, name):
+        self.name = name
+
+class Dog(Animal):
+    def __init__(self, name, breed):
+        super().__init__(name)             # extend: run the parent's logic first
+        self.breed = breed
+
+d = Dog("Rex", "lab")
+print(vars(d))
+
+class Broken(Animal):
+    def __init__(self, name, breed):
+        self.breed = breed                 # forgot super().__init__
+
+b = Broken("Rex", "lab")
+print(vars(b))
+try:
+    b.name
+except AttributeError as e:
+    print("AttributeError:", e)
+```
+
+```text title="Output"
+{'name': 'Rex', 'breed': 'lab'}
+{'breed': 'lab'}
+AttributeError: 'Broken' object has no attribute 'name'
+```
+
+Python does **not** call the parent's `__init__` for you. If you define `__init__` in a subclass and forget `super().__init__(...)`, the parent's setup silently never runs. If you do not define `__init__` at all, the parent's is inherited and used:
+
+```python
+class Animal:
+    def __init__(self, name):
+        self.name = name
+
+class Cat(Animal):
+    pass                                   # inherits __init__
+
+print(Cat("Tom").name)
+try:
+    Cat()
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+Tom
+TypeError: Animal.__init__() missing 1 required positional argument: 'name'
+```
+
+<Callout title="Coming from JS">
+  In a JS/TS subclass constructor you **must** call `super(...)` before touching `this`, or you get a `ReferenceError`. Python has no such rule: the object already exists (it was made by `__new__`), so `self` is usable immediately and forgetting `super().__init__()` is legal, and a silent bug. Inheritance itself is similar to the prototype chain: `Dog.__mro__` plays the role of `Dog.prototype -> Animal.prototype -> Object.prototype`, except it is a flat precomputed tuple rather than a linked list of objects.
+</Callout>
+
+## Multiple inheritance
+
+### What it is
+
+A class can list several bases: `class Duck(Swimmer, Flyer)`. Attributes are searched across all of them, in MRO order. The **order of the bases matters**: earlier bases win.
+
+```python
+class Swimmer:
+    def move(self):
+        return "swim"
+    def swim(self):
+        return "swimming"
+
+class Flyer:
+    def move(self):
+        return "fly"
+    def fly(self):
+        return "flying"
+
+class Duck(Swimmer, Flyer):
+    pass
+
+d = Duck()
+print(d.move(), d.swim(), d.fly())
+print([c.__name__ for c in Duck.__mro__])
+
+class Duck2(Flyer, Swimmer):
+    pass
+print(Duck2().move())
+```
+
+```text title="Output"
+swim swimming flying
+['Duck', 'Swimmer', 'Flyer', 'object']
+fly
+```
+
+For a simple tree like this the MRO is what you would guess: left to right. It gets interesting when bases share an ancestor.
+
+## The diamond problem
+
+### What it is
+
+```python
+class Base: ...
+class Left(Base): ...
+class Right(Base): ...
+class Child(Left, Right): ...
+```
+
+`Base` is reachable along two paths. Two questions arise: in what order should `Left`, `Right` and `Base` be searched, and how do we make sure `Base.__init__` runs **exactly once**?
+
+<Mermaid chart={`classDiagram
+  class Base {
+    +__init__()
+  }
+  class Left {
+    +__init__()
+  }
+  class Right {
+    +__init__()
+  }
+  class Child {
+    +__init__()
+  }
+  Base <|-- Left
+  Base <|-- Right
+  Left <|-- Child
+  Right <|-- Child`} />
+
+A naive depth-first search would give `Child, Left, Base, Right, Base`, visiting `Base` before `Right` even though `Right` is more specific. Explicit parent calls show the double-initialisation problem:
+
+```python
+class Base:
+    def __init__(self):
+        print("Base.__init__")
+
+class Left(Base):
+    def __init__(self):
+        print("Left.__init__")
+        Base.__init__(self)        # hard-coded parent call
+
+class Right(Base):
+    def __init__(self):
+        print("Right.__init__")
+        Base.__init__(self)
+
+class Child(Left, Right):
+    def __init__(self):
+        print("Child.__init__")
+        Left.__init__(self)
+        Right.__init__(self)
+
+Child()
+```
+
+```text title="Output"
+Child.__init__
+Left.__init__
+Base.__init__
+Right.__init__
+Base.__init__
+```
+
+`Base.__init__` ran twice. If it opened a DB connection or registered a signal handler, that is a real bug. The cure is to compute one consistent order (C3) and have every class call `super()` instead of naming its parent.
+
+## C3 linearisation, by hand
+
+### The rules
+
+C3 produces a list `L[C]` for each class `C` that respects three constraints:
+
+1. **A class comes before its bases** (children before parents).
+2. **Base order is preserved**: if `C(X, Y)`, then `X` comes before `Y` in `L[C]`.
+3. **Monotonicity**: the MRO of every base is a sub-sequence of `L[C]`, so a class's own lookup order is never contradicted by a subclass.
+
+The algorithm:
+
+```text
+L[object] = [object]
+L[C(B1, ..., Bn)] = [C] + merge(L[B1], ..., L[Bn], [B1, ..., Bn])
+
+merge(lists):
+  repeat:
+    look at the HEAD (first element) of each list, in order
+    pick the first head that does NOT appear in the TAIL (anything after
+      the first element) of any list
+    append it to the result and remove it from the front of every list
+  until all lists are empty
+  if no head qualifies -> TypeError: no consistent MRO
+```
+
+A head that appears in some tail is "blocked": some list says another class must come before it.
+
+### Worked example 1: the diamond
+
+Writing `O` for `object`:
+
+```text
+L[Base]  = Base O
+L[Left]  = Left  + merge([Base O], [Base])     = Left Base O
+L[Right] = Right + merge([Base O], [Base])     = Right Base O
+
+L[Child] = Child + merge([Left Base O], [Right Base O], [Left Right])
+
+step 1  heads: Left, Right, Left
+        Left in any tail? tails are [Base O], [Base O], [Right] -> no
+        take Left     lists: [Base O] [Right Base O] [Right]
+step 2  head Base: in tail of [Right Base O] -> blocked
+        next head Right: tails [O] [Base O] [] -> free
+        take Right    lists: [Base O] [Base O] []
+step 3  take Base     lists: [O] [O]
+step 4  take O
+
+L[Child] = Child Left Right Base O
+```
+
+`Base` is postponed until both `Left` and `Right` have been listed, which is exactly what we want.
+
+### Worked example 2: a bigger hierarchy
+
+```python
+class O: pass
+class A(O): pass
+class B(O): pass
+class C(O): pass
+class D(O): pass
+class E(O): pass
+class K1(A, B, C): pass
+class K2(D, B, E): pass
+class K3(D, A): pass
+class Z(K1, K2, K3): pass
+
+for cls in (K1, K2, K3, Z):
+    print(cls.__name__, [c.__name__ for c in cls.__mro__])
+```
+
+```text title="Output"
+K1 ['K1', 'A', 'B', 'C', 'O', 'object']
+K2 ['K2', 'D', 'B', 'E', 'O', 'object']
+K3 ['K3', 'D', 'A', 'O', 'object']
+Z ['Z', 'K1', 'K2', 'K3', 'D', 'A', 'B', 'C', 'E', 'O', 'object']
+```
+
+Here is how `L[Z]` comes out, ignoring the trailing `object`:
+
+```text
+L[Z] = Z + merge([K1 A B C O], [K2 D B E O], [K3 D A O], [K1 K2 K3])
+
+take K1   (K1 is in no tail)
+          [A B C O] [K2 D B E O] [K3 D A O] [K2 K3]
+A blocked (tail of [K3 D A O]);   take K2
+          [A B C O] [D B E O] [K3 D A O] [K3]
+A blocked; D blocked (tail of [K3 D A O]);   take K3
+          [A B C O] [D B E O] [D A O]
+A blocked (tail of [D A O]);   take D
+          [A B C O] [B E O] [A O]
+take A    [B C O] [B E O] [O]
+take B    [C O] [E O] [O]
+take C    [O] [E O] [O]
+O blocked (tail of [E O]);   take E
+          [O] [O] [O]
+take O
+
+L[Z] = Z K1 K2 K3 D A B C E O
+```
+
+### A runnable C3
+
+Writing the algorithm yourself is the best way to make it stick. This version matches CPython on the diamond:
+
+```python
+def c3(cls):
+    """Compute the MRO of cls by hand, printing each step."""
+    if not cls.__bases__ or cls.__bases__ == (object,):
+        return [cls] + ([object] if cls is not object else [])
+    seqs = [c3(b) for b in cls.__bases__] + [list(cls.__bases__)]
+    result = [cls]
+    while True:
+        seqs = [s for s in seqs if s]
+        if not seqs:
+            return result
+        for seq in seqs:
+            head = seq[0]
+            if not any(head in s[1:] for s in seqs):
+                break
+        else:
+            raise TypeError(f"no consistent MRO for {cls.__name__}")
+        result.append(head)
+        for s in seqs:
+            if s[0] is head:
+                del s[0]
+
+class A: pass
+class B(A): pass
+class C(A): pass
+class D(B, C): pass
+print([k.__name__ for k in c3(D)])
+print([k.__name__ for k in D.__mro__])
+print(D.mro() == list(D.__mro__))
+```
+
+```text title="Output"
+['D', 'B', 'C', 'A', 'object']
+['D', 'B', 'C', 'A', 'object']
+True
+```
+
+### When C3 refuses
+
+If the constraints contradict each other, class creation fails with `TypeError`:
+
+```python
+class A: pass
+class B(A): pass
+try:
+    class C(A, B): pass
+except TypeError as e:
+    print("TypeError:", e)
+
+class X: pass
+class Y: pass
+class P(X, Y): pass
+class Q(Y, X): pass
+try:
+    class R(P, Q): pass
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+TypeError: Cannot create a consistent method resolution order (MRO) for bases A, B
+TypeError: Cannot create a consistent method resolution order (MRO) for bases X, Y
+```
+
+`class C(A, B)` asks for `A` before `B` (base order) while `B(A)` requires `B` before `A` (children first). `R(P, Q)` inherits two contradictory orders of `X` and `Y`. The fix for the first case is to list the more specific class first: `class C(B, A)`, or just `class C(B)`.
+
+## How `super()` really works
+
+### What it is not
+
+`super()` does **not** mean "my parent class". It means: **"continue the attribute search in the MRO of `type(self)`, starting just after the class whose code I am in."** The MRO used is that of the *actual object*, not of the class where the method was written. That is why `super()` in `Left` can call `Right`, a class `Left` has never heard of.
+
+### How it works underneath
+
+`super()` with no arguments is shorthand for `super(__class__, self)`:
+
+- `__class__` is a hidden closure cell the compiler creates for any function defined in a class body that uses `super` (or `__class__`). It holds the class being defined, here `Left`.
+- `self` is the method's first argument.
+
+`super(Left, obj)` returns a proxy object. Looking up `.hello` on it takes `type(obj).__mro__`, finds `Left` in it, and searches the classes **after** `Left`, binding whatever it finds to `obj`.
+
+```python
+class Base:
+    def hello(self):
+        return "Base"
+
+class Left(Base):
+    def hello(self):
+        return "Left -> " + super().hello()
+
+class Right(Base):
+    def hello(self):
+        return "Right -> " + super().hello()
+
+class Child(Left, Right):
+    def hello(self):
+        return "Child -> " + super().hello()
+
+c = Child()
+print(c.hello())
+print(super(Left, c).hello())          # start searching AFTER Left in c's MRO
+print(super(Child, c).hello())
+s = super(Left, c)
+print(s)
+print(Left.hello.__code__.co_freevars) # the hidden __class__ cell
+```
+
+```text title="Output"
+Child -> Left -> Right -> Base
+Right -> Base
+Left -> Right -> Base
+<super: <class 'Left'>, <Child object>>
+('__class__',)
+```
+
+Now the diamond, rewritten with `super()`, runs every `__init__` exactly once:
+
+```python
+class Base:
+    def __init__(self):
+        print("Base.__init__")
+
+class Left(Base):
+    def __init__(self):
+        print("Left.__init__")
+        super().__init__()
+
+class Right(Base):
+    def __init__(self):
+        print("Right.__init__")
+        super().__init__()
+
+class Child(Left, Right):
+    def __init__(self):
+        print("Child.__init__")
+        super().__init__()
+
+Child()
+print([c.__name__ for c in Child.__mro__])
+print("--- a plain Left:")
+Left()
+```
+
+```text title="Output"
+Child.__init__
+Left.__init__
+Right.__init__
+Base.__init__
+['Child', 'Left', 'Right', 'Base', 'object']
+--- a plain Left:
+Left.__init__
+Base.__init__
+```
+
+The same `Left.__init__` code calls `Right.__init__` when the object is a `Child`, and `Base.__init__` when the object is a plain `Left`. The target of `super()` is decided **at runtime by the instance's MRO**.
+
+<Mermaid chart={`flowchart LR
+  Child --> Left --> Right --> Base --> object
+  Child -.->|"super() in Child"| Left
+  Left -.->|"super() in Left"| Right
+  Right -.->|"super() in Right"| Base`} />
+
+### Traps
+
+- **Zero-argument `super()` only works inside a class body.** A function attached to a class later has no `__class__` cell:
+
+```python
+class A:
+    def f(self):
+        return "A.f"
+
+class B(A):
+    pass
+
+def g(self):
+    return super().f()
+
+B.g = g
+try:
+    B().g()
+except RuntimeError as e:
+    print("RuntimeError:", e)
+```
+
+```text title="Output"
+RuntimeError: super(): __class__ cell not found
+```
+
+- **Mixing `super()` and explicit `Parent.method(self)` breaks the chain.** One class that calls its parent by name skips every class the MRO placed in between. Either the whole hierarchy uses `super()`, or none of it does.
+- `super()` inside a `@classmethod` works too: it binds to `cls` instead of an instance.
+
+<Callout title="Coming from JS">
+  In JS, `super.method()` is resolved **lexically**: it uses the `[[HomeObject]]` of the method and goes to that object's prototype, i.e. the literal parent in the source. Python's zero-argument `super()` also captures the defining class lexically (the `__class__` cell), but then continues along the **instance's** MRO. In single inheritance the two behave the same. In multiple inheritance, Python's `super()` can land on a sibling class, something JS never does because it has no multiple inheritance.
+</Callout>
+
+## Cooperative multiple inheritance with `**kwargs`
+
+### The problem
+
+If every `__init__` calls `super().__init__()`, each one must be prepared for **any** class to be next in line, and those classes take different arguments. You cannot know the next class's signature when you write yours.
+
+### The pattern
+
+1. Every class accepts `**kwargs`.
+2. Each class takes the keyword arguments **it** cares about (keyword-only, using `*`) and passes the rest along with `super().__init__(**kwargs)`.
+3. A root class sits just above `object`, so that by the time the chain reaches `object.__init__` all keywords have been consumed. `object.__init__` raises if it receives any extra arguments, which conveniently catches typos.
+
+```python
+class Base:
+    def __init__(self, **kwargs):
+        # object.__init__ accepts no extra args, so everything must be consumed
+        super().__init__(**kwargs)
+
+class TimestampMixin(Base):
+    def __init__(self, *, created_at="now", **kwargs):
+        print(f"TimestampMixin takes created_at={created_at!r}, passes {kwargs}")
+        self.created_at = created_at
+        super().__init__(**kwargs)
+
+class SoftDeleteMixin(Base):
+    def __init__(self, *, deleted=False, **kwargs):
+        print(f"SoftDeleteMixin takes deleted={deleted!r}, passes {kwargs}")
+        self.deleted = deleted
+        super().__init__(**kwargs)
+
+class Model(Base):
+    def __init__(self, *, id, **kwargs):
+        print(f"Model takes id={id!r}, passes {kwargs}")
+        self.id = id
+        super().__init__(**kwargs)
+
+class Order(TimestampMixin, SoftDeleteMixin, Model):
+    def __init__(self, *, total, **kwargs):
+        print(f"Order takes total={total!r}, passes {kwargs}")
+        self.total = total
+        super().__init__(**kwargs)
+
+o = Order(id=7, total=99.5, created_at="2026-10-13", deleted=False)
+print(vars(o))
+print([c.__name__ for c in Order.__mro__])
+try:
+    Order(id=1, total=1, colour="red")
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+Order takes total=99.5, passes {'id': 7, 'created_at': '2026-10-13', 'deleted': False}
+TimestampMixin takes created_at='2026-10-13', passes {'id': 7, 'deleted': False}
+SoftDeleteMixin takes deleted=False, passes {'id': 7}
+Model takes id=7, passes {}
+{'total': 99.5, 'created_at': '2026-10-13', 'deleted': False, 'id': 7}
+['Order', 'TimestampMixin', 'SoftDeleteMixin', 'Model', 'Base', 'object']
+Order takes total=1, passes {'id': 1, 'colour': 'red'}
+TimestampMixin takes created_at='now', passes {'id': 1, 'colour': 'red'}
+SoftDeleteMixin takes deleted=False, passes {'id': 1, 'colour': 'red'}
+Model takes id=1, passes {'colour': 'red'}
+TypeError: object.__init__() takes exactly one argument (the instance to initialize)
+```
+
+The unknown `colour` travelled down the whole chain and was rejected by `object.__init__`. That error message is confusing the first time you see it; it really means "someone passed a keyword argument that no class in the MRO consumed".
+
+### Rules for cooperative classes
+
+- Use **keyword arguments** for anything passing through a cooperative chain; positional arguments cannot be split safely between unknown classes.
+- Every class in the chain must call `super()` with the leftovers, including the ones that "obviously" have no parent.
+- Method signatures for the cooperative method must be compatible across the hierarchy.
+
+## Mixins
+
+### What they are
+
+A **mixin** is a small class that adds one capability and is not meant to be instantiated alone. It usually has no `__init__` (or a cooperative one), depends on a minimal, documented interface of the host class, and is listed **before** the main base class so its methods win and its `super()` calls flow into the base.
+
+### Backend example: model helpers
+
+```python
+import json
+from datetime import datetime, timezone
+
+class JsonMixin:
+    """Adds JSON serialisation to any class with a __dict__."""
+    def to_json(self):
+        return json.dumps(self.to_dict(), default=str)
+    def to_dict(self):
+        return {k: v for k, v in vars(self).items() if not k.startswith("_")}
+
+class AuditMixin:
+    """Records who changed what. Expects self.id."""
+    def touch(self, user):
+        self.updated_by = user
+        self.updated_at = datetime(2026, 10, 13, tzinfo=timezone.utc)
+        return self
+
+class ReprMixin:
+    def __repr__(self):
+        fields = ", ".join(f"{k}={v!r}" for k, v in self.to_dict().items())
+        return f"{type(self).__name__}({fields})"
+
+class User(ReprMixin, JsonMixin, AuditMixin):
+    def __init__(self, id, email):
+        self.id = id
+        self.email = email
+        self._password_hash = "secret"
+
+u = User(1, "ana@example.com").touch("admin")
+print(u)
+print(u.to_json())
+print([c.__name__ for c in User.__mro__])
+```
+
+```text title="Output"
+User(id=1, email='ana@example.com', updated_by='admin', updated_at=datetime.datetime(2026, 10, 13, 0, 0, tzinfo=datetime.timezone.utc))
+{"id": 1, "email": "ana@example.com", "updated_by": "admin", "updated_at": "2026-10-13 00:00:00+00:00"}
+['User', 'ReprMixin', 'JsonMixin', 'AuditMixin', 'object']
+```
+
+### Backend example: request-handling mixins (Django-style views)
+
+Mixins that wrap behaviour use `super()` to form a pipeline, much like middleware. The MRO **is** the middleware order:
+
+```python
+class Handler:
+    def handle(self, request):
+        return f"handled {request['path']}"
+
+class LoggingMixin:
+    def handle(self, request):
+        print(f"log: {request['method']} {request['path']}")
+        return super().handle(request)
+
+class AuthMixin:
+    def handle(self, request):
+        if not request.get("user"):
+            return "401 Unauthorized"
+        return super().handle(request)
+
+class OrdersView(LoggingMixin, AuthMixin, Handler):
+    pass
+
+v = OrdersView()
+print(v.handle({"method": "GET", "path": "/orders", "user": "ana"}))
+print(v.handle({"method": "GET", "path": "/orders"}))
+print([c.__name__ for c in OrdersView.__mro__])
+
+class WrongOrder(Handler, LoggingMixin, AuthMixin):
+    pass
+print(WrongOrder().handle({"method": "GET", "path": "/orders"}))
+```
+
+```text title="Output"
+log: GET /orders
+handled /orders
+log: GET /orders
+401 Unauthorized
+['OrdersView', 'LoggingMixin', 'AuthMixin', 'Handler', 'object']
+handled /orders
+```
+
+`LoggingMixin` has no base class with a `handle` method, yet `super().handle(...)` works because, for an `OrdersView` instance, the next class in the MRO is `AuthMixin`. With the base class listed first (`WrongOrder`), `Handler.handle` is found first and the mixins never run: **an unauthenticated request was served**. This is exactly the Django rule "put `LoginRequiredMixin` leftmost".
+
+<Mermaid chart={`classDiagram
+  class Handler {
+    +handle(request)
+  }
+  class LoggingMixin {
+    +handle(request)
+  }
+  class AuthMixin {
+    +handle(request)
+  }
+  class OrdersView
+  Handler <|-- OrdersView
+  LoggingMixin <|-- OrdersView
+  AuthMixin <|-- OrdersView
+  note for OrdersView "MRO: OrdersView, LoggingMixin,<br/>AuthMixin, Handler, object"`} />
+
+<Callout title="Coming from JS">
+  JS "mixins" are usually functions that return a subclass, `const Logged = (Base) => class extends Base { ... }`, composed as `class OrdersView extends Logged(Auth(Handler))`. The nesting order there is the call order. Python gets the same effect natively by listing classes in the bases tuple; the MRO plays the role of the nested `extends` chain. NestJS's guards and interceptors are a closer analogue of what these view mixins do.
+</Callout>
+
+### Mixin guidelines
+
+- Name them `SomethingMixin` and keep them focused on one capability.
+- Put mixins **left** of the concrete base class.
+- Prefer no state, or cooperative `__init__(self, **kwargs)`.
+- Document what the mixin expects from its host (`Expects self.id`). A [Protocol](/docs/python/abcs-and-protocols) can make that requirement checkable by type checkers.
+
+## Hooking subclass creation: `__init_subclass__`
+
+A related tool worth knowing: a base class can run code whenever it is subclassed, without a metaclass. It is a neat way to build plugin registries:
+
+```python
+class Plugin:
+    registry = {}
+    def __init_subclass__(cls, /, name=None, **kwargs):
+        super().__init_subclass__(**kwargs)
+        Plugin.registry[name or cls.__name__.lower()] = cls
+
+class S3Storage(Plugin, name="s3"):
+    pass
+
+class LocalStorage(Plugin):
+    pass
+
+print(Plugin.registry)
+```
+
+```text title="Output"
+{'s3': <class '__main__.S3Storage'>, 'localstorage': <class '__main__.LocalStorage'>}
+```
+
+Note the cooperative `**kwargs` again. More on class-creation hooks in [descriptors and metaclasses](/docs/python/descriptors-and-metaclasses).
+
+## `isinstance` and `issubclass`
+
+### What they are
+
+- `isinstance(obj, C)` is true if `type(obj)` is `C` or a subclass of it (or `C` claims the object via an ABC hook).
+- `issubclass(X, C)` is true if `C` is in `X.__mro__` (or the ABC hook says so). A class counts as a subclass of itself.
+- Both accept a tuple of classes, and since Python 3.10 also a union such as `int | str`.
+
+```python
+class Animal: pass
+class Dog(Animal): pass
+class Robot: pass
+
+d = Dog()
+print(isinstance(d, Dog), isinstance(d, Animal), isinstance(d, object))
+print(isinstance(d, (Robot, Animal)))
+print(type(d) is Animal, type(d) == Dog)
+print(issubclass(Dog, Animal), issubclass(Dog, Dog), issubclass(Animal, Dog))
+print(issubclass(bool, int), isinstance(True, int), True + True)
+from collections.abc import Sequence, Mapping
+print(isinstance([], Sequence), isinstance({}, Mapping), isinstance("x", Sequence))
+print(isinstance(3, int | str))
+```
+
+```text title="Output"
+True True True
+True
+False True
+True True False
+True True 2
+True True True
+True
+```
+
+### How it works underneath
+
+`isinstance(obj, C)` first checks `type(obj) is C` as a fast path, then calls `type(C).__instancecheck__(C, obj)` if defined, otherwise walks `type(obj).__mro__`. Abstract base classes in `collections.abc` override `__subclasshook__`, so a class can be an "instance" of an ABC **without inheriting from it**, just by having the right methods:
+
+```python
+from collections.abc import Iterable
+
+class Countdown:
+    def __iter__(self):
+        return iter([3, 2, 1])
+
+print(isinstance(Countdown(), Iterable))     # no inheritance needed
+print(Iterable in Countdown.__mro__)
+```
+
+```text title="Output"
+True
+False
+```
+
+### Traps and guidance
+
+- **`bool` is a subclass of `int`.** `isinstance(True, int)` is `True`, which bites validation code: check `bool` first, or use `type(x) is int`.
+- `type(x) is C` ignores subclasses; it is almost always wrong for "is this a C?". Use `isinstance`.
+- Long `isinstance` ladders are a smell. Prefer polymorphism (a method on each class), [`match` with class patterns](/docs/python/control-flow-and-match), or [`functools.singledispatch`](/docs/python/lambdas-and-functools). Prefer checking against ABCs or [Protocols](/docs/python/abcs-and-protocols) over concrete classes, in the spirit of duck typing.
+
+<Callout title="Coming from JS">
+  `isinstance(obj, C)` corresponds to `obj instanceof C`, which walks the prototype chain looking for `C.prototype`, and `__instancecheck__` is Python's version of `Symbol.hasInstance`. The big difference is ABCs: Python can answer "is this iterable?" with `isinstance(x, Iterable)`, while in JS you would write `typeof x[Symbol.iterator] === "function"`. TS interfaces vanish at runtime; Python ABCs and runtime-checkable Protocols do not.
+</Callout>
+
+## Subclassing built-ins: a trap
+
+Built-in types like `dict` and `list` are implemented in C, and their methods do not call each other through overridable Python methods. Overriding `__setitem__` on a `dict` subclass is **not** used by `__init__` or `update`:
+
+```python
+class LowerDict(dict):
+    def __setitem__(self, key, value):
+        super().__setitem__(key.lower(), value)
+
+d = LowerDict(Name="ana")        # __init__ does NOT call our __setitem__
+d["EMAIL"] = "a@x.com"
+d.update(ROLE="admin")           # neither does update
+print(d)
+
+from collections import UserDict
+class LowerDict2(UserDict):
+    def __setitem__(self, key, value):
+        super().__setitem__(key.lower(), value)
+
+d2 = LowerDict2(Name="ana")
+d2["EMAIL"] = "a@x.com"
+d2.update(ROLE="admin")
+print(d2)
+```
+
+```text title="Output"
+{'Name': 'ana', 'email': 'a@x.com', 'ROLE': 'admin'}
+{'name': 'ana', 'email': 'a@x.com', 'role': 'admin'}
+```
+
+Subclass `collections.UserDict`, `UserList` or `UserString` (written in Python, so every operation goes through your overrides), or implement a `collections.abc.MutableMapping`.
+
+## Composition vs inheritance
+
+### The guidance
+
+Inheritance expresses **is-a** and couples the subclass to the base's internals: every base change can break subclasses (the "fragile base class" problem), and deep hierarchies make it hard to find where behaviour lives. Composition expresses **has-a**: an object holds collaborators and delegates to them.
+
+```python
+class EmailSender:
+    def send(self, to, body):
+        return f"email to {to}: {body}"
+
+class FakeSender:
+    def __init__(self):
+        self.sent = []
+    def send(self, to, body):
+        self.sent.append((to, body))
+        return "queued (fake)"
+
+class SignupService:
+    def __init__(self, sender):
+        self.sender = sender              # has-a, injected
+
+    def register(self, email):
+        return self.sender.send(email, "welcome!")
+
+print(SignupService(EmailSender()).register("ana@example.com"))
+fake = FakeSender()
+print(SignupService(fake).register("bob@example.com"), fake.sent)
+```
+
+```text title="Output"
+email to ana@example.com: welcome!
+queued (fake) [('bob@example.com', 'welcome!')]
+```
+
+Swapping the sender in tests needed no subclassing and no mocking library. This is the same constructor-injection style NestJS uses, just without a container.
+
+### Rules of thumb
+
+| Use inheritance when | Use composition when |
+|---|---|
+| there is a true is-a relationship and the subclass honours the base's contract (Liskov) | you want to reuse behaviour but the relationship is has-a or uses-a |
+| a framework expects it (Django models, `Exception` subclasses, ABCs) | you need to swap implementations at runtime or in tests |
+| you are adding small, orthogonal capabilities via mixins | the hierarchy would grow beyond two or three levels |
+| the base class was designed for subclassing | you only need one or two methods of the would-be base |
+
+Python's duck typing makes composition especially cheap: the collaborator does not need to inherit from anything, it just needs the right methods. Use a [Protocol](/docs/python/abcs-and-protocols) to describe that shape for the type checker.
+
+## Interview questions
+
+1. **What is the MRO and how is it computed?** **The method resolution order is the tuple `C.__mro__` listing the classes searched for attributes. CPython computes it with C3 linearisation: the class, followed by a merge of its bases' MROs and the list of bases, always taking the first head that does not appear in any list's tail.**
+2. **What does `super()` actually call?** **The next class after the current one in the MRO of `type(self)`, not necessarily the parent. Zero-argument `super()` is `super(__class__, self)`, where `__class__` is a compiler-created cell holding the defining class.**
+3. **How does Python solve the diamond problem?** **C3 puts the shared base after all its subclasses in the MRO, and if every class calls `super()`, each method in the diamond runs exactly once.**
+4. **Why do cooperative `__init__` methods take `**kwargs`?** **A class cannot know which class follows it in the MRO of a future subclass, so each one takes its own keyword arguments and forwards the rest. `object.__init__` rejects leftovers, which catches unexpected arguments.**
+5. **When does class creation fail with "Cannot create a consistent method resolution order"?** **When the local base order contradicts an inherited order, e.g. `class C(A, B)` where `B` subclasses `A`, or two bases that order the same classes in opposite ways.**
+6. **Why must mixins usually come first in the bases list?** **Earlier bases come earlier in the MRO, so mixin methods override the base class and their `super()` calls flow into it. Put the concrete base first and its method is found first, so the mixin never runs.**
+7. **What is the difference between `isinstance(x, C)` and `type(x) is C`?** **`isinstance` respects inheritance and ABC hooks; `type(x) is C` matches only the exact class. Use `isinstance`, but remember that `bool` is a subclass of `int`.**
+8. **When would you choose composition over inheritance?** **When the relationship is has-a, when you need to swap implementations (tests, different backends), or when a hierarchy would become deep and fragile. Inherit for genuine is-a relationships, framework base classes and small mixins.**
+
+## Recap
+
+- Inheritance does not copy methods; lookup walks `type(obj).__mro__` at access time.
+- Python never calls the parent `__init__` automatically; extend with `super().__init__(...)`.
+- Multiple inheritance is real; base order matters, and C3 produces one consistent order (children first, base order kept, monotonic), or raises `TypeError`.
+- `super()` means "next in the instance's MRO", which can be a sibling. It relies on the hidden `__class__` cell, so it only works in functions defined in a class body.
+- Cooperative hierarchies: keyword arguments, `**kwargs` forwarding, every class calls `super()`.
+- Mixins add focused capabilities and go left of the base; the MRO is effectively their middleware order.
+- Use `isinstance` against ABCs or Protocols; avoid `type(x) is C`.
+- Subclass `UserDict` and friends rather than `dict` when overriding methods.
+- Default to composition; inherit when there is a true is-a relationship or a framework asks for it.

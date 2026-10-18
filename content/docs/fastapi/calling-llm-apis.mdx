@@ -1,0 +1,864 @@
+---
+title: "Calling LLM APIs"
+description: "Using AsyncAnthropic from FastAPI: one client per process created in the lifespan, request and response models, system prompts and history, timeouts, SDK retries plus tenacity, mapping 429/529 to 503 with Retry-After, concurrency limits with Semaphore, fan-out with TaskGroup, prompt caching, token cost tracking, and never blocking the loop."
+---
+
+This chapter is about the line in your code that actually calls the model, and everything around it that keeps that line safe under load: one shared client, a clear request shape, deadlines, retries, error mapping, concurrency limits, fan-out, caching and cost tracking.
+
+The examples use the official Anthropic Python SDK (`anthropic` **1.13**) and the model `claude-opus-5-5`. The same ideas apply to any provider. The [previous chapter](/docs/fastapi/ai-backend-architecture) explained why routes should usually talk to an `LLMClient` interface instead of the SDK. This chapter works with the SDK directly, because that is the code that lives inside the adapter.
+
+<Callout title="How the outputs on this page were produced">
+No snippet on this page called the paid API. Outputs come from one of three sources, and each output block says which:
+- **Fake model**: the `FakeLLM` from the previous chapter, which sleeps like a network call.
+- **Mock HTTP transport**: the **real** `AsyncAnthropic` client, pointed at an in-process `httpx2.MockTransport` that returns canned API responses and errors. The SDK's parsing, retries and exception classes are real. The model is not.
+- **Live API**: shown as code only, with no invented output.
+</Callout>
+
+## The smallest call
+
+```python
+import asyncio
+from anthropic import AsyncAnthropic
+
+async def main():
+    client = AsyncAnthropic()                 # reads ANTHROPIC_API_KEY from the environment
+    resp = await client.messages.create(
+        model="claude-opus-5-5",
+        max_tokens=1024,
+        system="You are a terse assistant.",
+        messages=[{"role": "user", "content": "What is FastAPI in one sentence?"}],
+    )
+    for block in resp.content:                # a list of blocks, not a string
+        if block.type == "text":
+            print(block.text)
+    print(resp.stop_reason, resp.usage.input_tokens, resp.usage.output_tokens)
+
+asyncio.run(main())
+```
+
+What to notice:
+
+- **`AsyncAnthropic`**, not `Anthropic`. The async client's methods are coroutines, so `await` hands control back to the event loop while the model works.
+- **`max_tokens` is required.** It's a hard cap on output tokens. If the model hits it, `stop_reason` is `"max_tokens"` and the text is cut off mid-sentence.
+- **`system`** is a top-level parameter, not a message with `role: "system"`. `messages` holds the conversation, starting with a `user` turn.
+- **`resp.content` is a list of typed blocks.** Text arrives as `type == "text"` blocks. Current models think before answering, so `thinking` blocks can come first. Tool calls are `tool_use` blocks. Never assume `resp.content[0].text`.
+- **`stop_reason`** tells you why generation ended: `end_turn` (finished), `max_tokens` (truncated), `tool_use` (wants a tool), `refusal` (declined), and a few others. Check it before trusting the text.
+- **`usage`** reports what you're billed for: `input_tokens`, `output_tokens`, and the cache counters covered [below](#prompt-caching).
+
+<Callout title="Thinking and effort on Claude Opus 5.5">
+On `claude-opus-5-5` adaptive thinking is always on: the model decides how much to think. You can't disable it. Instead you choose how much effort it spends with `output_config={"effort": "low" | "medium" | "high" | "xhigh" | "max"}`. The default on this model is `medium`. For chat and simple extraction, `low` cuts latency and cost. For hard reasoning, raise it. Don't send `temperature` or `thinking={"type": "disabled"}` to this model: the API rejects them with a 400.
+</Callout>
+
+## One client per process, created in the lifespan
+
+`AsyncAnthropic` wraps an HTTP client (`httpx2.AsyncClient`) with a **connection pool**. Opening an HTTPS connection to the API costs a TCP handshake plus a TLS handshake, which is several round trips. A pooled client keeps connections open and reuses them, so later requests skip that cost. The SDK's defaults are generous:
+
+```python
+import anthropic._constants as c
+print(c.DEFAULT_CONNECTION_LIMITS)
+print(c.DEFAULT_TIMEOUT, c.DEFAULT_MAX_RETRIES)
+```
+
+```text title="Output"
+Limits(max_connections=1000, max_keepalive_connections=100, keepalive_expiry=5.0)
+Timeout(connect=5.0, read=600, write=600, pool=600) 2
+```
+
+(These are private constants, printed only to show the defaults. Don't import them in application code.)
+
+If you create a client **per request**, every request pays the handshakes again, you leak sockets unless you close each client, and you lose the pool's limits. So create it **once**, in the [lifespan](/docs/fastapi/middleware-lifespan-and-background-tasks), close it at shutdown, and hand it out through a [dependency](/docs/fastapi/dependency-injection):
+
+```python
+# main.py
+from contextlib import asynccontextmanager
+from typing import Annotated, Literal
+
+import anthropic
+from anthropic import AsyncAnthropic
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+MODEL = "claude-opus-5-5"
+
+
+def build_client() -> AsyncAnthropic:          # tests replace this
+    return AsyncAnthropic(timeout=anthropic.Timeout(60.0, connect=5.0), max_retries=2)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.anthropic = build_client()       # ONE client for the whole process
+    yield
+    await app.state.anthropic.close()          # close the connection pool
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_anthropic(request: Request) -> AsyncAnthropic:
+    return request.app.state.anthropic
+
+
+Claude = Annotated[AsyncAnthropic, Depends(get_anthropic)]
+```
+
+Why the lifespan and not a module-level `client = AsyncAnthropic()`?
+
+- **It's bound to the right event loop.** The pool's connections belong to the loop that opened them. A module-level async client created at import time, and then used by a different loop (as happens in tests that start a fresh loop each time), can fail with "attached to a different loop" errors.
+- **Shutdown is clean.** `await client.close()` closes the sockets instead of leaving that to the garbage collector.
+- **Tests can swap it.** Here `build_client` is a seam. The test below replaces it with a client that talks to a mock transport.
+
+Each Uvicorn **worker process** runs its own lifespan, so with 4 workers you have 4 clients and 4 pools. That's correct: a pool can't be shared across processes.
+
+## Request and response models
+
+Don't let callers send you raw SDK payloads. Define what **your** API accepts, with limits, and what it returns:
+
+```python
+class Turn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=20_000)
+
+
+class ChatIn(BaseModel):
+    messages: list[Turn] = Field(min_length=1, max_length=50)
+
+
+class TokenUsage(BaseModel):
+    input_tokens: int
+    output_tokens: int
+
+
+class ChatOut(BaseModel):
+    reply: str
+    stop_reason: str | None
+    usage: TokenUsage
+
+
+SYSTEM = "You are a concise support assistant for Acme Cloud. Answer in at most three sentences."
+
+
+@app.post("/chat", response_model=ChatOut)
+async def chat(body: ChatIn, claude: Claude) -> ChatOut:
+    resp = await claude.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        system=SYSTEM,
+        messages=[t.model_dump() for t in body.messages],
+    )
+    reply = "".join(b.text for b in resp.content if b.type == "text")
+    return ChatOut(
+        reply=reply,
+        stop_reason=resp.stop_reason,
+        usage=TokenUsage(input_tokens=resp.usage.input_tokens, output_tokens=resp.usage.output_tokens),
+    )
+```
+
+The limits are a cost control, not just validation. `max_length=20_000` on each turn and `max_length=50` on the list put an upper bound on input tokens per request, and that bound is enforced before you spend anything. Note what the client **can't** send: a `system` prompt or a `model` name. Those are server decisions. A client that can set the system prompt can make your assistant do anything. A client that can choose the model can make you pay for the most expensive one.
+
+## System prompts and conversation history
+
+The Messages API is **stateless**. The model remembers nothing between calls. To continue a conversation you send the whole history again, every time, and pay for those input tokens every time. That leads to two decisions.
+
+**Who owns the history?** In the `/chat` endpoint above the client sends the full history. That's simple and stateless, but the client can rewrite past turns, including "assistant" turns it invents. For most products, keep history on the server, keyed by conversation id, and accept only the new user message:
+
+```python
+import uuid
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from llm import ChatMessage, FakeLLM
+
+MAX_TURNS = 4                                   # keep the last 4 messages (2 exchanges)
+
+class ConversationStore:                        # stand-in for a Postgres table
+    def __init__(self):
+        self._rows: dict[str, list[ChatMessage]] = {}
+    async def create(self) -> str:
+        cid = uuid.uuid4().hex[:8]
+        self._rows[cid] = []
+        return cid
+    async def load(self, cid: str) -> list[ChatMessage]:
+        if cid not in self._rows:
+            raise KeyError(cid)
+        return list(self._rows[cid])
+    async def append(self, cid: str, *msgs: ChatMessage) -> None:
+        self._rows[cid].extend(msgs)
+
+def window(history: list[ChatMessage], max_turns: int) -> list[ChatMessage]:
+    recent = history[-max_turns:]
+    while recent and recent[0].role != "user":   # the API wants the first message to be a user turn
+        recent = recent[1:]
+    return recent
+
+store = ConversationStore()
+llm = FakeLLM(lambda msgs: f"(I can see {len(msgs)} messages; last: {msgs[-1].content!r})")
+app = FastAPI()
+
+class SayIn(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+
+@app.post("/conversations")
+async def new_conversation():
+    return {"id": await store.create()}
+
+@app.post("/conversations/{cid}/messages")
+async def say(cid: str, body: SayIn):
+    try:
+        history = await store.load(cid)
+    except KeyError:
+        raise HTTPException(404, "Unknown conversation")
+    user = ChatMessage("user", body.text)
+    out = await llm.complete(window(history + [user], MAX_TURNS), system="You are helpful.")
+    await store.append(cid, user, ChatMessage("assistant", out.text))   # save only after success
+    return {"reply": out.text}
+```
+
+```python
+from fastapi.testclient import TestClient
+
+with TestClient(app) as client:
+    cid = client.post("/conversations").json()["id"]
+    for text in ["My name is Ada.", "I like Python.", "I live in London.", "What is my name?"]:
+        print(client.post(f"/conversations/{cid}/messages", json={"text": text}).json()["reply"])
+```
+
+```text title="Output (fake model)"
+(I can see 1 messages; last: 'My name is Ada.')
+(I can see 3 messages; last: 'I like Python.')
+(I can see 3 messages; last: 'I live in London.')
+(I can see 3 messages; last: 'What is my name?')
+```
+
+**How much history do you send?** Without a limit, a long chat grows until every request costs a fortune or exceeds the context window. A sliding window is the simplest fix, and the output shows its cost: by the fourth message, "My name is Ada." has fallen out of the window, so a real model could no longer answer. Better strategies keep a running summary of older turns, retrieve relevant old turns ([RAG](/docs/fastapi/rag-service)), or use the API's server-side compaction feature for very long conversations. Whatever you choose, trim by **tokens** rather than by message count in production (`client.messages.count_tokens(...)` gives exact counts), and keep the window starting on a `user` turn.
+
+The user and assistant turns are saved only **after** the model call succeeds. If the call fails, the user can retry without a dangling, unanswered message in their history.
+
+## Timeouts
+
+There are two different timeouts, and you want both.
+
+**1. The SDK's HTTP timeout** bounds each HTTP attempt. The default is 10 minutes for reads, which suits long generations but is far too long for an interactive endpoint. Set it on the client, or per request with `with_options`:
+
+```python
+import anthropic
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic(
+    timeout=anthropic.Timeout(60.0, connect=5.0),   # 60 s overall, 5 s to connect
+    max_retries=2,
+)
+
+# a stricter budget for one cheap call, without changing the shared client
+resp = await client.with_options(timeout=15.0, max_retries=1).messages.create(
+    model="claude-opus-5-5", max_tokens=256, messages=[{"role": "user", "content": "Classify: ..."}],
+)
+```
+
+A timeout raises `anthropic.APITimeoutError`, and **timeouts are retried**. With `timeout=60` and `max_retries=2` a call can take up to about 3 minutes of wall-clock time, plus backoff.
+
+**2. A route deadline** bounds the whole operation: queueing for a concurrency slot, every retry, and any post-processing. `asyncio.timeout` ([asyncio chapter](/docs/python/asyncio)) does this by cancelling whatever is in progress:
+
+```python
+import asyncio
+from fastapi import FastAPI, HTTPException
+from llm import ChatMessage, FakeLLM
+
+app = FastAPI()
+slow = FakeLLM("eventually", latency=3.0)
+ROUTE_DEADLINE = 0.5          # seconds; in real life maybe 30-60 s
+
+@app.post("/answer")
+async def answer(q: str):
+    try:
+        async with asyncio.timeout(ROUTE_DEADLINE):      # one budget for the whole route,
+            draft = await slow.complete([ChatMessage("user", q)])   # including SDK retries
+    except TimeoutError:
+        raise HTTPException(504, "The AI service took too long. Try a shorter question.")
+    return {"answer": draft.text}
+```
+
+```text title="Output (fake model)"
+504 {'detail': 'The AI service took too long. Try a shorter question.'} after 0.51s
+```
+
+The cancellation reaches all the way into the HTTP request: with the real SDK, the in-flight `httpx2` request is cancelled and its connection is dropped. Pick the route deadline first, from what the user will tolerate. Then make sure your proxy and load balancer timeouts are **longer** than it, so your clean 504 isn't replaced by their generic one.
+
+## Retries
+
+### What the SDK already does
+
+The SDK retries **connection errors, 408, 409, 429 and all 5xx** (including 529 "overloaded") with exponential backoff, `max_retries=2` times by default. When the response has a `retry-after` header, it waits that long instead. Here it is against a mock transport that always answers 529:
+
+```python
+import asyncio, time
+import anthropic, httpx2
+from anthropic import AsyncAnthropic
+
+attempts = []
+def handler(request):
+    attempts.append(time.perf_counter())
+    return httpx2.Response(529, json={"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})
+
+async def main():
+    client = AsyncAnthropic(api_key="test-key", max_retries=3,
+                            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+    start = time.perf_counter()
+    try:
+        await client.messages.create(model="claude-opus-5-5", max_tokens=64,
+                                     messages=[{"role": "user", "content": "hi"}])
+    except anthropic.OverloadedError as e:
+        print(type(e).__name__, e.status_code)
+    print("HTTP attempts:", len(attempts))
+    print("gaps between attempts:", [round(b - a, 2) for a, b in zip(attempts, attempts[1:])])
+    print(f"total: {time.perf_counter() - start:.2f}s")
+
+asyncio.run(main())
+```
+
+```text title="Output (real SDK, mock HTTP transport; gaps are jittered and vary per run)"
+OverloadedError 529
+HTTP attempts: 4
+gaps between attempts: [0.43, 0.79, 1.97]
+total: 3.24s
+```
+
+`max_retries=3` means 4 attempts. The gaps grow roughly exponentially with random jitter, so that thousands of clients that failed together don't retry together. In a separate run where the mock returned 429 with `retry-after: 7`, the SDK waited the full 7 seconds between attempts, so 3 attempts took about 14 seconds. That's correct behaviour, but it's also why a route deadline matters: SDK retries can quietly use up your whole latency budget.
+
+Note that 529 has its own exception class, `anthropic.OverloadedError`. Its parent class is `APIStatusError`, not `InternalServerError`, so `except InternalServerError` won't catch it.
+
+### When to add tenacity
+
+Leave transport-level retries to the SDK. Add your own retry layer, with [tenacity](https://tenacity.readthedocs.io/), for things the SDK can't know about:
+
+- **Semantic failures**: a 200 response that is useless to you, such as empty text, JSON that fails your schema, or a `max_tokens` cut-off.
+- **A different policy**: for example, a background job that should keep trying overloaded errors for minutes, while interactive routes give up quickly.
+
+```python
+import asyncio
+import anthropic, httpx2
+from tenacity import (AsyncRetrying, retry_if_exception_type,
+                      stop_after_attempt, stop_after_delay, wait_exponential_jitter)
+
+def overloaded() -> anthropic.OverloadedError:
+    req = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    return anthropic.OverloadedError("Overloaded", response=httpx2.Response(529, request=req), body=None)
+
+class EmptyReply(Exception):
+    """The model returned no usable text: worth one more try."""
+
+calls = 0
+async def summarise(doc: str) -> str:
+    global calls
+    calls += 1
+    if calls <= 2:
+        raise overloaded()          # pretend the SDK already used up its own retries
+    if calls == 3:
+        return "   "                # a 200 response that is useless to us
+    return f"Summary of {doc!r}"
+
+def log_retry(state):
+    print(f"  attempt {state.attempt_number} failed with "
+          f"{type(state.outcome.exception()).__name__}; sleeping {state.next_action.sleep:.2f}s")
+
+async def summarise_with_retries(doc: str) -> str:
+    async for attempt in AsyncRetrying(
+        retry=retry_if_exception_type((anthropic.OverloadedError, anthropic.RateLimitError, EmptyReply)),
+        stop=stop_after_attempt(5) | stop_after_delay(20),
+        wait=wait_exponential_jitter(multiplier=0.2, max=2.0, jitter=0.2),
+        before_sleep=log_retry,
+        reraise=True,
+    ):
+        with attempt:
+            text = await summarise(doc)
+            if not text.strip():
+                raise EmptyReply()
+    return text
+
+print(asyncio.run(summarise_with_retries("q3-report.pdf")))
+```
+
+```text title="Output (sleep times are jittered)"
+  attempt 1 failed with OverloadedError; sleeping 0.36s
+  attempt 2 failed with OverloadedError; sleeping 0.56s
+  attempt 3 failed with EmptyReply; sleeping 0.98s
+Summary of 'q3-report.pdf'
+```
+
+The parts that matter:
+
+- **`retry_if_exception_type(...)`** lists what is worth retrying. Never retry `BadRequestError` (400), `AuthenticationError` (401) or `NotFoundError` (404). They will fail the same way every time.
+- **Two stop conditions joined with `|`**: an attempt cap and a time cap. Without the time cap, retries can outlive the client that asked.
+- **`reraise=True`** re-raises the last real exception instead of tenacity's `RetryError`, so your error mapping still sees an `OverloadedError`.
+- **Multiplication.** Tenacity's 5 attempts around an SDK with `max_retries=2` can mean 15 HTTP requests. When you add your own layer, lower the SDK's `max_retries` for that call (`client.with_options(max_retries=0)`) or keep your attempt count small.
+
+<Callout type="warn" title="Retries cost money">
+A rate-limited or overloaded request was not billed, so retrying it is cheap. A request that **succeeded** and then failed your validation was billed in full, so every semantic retry pays for the input and output tokens again. Cap those at one or two attempts, and log them, so a bad prompt shows up as a cost spike in your dashboards and not only on the invoice.
+</Callout>
+
+## Mapping provider errors to your API's errors
+
+Your clients shouldn't see `anthropic.OverloadedError`, and they shouldn't get a bare 500 when the provider is busy. Translate provider failures into HTTP semantics your clients can act on. Register one [exception handler](/docs/fastapi/responses-errors-and-status-codes) for the SDK's base class:
+
+```python
+RETRYABLE = (anthropic.RateLimitError, anthropic.OverloadedError,
+             anthropic.ServiceUnavailableError, anthropic.InternalServerError)
+
+
+@app.exception_handler(anthropic.APIError)
+async def provider_error(request: Request, exc: anthropic.APIError) -> JSONResponse:
+    if isinstance(exc, RETRYABLE):
+        retry_after = exc.response.headers.get("retry-after", "10")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "The AI service is busy. Please retry shortly."},
+            headers={"Retry-After": retry_after},
+        )
+    if isinstance(exc, anthropic.APITimeoutError):
+        return JSONResponse(status_code=504, content={"detail": "The AI service timed out."})
+    if isinstance(exc, anthropic.APIConnectionError):
+        return JSONResponse(status_code=502, content={"detail": "Could not reach the AI service."})
+    # 400/401/403/404 from the provider: a bug or misconfiguration on OUR side.
+    request_id = exc.request_id if isinstance(exc, anthropic.APIStatusError) else None
+    print(f"provider rejected our request: {type(exc).__name__} request_id={request_id}")
+    return JSONResponse(status_code=502, content={"detail": "AI service error."})
+```
+
+| Provider says | Exception | You return | Why |
+|---|---|---|---|
+| 429 rate limited | `RateLimitError` | **503** + `Retry-After` | Your service is temporarily unable to serve. The user did nothing wrong, so it's not a 429 from you (unless it's **your** per-user limit) |
+| 529 overloaded, 503, 500 | `OverloadedError`, `ServiceUnavailableError`, `InternalServerError` | **503** + `Retry-After` | Transient. Clients and load balancers know how to back off on 503 |
+| timeout | `APITimeoutError` | **504** | An upstream took too long |
+| network failure | `APIConnectionError` | **502** | Bad gateway: you couldn't reach the upstream |
+| 400, 401, 403, 404 | `BadRequestError`, `AuthenticationError`, ... | **502** (or 500) and an alert | Your request or your key is wrong. Retrying won't help. Log the provider's `request_id` so you can trace it |
+
+The order of the `isinstance` checks matters, because `APITimeoutError` is a subclass of `APIConnectionError`. Here is the handler running, with the real SDK on a mock transport (`max_retries=0`, so the errors surface at once):
+
+```python
+import json
+import httpx2
+from fastapi.testclient import TestClient
+from anthropic import AsyncAnthropic
+import main
+
+def error(status, etype, msg, headers=None):
+    return httpx2.Response(status, json={"type": "error", "error": {"type": etype, "message": msg}},
+                           headers={"request-id": "req_mock123", **(headers or {})})
+
+SCRIPT = {
+    "hello":    lambda: httpx2.Response(200, json=message_json("Hi! How can I help with Acme Cloud?",
+                                                               input_tokens=31, output_tokens=11)),
+    "busy":     lambda: error(529, "overloaded_error", "Overloaded"),
+    "limited":  lambda: error(429, "rate_limit_error", "Number of requests has exceeded your rate limit",
+                              {"retry-after": "7"}),
+    "badmodel": lambda: error(404, "not_found_error", "model: claude-nonexistent"),
+}
+sent = []
+
+def handler(request: httpx2.Request) -> httpx2.Response:
+    body = json.loads(request.content)
+    sent.append(body)
+    return SCRIPT[body["messages"][-1]["content"]]()
+
+main.build_client = lambda: AsyncAnthropic(
+    api_key="test-key", max_retries=0,
+    http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+
+with TestClient(main.app) as client:
+    for text in ["hello", "busy", "limited", "badmodel"]:
+        r = client.post("/chat", json={"messages": [{"role": "user", "content": text}]})
+        print(text, "->", r.status_code, r.headers.get("retry-after"), r.json())
+
+print("body sent to the API:", json.dumps(sent[0]))
+```
+
+```text title="Output (real SDK, mock HTTP transport)"
+hello -> 200 None {'reply': 'Hi! How can I help with Acme Cloud?', 'stop_reason': 'end_turn', 'usage': {'input_tokens': 31, 'output_tokens': 11}}
+busy -> 503 10 {'detail': 'The AI service is busy. Please retry shortly.'}
+limited -> 503 7 {'detail': 'The AI service is busy. Please retry shortly.'}
+provider rejected our request: NotFoundError request_id=req_mock123
+badmodel -> 502 None {'detail': 'AI service error.'}
+body sent to the API: {"max_tokens": 1024, "messages": [{"role": "user", "content": "hello"}], "model": "claude-opus-5-5", "system": "You are a concise support assistant for Acme Cloud. Answer in at most three sentences."}
+```
+
+(`message_json` is a small helper that builds a valid Messages API response body.) The provider's `retry-after: 7` passed through as the client's `Retry-After: 7`. When the provider sent none, the handler used a default of 10 seconds. This test style is worth copying: it exercises the **real** SDK's exception classes and your **real** handler, with no network and no key. For the general theory of retries, backoff and graceful degradation, see [error handling and fault tolerance](/docs/backend-first-principles/16-error-handling-fault-tolerance).
+
+### Refusals are not exceptions
+
+A request the model declines comes back as **HTTP 200** with `stop_reason == "refusal"`. No exception is raised, so the handler above never sees it. Check `stop_reason` in your service code and return something deliberate. For `claude-opus-5-5`, Anthropic also offers server-side fallbacks (a beta feature): when the model declines, the API re-runs the request on a fallback model within the same call.
+
+```python
+resp = await claude.beta.messages.create(          # live API: no output shown
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    betas=["server-side-fallback-2026-07-01"],
+    fallbacks="default",                           # let the API choose the fallback route
+    messages=[{"role": "user", "content": question}],
+)
+if resp.stop_reason == "refusal":                  # the whole fallback chain declined
+    raise HTTPException(422, "This request can't be answered.")
+```
+
+## Concurrency limits with `asyncio.Semaphore`
+
+Async lets one worker start thousands of LLM calls. That is not always what you want. Your provider account has rate limits (requests and tokens per minute), and a burst of 500 concurrent calls turns into 500 rate-limit errors, each retried, which makes things worse. A semaphore caps how many calls a process makes at once. Everyone else waits for a slot.
+
+Following the previous chapter's design, the limit is a wrapper around any `LLMClient`:
+
+```python
+import asyncio, time
+from llm import ChatMessage, Completion, FakeLLM, LLMClient
+
+
+class LimitedLLM:
+    """At most `limit` provider calls in flight per process; wait at most `queue_timeout` for a slot."""
+
+    def __init__(self, inner: LLMClient, limit: int, queue_timeout: float = 30.0):
+        self.inner = inner
+        self.sem = asyncio.Semaphore(limit)
+        self.queue_timeout = queue_timeout
+        self.in_flight = 0
+        self.peak = 0
+
+    async def complete(self, messages, *, system=None, max_tokens=1024) -> Completion:
+        async with asyncio.timeout(self.queue_timeout):   # raises TimeoutError if no slot in time
+            await self.sem.acquire()
+        try:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            return await self.inner.complete(messages, system=system, max_tokens=max_tokens)
+        finally:
+            self.in_flight -= 1
+            self.sem.release()
+
+
+async def main():
+    llm = LimitedLLM(FakeLLM("ok", latency=0.5), limit=5)
+    start = time.perf_counter()
+    await asyncio.gather(*(llm.complete([ChatMessage("user", f"q{i}")]) for i in range(20)))
+    print(f"20 calls, limit 5: {time.perf_counter() - start:.2f}s, peak in flight = {llm.peak}")
+
+    impatient = LimitedLLM(FakeLLM("ok", latency=0.5), limit=2, queue_timeout=0.7)
+    results = await asyncio.gather(
+        *(impatient.complete([ChatMessage("user", "q")]) for _ in range(6)), return_exceptions=True)
+    print("limit 2, queue timeout 0.7s:", [type(r).__name__ for r in results])
+
+asyncio.run(main())
+```
+
+```text title="Output (fake model)"
+20 calls, limit 5: 2.05s, peak in flight = 5
+limit 2, queue timeout 0.7s: ['Completion', 'Completion', 'Completion', 'Completion', 'TimeoutError', 'TimeoutError']
+```
+
+Twenty half-second calls with 5 slots take 4 waves, about 2 seconds, and never more than 5 run at once. The second run shows **load shedding**: with 2 slots and a 0.7 s queue limit, the first two calls finish at 0.5 s, the next two get slots and finish at 1.0 s, and the last two give up waiting at 0.7 s. In a route you'd turn that `TimeoutError` into a 503 with `Retry-After`. Failing fast under overload is kinder than letting requests pile up until everything times out.
+
+Things to know about this limiter:
+
+- **It's per process.** With 4 workers on 3 machines and `limit=10`, the real cap is 120. For a cluster-wide limit you need shared state, such as a Redis token bucket. See [Production AI concerns](/docs/fastapi/production-ai-concerns).
+- **It limits concurrency, not rate.** Providers limit requests **per minute** and tokens **per minute**. A concurrency cap is a good first approximation, because in-flight count is roughly rate times latency. Token-aware limiting comes later.
+- **Create the semaphore inside the running app**, for example in the lifespan. Since Python 3.10 asyncio primitives bind to a loop lazily, on first use, but keeping all loop-bound objects in the lifespan is a good habit.
+
+## Fan-out with `asyncio.TaskGroup`
+
+Some endpoints need several model calls for one request: summarise each of N documents, classify each of N tickets, ask three prompts and compare. Run them concurrently with a [`TaskGroup`](/docs/python/asyncio), and bound the concurrency with a semaphore:
+
+```python
+import asyncio
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+from llm import ChatMessage, FakeLLM
+
+class Doc(BaseModel):
+    id: str
+    text: str = Field(min_length=1)
+
+class SummariseIn(BaseModel):
+    docs: list[Doc] = Field(min_length=1, max_length=20)
+
+class Summary(BaseModel):
+    id: str
+    summary: str | None = None
+    error: str | None = None
+
+def fake_reply(messages: list[ChatMessage]) -> str:
+    text = messages[-1].content
+    if "CORRUPT" in text:
+        raise ValueError("unreadable document")
+    return "Summary: " + text.split(":", 1)[1].strip()[:30]
+
+llm = FakeLLM(fake_reply, latency=1.0)
+sem = asyncio.Semaphore(4)          # at most 4 provider calls from this endpoint at once
+app = FastAPI()
+
+async def summarise_one(doc: Doc) -> Summary:
+    async with sem:
+        try:
+            out = await llm.complete([ChatMessage("user", f"Summarise in one line: {doc.text}")])
+            return Summary(id=doc.id, summary=out.text)
+        except Exception as e:                      # one bad doc must not sink the batch
+            return Summary(id=doc.id, error=f"{type(e).__name__}: {e}")
+
+@app.post("/summaries", response_model=list[Summary])
+async def summaries(body: SummariseIn) -> list[Summary]:
+    async with asyncio.TaskGroup() as tg:
+        tasks = [tg.create_task(summarise_one(d)) for d in body.docs]
+    return [t.result() for t in tasks]              # same order as the input
+```
+
+```python
+import time
+from fastapi.testclient import TestClient
+
+docs = [{"id": f"d{i}", "text": f"Quarterly report number {i} with lots of detail"} for i in range(1, 8)]
+docs[2]["text"] = "CORRUPT bytes"
+with TestClient(app) as client:
+    start = time.perf_counter()
+    r = client.post("/summaries", json={"docs": docs})
+    print(f"{len(docs)} docs in {time.perf_counter() - start:.2f}s")
+    for s in r.json():
+        print(s)
+```
+
+```text title="Output (fake model, 1 s per call)"
+7 docs in 2.01s
+{'id': 'd1', 'summary': 'Summary: Quarterly report number 1 with', 'error': None}
+{'id': 'd2', 'summary': 'Summary: Quarterly report number 2 with', 'error': None}
+{'id': 'd3', 'summary': None, 'error': 'ValueError: unreadable document'}
+{'id': 'd4', 'summary': 'Summary: Quarterly report number 4 with', 'error': None}
+{'id': 'd5', 'summary': 'Summary: Quarterly report number 5 with', 'error': None}
+{'id': 'd6', 'summary': 'Summary: Quarterly report number 6 with', 'error': None}
+{'id': 'd7', 'summary': 'Summary: Quarterly report number 7 with', 'error': None}
+```
+
+Seven one-second calls with 4 slots finish in 2 seconds instead of 7. The broken document failed instantly and freed its slot, so the six good ones ran in two waves.
+
+Why catch inside `summarise_one`? Because a `TaskGroup` is **all or nothing**: when one task raises, it cancels all the others and raises an `ExceptionGroup`. Without the `try`, it looks like this:
+
+```python
+import asyncio
+
+async def summarise(i: int) -> str:
+    try:
+        await asyncio.sleep(0.1 if i == 3 else 1.0)
+        if i == 3:
+            raise ValueError(f"doc {i} is unreadable")
+        return f"summary {i}"
+    except asyncio.CancelledError:
+        print(f"  call {i} cancelled")
+        raise
+
+async def main():
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tasks = [tg.create_task(summarise(i)) for i in range(1, 6)]
+    except* ValueError as eg:
+        print("TaskGroup raised:", repr(eg.exceptions[0]))
+
+asyncio.run(main())
+```
+
+```text title="Output"
+  call 1 cancelled
+  call 2 cancelled
+  call 4 cancelled
+  call 5 cancelled
+TaskGroup raised: ValueError('doc 3 is unreadable')
+```
+
+Both behaviours are useful. Choose on purpose:
+
+- **All-or-nothing** (a bare `TaskGroup`) when the results only make sense together. Example: three calls whose outputs are merged into one answer. If one fails, the others' tokens would be wasted, and cancelling them stops the spending.
+- **Partial results** (catch inside each task, return an error entry) when items are independent, like the batch summary above.
+
+For large offline batches (thousands of documents, results needed in hours rather than seconds), use the provider's **Message Batches API** instead of fanning out yourself. It runs asynchronously at a lower price. That belongs in a background job, see [Agents and long-running jobs](/docs/fastapi/agents-and-long-running-jobs).
+
+## Prompt caching
+
+Most requests to the same endpoint start with the same long prefix: tool definitions, a system prompt with instructions and examples, maybe a reference document. With **prompt caching**, the provider stores the processed prefix and reuses it on the next request that starts with exactly the same bytes. Cached input tokens are billed at a small fraction of the normal input price and are processed faster.
+
+```python
+LONG_POLICY = open("refund_policy.md").read()      # thousands of tokens, identical every call
+
+resp = await claude.messages.create(                # live API: no output shown
+    model="claude-opus-5-5",
+    max_tokens=1024,
+    system=[{
+        "type": "text",
+        "text": "You answer questions about Acme's refund policy.\n\n" + LONG_POLICY,
+        "cache_control": {"type": "ephemeral"},     # cache everything up to and including this block
+    }],
+    messages=[{"role": "user", "content": question}],   # varies per request: after the breakpoint
+)
+u = resp.usage
+print(u.cache_creation_input_tokens, u.cache_read_input_tokens, u.input_tokens)
+```
+
+How it works, and the rules that decide whether it pays off:
+
+- **It's a prefix match.** The request is processed in the order `tools`, then `system`, then `messages`. A `cache_control` marker says "cache everything up to here". The next request gets a cache hit only if everything up to that point is **byte-identical**.
+- **Stable content first, variable content last.** Put the question, the user's name, today's date and retrieved documents **after** the breakpoint. A `datetime.now()` in the system prompt silently disables caching for every request.
+- **Reading the counters.** On the first request, `cache_creation_input_tokens` is large (a cache write, billed slightly above normal input). On later requests within the cache lifetime (5 minutes by default, refreshed on each hit), `cache_read_input_tokens` is large and cheap. `input_tokens` counts only the uncached part. If `cache_read_input_tokens` stays at 0 across identical requests, something in your prefix is changing.
+- **There's a minimum size.** Prefixes shorter than a model-dependent minimum (from a few hundred to a few thousand tokens) are simply not cached.
+- **Shortcut.** Passing a top-level `cache_control={"type": "ephemeral"}` to `messages.create` caches the last cacheable block automatically, which suits multi-turn chats where the history grows.
+
+Prompt caching is the provider's cache. It is separate from a **response cache** that **you** run in Redis, which skips the model call completely for repeated questions. Both are covered in [Production AI concerns](/docs/fastapi/production-ai-concerns).
+
+## Tracking token usage and cost
+
+Every response carries `usage`. Turn it into money **per request**, and attribute it to a user, a route and a model. Without that, your first sign of a prompt bug or an abusive user is the monthly invoice.
+
+```python
+from collections import defaultdict
+from dataclasses import dataclass
+from decimal import Decimal
+
+@dataclass(frozen=True)
+class Price:                      # USD per million tokens
+    input: Decimal
+    output: Decimal
+    cache_read: Decimal
+    cache_write: Decimal          # 5-minute cache writes
+
+# Illustrative numbers: load real prices from config, they change.
+PRICES = {
+    "claude-opus-5-5":   Price(Decimal("4.00"), Decimal("20.00"), Decimal("0.20"), Decimal("5.00")),
+    "claude-sonnet-5-5": Price(Decimal("2.00"), Decimal("10.00"), Decimal("0.20"), Decimal("2.50")),
+}
+M = Decimal(1_000_000)
+
+def cost_usd(model: str, usage) -> Decimal:
+    p = PRICES[model]
+    return (usage.input_tokens * p.input
+            + usage.output_tokens * p.output
+            + (usage.cache_read_input_tokens or 0) * p.cache_read
+            + (usage.cache_creation_input_tokens or 0) * p.cache_write) / M
+
+class UsageLedger:
+    def __init__(self):
+        self.by_user = defaultdict(lambda: {"requests": 0, "input": 0, "output": 0, "usd": Decimal(0)})
+
+    def record(self, user_id: str, model: str, usage) -> Decimal:
+        c = cost_usd(model, usage)
+        row = self.by_user[user_id]
+        row["requests"] += 1
+        row["input"] += usage.input_tokens + (usage.cache_read_input_tokens or 0) + (usage.cache_creation_input_tokens or 0)
+        row["output"] += usage.output_tokens
+        row["usd"] += c
+        return c
+
+# --- demo with SDK Usage objects (constructed locally, no API call) --------
+from anthropic.types import Usage
+ledger = UsageLedger()
+first = Usage(input_tokens=40, output_tokens=300, cache_creation_input_tokens=6_000, cache_read_input_tokens=0)
+later = Usage(input_tokens=55, output_tokens=280, cache_creation_input_tokens=0, cache_read_input_tokens=6_000)
+print("first call :", ledger.record("u_42", "claude-opus-5-5", first))
+print("cached call:", ledger.record("u_42", "claude-opus-5-5", later))
+print("no caching :", cost_usd("claude-opus-5-5", Usage(input_tokens=6_055, output_tokens=280)))
+print(dict(ledger.by_user))
+```
+
+```text title="Output"
+first call : 0.03616
+cached call: 0.00702
+no caching : 0.02982
+{'u_42': {'requests': 2, 'input': 12095, 'output': 580, 'usd': Decimal('0.04318')}}
+```
+
+What the numbers show:
+
+- **Output tokens dominate.** 300 output tokens cost $0.006, five times the price per token of input. Asking for shorter answers (and using lower effort) saves more than trimming the prompt.
+- **Caching pays from the second request.** The first call paid a small premium to write 6,000 tokens to the cache. The second read them for $0.0012 instead of $0.024, and the whole request cost about a quarter of the uncached version.
+- **Use `Decimal`** for money. Float rounding errors add up across millions of rows.
+- **Prices change.** Keep them in configuration, not code, and check the provider's pricing page. The numbers here are for illustration.
+
+In a real service, `record` writes a row to a usage table (user, route, model, the four token counts, cost, request id, latency). The same data drives per-user budgets, which are just a check of that table, or a Redis counter, before the call. For streamed responses, the usage arrives at the **end** of the stream: the [streaming chapter](/docs/fastapi/streaming-llm-responses) shows how to record it even when the client disconnects early.
+
+## Never block the event loop
+
+The [architecture chapter](/docs/fastapi/ai-backend-architecture) showed that a sync call inside `async def` serialises requests. Here's how it looks from inside the process: a probe task tries to wake up every 100 ms and records how late it was.
+
+```python
+import asyncio, time
+
+def sync_llm_call() -> str:          # stands in for Anthropic().messages.create(...)
+    time.sleep(2.0)
+    return "answer"
+
+async def async_llm_call() -> str:   # stands in for await AsyncAnthropic().messages.create(...)
+    await asyncio.sleep(2.0)
+    return "answer"
+
+async def handler_async():
+    return await async_llm_call()
+
+async def handler_blocking():
+    return sync_llm_call()                       # the bug: a sync call in async def
+
+async def handler_offloaded():
+    return await asyncio.to_thread(sync_llm_call)  # escape hatch for sync-only libraries
+
+async def lag_probe(samples: list[float], interval=0.1):
+    """Wake up every 100 ms and record how late we were. Late = the loop was blocked."""
+    while True:
+        t = time.perf_counter()
+        await asyncio.sleep(interval)
+        samples.append(time.perf_counter() - t - interval)
+
+async def run(label, handler):
+    samples: list[float] = []
+    probe = asyncio.create_task(lag_probe(samples))
+    await asyncio.sleep(0)                       # let the probe start
+    await handler()
+    await asyncio.sleep(0.15)                    # let the probe record its last sample
+    probe.cancel()
+    print(f"{label:<20} worst loop lag = {max(samples) * 1000:7.1f} ms")
+
+async def main():
+    await run("await async client", handler_async)
+    await run("sync client", handler_blocking)
+    await run("asyncio.to_thread", handler_offloaded)
+
+asyncio.run(main())
+```
+
+```text title="Output (Windows; the ~10-15 ms baseline is timer resolution)"
+await async client   worst loop lag =    13.1 ms
+sync client          worst loop lag =  1900.5 ms
+asyncio.to_thread    worst loop lag =    10.4 ms
+```
+
+During the sync call the loop was frozen for about 1.9 seconds. Nothing else on that worker ran: no other request, no health check, no streaming token. A loop-lag metric like this probe is worth exporting in production. A lag spike points straight at a blocking call.
+
+The usual culprits in AI code:
+
+- `anthropic.Anthropic()` (sync) or `requests` inside `async def`. Use `AsyncAnthropic` and `httpx.AsyncClient`.
+- Tokenizers, embedding models, PDF parsing or NumPy work on large inputs. They are CPU-bound. Move them to `asyncio.to_thread` (if the library releases the GIL) or to a process pool or separate service. See [Serving your own models](/docs/fastapi/serving-your-own-models).
+- Sync database drivers. See [Databases with SQLAlchemy](/docs/fastapi/databases-with-sqlalchemy) for the async engine.
+
+If a library only has a sync API, `asyncio.to_thread` keeps the loop free, as the third line shows, at the price of one pool thread per in-flight call.
+
+## Traps
+
+- **A new `AsyncAnthropic()` per request.** You pay TCP and TLS handshakes every time and leak connection pools. Create one in the lifespan and close it on shutdown.
+- **Letting clients choose `model`, `system` or `max_tokens` freely.** That hands them your costs and your prompt. Validate and cap everything that affects tokens.
+- **`resp.content[0].text`.** The first block can be a `thinking` or `tool_use` block. Filter on `block.type == "text"`.
+- **Ignoring `stop_reason`.** `max_tokens` means truncated output, and `refusal` arrives as a 200. Neither raises an exception.
+- **Retry stacking.** Tenacity times SDK retries times a client-side retry can turn one click into dozens of provider requests. Decide which layer retries what, and add a time cap.
+- **Retrying 400s.** A bad request fails the same way every time. Only retry 429, 5xx, 529, timeouts and connection errors.
+- **Returning 429 to your users when the provider rate-limited you.** It tells them they did something wrong. Return 503 with `Retry-After`, and keep 429 for your own per-user limits.
+- **`except InternalServerError` to catch overloads.** 529 is `OverloadedError`, which is not a subclass of it.
+- **Per-process limits that you think are global.** A semaphore of 10 across 12 worker processes is a limit of 120.
+- **Silent cache misses.** A timestamp, a random id, or unsorted JSON in the system prompt breaks prompt caching. Watch `cache_read_input_tokens`.
+
+## Key points
+
+- Create one `AsyncAnthropic` per process in the lifespan, inject it with `Depends`, and close it on shutdown. One pool, reused connections, easy to swap in tests.
+- Own the request shape: validate and cap client input, keep `system`, `model` and token limits on the server, and keep conversation history server-side, trimmed by tokens.
+- Use two timeouts: the SDK's per-attempt HTTP timeout and an `asyncio.timeout` route deadline that covers queueing and retries.
+- The SDK already retries 408, 409, 429, 5xx and 529 with backoff and honours `retry-after`. Use tenacity for semantic failures and custom policies, and bound it by attempts and by time.
+- Map provider failures to 503 with `Retry-After` (busy), 504 (timeout) and 502 (unreachable or our bug). Refusals are 200s with `stop_reason == "refusal"`.
+- Cap in-flight calls with a semaphore and shed load with a queue timeout. Fan out with `TaskGroup`, catching per item when partial results are acceptable.
+- Put stable prompt content first and mark it with `cache_control`, then verify with `cache_read_input_tokens`.
+- Record usage on every call and turn it into dollars per user and route.
+- Never call a sync client inside `async def`. Measure loop lag to catch it.

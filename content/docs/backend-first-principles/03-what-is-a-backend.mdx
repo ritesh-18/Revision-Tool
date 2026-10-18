@@ -1,0 +1,625 @@
+---
+title: "What is a Backend, how do they work and why do we need them?"
+description: Tracing a real request from the browser through DNS, a cloud firewall, Nginx and a Node process, and why backend logic cannot live in the browser.
+---
+
+<Callout type="info">
+  Notes for [What is a Backend, how do they work and why do we need them?](https://youtu.be/6Ss4dJD9Kzg) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (configs, code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+The lesson answers three questions in order: **what** a backend is, **how** a request physically reaches one, and **why** we can't just do everything in the frontend.
+
+<Mermaid chart={`flowchart LR
+  A["Definition"] --> B["Demo: trace a request<br/>DNS, firewall, Nginx, Node"]
+  B --> C["Why backends exist<br/>(Instagram like)"]
+  C --> D["One word: data"]
+  D --> E["Demo: how a frontend works"]
+  E --> F["Why not do it in the browser?<br/>4 reasons"]`} />
+
+---
+
+## 1. Definition 🎓
+
+In its traditional sense, a backend is **a computer that listens for requests on an open port** reachable over the internet (commonly **80** for HTTP or **443** for HTTPS). Requests can be HTTP, WebSocket, gRPC or another protocol.
+
+- **Clients** (browsers, mobile apps, other servers) connect to it to **send** data or **receive** data.
+- It's called a **server** because it *serves* something: static files (images, JavaScript, HTML) or data such as JSON. It also **accepts** data when the client sends some.
+
+🔧 At the OS level, "listening on a port" means the process opened a TCP socket bound to an address and port. In Python, with only the standard library:
+
+```python title="server.py"
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class UsersHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = json.dumps([{"id": 1, "name": "Demo user"}]).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+# only reachable from this machine (Nginx will forward to it)
+server = HTTPServer(("127.0.0.1", 3001), UsersHandler)
+server.serve_forever()
+```
+
+Binding to `127.0.0.1` instead of `0.0.0.0` is deliberate: the Python process is **not** directly reachable from the internet; only the reverse proxy on the same box can talk to it.
+
+### What "listening" means inside the kernel ➕
+
+`HTTPServer((host, port), ...)` is one line of Python, but the waiting room for new connections lives in the **operating system**, and it has a size. When it's full, clients see timeouts that never show up in your app logs.
+
+#### socket, bind, listen, accept and the backlog ➕
+
+- **Problem:** connections can arrive faster than the process picks them up (a traffic spike, or an event loop busy with CPU work). Something has to hold them in the meantime.
+- **Mechanism:** `listen()` makes the kernel do four things: create a socket, **bind** it to an address and port, mark it **listening**, and keep two queues. The kernel completes the TCP three-way handshake **on its own**; finished connections wait in the **accept queue** until the process calls `accept()` (an asyncio server such as uvicorn does this on the event loop; `http.server` does it in its `serve_forever` loop). The queue's length is the **backlog**.
+
+<Mermaid chart={`flowchart LR
+  C["Client SYN"] --> SQ["SYN queue<br/>half-open handshakes"]
+  SQ -->|"handshake done"| AQ["Accept queue<br/>size = backlog"]
+  AQ -->|"accept() on the event loop"| N["asyncio: connection_made()"]
+  AQ -. "queue full" .-> D["new SYNs dropped<br/>client retries, then times out"]`} />
+
+- **Implementation:** Python's defaults differ by layer: `http.server`'s `HTTPServer` listens with a backlog of just **5** (`request_queue_size`), asyncio's `loop.create_server` uses **100**, and uvicorn uses **2048** (`--backlog`). The kernel caps it at `net.core.somaxconn` (4096 by default on Linux 5.4 and later, 128 on older kernels). Inspect and tune:
+
+```bash
+ss -ltn 'sport = :3001'                  # for a listening socket: Recv-Q = waiting now, Send-Q = backlog limit
+nstat -az TcpExtListenOverflows          # counter of connections dropped because the accept queue was full
+sysctl net.core.somaxconn                # kernel cap on any backlog
+```
+
+```python
+import uvicorn
+
+uvicorn.run("app.main:app", host="127.0.0.1", port=3001, backlog=1024)  # still capped by somaxconn
+```
+
+- **Edge cases:** a growing accept queue usually means the **event loop is blocked** (CPU work on the main thread), not that the backlog is too small; raising the backlog only makes clients wait longer. A dropped SYN is retried by the client after about a second, so overflow shows up as sudden **1 s and 3 s latency spikes**, not errors.
+
+#### Privileged ports and why the app doesn't run as root ➕
+
+- **Problem:** on Linux, binding to a port **below 1024** (80, 443) requires privileges. The tempting shortcut is `sudo python server.py`, which means any remote-code-execution bug in your app or one of its hundreds of dependencies hands the attacker **root**.
+- **Why the rule exists:** historically, low ports signalled "this service was started by the administrator", so other machines could trust it. Today it's mostly a footgun, but it's still the default.
+- **Mechanism:** let something small and audited hold the privileged port. That's one reason the demo puts **Nginx** in front: its master process starts as root only to bind 80/443, and its worker processes, which handle traffic, run as an unprivileged user. The app listens on a high port (3001) as a normal user.
+- **Implementation:** if the app really must bind a low port itself, grant only that one capability instead of root:
+
+```bash
+sudo setcap 'cap_net_bind_service=+ep' "$(readlink -f "$(which python3)")"   # python may bind <1024, nothing else
+sysctl net.ipv4.ip_unprivileged_port_start                              # or lower this threshold (system-wide)
+```
+
+```nginx
+user www-data;          # nginx.conf: workers drop root after the master binds the ports
+```
+
+- **Edge cases:** `setcap` applies to the binary, so **every** script run with that `python3` gets the capability (a virtualenv's `python` is usually a symlink to the same binary), and upgrading Python (a new binary) silently removes it. In containers, run as a non-root user (create one with `useradd` and switch to it with `USER app` in the Dockerfile) and map host port 443 to a high container port.
+
+---
+
+## 2. Demo: tracing a real request to a deployed backend 🎓
+
+The author has a Node backend deployed on **AWS EC2**, on a subdomain (something like `backend-demo.<domain>`), returning sample JSON at `/users`. With the browser's **Network** tab open (and **cache disabled** so you see a real status code, not a cached one), the request goes through these hops:
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant D as DNS
+  participant FW as AWS security group
+  participant N as Nginx (port 80/443)
+  participant APP as Node app (localhost 3001)
+  B->>D: What is the IP of backend-demo.domain?
+  D-->>B: A record, EC2 public IP
+  B->>FW: TCP to public IP, port 443
+  Note over FW: Port 443 allowed? Otherwise dropped here
+  FW->>N: Packet reaches the EC2 instance
+  N->>N: Terminate TLS, match server_name
+  N->>APP: proxy_pass to 127.0.0.1 port 3001
+  APP-->>N: 200 + JSON
+  N-->>B: 200 + JSON (over HTTPS)`} />
+
+### Hop 1: DNS, turning a name into an IP
+- **Problem:** the browser knows a **name**, but the network routes packets to **IP addresses**.
+- **Mechanism:** the DNS provider holds **records** for the domain. Simplified:
+  - an **A record** maps a name to an **IPv4 address**,
+  - a **CNAME record** maps a name to **another name** (domain or subdomain).
+- In the demo, the subdomain `backend-demo` has an **A record** pointing to an IP. That IP is the **public IP of the EC2 instance** (you can match it in the EC2 console).
+
+🔧 You can watch this hop yourself:
+
+```bash
+dig +short backend-demo.example.com A      # the IP the browser will connect to
+dig backend-demo.example.com               # full answer, including the TTL
+```
+
+🔧 **Edge case: TTL.** Resolvers cache answers for the record's **TTL** (seconds). If you move the server to a new IP, some clients keep using the old one until the TTL expires. Lower the TTL **before** a migration.
+
+### DNS resolution, step by step ➕
+
+The lesson treats DNS as one lookup. In reality it's a **chain of caches and servers**, and knowing the chain explains slow first requests, "it works for me but not for them" after a change, and record types that can't be used where you'd expect.
+
+#### The resolution chain ➕
+
+- **Problem:** no single server knows every name on the internet, and asking the authoritative server for every request would be slow and overload it.
+- **Mechanism:** a hierarchy plus caching at every level:
+
+<Mermaid chart={`sequenceDiagram
+  participant App as Browser or Python app
+  participant Stub as OS stub resolver
+  participant Rec as Recursive resolver<br/>(ISP, 1.1.1.1, VPC resolver)
+  participant Root as Root servers
+  participant TLD as .com servers
+  participant Auth as Authoritative<br/>(e.g. Route 53)
+  App->>Stub: backend-demo.example.com?
+  Stub->>Rec: same question (if not cached locally)
+  Rec->>Root: who handles .com?
+  Root-->>Rec: the .com servers
+  Rec->>TLD: who handles example.com?
+  TLD-->>Rec: example.com's name servers
+  Rec->>Auth: backend-demo.example.com A?
+  Auth-->>Rec: 203.0.113.10, TTL 300
+  Rec-->>Stub: cached for 300 s
+  Stub-->>App: 203.0.113.10`} />
+
+- **Implementation:** watch each step, and know how Python resolves names:
+
+```bash
+dig +trace backend-demo.example.com          # walk root → TLD → authoritative yourself, no caches
+dig @1.1.1.1 backend-demo.example.com        # ask one specific recursive resolver
+```
+
+```python
+import asyncio
+import socket
+
+import dns.asyncresolver  # third-party: dnspython
+
+
+async def main() -> None:
+    # what httpx, requests and urllib use: the OS resolver (getaddrinfo, honours /etc/hosts),
+    # a blocking call that asyncio runs in a worker thread; no caching inside Python
+    loop = asyncio.get_running_loop()
+    print(await loop.getaddrinfo("api.example.com", 443, type=socket.SOCK_STREAM))
+
+    # talks DNS directly over the network, bypasses /etc/hosts
+    answer = await dns.asyncresolver.resolve("api.example.com", "A")
+    print([rr.address for rr in answer])
+
+
+asyncio.run(main())
+```
+
+- **Edge cases:** Python doesn't cache DNS itself, so a backend making many outbound calls does many lookups. `getaddrinfo` blocks, so asyncio (and AnyIO, which httpx and FastAPI use) runs each lookup on a **worker thread**: asyncio's default executor (`min(32, cpu_count + 4)` threads, shared with `asyncio.to_thread`) or AnyIO's thread limiter (40 by default, shared with FastAPI's sync `def` endpoints). Slow DNS can then delay all the other blocking work offloaded to that pool ([Concurrency and parallelism](/docs/backend-first-principles/23-concurrency-parallelism) covers threadpool starvation). Keep-alive connection pools sidestep most lookups.
+
+#### Record types you'll actually touch ➕
+
+- **Problem:** the lesson mentions A and CNAME, but real setups trip over the rules around them.
+- **Mechanism:**
+
+| Record | Maps | Typical use |
+|---|---|---|
+| `A` / `AAAA` | name to IPv4 / IPv6 address | a server or load balancer IP |
+| `CNAME` | name to another name | `www` to `myapp.herokuapp.com`, `api` to an ALB's DNS name |
+| `ALIAS` / `ANAME` (provider-specific) | apex name to another name, answered as A/AAAA | `example.com` itself pointing at a load balancer |
+| `TXT` | free text | domain verification, SPF/DKIM for email |
+| `CAA` | which CAs may issue certificates | restrict issuance to Let's Encrypt |
+
+- **The apex rule:** a `CNAME` can't coexist with any other record at the same name (RFC 1034), and the zone apex (`example.com`) always has `SOA` and `NS` records. So **the bare domain can't be a CNAME**. Providers work around it with alias records (Route 53 "alias", Cloudflare "CNAME flattening") that resolve the target themselves and answer with plain A/AAAA records.
+- **Edge cases:** if you publish an `AAAA` record, the server must actually be reachable over IPv6 (security group rules for `::/0`, a listening socket on IPv6); otherwise IPv6-capable clients try it first and see delays or failures. A `CAA` record that doesn't list your CA makes certificate renewal fail.
+
+#### Negative caching and the "propagation" myth ➕
+
+- **Problem:** after a DNS change, some users see the new IP and others the old one for hours, and a brand-new subdomain "doesn't exist" for some people even though you created it.
+- **Why:** DNS changes are **not pushed** anywhere. Every resolver keeps its cached answer until the TTL expires. "Propagation" is just caches expiring at different times. Failed lookups are cached too: an `NXDOMAIN` answer is cached for a time derived from the zone's `SOA` record (RFC 2308). If someone (or your deploy script) looked up the name **before** you created it, resolvers remember "doesn't exist".
+- **Mechanism:** plan changes around TTLs:
+  1. a day before, lower the record's TTL (e.g. to 60 s) and wait for the **old** TTL to pass;
+  2. change the record, keep the old server running until traffic on it drops to zero;
+  3. raise the TTL again.
+- **Implementation:** check what a specific resolver still has cached, and how long it will keep it:
+
+```bash
+dig +noall +answer @8.8.8.8 backend-demo.example.com   # the TTL column counts down in a cached answer
+dig +noall +authority example.com SOA                   # the last SOA field drives negative-cache time
+```
+
+- **Edge cases:** some clients ignore TTLs: long-running processes with their own DNS cache (the JVM, some HTTP client libraries) and long-lived keep-alive connections keep talking to the old IP. That's why step 2 says to keep the old server running and watch its traffic, not the clock.
+
+### Hop 2: the cloud firewall (security group)
+- **Problem:** a public IP would expose every port on the machine to the whole internet.
+- **Mechanism:** before traffic reaches the instance, it passes **AWS's own firewall**, the **security group** attached to the instance. It lists which ports are allowed in. The demo allows three:
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| 22 | SSH | logging into the instance from a terminal |
+| 80 | HTTP | plain web traffic (redirected to HTTPS) |
+| 443 | HTTPS | encrypted web traffic |
+
+- If **80 and 443 aren't allowed, AWS drops the request right there**. It never reaches your server, and the browser just times out.
+
+🔧 Notes from the AWS docs: security groups are **stateful**, so response traffic for an allowed inbound connection is automatically allowed back out. Also, in production, restrict port 22 to **your own IP** (or use SSM Session Manager) instead of `0.0.0.0/0`.
+
+### Layered firewalls: network ACLs and host firewalls ➕
+
+The security group is one firewall. Production setups usually have **more layers**, and they don't all behave the same way, which is a common source of "the port is open but connections still hang".
+
+#### Network ACLs are stateless ➕
+
+- **Problem:** you allow port 443 inbound in the subnet's **network ACL** (a second AWS firewall, applied to the whole subnet), but requests still time out.
+- **Why (first principles):** a TCP connection has two directions. The client connects **to** port 443, but the replies go back **to the client's ephemeral port** (a random high port the client's OS picked, e.g. 51234). A **stateful** firewall (a security group) remembers the connection and lets replies out automatically. A **stateless** one (a network ACL) judges every packet on its own, so the replies need their **own outbound rule**.
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client 198.51.100.7 port 51234
+  participant NACL as Network ACL (stateless)
+  participant SG as Security group (stateful)
+  participant EC2 as EC2 port 443
+  C->>NACL: SYN to port 443
+  NACL->>SG: inbound rule allows 443
+  SG->>EC2: allowed, connection remembered
+  EC2-->>SG: reply to port 51234
+  SG-->>NACL: allowed automatically (stateful)
+  NACL-->>C: needs an OUTBOUND rule for ports 1024-65535`} />
+
+- **Implementation:** the matching NACL rules (rules are evaluated in ascending rule number, first match wins):
+
+| Direction | Rule # | Ports | Source / destination | Action |
+|---|---|---|---|---|
+| inbound | 100 | 443 | 0.0.0.0/0 | allow |
+| inbound | 110 | 1024-65535 | 0.0.0.0/0 | allow (replies to the instance's own outbound calls) |
+| outbound | 100 | 1024-65535 | 0.0.0.0/0 | allow (replies to clients) |
+| outbound | 110 | 443 | 0.0.0.0/0 | allow (the instance calling HTTPS APIs) |
+
+- **Edge cases:** the default NACL allows everything, so most people never touch it, until someone "hardens" it and outbound API calls and package installs start hanging. NACLs are useful for **deny** rules (blocking an abusive IP range for a whole subnet), which security groups can't express.
+
+#### A host firewall as the last layer ➕
+
+- **Problem:** cloud firewalls protect against the internet, but a misconfigured security group (one wrong `0.0.0.0/0`) exposes every port that's listening on the machine, such as Redis or the app's port 3001.
+- **Mechanism:** defence in depth. A firewall **on the instance** (`ufw`/`nftables` on Linux) enforces the same policy again, and binding internal services to `127.0.0.1` (as the demo does for its app server) means they aren't reachable from outside even if every firewall fails.
+- **Implementation:**
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from 203.0.113.50 to any port 22 proto tcp    # SSH only from your IP
+sudo ufw allow 80,443/tcp
+sudo ufw enable
+ss -ltnp                                                     # what is actually listening, and on which address
+```
+
+- **Edge cases:** **Docker bypasses ufw**: ports published with `-p 6379:6379` are opened through Docker's own iptables rules, which take effect before ufw's. Publish internal services on loopback only (`-p 127.0.0.1:6379:6379`) or not at all. Always check with `ss -ltnp` that sensitive services listen on `127.0.0.1`, not `0.0.0.0`.
+
+### Hop 3: the reverse proxy (Nginx)
+- **What it is:** a server that **sits in front of other servers**. Redirects and configs live in **one central place** instead of in every app.
+- In the demo:
+  - **Certbot** issues and renews the **TLS certificates** automatically.
+  - Nginx listens on **port 80** and **redirects to 443** (HTTPS). Certbot manages that part.
+  - The author's own part: a `server_name` block for the `backend-demo` subdomain that **forwards** every request to **`localhost:3001`**, where the Node server runs.
+- DNS already ensured the request arrived at this machine; Nginx's job is to send it to the **right local process**.
+
+🔧 Roughly what that config looks like:
+
+```nginx title="/etc/nginx/sites-available/backend-demo"
+server {
+    listen 80;
+    server_name backend-demo.example.com;
+    return 301 https://$host$request_uri;          # HTTP → HTTPS (Certbot adds this)
+}
+
+server {
+    listen 443 ssl;
+    server_name backend-demo.example.com;
+    ssl_certificate     /etc/letsencrypt/live/backend-demo.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/backend-demo.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3001;            # the final hop
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;  # app knows the client used HTTPS
+    }
+}
+```
+
+🔧 **Why `X-Forwarded-*` matters:** from the app's point of view, every request now comes from `127.0.0.1` over plain HTTP. Without these headers, logs show the wrong client IP and rate limiting by IP is useless. Uvicorn handles this with `--proxy-headers` (on by default), which trusts these headers only from `--forwarded-allow-ips` (default `127.0.0.1`), so with Nginx on the same box `request.client.host` and `request.url.scheme` reflect the real client.
+
+➕ Two follow-ups a backend engineer needs at this hop, both covered in the HTTP lesson: why `$proxy_add_x_forwarded_for` lets clients forge entries and how `Host` header attacks poison password-reset links ([HTTP, section 16](/docs/backend-first-principles/05-http)), and why Nginx needs `proxy_http_version 1.1` plus an `upstream` `keepalive` pool to reuse connections to the app ([HTTP, section 4](/docs/backend-first-principles/05-http)).
+
+### Hop 4: the Node process (PM2)
+- The app is managed by **PM2**, a process manager. `pm2 list` shows **two processes**: the frontend and the backend.
+- **Proof that this is the final hop:** on the instance itself, `curl localhost:3001/users` returns **the same response** the browser got.
+- **Key insight:** from the instance's point of view, the backend is just a server on **localhost**, exactly like in local development (`localhost:3000/users` on your laptop). **DNS, the firewall and Nginx are what make that localhost server reachable over the internet.**
+
+🔧 **Edge cases at this hop:**
+- If the app process crashes, Nginx can't connect upstream and returns **502 Bad Gateway**. If the app is alive but too slow, Nginx returns **504 Gateway Timeout** (after `proxy_read_timeout`, 60 s by default). PM2 restarts crashed processes, which is why it's there.
+- Use `pm2 startup` + `pm2 save` so processes come back after the instance reboots.
+
+### One process, one core: worker processes ➕
+
+The demo runs **one** process for the backend. On a machine with 4 or 8 cores, that leaves most of the CPU idle, and it makes every deploy a short outage.
+
+#### Using every core ➕
+
+- **Problem:** a uvicorn process runs one asyncio event loop on **one thread**, and on the standard CPython build the **GIL** lets only one thread execute Python bytecode at a time anyway. Under CPU-heavy load (JSON serialisation, templating, hashing), one process saturates one core and requests queue up while the other cores do nothing. And restarting a single process drops every in-flight request.
+- **Mechanism:** run **N copies** of the app on the same port. `uvicorn --workers N` (or Gunicorn with Uvicorn workers) starts a supervisor process that binds the listening socket and then spawns workers that **share** it; each worker calls `accept()` on that socket itself, and the kernel decides which one gets each connection. Each worker is a full Python process with its own event loop, GIL and memory. (Python 3.14's officially supported free-threaded build removes the GIL, but servers still scale this way today.)
+
+<Mermaid chart={`flowchart LR
+  NX["Nginx"] --> P["uvicorn supervisor<br/>binds port 3001"]
+  P --> W1["worker 1<br/>core 1"]
+  P --> W2["worker 2<br/>core 2"]
+  P --> W3["worker 3<br/>core 3"]
+  P --> W4["worker 4<br/>core 4"]`} />
+
+- **Implementation:**
+
+```python title="serve.py"
+import os
+
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "app.main:app",
+        host="127.0.0.1",
+        port=int(os.environ.get("PORT", "3001")),
+        workers=os.cpu_count(),  # one worker process per CPU core (or a number)
+        limit_max_requests=10_000,  # recycle a leaking worker instead of letting the box swap
+        limit_max_requests_jitter=1_000,  # stagger recycling so workers don't all restart at once
+    )
+```
+
+```bash
+APP_ENV=production uv run python serve.py     # run it under systemd (or PM2) so it comes back after a crash or reboot
+kill -HUP "$(pgrep -of 'python serve.py')"    # zero-downtime: each worker is replaced only once its replacement is ready
+```
+
+- **Edge cases:** with containers or Kubernetes, the usual approach is **one process per container** and more replicas, letting the orchestrator do the work the uvicorn supervisor does here ([Twelve-factor app](/docs/backend-first-principles/28-twelve-factor-app) explains why). Size the DB pool per process: 8 workers × `max_size=10` = 80 Postgres connections from one box. Uvicorn recycles by request count, not memory; a memory cap belongs to the process manager or the container (`MemoryMax=` in systemd, a memory limit in Kubernetes).
+
+#### What breaks when you go from one process to many ➕
+
+- **Problem:** code that was correct with one process silently becomes wrong with four, because each worker has its **own memory**.
+- **Why:** anything kept in a Python variable (a module-level `dict`, a class attribute) exists once **per worker**. Consecutive requests from one user can hit different workers.
+- **Mechanism:** move shared state out of the process, the same rule that lets you later scale to many machines:
+
+| In-process state | What goes wrong with 4 workers | Fix |
+|---|---|---|
+| sessions in a `dict` | users "randomly" logged out | Redis or Postgres session store, or signed tokens |
+| in-memory rate limiter | each worker allows the full limit: 4x the intended rate | Redis-backed limiter |
+| a background `asyncio` task in the lifespan / cron jobs | the job runs 4 times | a scheduler with a lock, or a separate worker process |
+| in-memory cache | 4 copies, 4 cold starts, inconsistent after updates | accept it for small caches, or use Redis |
+| WebSocket connections | an event on worker 1 can't reach a client on worker 2 | pub/sub between workers |
+
+- **Implementation:** for a scheduled job, take a lock so only one process runs it:
+
+```python
+async def run_daily_digest() -> None:
+    # Postgres advisory lock: only one process across all workers (and machines) gets True
+    async with pool.connection() as conn:  # lock and unlock must use the SAME connection
+        cur = await conn.execute("SELECT pg_try_advisory_lock(42)")
+        (got,) = await cur.fetchone()
+        if got:
+            try:
+                await send_daily_digest()
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock(42)")
+```
+
+- **Edge cases:** advisory locks belong to a **database session**. Run the unlock in a separate `pool.connection()` block instead and it may land on a different pooled connection, where it does nothing, while the lock stays held until the original connection closes. If the process crashes mid-job, Postgres releases the lock when the connection drops, so a crash can't block the job forever.
+
+### Summary of the trace 🎓
+
+<Mermaid chart={`flowchart LR
+  B[Browser] --> D[DNS]
+  D --> AWS["AWS: public IP"]
+  AWS --> FW["Firewall<br/>(security group)"]
+  FW --> EC2["EC2 instance"]
+  EC2 --> NX["Nginx"]
+  NX --> APP["App on localhost:3001"]`} />
+
+---
+
+## 3. Why do we need backends at all? 🎓
+
+### The lesson's example: liking a friend's Instagram post
+Between you tapping **Like** and your friend getting a notification, this happens:
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant You as Your app
+  participant S as Server
+  participant DB as Database
+  participant P as Push service
+  participant F as Friend phone
+  You->>S: POST like (post id, your credentials)
+  S->>S: Identify the user from the request
+  S->>DB: Persist the like
+  S->>DB: Look up the post's owner
+  S->>P: Trigger a notification for the owner
+  P-->>F: Someone liked your post`} />
+
+1. The app sends a request to the server.
+2. The server **parses** it and works out **who you are** (your ID).
+3. It **persists** the action, usually in a **database**.
+4. It finds **whose post** it was, gets that user's ID, and **triggers a notification** to them.
+
+### Why it has to be centralised
+- **Your** app is personalised: your feed, the people you follow, the actions you can take. Your friend's app only receives **their** notifications.
+- But something must hold **information about all users and all state** to connect your action to their notification. That has to be a **central computer**: the server.
+
+### One word: data 🎓
+Strip the backend's job down to one word and it's **data**: fetching it, receiving it, persisting it, and every action that deals with it.
+
+---
+
+## 4. How a frontend actually works (demo) 🎓
+
+To answer "why not do it all in the frontend?", the lesson first shows how a frontend is delivered. A **Next.js** app is deployed on the **same EC2 instance**:
+
+- **DNS:** a `frontend-demo` subdomain with its own **A record** pointing to the **same public IP**.
+- **Firewall:** the same ports 80 and 443.
+- **Nginx:** the same Certbot setup, but this `server_name` block forwards to **`localhost:3000`** (the Next.js server) instead of 3001.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant B as Browser
+  participant S as Next.js server (via Nginx)
+  B->>S: GET / (document)
+  S-->>B: HTML
+  par one request per resource
+    B->>S: GET CSS files
+    B->>S: GET JS bundles
+    B->>S: GET fonts, images
+  end
+  Note over B: CSS loaded, browser paints styles
+  Note over B: JS loaded, hydration attaches event listeners
+  Note over B: Buttons now work (e.g. click navigates)`} />
+
+1. The browser first fetches the **HTML document**.
+2. Then it fetches every resource it references (**JavaScript, CSS, fonts, images**), each in its **own request**.
+3. Once the **CSS** arrives, it **paints** the page (the black background, fonts, button styles).
+4. Once the **JavaScript** arrives, it **hydrates**: attaches event listeners, so interactions such as a button that navigates to another page start working.
+
+### The key difference 🎓
+
+| | Backend | Frontend |
+|---|---|---|
+| Server sends | the **result** of processing | the **code** |
+| Code runs on | the server | the **user's machine**; the **browser is the runtime** |
+
+---
+
+## 5. Why backend logic can't live in the browser 🎓
+
+### The root cause: the browser sandbox
+- **Problem it solves:** a browser **downloads code from a remote server you don't know and runs it on your machine**. Without isolation, any website's script could read your file system, copy your sensitive files and send them to its own servers.
+- **Mechanism:** browser runtimes are **sandboxed**, isolated from the OS, its processes and its file system. Code can only reach a limited set of things:
+  - the **DOM**,
+  - **browser APIs** (local storage, cookies...),
+  - **external APIs**, but only when those APIs send the right **CORS** headers.
+- **CORS** (covered in depth in the HTTP lesson) is a browser security policy: by default, JavaScript from `frontend-demo.<domain>` may only call resources on the **same origin**. Calls to a different domain are blocked unless the other server opts in via HTTP headers.
+
+<Mermaid chart={`flowchart TD
+  Q["Run backend logic in the browser?"] --> R1["1. Security<br/>no file system, no env vars"]
+  Q --> R2["2. CORS<br/>can't call arbitrary external APIs"]
+  Q --> R3["3. Databases<br/>no native drivers, no pooling"]
+  Q --> R4["4. Compute<br/>unknown, often weak device"]
+  R1 & R2 & R3 & R4 --> A["Keep it on a central server"]`} />
+
+### Reason 1: security restrictions
+A backend regularly needs the **file system** (e.g. writing log files) and **environment variables**. The browser forbids both.
+
+🔧 **The deeper version of this reason is trust.** Anything shipped to the browser is fully controlled by the user: they can read it, change it and replay requests with any values. So:
+- **Secrets can't live there.** A DB password or a payment API key in a JS bundle is public.
+- **Rules can't be enforced there.** "Only the owner may delete this post" must be checked where the user can't edit the code: on the server.
+
+### Reason 2: calling external APIs
+Backends constantly call **other servers** and gather data from many places. In the browser, each call only works if that API sends suitable **CORS headers**, and you **don't control** third-party APIs. That's a deal breaker. 🔧 Server-to-server calls have no CORS at all; CORS is enforced **only by browsers**.
+
+### Reason 3: databases
+- **Server runtimes** have **native database drivers** (e.g. `pg` for Postgres, the MongoDB driver). They work in environments that can open raw **TCP sockets**, handle **binary** protocols and keep **persistent connections**, none of which a browser allows.
+- **Connection pooling:** a backend keeps a **list of open connections** (the **pool**) to the DB and reuses them. It handles thousands of requests per second; if it opened and closed a connection for each one, the **database server would be overwhelmed**.
+- Even if browsers *could* connect, **every user would need their own connection** to the database, which again overwhelms it, and there'd be no sane way to pool connections or run queries efficiently.
+
+<Mermaid chart={`flowchart LR
+  subgraph Browsers["If every browser connected directly"]
+    direction TB
+    U1[User 1] --> DB1[(Postgres)]
+    U2[User 2] --> DB1
+    U3["User 10,000"] --> DB1
+  end
+  subgraph Server["With a backend"]
+    direction TB
+    V1[User 1] --> API[Backend]
+    V2[User 2] --> API
+    V3["User 10,000"] --> API
+    API -->|"pool of ~10-20 connections"| DB2[(Postgres)]
+  end`} />
+
+🔧 **Why connections are expensive (first principles):** each new Postgres connection costs a TCP handshake, a TLS handshake, authentication, and on the server a whole **new backend process** with its own memory. Postgres also has a hard cap (`max_connections`, **100 by default**). A pool pays those costs once and shares a few connections across many requests:
+
+```python title="db.py"
+import os
+
+from psycopg_pool import AsyncConnectionPool
+
+pool = AsyncConnectionPool(
+    os.environ["DATABASE_URL"],  # a secret: only possible server-side
+    min_size=1,
+    max_size=10,  # never more than 10 connections from this process
+    max_idle=30,  # close connections (above min_size) idle for 30 s
+    timeout=2,  # fail fast if the pool is exhausted
+    open=False,  # opened in the app's lifespan with `await pool.open()`
+)
+
+
+async def get_user(user_id: int) -> tuple | None:
+    # each request borrows a connection, runs the query, and returns it to the pool
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT id, name FROM users WHERE id = %s", (user_id,))
+        return await cur.fetchone()
+```
+
+🔧 **Edge case:** pool size multiplies with instances. 20 app replicas × `max_size=10` = 200 connections, which already exceeds the default 100. Size pools per replica, or put **PgBouncer** in front.
+
+### Reason 4: computing power
+- Frontends run on **anything**: phones, laptops, desktops, even a machine with **256 MB of RAM** and a single core. Heavy business logic there makes things lag or break.
+- A **central server** can be given **more memory and CPU whenever needed** and serves a large number of clients.
+
+The list could go on, but the conclusion is clear: **keeping backend logic in the frontend is a bad idea**, assuming it's even possible.
+
+---
+
+## 6. Recap 🎓
+
+- A backend is a computer **listening on an open port** that serves and accepts data.
+- A request travels **browser → DNS → the cloud provider's IP → firewall → instance → reverse proxy → the app on localhost**.
+- Backends exist because some computer must hold **all users' state centrally**. In one word: **data**.
+- The frontend's code runs **in the browser's sandbox**, which rules it out for backend work: no file system or env vars, CORS limits, no DB drivers or pooling, unpredictable compute.
+- ➕ The kernel completes handshakes and queues connections (backlog 2048 in uvicorn, 100 in asyncio, capped by `somaxconn`); low ports need privileges, so a proxy holds 80/443 and the app runs unprivileged.
+- ➕ DNS is a chain of caches: changes aren't pushed, they expire; failed lookups are cached too; the bare domain can't be a CNAME.
+- ➕ Security groups are stateful, network ACLs are stateless (allow ephemeral ports both ways); a host firewall and loopback binding are the last layer, and Docker bypasses ufw.
+- ➕ One Python process uses one core: worker processes (or more replicas) uses the rest, and forces in-memory state (sessions, rate limits, cron) out of the process.
+
+---
+
+## Interview questions
+
+1. **Walk through what happens when you open `https://api.example.com/users`.** **DNS resolves the name to an IP (A record) → TCP + TLS to port 443 → the cloud firewall checks the port → the request reaches the instance → a reverse proxy matches the host name and forwards to the app on a local port → the app responds, back along the same path.**
+2. **What does a reverse proxy give you?** **One central place for TLS termination, HTTP→HTTPS redirects, routing many domains to different local apps, and headers such as `X-Forwarded-For`; the app itself stays on localhost.**
+3. **Nginx returns 502 vs 504. What's the difference?** **502: the upstream gave an invalid response or couldn't be reached (e.g. the app crashed). 504: the upstream didn't answer within the proxy's timeout.**
+4. **Why can't a browser connect directly to Postgres?** **No raw TCP sockets or native drivers in the sandbox, credentials would be public, and one connection per user would exhaust the DB; servers pool a few connections for many users.**
+5. **Why is a security group "stateful" important?** **Response traffic for an allowed inbound connection is allowed back automatically, so you only write inbound rules for the ports you serve.**
+6. **What does hydration mean?** **After the HTML and CSS render, the downloaded JavaScript runs in the browser and attaches event listeners, making the page interactive.**
+7. ➕ **Clients see 1 s and 3 s connection delays, but the app logs nothing unusual. What could it be?** **The listen backlog (accept queue) overflowing, usually because the event loop is blocked, so the kernel drops SYNs and clients retransmit. Check `nstat` ListenOverflows and event-loop lag.**
+8. ➕ **Why shouldn't you run `sudo python server.py` to bind port 443?** **Any RCE in the app or its dependencies becomes root. Let a proxy bind the low port, grant only `CAP_NET_BIND_SERVICE`, or map ports in a container.**
+9. ➕ **You changed an A record an hour ago and some users still hit the old server. Why?** **Resolvers cache answers until the TTL expires; nothing is pushed. Lower the TTL in advance and keep the old server running until its traffic stops; some clients and long-lived connections ignore TTLs.**
+10. ➕ **Why can't `example.com` be a CNAME to a load balancer's DNS name?** **A CNAME can't coexist with other records, and the apex always has SOA and NS. Use the provider's alias/flattening record.**
+11. ➕ **Port 443 is allowed in the network ACL but connections hang. Why?** **NACLs are stateless: replies go to the client's ephemeral port and need an outbound rule (1024-65535).**
+12. ➕ **What breaks when you move from one Python process to `uvicorn --workers 4`?** **Anything in process memory: sessions, rate-limit counters, scheduled jobs (run once per worker), caches, WebSocket fan-out. Move state to Redis/Postgres and use a lock for jobs.**
+
+## Sources
+
+- [Lesson video: What is a Backend, how do they work and why do we need them? (Sriniously)](https://youtu.be/6Ss4dJD9Kzg)
+- [AWS: Security groups for EC2 (stateful rules)](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security-groups.html)
+- [Nginx: ngx_http_proxy_module (proxy_pass, proxy_read_timeout)](https://nginx.org/en/docs/http/ngx_http_proxy_module.html)
+- [Uvicorn: settings (proxy headers, forwarded-allow-ips, backlog, workers)](https://www.uvicorn.org/settings/)
+- [PostgreSQL: max_connections](https://www.postgresql.org/docs/current/runtime-config-connection.html)
+- [psycopg 3: connection pools](https://www.psycopg.org/psycopg3/docs/advanced/pool.html)
+- [MDN: Cross-Origin Resource Sharing (CORS)](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS)
+- ➕ [Python: asyncio loop.create_server (backlog default 100)](https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.create_server)
+- ➕ [Linux man page: listen(2) (backlog and somaxconn)](https://man7.org/linux/man-pages/man2/listen.2.html)
+- ➕ [Linux man page: capabilities(7) (CAP_NET_BIND_SERVICE)](https://man7.org/linux/man-pages/man7/capabilities.7.html)
+- ➕ [Python: asyncio loop.getaddrinfo (runs socket.getaddrinfo in a thread)](https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.getaddrinfo)
+- ➕ [dnspython: asynchronous resolver](https://dnspython.readthedocs.io/en/stable/async-resolver.html)
+- ➕ [RFC 1034: Domain names, concepts (CNAME rules)](https://www.rfc-editor.org/rfc/rfc1034.html)
+- ➕ [RFC 2308: Negative caching of DNS queries](https://www.rfc-editor.org/rfc/rfc2308.html)
+- ➕ [AWS Route 53: alias vs CNAME records](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-choosing-alias-non-alias.html)
+- ➕ [AWS VPC: network ACLs (stateless, ephemeral ports)](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html)
+- ➕ [Docker: packet filtering and firewalls (Docker and ufw)](https://docs.docker.com/engine/network/packet-filtering-firewalls/)
+- ➕ [Uvicorn: deployment (workers and process managers)](https://www.uvicorn.org/deployment/)
+- ➕ [Gunicorn: design (pre-fork workers sharing one socket)](https://docs.gunicorn.org/en/stable/design.html)
+- ➕ [PostgreSQL: advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)

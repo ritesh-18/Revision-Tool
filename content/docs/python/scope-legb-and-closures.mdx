@@ -1,0 +1,706 @@
+---
+title: "Scope, LEGB and Closures"
+description: How Python resolves names with the LEGB rule, why the compiler decides what is local, global and nonlocal, how closures capture cells, and the late-binding and class-scope traps.
+---
+
+Python scoping looks simple: there are no braces and no `let`, so you just assign. Underneath, the rules are strict and **decided at compile time**, and they explain a whole family of surprises: `UnboundLocalError`, lambdas in a loop all returning the last value, and methods that can't see class attributes. This page builds the model from the bytecode up.
+
+<Callout type="info">
+  Snippets run on **CPython 3.14.6**. Opcode names in `dis` output (like `LOAD_FAST_BORROW`) change between versions. The `FAST` / `GLOBAL` / `DEREF` distinction this page relies on has been stable for many years.
+</Callout>
+
+## What creates a scope
+
+Only three things create a new scope in Python:
+
+1. A **module** (the global scope of a file).
+2. A **function** body (including `lambda`).
+3. A **class** body (a special, limited kind of scope, covered at the end).
+
+Comprehensions behave like functions for their loop variable (more below). That's it. **`if`, `for`, `while`, `with` and `try` blocks do not create a scope.** A variable assigned inside an `if` or a `for` is visible after the block ends.
+
+```python
+for i in range(3):
+    last = i * 10
+print(i, last)   # both still visible after the loop
+```
+
+```text title="Output"
+2 20
+```
+
+<Callout title="Coming from JS">
+  Python has **function scope**, like JS `var`, not block scope like `let` and `const`. But unlike `var`, nothing is hoisted: reading a name before it's assigned is an error, not `undefined`. Think of every Python local as "function-scoped, with a temporal dead zone covering the whole function until the first assignment".
+</Callout>
+
+## The LEGB rule
+
+When Python looks up a name that is **not local**, it searches in this order:
+
+- **L**ocal: the current function's own names.
+- **E**nclosing: the local scopes of any enclosing functions, innermost first.
+- **G**lobal: the module's namespace (`globals()`).
+- **B**uiltins: the `builtins` module (`len`, `print`, `ValueError`...).
+
+The first match wins. If nothing matches, you get `NameError`.
+
+<Mermaid chart={`flowchart LR
+  N["Name lookup: x"] --> L["Local<br/>function's fast locals"]
+  L -->|"not found"| E["Enclosing<br/>outer function cells"]
+  E -->|"not found"| G["Global<br/>module __dict__"]
+  G -->|"not found"| B["Builtins<br/>builtins module"]
+  B -->|"not found"| X["NameError"]`} />
+
+```python
+x = "global"
+
+def outer():
+    x = "enclosing"
+    def inner():
+        x = "local"
+        print("inner sees:", x)
+    inner()
+    print("outer sees:", x)
+
+outer()
+print("module sees:", x)
+
+import builtins
+print(len is builtins.len)
+```
+
+```text title="Output"
+inner sees: local
+outer sees: enclosing
+module sees: global
+True
+```
+
+Each function assigned its own `x`, so three separate variables exist. When a function doesn't assign a name, lookup falls through:
+
+```python
+level = "global"
+
+def outer():
+    def inner():
+        print(level)       # not local, not enclosing -> global
+        print(max(3, 7))   # not local, enclosing or global -> builtin
+    inner()
+outer()
+```
+
+```text title="Output"
+global
+7
+```
+
+Because globals are searched before builtins, a module-level name **shadows** a builtin. That's the source of the classic `list = [...]` bug:
+
+```python
+list = ["oops"]           # shadows builtins.list for this module
+try:
+    print(list("abc"))
+except TypeError as err:
+    print("TypeError:", err)
+del list                  # remove the global; lookup falls through to builtins again
+print(list("abc"))
+```
+
+```text title="Output"
+TypeError: 'list' object is not callable
+['a', 'b', 'c']
+```
+
+Watch out for `id`, `type`, `input`, `filter`, `hash`, `max` and `sum` as variable names. Ruff rule `A001` flags them.
+
+## The compiler decides what is local
+
+### The rule
+
+Here's the key fact: **a name is local to a function if the function assigns it anywhere in its body**, regardless of where the assignment is or whether it runs. The compiler scans the whole body before generating bytecode. The decision is static, made once per function, not per line.
+
+"Assigns" means any **binding** operation, not just `=`:
+
+```python
+def f():
+    import json          # binds 'json' locally
+    for item in [1]:     # binds 'item'
+        pass
+    with open(__file__) as fh:   # binds 'fh'
+        pass
+    try:
+        1 / 0
+    except ZeroDivisionError as exc:  # binds 'exc' (and deletes it after the block)
+        pass
+    total = 0            # plain assignment
+    total += 1           # augmented assignment also binds
+    def helper(): pass   # def binds 'helper'
+    class Box: pass      # class binds 'Box'
+    if (n := 10):        # walrus binds 'n'
+        pass
+
+print(f.__code__.co_varnames)
+```
+
+```text title="Output"
+('json', 'item', 'fh', 'exc', 'total', 'helper', 'Box', 'n')
+```
+
+### `UnboundLocalError` explained
+
+Now the famous error makes sense:
+
+```python
+count = 0
+
+def increment():
+    print(count)      # looks harmless...
+    count = 1         # ...but this assignment makes 'count' local everywhere in the function
+
+try:
+    increment()
+except UnboundLocalError as err:
+    print("UnboundLocalError:", err)
+
+print(increment.__code__.co_varnames)
+```
+
+```text title="Output"
+UnboundLocalError: cannot access local variable 'count' where it is not associated with a value
+('count',)
+```
+
+Because `count = 1` appears in the body, `count` is local for the **whole** function, including the `print` on the line above. Python doesn't fall back to the global, because the lookup kind was fixed at compile time.
+
+The bytecode shows the decision. A function that only reads `count` uses `LOAD_GLOBAL`. A function that also assigns it uses a fast-local opcode, and here the compiler even emits `LOAD_FAST_CHECK` because it can see the slot might still be empty:
+
+```python
+import dis
+count = 0
+
+def reads_only():
+    return count
+
+def reads_then_writes():
+    print(count)
+    count = 1
+
+dis.dis(reads_only)
+print("-" * 40)
+dis.dis(reads_then_writes)
+```
+
+```text title="Output"
+  4           RESUME                   0
+
+  5           LOAD_GLOBAL              0 (count)
+              RETURN_VALUE
+----------------------------------------
+  7           RESUME                   0
+
+  8           LOAD_GLOBAL              1 (print + NULL)
+              LOAD_FAST_CHECK          0 (count)
+              CALL                     1
+              POP_TOP
+
+  9           LOAD_SMALL_INT           1
+              STORE_FAST               0 (count)
+              LOAD_CONST               1 (None)
+              RETURN_VALUE
+```
+
+Why design it this way? **Speed.** Locals live in a fixed-size array inside the frame, and `LOAD_FAST` is an index into it, with no dict lookup. That's only possible if the compiler knows the full set of locals up front. Globals and builtins are dict lookups (cached by the specialising interpreter, but still more work).
+
+Even dead code counts, because the decision is about the text, not about what runs:
+
+```python
+flag = "global"
+
+def f():
+    if False:
+        flag = "never runs"
+    return flag
+
+try:
+    f()
+except UnboundLocalError as err:
+    print("UnboundLocalError:", err)
+```
+
+```text title="Output"
+UnboundLocalError: cannot access local variable 'flag' where it is not associated with a value
+```
+
+A related surprise: the `except ... as exc` name is **deleted** at the end of the `except` block (to break a reference cycle between the exception, its traceback and the frame). If you need the exception later, assign it to another name inside the block.
+
+```python
+def f():
+    try:
+        1 / 0
+    except ZeroDivisionError as exc:
+        pass
+    return exc
+
+try:
+    f()
+except UnboundLocalError as err:
+    print("UnboundLocalError:", err)
+```
+
+```text title="Output"
+UnboundLocalError: cannot access local variable 'exc' where it is not associated with a value
+```
+
+<Callout title="Coming from JS">
+  The JS equivalent is the `let` temporal dead zone: `let x = 1; function f() { console.log(x); let x = 2; }` throws `ReferenceError: Cannot access 'x' before initialization`. Python behaves like that **for every assignment**, since there's no declaration keyword. The assignment itself is the declaration.
+</Callout>
+
+## `global` and `nonlocal`
+
+Since assignment makes a name local, you need a declaration to **rebind** a name in an outer scope.
+
+- `global name`: assignments to `name` in this function go to the **module** namespace.
+- `nonlocal name`: assignments go to the nearest **enclosing function** scope that already has `name`.
+
+```python
+counter = 0
+
+def bump():
+    global counter
+    counter += 1
+
+bump(); bump()
+print(counter)
+
+def create_late():
+    global late_name
+    late_name = "created from inside a function"
+
+create_late()
+print(late_name)
+```
+
+```text title="Output"
+2
+created from inside a function
+```
+
+```python
+def make_counter():
+    n = 0
+    def inc():
+        nonlocal n
+        n += 1
+        return n
+    return inc
+
+c1 = make_counter()
+c2 = make_counter()
+print(c1(), c1(), c1())
+print(c2())
+```
+
+```text title="Output"
+1 2 3
+1
+```
+
+Each call to `make_counter` creates a fresh `n`, so `c1` and `c2` count independently.
+
+These are **compile-time** declarations, so mistakes are `SyntaxError`s, raised before any code runs:
+
+```python
+for src in (
+    "def f():\n    nonlocal x\n",
+    "x = 1\ndef f():\n    def g():\n        nonlocal x\n",
+    "def f():\n    x = 1\n    print(x)\n    global x\n",
+):
+    try:
+        compile(src, "<demo>", "exec")
+    except SyntaxError as err:
+        print("SyntaxError:", err.msg)
+```
+
+```text title="Output"
+SyntaxError: no binding for nonlocal 'x' found
+SyntaxError: no binding for nonlocal 'x' found
+SyntaxError: name 'x' is used prior to global declaration
+```
+
+The second one matters: `nonlocal` never reaches the module scope, even if a global `x` exists. That's what `global` is for.
+
+**You only need these to rebind.** Mutating an object through the name is a read of the name, not an assignment:
+
+```python
+def make_log():
+    entries = []
+    def log(msg):
+        entries.append(msg)     # mutation, not rebinding: no nonlocal needed
+        return len(entries)
+    return log, entries
+
+log, entries = make_log()
+log("start"); log("stop")
+print(entries)
+```
+
+```text title="Output"
+['start', 'stop']
+```
+
+When to use them: `nonlocal` is fine in small closures and decorators (counters, rate limiters). `global` in application code usually signals state that belongs in an object, a module-level container, or dependency injection. In a multi-threaded or async server, mutable globals are shared by every request.
+
+## Closures and cells
+
+### What a closure is
+
+A **closure** is a function that remembers variables from the scope where it was defined, even after that scope has finished running.
+
+```python
+def make_multiplier(k):
+    def mul(x):
+        return x * k
+    return mul
+
+triple = make_multiplier(3)
+print(triple(10))
+print(make_multiplier.__code__.co_cellvars)  # names this function shares with inner functions
+print(triple.__code__.co_freevars)           # names the inner function borrows
+print(type(triple.__closure__[0]).__name__)
+print(triple.__closure__[0].cell_contents)
+print(make_multiplier(3).__closure__[0] is triple.__closure__[0])
+```
+
+```text title="Output"
+30
+('k',)
+('k',)
+cell
+3
+False
+```
+
+### How it works: cells
+
+`make_multiplier` has returned, so its frame is gone. How does `mul` still see `k`? The compiler noticed that `k` is used by an inner function, so it does **not** store `k` as a plain local. It stores it in a **cell**: a tiny heap object holding one reference. The outer function and the inner function both point at the same cell.
+
+- In the outer function, `k` is a **cell variable** (`co_cellvars`).
+- In the inner function, `k` is a **free variable** (`co_freevars`).
+- The function object keeps the cells in `__closure__`, a tuple aligned with `co_freevars`.
+
+Every call to `make_multiplier` creates a new cell, which is why the last line prints `False`.
+
+```python
+def make_multiplier(k):
+    def mul(x):
+        return x * k
+    return mul
+
+import dis
+dis.dis(make_multiplier)
+```
+
+```text title="Output"
+  --           MAKE_CELL                0 (k)
+
+   1           RESUME                   0
+
+   2           LOAD_FAST_BORROW         0 (k)
+               BUILD_TUPLE              1
+               LOAD_CONST               0 (<code object mul at 0x0000016465981E30, file "demo.py", line 2>)
+               MAKE_FUNCTION
+               SET_FUNCTION_ATTRIBUTE   8 (closure)
+               STORE_FAST               1 (mul)
+
+   4           LOAD_FAST_BORROW         1 (mul)
+               RETURN_VALUE
+
+Disassembly of <code object mul at 0x0000016465981E30, file "demo.py", line 2>:
+  --           COPY_FREE_VARS           1
+
+   2           RESUME                   0
+
+   3           LOAD_FAST_BORROW         0 (x)
+               LOAD_DEREF               1 (k)
+               BINARY_OP                5 (*)
+               RETURN_VALUE
+```
+
+Reading it:
+
+1. `MAKE_CELL k` wraps the argument `k` in a cell when the outer function starts.
+2. `LOAD_FAST_BORROW k` + `BUILD_TUPLE 1` pushes **the cell itself** (not the number 3) and packs it in a tuple.
+3. `SET_FUNCTION_ATTRIBUTE 8 (closure)` stores that tuple as the new function's `__closure__`.
+4. Inside `mul`, `COPY_FREE_VARS` copies the cells into the frame, and `LOAD_DEREF k` reads **the current content** of the cell.
+
+<Mermaid chart={`flowchart LR
+  subgraph O["make_multiplier frame (gone after return)"]
+    K["local slot k"]
+  end
+  K --> C["cell object<br/>cell_contents = 3"]
+  F["function mul<br/>__closure__ tuple"] --> C
+  M["mul frame<br/>LOAD_DEREF k"] --> C`} />
+
+### Closures capture variables, not values
+
+The closure holds the **cell**, and the cell holds whatever the variable *currently* refers to. Two closures created in the same call share one cell, so a write through one is visible through the other:
+
+```python
+def account(balance=0):
+    def deposit(amount):
+        nonlocal balance
+        balance += amount
+        return balance
+    def read():
+        return balance
+    return deposit, read
+
+deposit, read = account(100)
+deposit(50)
+print(read())
+print(deposit.__closure__[0] is read.__closure__[0])
+print(read.__closure__[0].cell_contents)
+read.__closure__[0].cell_contents = 999   # cells are writable (3.7+); don't do this in real code
+print(read())
+```
+
+```text title="Output"
+150
+True
+150
+999
+```
+
+This "private state via closure" is the functional equivalent of an object with private fields. In Python you'd more often reach for a small class, but closures are what decorators are made of.
+
+## Late binding: the lambda-in-a-loop bug
+
+### The bug
+
+```python
+fns = [lambda: i for i in range(3)]
+print([f() for f in fns])
+print(fns[0].__closure__[0] is fns[2].__closure__[0])
+print(fns[0].__closure__[0].cell_contents)
+
+handlers = []
+for name in ["a", "b", "c"]:
+    def handler():
+        return name
+    handlers.append(handler)
+print([h() for h in handlers])
+```
+
+```text title="Output"
+[2, 2, 2]
+True
+2
+['c', 'c', 'c']
+```
+
+### Why
+
+All three lambdas close over **the same variable** `i`, so they share **one cell** (the second line proves it). The lambda body `i` is evaluated when the lambda is **called**, and by then the loop has finished and the cell holds `2`. This is **late binding**: names in a closure are resolved at call time, not at definition time.
+
+The plain `for` loop version is the same thing with a global instead of a cell: `name` is one module-level variable that ends as `"c"`.
+
+### Fixes
+
+```python
+from functools import partial
+
+# Fix 1: default argument captures the current value at definition time
+fns = [lambda i=i: i for i in range(3)]
+print([f() for f in fns])
+
+# Fix 2: a factory function gives each closure its own scope, hence its own cell
+def make(i):
+    return lambda: i
+fns = [make(i) for i in range(3)]
+print([f() for f in fns])
+
+# Fix 3: functools.partial binds the value eagerly
+def show(i):
+    return i
+fns = [partial(show, i) for i in range(3)]
+print([f() for f in fns])
+```
+
+```text title="Output"
+[0, 1, 2]
+[0, 1, 2]
+[0, 1, 2]
+```
+
+Fix 1 works *because of* the "defaults are evaluated once" rule from the [functions page](/docs/python/functions-and-arguments): each lambda gets its own `__defaults__` tuple holding the value at that moment. It's the most common idiom, but it adds an optional parameter that a caller could override by accident. Fix 2 (a factory) is the most explicit. Fix 3 is neat when you already have a named function.
+
+Where this bites in backend code: registering callbacks or routes in a loop, building `asyncio` tasks with `lambda`, creating per-item handlers for a queue consumer.
+
+<Callout title="Coming from JS" type="warn">
+  You know this bug from `var`: `for (var i = 0; i < 3; i++) fns.push(() => i)` gives `3, 3, 3`, and the fix is `let`, because JS creates a **fresh binding per iteration** of a `let` loop. **Python has no `let`.** A Python `for` loop always reuses one variable, so it always behaves like `var` here. You must use one of the fixes above.
+</Callout>
+
+## Comprehension scopes
+
+A comprehension's loop variable doesn't leak into the surrounding scope (it did in Python 2 for list comprehensions):
+
+```python
+x = "outer"
+squares = [x * x for x in range(4)]
+print(squares)
+print(x)                       # comprehension variable didn't leak
+
+total = 0
+evens = [total := total + n for n in range(5)]   # walrus binds in the enclosing scope
+print(evens, total)
+```
+
+```text title="Output"
+[0, 1, 4, 9]
+outer
+[0, 1, 3, 6, 10] 10
+```
+
+Underneath: until Python 3.11 every comprehension was compiled as a hidden nested function called immediately. Since 3.12 (PEP 709), list, dict and set comprehensions are **inlined** into the enclosing function for speed, but the compiler keeps the same isolation, so the visible behaviour didn't change. Generator expressions are still separate functions, because they run lazily.
+
+Two edge cases:
+
+- An **assignment expression** (`:=`) inside a comprehension binds in the **enclosing** scope, on purpose, so you can capture a running value or "the item that matched".
+- Lambdas created in a comprehension close over the comprehension's variable, which is where the late-binding bug above came from.
+
+## Class body scope
+
+### The trap
+
+A class body runs top to bottom like a function, and names assigned there become class attributes. But the class body is **not an enclosing scope** for the functions defined inside it:
+
+```python
+class Service:
+    retries = 3
+    label = f"retries={retries}"          # fine: same class body
+    def run(self):
+        try:
+            return retries                  # class body is NOT an enclosing scope
+        except NameError as err:
+            return f"NameError: {err}"
+    def run_ok(self):
+        return self.retries, type(self).retries, Service.retries
+
+s = Service()
+print(Service.label)
+print(s.run())
+print(s.run_ok())
+```
+
+```text title="Output"
+retries=3
+NameError: name 'retries' is not defined
+(3, 3, 3)
+```
+
+Inside `run`, LEGB skips the class: Local (nothing), Enclosing (no enclosing *function*), Global (no `retries`), Builtins, then `NameError`. Methods must go through the object: `self.retries` (respects instance overrides and subclasses), `type(self).retries`, or `Service.retries` (hard-codes the class).
+
+### Why it's designed this way
+
+The class body executes once to build a namespace dict, which then becomes the class's `__dict__`. Methods run **later**, on instances, possibly on subclasses that override the attribute. If methods could read class-body names as closure variables, `retries` inside `run` would be frozen to `Service`'s value and ignore `self` and inheritance entirely. Forcing explicit `self.` keeps attribute lookup dynamic and the one place where overriding happens. (The one exception is the hidden `__class__` cell the compiler creates so that zero-argument `super()` works.)
+
+The same rule catches comprehensions in a class body, since they have their own scope:
+
+```python
+class Config:
+    base = 10
+    try:
+        scaled = [base * i for i in range(3)]
+    except NameError as err:
+        scaled = f"NameError: {err}"
+    ok = [n * 2 for n in [base, base + 1]]   # the outermost iterable IS evaluated in class scope
+
+print(Config.scaled)
+print(Config.ok)
+```
+
+```text title="Output"
+NameError: name 'base' is not defined
+[20, 22]
+```
+
+The outermost iterable is evaluated in the class body (so it can see `base`), but the element expression runs in the comprehension's scope, which skips the class. Work around it by computing outside the comprehension or after the class is created.
+
+## Hoisting: there isn't any
+
+```python
+try:
+    early()
+except NameError as err:
+    print("NameError:", err)
+
+def early():
+    return "defined now"
+
+print(early())
+
+def caller():
+    return later()     # resolved at call time, not at def time
+
+def later():
+    return "later works"
+
+print(caller())
+```
+
+```text title="Output"
+NameError: name 'early' is not defined
+defined now
+later works
+```
+
+`def` is an assignment that runs in order, so a module-level call before it fails. But a function **body** only looks names up when it runs, so `caller` can refer to `later` as long as `later` exists by the time `caller` is **called**. That's why mutually recursive functions and "helpers at the bottom of the file" work.
+
+## Python vs JavaScript, side by side
+
+| Topic | JavaScript | Python |
+|---|---|---|
+| Block scope | `let` and `const` are block-scoped | no block scope; only module, function, class |
+| Declaring a local | `let x`, `const x`, `var x` | any assignment in the function body |
+| Hoisting | `var` and function declarations hoisted | nothing hoisted; `def` runs in order |
+| Read before assign | `undefined` (`var`) or TDZ error (`let`) | `UnboundLocalError` |
+| Writing an outer variable | just assign | needs `nonlocal` or `global` |
+| Loop closures | `let` gives a fresh binding per iteration | one variable for the whole loop: late binding |
+| Closure capture | by reference to the binding | by reference to a cell |
+| Class fields in methods | `this.x` | `self.x`; class body names are invisible |
+
+## Interview questions
+
+1. **What is LEGB?**
+   **The lookup order for non-local names: Local, Enclosing function scopes, Global (module), Builtins. First match wins, otherwise `NameError`.**
+
+2. **Why does reading a global and then assigning it in the same function raise `UnboundLocalError`?**
+   **The compiler sees the assignment and marks the name local for the whole function, so the earlier read uses a fast-local slot that is still empty. Declare `global` (or `nonlocal`), or use a different name.**
+
+3. **What's the difference between `global` and `nonlocal`?**
+   **`global` rebinds a module-level name. `nonlocal` rebinds a name in the nearest enclosing function scope and is a `SyntaxError` if none exists. Neither is needed just to mutate an object.**
+
+4. **How does a closure keep a variable alive after the outer function returns?**
+   **The shared variable is stored in a cell object. The inner function's `__closure__` holds a reference to that cell, so the cell (and its value) outlives the outer frame.**
+
+5. **Why does `[lambda: i for i in range(3)]` give lambdas that all return 2? How do you fix it?**
+   **They all share one cell for `i` and read it when called (late binding). Fix with a default argument `lambda i=i: i`, a factory function, or `functools.partial`.**
+
+6. **Why can't a method refer to a class attribute without `self.`?**
+   **The class body isn't an enclosing scope for its functions. Lookup goes through the instance or class so overrides and inheritance work.**
+
+7. **Does a `for` or `if` block create a new scope?**
+   **No. Only modules, functions (including lambdas and comprehensions) and class bodies do.**
+
+8. **Can you call a function before its `def` line?**
+   **Not at module level, since `def` runs in order (`NameError`). Inside another function's body it's fine as long as the name exists when that body runs.**
+
+## Recap
+
+- Scopes come from modules, functions, comprehensions and class bodies only. Blocks don't create scope.
+- LEGB: Local, Enclosing, Global, Builtins. Module names shadow builtins.
+- Any binding anywhere in a function makes the name local for the whole function, decided at compile time. That's `UnboundLocalError`.
+- `global` and `nonlocal` are compile-time declarations needed only to **rebind**, not to mutate.
+- Closures share **cells**. They capture variables, not values, which causes late binding in loops. Fix with defaults, factories or `partial`.
+- Comprehension variables don't leak (and since 3.12 comprehensions are inlined), but `:=` binds outside on purpose.
+- Class bodies are invisible to their methods. Use `self.attr`.

@@ -1,0 +1,675 @@
+---
+title: "Performance and Profiling"
+description: "How to measure Python performance properly, the speedups that actually matter, why 3.11+ is faster, the experimental JIT, and when to leave pure Python."
+---
+
+Python performance work follows one rule: **measure first**. CPython's cost model is unintuitive if you come from V8. Function calls, attribute lookups and boxed integers are expensive. Built-ins written in C are very cheap. A single O(n) mistake usually outweighs every micro-optimisation you could make. This page covers the measuring tools first, then the speedups worth knowing, then what CPython itself does to go faster, and finally when to reach for something other than pure Python.
+
+Unless stated otherwise, timings are **on my machine** (Windows, x86-64) with **CPython 3.14.6**. Most use the conda build. The cross-version and JIT comparisons use the python.org builds and uv's standalone builds, and each one is labelled. Your numbers will differ. Look at the ratios.
+
+## Measure first
+
+<Mermaid chart={`flowchart TD
+  A["it feels slow"] --> B["reproduce with a realistic workload"]
+  B --> C["profile the whole thing<br/>cProfile, py-spy, Tachyon"]
+  C --> D{"where does the time go?"}
+  D -->|"one hot Python function"| E["line profiler, then fix the algorithm or data structure"]
+  D -->|"waiting on I/O"| F["concurrency, batching, caching, fewer round trips"]
+  D -->|"tight numeric loop"| G["NumPy, Cython, Rust, PyPy"]
+  E --> H["re-measure with timeit or a benchmark"]
+  F --> H
+  G --> H
+`} />
+
+### `timeit`: micro-benchmarks
+
+`timeit` runs a snippet many times, disables the GC during the timed loop, and uses `time.perf_counter`. From the command line:
+
+```text title="Output"
+$ python -m timeit -s "data = list(range(1000))" "sum(data)"
+100000 loops, best of 5: 3.62 usec per loop
+
+$ python -m timeit -s "data = list(range(1000))" "total = 0" "for x in data: total += x"
+10000 loops, best of 5: 27 usec per loop
+```
+
+The C built-in `sum` is about 7× faster than the equivalent Python loop. Things to keep in mind:
+
+- Report the **minimum** of several repeats (as "best of 5" does). Noise only ever adds time.
+- `-s` setup isn't timed. Put data construction there.
+- Micro-benchmarks answer "which of these two snippets is faster", not "why is my service slow". Don't optimise a line until a profiler has pointed at it.
+- In IPython or Jupyter, `%timeit expr` does the same thing.
+
+### `cProfile` and `pstats`: where does the time go?
+
+`cProfile` is a **deterministic** (tracing) profiler. It hooks every function call and return, so it counts exactly, but it adds overhead to every call.
+
+Here's a small order-processing workload with a hidden O(n) scan:
+
+```python
+# orders.py
+import json, re
+
+EMAIL = r"^[\w.+-]+@[\w-]+\.[\w.]+$"
+
+def validate(order):
+    return re.match(EMAIL, order["email"]) is not None   # recompiles? (cached, but still a lookup)
+
+def price(order):
+    total = 0.0
+    for item in order["items"]:
+        total += item["qty"] * item["unit_price"]
+    return round(total, 2)
+
+def serialize(order):
+    return json.dumps(order, sort_keys=True)
+
+def find_customer(customers, cid):
+    for c in customers:                      # O(n) scan on every call
+        if c["id"] == cid:
+            return c
+
+def process(orders, customers):
+    out = []
+    for o in orders:
+        if validate(o):
+            o["customer"] = find_customer(customers, o["customer_id"])["name"]
+            o["total"] = price(o)
+            out.append(serialize(o))
+    return out
+
+def make_data(n=3000):
+    customers = [{"id": i, "name": f"c{i}"} for i in range(2000)]
+    orders = [{"email": f"u{i}@ex.com", "customer_id": i % 2000,
+               "items": [{"qty": j, "unit_price": 9.99} for j in range(5)]} for i in range(n)]
+    return orders, customers
+
+if __name__ == "__main__":
+    process(*make_data())
+```
+
+```text title="Output"
+$ python -m cProfile -s cumulative orders.py
+         55221 function calls (55090 primitive calls) in 0.157 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      5/1    0.000    0.000    0.157    0.157 {built-in method builtins.exec}
+        1    0.001    0.001    0.157    0.157 orders.py:1(<module>)
+        1    0.004    0.004    0.147    0.147 orders.py:22(process)
+     3000    0.106    0.000    0.106    0.000 orders.py:17(find_customer)
+     3000    0.001    0.000    0.027    0.000 orders.py:14(serialize)
+     3000    0.004    0.000    0.025    0.000 __init__.py:185(dumps)
+     3000    0.003    0.000    0.021    0.000 encoder.py:185(encode)
+     3000    0.017    0.000    0.017    0.000 encoder.py:207(iterencode)
+        1    0.006    0.006    0.006    0.006 orders.py:31(make_data)
+     3000    0.001    0.000    0.006    0.000 orders.py:5(validate)
+```
+
+How to read it:
+
+- **`ncalls`**: number of calls. `5/1` means 5 total calls, of which 1 was primitive (not recursive).
+- **`tottime`**: time spent *in the function itself*, excluding its callees. Sort by this to find hot code.
+- **`cumtime`**: time *including* callees. Sort by this to find which high-level operation is expensive.
+
+`find_customer` has a `tottime` of 0.106 s out of 0.157 s. That's the bug. You can profile just one region from code and query the results with `pstats`:
+
+```python
+import cProfile, pstats, time
+from orders import make_data, process
+import orders
+
+orders_, customers = make_data()
+with cProfile.Profile() as prof:
+    process([dict(o) for o in orders_], customers)
+stats = pstats.Stats(prof).strip_dirs().sort_stats("tottime")
+stats.print_stats(3)
+
+# the fix: build an index once, O(1) lookups
+def process_fast(orders_list, customers):
+    by_id = {c["id"]: c for c in customers}
+    out = []
+    for o in orders_list:
+        if orders.validate(o):
+            o["customer"] = by_id[o["customer_id"]]["name"]
+            o["total"] = orders.price(o)
+            out.append(orders.serialize(o))
+    return out
+
+for fn in (process, process_fast):
+    data = [dict(o) for o in orders_]
+    t = time.perf_counter(); fn(data, customers)
+    print(f"{fn.__name__:13} {time.perf_counter() - t:.3f} s")
+```
+
+```text title="Output"
+         51380 function calls (51370 primitive calls) in 0.145 seconds
+
+   Ordered by: internal time
+   List reduced from 62 to 3 due to restriction <3>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+     3000    0.108    0.000    0.108    0.000 orders.py:17(find_customer)
+     3000    0.016    0.000    0.016    0.000 encoder.py:207(iterencode)
+     3000    0.004    0.000    0.024    0.000 __init__.py:185(dumps)
+
+
+process       0.131 s
+process_fast  0.024 s
+```
+
+That's 5× faster from one dict. No micro-optimisation comes close. To explore a profile visually, save it with `python -m cProfile -o out.prof app.py` and open it in **snakeviz** (an icicle chart in the browser), or convert it to a call graph with **gprof2dot**.
+
+cProfile's limitations:
+
+- **Overhead** is per call, so code with many tiny functions looks slower than it really is, relative to code that calls into C.
+- It only sees the thread it was started in, and it shows the event loop's internals rather than your coroutines in async code.
+- You have to start the program under it. That's no good for a production process that's slow right now.
+
+In 3.15 (PEP 799), cProfile also lives on as `profiling.tracing`. `cProfile` stays as an alias, and the old pure-Python `profile` module is deprecated.
+
+### Sampling profilers: py-spy and Tachyon
+
+A **sampling** profiler interrupts the program (or reads its memory from outside) many times per second and records the current stack. Overhead is low and doesn't depend on how many calls you make, so it's safe in production, and it sees all threads.
+
+**py-spy** is written in Rust and reads the target process's memory from outside, so the target needs no code changes:
+
+```text title="Output"
+$ py-spy record -o profile.svg -- python big.py      # flame graph of a run
+$ py-spy top --pid 12345                             # live "top" for a running process
+$ py-spy dump --pid 12345                            # every thread's current stack, right now
+$ py-spy record --format raw -o raw.txt -- python big.py
+py-spy> Stopped sampling because process exited
+py-spy> Wrote raw flamegraph data to 'raw.txt'. Samples: 110 Errors: 0
+```
+
+`py-spy dump` is the first thing to run against a hung or pegged production worker. On Linux in containers it needs the `SYS_PTRACE` capability. Add `--native` to see C-extension frames, and `--gil` to sample only threads holding the GIL.
+
+**Tachyon** (`profiling.sampling`, new in 3.15) is a sampling profiler in the standard library built on the 3.14 remote-debugging support. It can `run` a script, `attach` to a PID, or `dump` stacks, and it can output pstats tables, flame graphs, Firefox-profiler (gecko) files or a live TUI. It works at **line** granularity:
+
+```text title="Output"
+$ python3.15 -m profiling.sampling run --sort tottime -l 6 big.py
+Captured 878 samples in 0.88 seconds
+Sample rate: 999.47 samples/sec
+Profile Stats:
+       nsamples   sample%  tottime (ms)    cumul%  cumtime (ms)  filename:lineno(function)
+        335/339      49.4       335.000      50.0       339.000  orders.py:19(find_customer)
+        163/187      24.0       163.000      27.6       187.000  orders.py:15(serialize)
+          66/66       9.7        66.000       9.7        66.000  orders.py:18(find_customer)
+          23/27       3.4        23.000       4.0        27.000  orders.py:34(make_data)
+          15/28       2.2        15.000       4.1        28.000  __init__.py:241(dumps)
+          11/11       1.6        11.000       1.6        11.000  orders.py:12(price)
+```
+
+(Run on 3.15.0b4, where `big.py` calls `process` 15 times.) Line 19 of `orders.py` is `if c["id"] == cid`, which is the loop body of the linear scan. Tachyon offers `--mode wall|cpu|gil|exception`, and `--async-aware` reconstructs **asyncio task** stacks instead of event-loop frames.
+
+### Line profilers
+
+Once you know *which function* is hot, `line_profiler` tells you *which line*. Decorate the function with `@profile` and run it under `kernprof`:
+
+```python
+from line_profiler import profile
+
+@profile
+def find_customer(customers, cid):
+    for c in customers:
+        if c["id"] == cid:
+            return c
+
+customers = [{"id": i, "name": f"c{i}"} for i in range(2000)]
+for i in range(3000):
+    find_customer(customers, i % 2000)
+```
+
+```text title="Output"
+$ kernprof -l -v lp.py
+Timer unit: 1e-06 s
+
+Total time: 0.892703 s
+File: lp.py
+Function: find_customer at line 3
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+     3                                           @profile
+     4                                           def find_customer(customers, cid):
+     5   2501500     429895.6      0.2     48.2      for c in customers:
+     6   2501500     462074.9      0.2     51.8          if c["id"] == cid:
+     7      3000        732.5      0.2      0.1              return c
+```
+
+2.5 million hits for 3000 calls makes the O(n) scan obvious. Note the overhead: 0.89 s under the profiler, against about 0.1 s without it. Line profilers are for finding *where*, not for absolute numbers. **Scalene** is an alternative that samples CPU (separating Python from native time), memory and GPU per line, with low overhead.
+
+<Callout title="Coming from JS">
+`node --inspect` combined with Chrome DevTools' Performance tab is a **sampling** profiler, so the closest Python equivalents are py-spy and Tachyon, not cProfile. `node --cpu-prof` writing a `.cpuprofile` corresponds to `py-spy record --format speedscope` or Tachyon's `--gecko`, which you then open in speedscope or the Firefox Profiler. `console.time` corresponds to `time.perf_counter()`, and benchmark.js or tinybench correspond to `timeit` (or `pyperf` for rigorous benchmarks). One difference: V8's profiler shows optimised and deoptimised functions. In Python, the adaptive interpreter's specialisations are visible through `dis` (see below).
+</Callout>
+
+## Common speedups, and why they work
+
+The reasons behind all of these are the same: **each bytecode instruction has a fixed overhead** (dispatch, refcounting, type checks), and **work done inside C built-ins skips that overhead per element**. Moving the loop into C, or doing fewer instructions per element, is how you win.
+
+### Built-ins and comprehensions vs loops
+
+```python
+import timeit
+setup = "data = list(range(10_000))"
+cases = {
+    "for loop + append": "out = []\nfor x in data:\n    out.append(x * 2)",
+    "list comprehension": "[x * 2 for x in data]",
+    "map + lambda": "list(map(lambda x: x * 2, data))",
+}
+for name, stmt in cases.items():
+    best = min(timeit.repeat(stmt, setup, number=1000, repeat=5)) / 1000
+    print(f"{name:20} {best * 1e6:8.1f} us")
+print()
+for name, stmt in {
+    "manual sum loop": "t = 0\nfor x in data:\n    t += x",
+    "sum()": "sum(data)",
+    "max via loop": "m = data[0]\nfor x in data:\n    if x > m: m = x",
+    "max()": "max(data)",
+}.items():
+    best = min(timeit.repeat(stmt, setup, number=1000, repeat=5)) / 1000
+    print(f"{name:20} {best * 1e6:8.1f} us")
+```
+
+```text title="Output"
+for loop + append       528.5 us
+list comprehension      365.8 us
+map + lambda            861.2 us
+
+manual sum loop         404.0 us
+sum()                    41.9 us
+max via loop            382.4 us
+max()                   156.2 us
+```
+
+- The comprehension beats `append` because it uses a dedicated `LIST_APPEND` opcode instead of looking up and calling the `.append` method on every iteration. Since 3.12 (PEP 709), comprehensions are also inlined into the enclosing function, so there's no hidden function call.
+- `map` with a **lambda** is the slowest: every element pays for a Python function call. `map` only wins when the function is itself a C built-in (`map(str, data)`).
+- `sum`, `max`, `min`, `any`, `all`, `sorted`, `"".join`, `collections.Counter` and `itertools` run their loops in C.
+
+### Local variables are faster than globals
+
+```python
+import time, math
+
+N = 2_000_000
+start = time.perf_counter()
+total = 0
+for i in range(N):              # module level: i and total are globals (dict lookups)
+    total += math.sqrt(i)
+print(f"module level:        {time.perf_counter() - start:.3f} s")
+
+def in_function():
+    total = 0
+    for i in range(N):          # locals: indexed array slots
+        total += math.sqrt(i)
+    return total
+start = time.perf_counter(); in_function()
+print(f"inside a function:   {time.perf_counter() - start:.3f} s")
+
+def hoisted():
+    total = 0
+    sqrt = math.sqrt            # one lookup instead of N
+    for i in range(N):
+        total += sqrt(i)
+    return total
+start = time.perf_counter(); hoisted()
+print(f"hoisted math.sqrt:   {time.perf_counter() - start:.3f} s")
+```
+
+```text title="Output"
+module level:        0.298 s
+inside a function:   0.180 s
+hoisted math.sqrt:   0.148 s
+```
+
+How it works: the compiler knows every local variable of a function ahead of time and stores locals in a fixed array in the frame. `LOAD_FAST` is just an index. Globals and builtins live in dicts, so `LOAD_GLOBAL` and `STORE_GLOBAL` are dict operations. The specialising interpreter caches global lookups, but writes to module-level variables (`total += ...` at top level) still go through a dict. The practical rule: **put scripts' main loops inside a `main()` function**. Hoisting `math.sqrt` saves an attribute lookup per iteration. It's worth doing only in genuinely hot loops, because it hurts readability.
+
+### Avoid repeated attribute lookups
+
+The same idea applies to `self.x` in a hot loop, `obj.method` called millions of times, or `re.match(PATTERN, s)` (which looks up the compiled-pattern cache on every call). Bind it once:
+
+```python
+append = out.append              # bound method created once
+pattern = re.compile(EMAIL)      # compile once, call pattern.match(s)
+```
+
+### Join strings, don't `+=` them
+
+```python
+import timeit
+words = ["token"] * 100_000
+def plus_equals():
+    s = ""
+    for w in words:
+        s += w + " "
+    return s
+def join():
+    return " ".join(words)
+def join_gen():
+    return " ".join(w for w in words)
+for f in (plus_equals, join, join_gen):
+    print(f"{f.__name__:12} {min(timeit.repeat(f, number=10, repeat=5)) / 10 * 1000:7.2f} ms")
+```
+
+```text title="Output"
+plus_equals    10.29 ms
+join            0.40 ms
+join_gen        4.22 ms
+```
+
+Strings are immutable, so `s += x` would normally copy `s` every time (O(n²) overall). CPython has an optimisation that resizes the string in place when its refcount is 1, which is why `+=` isn't catastrophic here. But it's fragile (it breaks if another reference exists, and PyPy doesn't have it) and it's still 25× slower. `"".join(list)` computes the total size once and copies once. Joining a generator is slower than joining a list, because `join` turns the generator into a list internally first anyway.
+
+### Choose the right data structure
+
+```python
+import timeit
+from collections import deque
+n = 10_000
+items_list = list(range(n)); items_set = set(items_list)
+print("membership, 1000 lookups of a missing value:")
+print(f"  list: {min(timeit.repeat(lambda: -1 in items_list, number=1000, repeat=5)) * 1000:8.3f} ms")
+print(f"  set:  {min(timeit.repeat(lambda: -1 in items_set, number=1000, repeat=5)) * 1000:8.3f} ms")
+def drain_list():
+    q = list(range(n))
+    while q: q.pop(0)
+def drain_deque():
+    q = deque(range(n))
+    while q: q.popleft()
+print("queue of 10k, pop from the front:")
+print(f"  list.pop(0):     {min(timeit.repeat(drain_list, number=5, repeat=3)) / 5 * 1000:7.2f} ms")
+print(f"  deque.popleft(): {min(timeit.repeat(drain_deque, number=5, repeat=3)) / 5 * 1000:7.2f} ms")
+```
+
+```text title="Output"
+membership, 1000 lookups of a missing value:
+  list:   74.180 ms
+  set:     0.063 ms
+queue of 10k, pop from the front:
+  list.pop(0):       85.78 ms
+  deque.popleft():    0.49 ms
+```
+
+| Need | Use | Avoid |
+|---|---|---|
+| repeated membership tests | `set`, `dict` (O(1)) | `x in list` (O(n)) |
+| lookup by key | `dict` index built once | scanning a list of dicts |
+| FIFO queue | `collections.deque` | `list.pop(0)`, which shifts every element |
+| counting | `collections.Counter` | manual dict increments |
+| top-k | `heapq.nlargest` | `sorted(...)[:k]` for large n |
+| sorted insertions | `bisect` | append then sort each time |
+| many small records | `__slots__` classes, tuples, or NumPy arrays | dicts per record, when memory is tight |
+
+Other cheap wins: cache pure functions with `functools.cache`/`lru_cache`, avoid the `try`/`except` path when failure is common (see [Exceptions](/docs/python/exceptions)), use generators to stream instead of building huge lists, and for I/O, batch calls (one query with `IN (...)` instead of N queries). The N+1 query problem beats every CPU optimisation in a web backend.
+
+## Why Python 3.11+ got faster
+
+Python 3.11 was the first release from the "Faster CPython" project, about **1.25× faster than 3.10** on average on the pyperformance suite (10–60% depending on the workload). The main changes:
+
+1. **The specialising adaptive interpreter (PEP 659).** Described below.
+2. **Cheaper frames.** Frame data now lives in a contiguous per-thread stack. A full Python frame *object* is created only if someone asks for it (a traceback, `sys._getframe`).
+3. **Inlined Python-to-Python calls.** Calling a Python function no longer recurses through C `_PyEval_EvalFrameDefault`. The interpreter just pushes a new frame and keeps looping, which makes calls faster and deep recursion cheaper.
+4. **Zero-cost exceptions.** A `try` costs nothing until something raises.
+5. Later releases continued the work: comprehension inlining (3.12), the tier-2 micro-op optimizer and JIT infrastructure (3.13), the free-threaded build becoming supported and an optional **tail-calling interpreter** (3.14, about 3–5% faster with Clang 19+), and borrowed stack references (`LOAD_FAST_BORROW`) that skip refcount updates.
+
+Same script, several interpreters, on my machine:
+
+```python
+import sys, time
+class P:
+    def __init__(self, x, y): self.x, self.y = x, y
+    def dot(self, o): return self.x * o.x + self.y * o.y
+def run(n):
+    a, b = P(1, 2), P(3, 4)
+    t = 0
+    for _ in range(n):
+        t += a.dot(b)
+    return t
+def fib(n): return n if n < 2 else fib(n - 1) + fib(n - 2)
+for name, f, arg in (("method calls", run, 2_000_000), ("recursive fib(27)", fib, 27)):
+    best = min((lambda: (s := time.perf_counter(), f(arg), time.perf_counter() - s)[2])() for _ in range(3))
+    print(f"{sys.version.split()[0]:9} {name:18} {best:.3f} s")
+```
+
+```text title="Output"
+3.10.20   method calls       0.184 s
+3.10.20   recursive fib(27)  0.030 s
+3.11.15   method calls       0.135 s
+3.11.15   recursive fib(27)  0.023 s
+3.13.14   method calls       0.099 s
+3.13.14   recursive fib(27)  0.016 s
+3.14.6    method calls       0.107 s
+3.14.6    recursive fib(27)  0.019 s
+3.15.0b4  method calls       0.078 s
+3.15.0b4  recursive fib(27)  0.013 s
+```
+
+(3.10, 3.11, 3.13 and 3.15 are uv's standalone builds. 3.14 is the python.org build.) Call-heavy code is about 2× faster from 3.10 to 3.15. **How the binary was built matters as much as the version.** On the same machine the conda build of 3.14.6 ran a numeric loop benchmark about 1.7× *slower* than the python.org build of 3.14.6, presumably because of different compiler and optimisation settings (PGO, LTO). Benchmark the interpreter you actually deploy.
+
+### The specialising adaptive interpreter
+
+**What it is.** Every bytecode instruction that has a "generic" slow path (attribute access, global lookup, binary operations, calls) gets an inline cache. After an instruction has run a few times, the interpreter **rewrites it in place** into a specialised version for the types it actually saw. If the guess later turns out wrong (a different type shows up), the specialised instruction **deoptimises** back to the generic one and may re-specialise later.
+
+You can watch it with `dis(..., adaptive=True)`:
+
+```python
+import dis
+
+class Point:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+def norm1(p):
+    return abs(p.x) + abs(p.y)
+
+dis.dis(norm1)
+for _ in range(1000):          # warm up: let the interpreter observe real types
+    norm1(Point(3, -4))
+print("----- after warm-up (adaptive=True) -----")
+dis.dis(norm1, adaptive=True)
+```
+
+```text title="Output"
+  7           RESUME                   0
+
+  8           LOAD_GLOBAL              1 (abs + NULL)
+              LOAD_FAST_BORROW         0 (p)
+              LOAD_ATTR                2 (x)
+              CALL                     1
+              LOAD_GLOBAL              1 (abs + NULL)
+              LOAD_FAST_BORROW         0 (p)
+              LOAD_ATTR                4 (y)
+              CALL                     1
+              BINARY_OP                0 (+)
+              RETURN_VALUE
+----- after warm-up (adaptive=True) -----
+  7           RESUME_CHECK             0
+
+  8           LOAD_GLOBAL_BUILTIN      1 (abs + NULL)
+              LOAD_FAST_BORROW         0 (p)
+              LOAD_ATTR_INSTANCE_VALUE 2 (x)
+              CALL_BUILTIN_O           1
+              LOAD_GLOBAL_BUILTIN      1 (abs + NULL)
+              LOAD_FAST_BORROW         0 (p)
+              LOAD_ATTR_INSTANCE_VALUE 4 (y)
+              CALL_BUILTIN_O           1
+              BINARY_OP_ADD_INT        0 (+)
+              RETURN_VALUE
+```
+
+What each specialisation saves:
+
+| Generic | Specialised | Shortcut taken |
+|---|---|---|
+| `LOAD_GLOBAL` | `LOAD_GLOBAL_BUILTIN` | checks the version tags of the globals and builtins dicts, then reads a cached index. No hashing |
+| `LOAD_ATTR` | `LOAD_ATTR_INSTANCE_VALUE` | checks that the type version matches, then reads the value from a fixed slot in the instance's inline values. No MRO walk, no dict lookup |
+| `CALL` | `CALL_BUILTIN_O` | calls the C function directly with one argument |
+| `BINARY_OP` | `BINARY_OP_ADD_INT` | both operands are exact `int`, so it adds them directly without `__add__` dispatch |
+
+**What helps specialisation:** code that's *type-stable*. Pass the same types into a function, and set all attributes in `__init__` and in the same order (instances then share a key layout and keep "inline values"). Avoid adding attributes dynamically later, mutating classes at runtime in hot paths, or mixing int and float in the same arithmetic. These are the same habits that keep V8 on its fast path. Python just rewards them less dramatically.
+
+<Callout title="Coming from JS">
+This is the same idea as V8's **inline caches** and hidden classes: observe types at each site, cache the fast path, guard it, and deoptimise on surprise. The difference is the scale of what comes next. V8 then compiles hot functions to optimised machine code with TurboFan/Maglev. CPython 3.11–3.12 stops at specialised *bytecode*, and the 3.13+ JIT is still experimental and modest. That's why a tight numeric loop is often 10–50× slower in CPython than in Node.
+</Callout>
+
+## The experimental JIT (3.13+)
+
+**What it is.** PEP 744 added a JIT in 3.13, built as a **copy-and-patch** compiler. Hot code is first translated into "tier 2" **micro-ops** (smaller pieces of the specialised instructions), optimised (redundant guards removed, constants propagated), and then each micro-op is emitted by copying a machine-code template that was precompiled with LLVM at CPython *build time*, with addresses and constants patched in. That way CPython needs no LLVM at runtime and the compiler stays small.
+
+**Status, as of October 2026:**
+
+- **3.13:** opt-in at build time (`--enable-experimental-jit`). Off by default, roughly neutral on performance.
+- **3.14:** the official Windows and macOS installers include it, but it's **disabled by default**. Turn it on with `PYTHON_JIT=1`. It's still labelled experimental and isn't recommended for production. It doesn't work with the free-threaded build.
+- **3.15:** the JIT has been "significantly upgraded" according to the 3.15 What's New. It's still experimental. The uv standalone 3.15.0b4 build I tested doesn't include it.
+
+You can check at runtime with `sys._jit` (3.14+):
+
+```python
+import sys, time
+jit = getattr(sys, "_jit", None)
+print(sys.version.split()[0], "JIT available:", jit and jit.is_available(), "| enabled:", jit and jit.is_enabled())
+def fib_loop(n):
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, (a + b) % 1_000_007
+    return a
+def nbody_like(n):
+    x = y = 0.0
+    vx, vy = 0.01, 0.02
+    for _ in range(n):
+        x += vx; y += vy
+        vx -= x * 0.001; vy -= y * 0.001
+    return x + y
+for f in (fib_loop, nbody_like):
+    best = min((lambda: (t := time.perf_counter(), f(3_000_000), time.perf_counter() - t)[2])() for _ in range(3))
+    print(f"  {f.__name__:11} {best:.3f} s")
+```
+
+```text title="Output"
+$ python jit.py                    # python.org 3.14.6
+3.14.6 JIT available: True | enabled: False
+  fib_loop    0.105 s
+  nbody_like  0.161 s
+$ PYTHON_JIT=1 python jit.py
+3.14.6 JIT available: True | enabled: True
+  fib_loop    0.078 s
+  nbody_like  0.150 s
+```
+
+On my machine the JIT gave about 25% on an integer loop and about 7% on a float loop. The call-heavy benchmark above went from 0.107 s to 0.086 s with `PYTHON_JIT=1`. Results vary a lot by workload, and some code gets slower. Treat the JIT as something to benchmark, not something to rely on yet. For web services, which mostly wait on I/O and run C code (JSON, database drivers), it makes little difference.
+
+## When to leave pure Python
+
+| Tool | What it is | Use it when | Costs |
+|---|---|---|---|
+| **NumPy** (and pandas, Polars) | operations over whole arrays run in C/SIMD | numeric or columnar data, where you can express the loop as array operations | rethinking code as vectorised; a per-element Python loop over a NumPy array is *slower* than over a list |
+| **Cython** | Python-like language compiled to C, with optional static types | a hot loop over custom logic, wrapping C libraries | a build step and a compiler in CI |
+| **mypyc** | compiles type-annotated Python to C extensions | an existing, well-typed codebase (black and mypy use it) | a subset of dynamic features |
+| **Numba** | JIT for numeric functions via LLVM, `@njit` | NumPy-style numeric kernels | numeric subset only, compile time on first call |
+| **PyPy** | an alternative interpreter with a tracing JIT | long-running pure-Python CPU work | lags behind CPython versions, slower C-extension compatibility layer |
+| **Rust + PyO3/maturin** | write the hot part in Rust and expose it as a module | performance-critical libraries, parsing, crypto, and safe parallelism outside the GIL | a second language. This is how pydantic-core, orjson, polars, tokenizers and ruff are built |
+| **multiprocessing / free-threaded 3.14t** | use more cores | CPU-bound work that can be parallelised | process overhead, or ecosystem readiness for 3.14t |
+
+Before writing an extension, check whether one exists: `orjson` instead of `json` for fast serialisation, `uvloop` for the event loop, `polars` instead of hand-written aggregation, `regex`/`re2` for pathological patterns. Swapping one library is often the whole win.
+
+## Profiling an async web service
+
+In an async service, "slow" usually means one of three things:
+
+1. **Waiting on I/O** (database, HTTP calls). Look at timing per await: tracing with OpenTelemetry spans, database query logs, `EXPLAIN`.
+2. **Blocking the event loop** with CPU work or sync I/O in an `async def`. One slow handler stalls *every* concurrent request.
+3. **Too much concurrency or too little**: connection-pool limits, semaphores, missing `gather`.
+
+cProfile is misleading here, because time spent awaiting shows up inside the event loop's `select` call, not in your handler. Use these instead:
+
+- **asyncio debug mode** to catch event-loop blocking: `PYTHONASYNCIODEBUG=1`, or `loop.set_debug(True)`. Any task step that takes longer than `slow_callback_duration` (default 100 ms) is logged.
+- **py-spy dump/top** or **Tachyon `--async-aware`** on the live process. 3.14 also adds `python -m asyncio ps PID` and `python -m asyncio pstree PID` to show what every task is awaiting.
+- **APM/tracing** (OpenTelemetry, Datadog, Sentry performance) for per-endpoint latency broken down by await.
+
+A demo of loop blocking, with a CPU-heavy password hash inside `async def`:
+
+```python
+import asyncio, hashlib, logging, time
+
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+
+def hash_password(pw: str) -> str:              # CPU-bound, ~100 ms
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), b"salt", 600_000).hex()
+
+async def login_blocking(pw):
+    return hash_password(pw)                     # runs ON the event loop thread
+
+async def login_offloaded(pw):
+    return await asyncio.to_thread(hash_password, pw)   # hashlib releases the GIL
+
+async def heartbeat(stop):
+    worst, last = 0.0, time.perf_counter()
+    while not stop.is_set():
+        await asyncio.sleep(0.01)
+        now = time.perf_counter()
+        worst, last = max(worst, now - last - 0.01), now
+    return worst
+
+async def bench(handler):
+    stop = asyncio.Event()
+    hb = asyncio.create_task(heartbeat(stop))
+    t = time.perf_counter()
+    await asyncio.gather(*(handler(f"pw{i}") for i in range(4)))
+    elapsed = time.perf_counter() - t
+    stop.set()
+    print(f"{handler.__name__:16} 4 logins in {elapsed:.2f} s, worst event-loop stall {await hb * 1000:.0f} ms")
+
+async def main():
+    loop = asyncio.get_running_loop()
+    loop.set_debug(True)
+    loop.slow_callback_duration = 0.05           # warn for steps longer than 50 ms
+    await bench(login_blocking)
+    await bench(login_offloaded)
+
+asyncio.run(main())
+```
+
+```text title="Output"
+WARNING asyncio: Executing <Task finished name='Task-3' coro=<login_blocking() done, defined at demo.py:8> result='bcaf786b1b5a...f81a77c9d585c' created at ...\asyncio\tasks.py:734> took 0.100 seconds
+WARNING asyncio: Executing <Task finished name='Task-4' coro=<login_blocking() done, defined at demo.py:8> ... took 0.100 seconds
+WARNING asyncio: Executing <Task finished name='Task-5' coro=<login_blocking() done, defined at demo.py:8> ... took 0.100 seconds
+WARNING asyncio: Executing <Task finished name='Task-6' coro=<login_blocking() done, defined at demo.py:8> ... took 0.100 seconds
+login_blocking   4 logins in 0.41 s, worst event-loop stall 399 ms
+login_offloaded  4 logins in 0.13 s, worst event-loop stall 7 ms
+```
+
+The blocking version froze the loop for 400 ms, so every other request (health checks included) waited that long. Moving the work to a thread fixed both latency and throughput, and the hashes even ran in parallel because `hashlib` releases the GIL for large inputs. For pure-Python CPU work, a thread doesn't give parallelism (except on 3.14t). Use a `ProcessPoolExecutor` or a task queue instead.
+
+A practical checklist for a FastAPI/Starlette service:
+
+1. Load test realistically (`locust`, `k6`, `oha`) and watch p50, p95 and p99, not just averages.
+2. Turn on asyncio debug in staging to catch blocking calls. Look for sync DB drivers, `requests`, `time.sleep`, or big `json.dumps` calls inside `async def`.
+3. Remember that `def` endpoints in FastAPI run in a threadpool (40 threads by default via AnyIO) while `async def` endpoints run on the loop. Choose deliberately.
+4. When p99 spikes, `py-spy dump` the worker, or `py-spy record --idle` to include waiting threads.
+5. Fix the biggest item and measure again. It's usually a query, a missing index, N+1 calls, or serialisation (`orjson` helps).
+
+<Callout title="Coming from JS">
+Blocking the event loop is the same sin as in Node, and asyncio debug mode plays the role of `--trace-sync-io` or the event-loop-lag metrics from `perf_hooks.monitorEventLoopDelay`. The heartbeat in the demo is exactly how libraries like `blocked-at` measure lag. The difference is the escape hatch. In Node you'd move CPU work to `worker_threads`. In Python, `asyncio.to_thread` is enough for C code that releases the GIL, and otherwise you need processes (or the free-threaded build).
+</Callout>
+
+## Interview questions
+
+1. **How do you approach a "Python is slow" complaint?** **Reproduce it with a realistic workload, profile the whole program (cProfile, py-spy or Tachyon), find whether it's I/O, an algorithmic hotspot or a numeric loop, fix the biggest item, and re-measure. Never micro-optimise before profiling.**
+2. **`tottime` vs `cumtime` in cProfile?** **`tottime` is time inside the function itself, excluding callees. `cumtime` includes everything it calls. Sort by `tottime` to find hot code and by `cumtime` to find expensive operations.**
+3. **Deterministic vs sampling profiler?** **Deterministic profilers (cProfile) hook every call: exact counts but per-call overhead and distortion. Sampling profilers (py-spy, Tachyon) record stacks periodically: low overhead, safe in production, see all threads, but they're statistical.**
+4. **Why are local variables faster than globals?** **Locals are stored in a fixed array in the frame and accessed by index (`LOAD_FAST`). Globals and builtins are dict lookups (cached by the specialising interpreter, but writes are still dict operations).**
+5. **What is the specialising adaptive interpreter?** **PEP 659 (3.11): instructions observe the types they see and rewrite themselves into specialised versions, for example `LOAD_ATTR_INSTANCE_VALUE` or `BINARY_OP_ADD_INT`, guarded by cheap checks and deoptimised when the guard fails. It's similar to V8's inline caches.**
+6. **What is CPython's JIT and should you enable it?** **A copy-and-patch JIT over tier-2 micro-ops (PEP 744). It shipped in 3.13, is included but off by default in the 3.14 Windows and macOS builds (`PYTHON_JIT=1`), and is still experimental. Benchmark your own workload, since gains are modest and vary.**
+7. **When would you use NumPy vs Cython vs Rust/PyO3?** **NumPy when the work can be expressed as whole-array operations. Cython or mypyc to compile custom Python-like hot loops. Rust/PyO3 for a performance-critical library that needs safety, parallelism outside the GIL or heavy parsing, as pydantic-core and orjson do.**
+8. **How do you find event-loop blocking in an asyncio service?** **Enable asyncio debug mode (slow-callback warnings), measure loop lag, sample the live process with py-spy or Tachyon `--async-aware` or `python -m asyncio pstree`, and move CPU or sync work to threads or processes.**
+
+## Recap
+
+- Measure first: `timeit` for snippets, `cProfile`/`pstats` for call-level profiles, py-spy or Tachyon (3.15) for low-overhead sampling, and `line_profiler` or Scalene for line-level detail.
+- Big wins come from algorithms and data structures (dict indexes, sets, deque) and from fewer I/O round trips.
+- Push loops into C built-ins, prefer comprehensions, keep hot code in functions, hoist repeated lookups, and `join` strings.
+- 3.11+ is faster thanks to specialised bytecode, cheaper frames, inlined calls and zero-cost exceptions. Type-stable code specialises best.
+- The JIT (3.13+) is experimental: off by default in 3.14 (`PYTHON_JIT=1`) and upgraded in 3.15. Benchmark it rather than trusting it.
+- Leave pure Python with NumPy, Cython, mypyc, Numba, PyPy or Rust/PyO3 when profiling shows a CPU hotspot.
+- For async services, watch for event-loop blocking with debug mode and sampling profilers, and offload CPU work.

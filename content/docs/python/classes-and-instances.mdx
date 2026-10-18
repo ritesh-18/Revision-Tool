@@ -1,0 +1,1017 @@
+---
+title: "Classes and Instances"
+description: "How Python classes really work: classes as objects, __new__ vs __init__, explicit self and bound methods, class vs instance attributes, attribute lookup, properties, classmethods, name mangling and dynamic attributes."
+---
+
+A Python class looks like a JS/TS class on the surface: a `class` keyword, a constructor, methods. Underneath it works very differently. There is no hidden `this`, no prototype chain wired up by `new`, and no real privacy. Instead there are a few simple rules: **a class is an ordinary object holding a namespace dict**, **methods are plain functions that become bound when you reach them through an instance**, and **attribute lookup walks a well-defined order**. Once you understand those rules, every "weird" behaviour on this page follows from them.
+
+<Callout title="Version note">
+  Every snippet on this page was run with **CPython 3.14.6**. Memory addresses such as `0x0000016955178D70` change from run to run.
+</Callout>
+
+## Classes are objects too
+
+### What it is
+
+The `class` statement is not a declaration that the compiler reads ahead of time. It is a **statement that runs** when Python reaches it, and it produces an object (the class) that gets bound to a name, exactly like `def` produces a function object.
+
+### How it works underneath
+
+When CPython executes `class User: ...` it:
+
+1. Creates a fresh namespace (a dict).
+2. **Runs the class body** as code inside that namespace. Every `def` and every assignment in the body adds a key to that dict.
+3. Calls the **metaclass** (by default `type`) as `type("User", bases, namespace)` to build the class object.
+4. Binds the result to the name `User` in the enclosing scope.
+
+Because the class is just an object, you can pass it around, store it in a dict, return it from a function, or build one at runtime by calling `type` yourself.
+
+```python
+class User:
+    """A user of the system."""
+    kind = "human"
+
+    def greet(self):
+        return f"hi, I am {self.name}"
+
+print(type(User))
+print(User.__name__, User.__qualname__, User.__module__)
+print(User.__doc__)
+print(sorted(k for k in User.__dict__ if not k.startswith("__")))
+
+Alias = User              # classes are values: bind to another name
+registry = {"user": User} # store in a dict
+u = registry["user"]()    # call it to make an instance
+print(type(u) is User, isinstance(u, Alias))
+
+def make_class(name):
+    return type(name, (), {"hello": lambda self: f"hello from {name}"})
+
+Dyn = make_class("Dyn")
+print(Dyn, Dyn().hello())
+```
+
+```text title="Output"
+<class 'type'>
+User User __main__
+A user of the system.
+['greet', 'kind']
+True True
+<class '__main__.Dyn'> hello from Dyn
+```
+
+`type(User)` is `type`: the class of a class is its **metaclass**. `User.__dict__` holds `greet` and `kind` as plain entries. The three-argument call `type(name, bases, namespace)` is precisely what the `class` statement does for you (metaclasses are covered in [descriptors and metaclasses](/docs/python/descriptors-and-metaclasses)).
+
+The class body really is executed top to bottom, at definition time:
+
+```python
+print("before class")
+class Config:
+    print("  running the class body")
+    debug = True
+    print("  debug defined:", debug)
+print("after class")
+```
+
+```text title="Output"
+before class
+  running the class body
+  debug defined: True
+after class
+```
+
+<Callout title="Coming from JS">
+  A JS `class` is also an expression that produces a value (a constructor function), so "classes are values" will feel familiar. The difference is what is inside. A JS class body only allows method and field definitions; a Python class body is **arbitrary code** (loops, `if`, prints) whose local variables become class attributes. And there is no `prototype` object: methods live directly in the class's `__dict__`.
+</Callout>
+
+### When to use it
+
+You rarely call `type(...)` by hand, but "classes are values" is used all the time in backend code: registries that map strings to handler classes, dependency-injection containers keyed by class, factories that receive a class as an argument (`def create(model_cls, data): return model_cls(**data)`), and frameworks like Django or SQLAlchemy that inspect class bodies.
+
+## `__init__` vs `__new__`
+
+### What they are
+
+Creating an instance happens in **two steps**:
+
+| Method | Kind | Receives | Job | Returns |
+|---|---|---|---|---|
+| `__new__` | static method (implicitly) | the class `cls` | allocate and return a new object | the new object |
+| `__init__` | regular method | the new object `self` | fill in the object's state | must return `None` |
+
+`__init__` is **not** a constructor in the C++/Java sense: by the time it runs, the object already exists. It is an *initialiser*. The real constructor is `__new__`, and in 99% of classes you never write one because `object.__new__` does the right thing.
+
+### How it works underneath
+
+`Point(1, 2)` is a call on the class object. Calling any object invokes `type(obj).__call__`, so this ends up in `type.__call__(Point, 1, 2)`, which roughly does:
+
+1. `obj = Point.__new__(Point, 1, 2)`
+2. If `obj` is an instance of `Point`, call `Point.__init__(obj, 1, 2)`.
+3. Return `obj`.
+
+```python
+class Point:
+    def __new__(cls, *args, **kwargs):
+        print(f"__new__(cls={cls.__name__}, args={args})")
+        instance = super().__new__(cls)   # object.__new__ allocates
+        print("  allocated", type(instance).__name__, "with dict", instance.__dict__)
+        return instance
+
+    def __init__(self, x, y):
+        print(f"__init__(self, {x}, {y})")
+        self.x = x
+        self.y = y
+
+p = Point(1, 2)
+print(p.__dict__)
+
+# what Point(1, 2) roughly does:
+q = Point.__new__(Point, 3, 4)
+if isinstance(q, Point):
+    Point.__init__(q, 3, 4)
+print(q.__dict__)
+```
+
+```text title="Output"
+__new__(cls=Point, args=(1, 2))
+  allocated Point with dict {}
+__init__(self, 1, 2)
+{'x': 1, 'y': 2}
+__new__(cls=Point, args=(3, 4))
+  allocated Point with dict {}
+__init__(self, 3, 4)
+{'x': 3, 'y': 4}
+```
+
+Note that `__new__` receives the same arguments as `__init__`, and the object comes out of `object.__new__` with an **empty** `__dict__`. Attributes only exist once `__init__` assigns them.
+
+### When you actually need `__new__`
+
+**Subclassing an immutable type.** `int`, `float`, `str`, `tuple` and `frozenset` fix their value at allocation time. By the time `__init__` runs, it is too late to change it, so you must customise `__new__`:
+
+```python
+class Celsius(float):
+    def __new__(cls, value):
+        if value < -273.15:
+            raise ValueError("below absolute zero")
+        return super().__new__(cls, round(value, 1))
+
+    def __init__(self, value):
+        # too late to change the float value here; it is already built
+        pass
+
+t = Celsius(21.456)
+print(t, type(t).__name__, t + 1)
+try:
+    Celsius(-300)
+except ValueError as e:
+    print("ValueError:", e)
+```
+
+```text title="Output"
+21.5 Celsius 22.5
+ValueError: below absolute zero
+```
+
+Other legitimate uses: instance caching or interning, and metaclasses (where `__new__` builds the *class*).
+
+### Traps
+
+**A singleton via `__new__` still re-runs `__init__`.** Every call goes through both steps, so `__init__` wipes the state each time:
+
+```python
+class Settings:
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    def __init__(self):
+        print("__init__ runs again!")
+        self.values = {}
+
+a = Settings()
+a.values["db"] = "postgres"
+b = Settings()
+print(a is b, b.values)
+```
+
+```text title="Output"
+__init__ runs again!
+__init__ runs again!
+True {}
+```
+
+In Python the idiomatic "singleton" is usually just a **module-level instance** (`settings = Settings()` in `config.py`): modules are imported once and cached, so everyone shares the same object.
+
+**If `__new__` returns something that is not an instance of the class, `__init__` is skipped:**
+
+```python
+class Weird:
+    def __new__(cls):
+        return 42
+    def __init__(self):
+        print("never printed")
+
+w = Weird()
+print(w, type(w))
+```
+
+```text title="Output"
+42 <class 'int'>
+```
+
+<Callout title="Coming from JS">
+  JS `new` also has a two-phase flavour: it creates an object linked to `Ctor.prototype`, runs the constructor with `this` bound to it, and if the constructor explicitly returns an object, that object replaces `this`. Python splits those phases into two separate, overridable methods. Also, Python has **no `new` keyword**: you just call the class like a function, `User("ana")`.
+</Callout>
+
+## `self` is just the first argument
+
+### What it is
+
+Inside a method, `self` is not a keyword and not magic. It is the **first positional parameter** of an ordinary function. The name `self` is only a strong convention.
+
+```python
+class Weird:
+    def __init__(this, name):
+        this.name = name
+    def show(me):
+        return me.name
+
+print(Weird("still works").show())
+```
+
+```text title="Output"
+still works
+```
+
+(Don't do this in real code; linters and readers expect `self`.)
+
+### How `obj.method(...)` works
+
+`c.inc()` is sugar for "look up `inc`, get back a function that already knows `c`, call it". You can do the explicit version yourself:
+
+```python
+class Counter:
+    def __init__(self):
+        self.count = 0
+    def inc(self, by=1):
+        self.count += by
+        return self.count
+
+c = Counter()
+print(c.inc())           # sugar for ...
+print(Counter.inc(c))    # ... this: plain function call, c passed explicitly
+print(Counter.inc(c, 10))
+```
+
+```text title="Output"
+1
+2
+12
+```
+
+### Bound and unbound methods
+
+A `def` inside a class body stores a **plain function** in the class dict. Functions are [descriptors](/docs/python/descriptors-and-metaclasses): they have a `__get__` method. When attribute lookup finds a function on the class while looking up an attribute on an *instance*, it calls `function.__get__(instance, cls)`, which returns a **bound method** object: a tiny wrapper holding `__func__` (the function) and `__self__` (the instance). Calling the bound method calls `__func__(__self__, *args)`.
+
+Accessed through the class, you get the raw function back. Python 2 called that an "unbound method"; in Python 3 it is simply a function.
+
+```python
+class Counter:
+    def __init__(self):
+        self.count = 0
+    def inc(self):
+        self.count += 1
+        return self.count
+
+c = Counter()
+print(Counter.inc)            # plain function stored on the class
+print(c.inc)                  # bound method: function + instance
+m = c.inc
+print(m.__func__ is Counter.inc, m.__self__ is c)
+print(c.inc is c.inc)         # a new bound method object each time
+print(c.inc == c.inc)         # but they compare equal
+
+# a bound method remembers its instance, even when passed around
+callbacks = [m, m, m]
+print([cb() for cb in callbacks])
+
+# the machinery: functions are descriptors
+bound = Counter.__dict__["inc"].__get__(c, Counter)
+print(bound, bound())
+```
+
+```text title="Output"
+<function Counter.inc at 0x000001695519DDD0>
+<bound method Counter.inc of <__main__.Counter object at 0x0000016955178D70>>
+True True
+False
+True
+[1, 2, 3]
+<bound method Counter.inc of <__main__.Counter object at 0x0000016955178D70>> 4
+```
+
+`c.inc is c.inc` is `False` because each attribute access builds a fresh bound-method object. (CPython optimises the common `c.inc()` call so that no bound method is actually allocated, but semantically this is what happens.)
+
+<Mermaid chart={`flowchart LR
+  A["c.inc()"] --> B["lookup 'inc'<br/>not in c.__dict__"]
+  B --> C["found in Counter.__dict__<br/>a plain function"]
+  C --> D["function.__get__(c, Counter)"]
+  D --> E["bound method<br/>__func__ = inc<br/>__self__ = c"]
+  E --> F["call inc(c)"]`} />
+
+### Because `self` is captured, there is no "lost this" problem
+
+```python
+class Button:
+    def __init__(self, label):
+        self.label = label
+    def on_click(self):
+        return f"clicked {self.label}"
+
+b = Button("Save")
+handler = b.on_click     # no .bind() needed
+print(handler())
+print(list(map(Button.on_click, [Button("A"), Button("B")])))
+```
+
+```text title="Output"
+clicked Save
+['clicked A', 'clicked B']
+```
+
+<Callout title="Coming from JS">
+  In JS, `this` is decided **at call time** by how you call the function: `const f = obj.method; f()` loses `this`, which is why NestJS/React code is full of `.bind(this)` and arrow-function class fields. In Python the instance is bound **at lookup time**: `obj.method` already returns a function that carries `obj` inside it. Pass `b.on_click` as a callback and it just works. There is also no `call`/`apply` dance: to call a method with a different receiver, call the function on the class and pass the object: `Button.on_click(other)`.
+</Callout>
+
+### Trap: forgetting `self`
+
+```python
+class Oops:
+    def hello():
+        return "hi"
+
+print(Oops.hello())
+try:
+    Oops().hello()
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+hi
+TypeError: Oops.hello() takes 0 positional arguments but 1 was given
+```
+
+"Takes 0 positional arguments but 1 was given" when you passed nothing is the tell-tale sign: the "1" is the instance Python inserted for you.
+
+## Instance attributes vs class attributes
+
+### What they are
+
+- **Class attribute**: assigned in the class body. Stored once, in `Class.__dict__`, and shared by every instance.
+- **Instance attribute**: assigned on `self` (usually in `__init__`). Stored in that object's own `__dict__`.
+
+### How it works: reading falls back, writing never does
+
+Reading `obj.x` checks the instance dict first and then falls back to the class. **Assigning** `obj.x = ...` always writes into the instance dict (unless a data descriptor such as a property intercepts it). So assignment through an instance **shadows** the class attribute instead of changing it.
+
+```python
+class Dog:
+    species = "canis familiaris"   # class attribute: one copy, shared
+    def __init__(self, name):
+        self.name = name           # instance attribute: one per object
+
+a, b = Dog("Rex"), Dog("Fido")
+print(a.species, b.species)
+print("species" in a.__dict__, "species" in Dog.__dict__)
+
+Dog.species = "wolf?"              # change on the class: everyone sees it
+print(a.species, b.species)
+
+a.species = "good boy"             # assignment on instance: creates a shadow
+print(a.species, b.species, Dog.species)
+print(a.__dict__)
+del a.species                      # remove the shadow, class value shows again
+print(a.species)
+```
+
+```text title="Output"
+canis familiaris canis familiaris
+False True
+wolf? wolf?
+good boy wolf? wolf?
+{'name': 'Rex', 'species': 'good boy'}
+wolf?
+```
+
+### The shared-mutable-class-attribute trap
+
+This is one of the most common Python bugs. If the class attribute is **mutable** and you **mutate** it (rather than assign to it), there is no shadowing: you change the single shared object.
+
+```python
+class Cart:
+    items = []                     # BUG: one list shared by every Cart
+    def add(self, item):
+        self.items.append(item)    # mutates the class list (no assignment!)
+
+c1, c2 = Cart(), Cart()
+c1.add("apple")
+c2.add("pear")
+print(c1.items, c2.items, c1.items is c2.items)
+print(c1.__dict__)
+```
+
+```text title="Output"
+['apple', 'pear'] ['apple', 'pear'] True
+{}
+```
+
+`self.items.append(...)` is a **read** of `self.items` (which falls back to the class) followed by a method call. Nothing is ever written to the instance. The fix is to create mutable state per instance in `__init__`:
+
+```python
+class Cart:
+    def __init__(self):
+        self.items = []            # fresh list per instance
+    def add(self, item):
+        self.items.append(item)
+
+c1, c2 = Cart(), Cart()
+c1.add("apple")
+c2.add("pear")
+print(c1.items, c2.items)
+```
+
+```text title="Output"
+['apple'] ['pear']
+```
+
+It is the same family of bug as mutable default arguments (`def f(x=[])`), and [dataclasses](/docs/python/dataclasses-slots-and-enums) refuse `items: list = []` for exactly this reason, forcing `field(default_factory=list)`.
+
+The mirror-image trap is `self.count += 1` on a class counter. `+=` reads the class value, then **writes** the result to the instance:
+
+```python
+class Request:
+    count = 0
+    def __init__(self):
+        self.count += 1            # reads class attr, writes INSTANCE attr
+
+r1, r2 = Request(), Request()
+print(Request.count, r1.count, r2.count)
+
+class FixedRequest:
+    count = 0
+    def __init__(self):
+        type(self).count += 1      # explicitly target the class
+
+FixedRequest(); FixedRequest()
+print(FixedRequest.count)
+```
+
+```text title="Output"
+0 1 1
+2
+```
+
+<Callout title="Coming from JS">
+  A TS class field like `items: string[] = []` is initialised **per instance** (it is effectively code that runs in the constructor). The Python line `items = []` in a class body looks identical but means the opposite: it is evaluated **once** and stored on the class, like `static items = []` that instances can also read through. Python class attributes behave like properties on `Cart.prototype`: reads fall through, writes create an own property.
+</Callout>
+
+### When to use class attributes
+
+Use them for constants and defaults that are immutable (`MAX_RETRIES = 3`, `table_name = "users"`), for per-class configuration that subclasses override (Django `Meta`, DRF `serializer_class`), and for deliberate shared state that you update through the class. Put anything mutable and per-object in `__init__`.
+
+## Attribute lookup order
+
+### The rule for `obj.name`
+
+For an ordinary class, `obj.name` is handled by `object.__getattribute__`, which does this:
+
+1. Search the **type's MRO** (the class, then its bases in [MRO order](/docs/python/inheritance-mro-and-super)) for `name`. Remember what is found.
+2. If what was found is a **data descriptor** (defines `__set__` or `__delete__`, such as a `property`), call its `__get__` and return. It beats the instance.
+3. Otherwise, if `name` is in the **instance `__dict__`**, return that.
+4. Otherwise, if step 1 found a **non-data descriptor** (only `__get__`, such as a function), call `__get__` (this is how bound methods are made). If it found a plain value, return it.
+5. Otherwise, if the class defines `__getattr__`, call it as a last resort.
+6. Otherwise raise `AttributeError`.
+
+The simplified mental model "instance, then class, then bases" is right for plain values and methods:
+
+```python
+class Base:
+    greeting = "hello from Base"
+    def who(self):
+        return "Base.who"
+
+class Child(Base):
+    def who(self):
+        return "Child.who"
+
+c = Child()
+c.greeting = "hello from instance"
+print(c.greeting)                  # found in the instance __dict__
+del c.greeting
+print(c.greeting)                  # found on the base class
+print(c.who())                     # found on the class itself
+print([k.__name__ for k in Child.__mro__])
+try:
+    c.missing
+except AttributeError as e:
+    print("AttributeError:", e)
+```
+
+```text title="Output"
+hello from instance
+hello from Base
+Child.who
+['Child', 'Base', 'object']
+AttributeError: 'Child' object has no attribute 'missing'
+```
+
+The descriptor detail matters for properties: a property on the class wins even if the instance dict has the same key.
+
+```python
+class Account:
+    @property
+    def balance(self):
+        return 100
+
+acct = Account()
+acct.__dict__["balance"] = 999      # sneak a value into the instance dict
+print(acct.balance)                 # property (data descriptor) still wins
+print(acct.__dict__)
+```
+
+```text title="Output"
+100
+{'balance': 999}
+```
+
+<Mermaid chart={`flowchart TD
+  S["obj.name"] --> T["search type(obj).__mro__ for name"]
+  T --> DD{"found a data descriptor?<br/>(has __set__ or __delete__)"}
+  DD -- yes --> R1["return descriptor.__get__(obj, type)"]
+  DD -- no --> I{"name in obj.__dict__?"}
+  I -- yes --> R2["return obj.__dict__[name]"]
+  I -- no --> F{"found anything on the class?"}
+  F -- "non-data descriptor<br/>(e.g. a function)" --> R3["return __get__(obj, type)<br/>e.g. a bound method"]
+  F -- "plain value" --> R4["return the class value"]
+  F -- nothing --> G{"class defines __getattr__?"}
+  G -- yes --> R5["return __getattr__(obj, name)"]
+  G -- no --> E["raise AttributeError"]`} />
+
+<Callout title="Coming from JS">
+  JS lookup walks a linked list of objects: own properties, then `__proto__`, then its `__proto__`, and so on. Python does something similar but the "chain" is the precomputed tuple `type(obj).__mro__`, the instance is a separate step, and descriptors can take over. There is no per-object `__proto__` to reassign (though you can, rarely, assign `obj.__class__`).
+</Callout>
+
+## `@property`: getters, setters and validation
+
+### What it is
+
+`property` turns method calls into attribute syntax. Callers write `t.celsius` and `t.celsius = 30`; your code runs a getter and a setter. Because Python has properties, the Java habit of writing `get_x()`/`set_x()` up front is unnecessary: **start with a plain attribute, and switch to a property later without changing any caller.**
+
+### How it works underneath
+
+`property` is a class implementing `__get__`, `__set__` and `__delete__`, which makes it a **data descriptor**. `@property` creates one with the getter; `@celsius.setter` returns a *copy* of that property object with the setter added, which is why the setter function must have the **same name**. The value itself is usually stored in an underscore attribute like `_celsius`.
+
+```python
+class Temperature:
+    def __init__(self, celsius):
+        self.celsius = celsius            # goes through the setter below
+
+    @property
+    def celsius(self):
+        return self._celsius
+
+    @celsius.setter
+    def celsius(self, value):
+        if not isinstance(value, (int, float)):
+            raise TypeError("celsius must be a number")
+        if value < -273.15:
+            raise ValueError("below absolute zero")
+        self._celsius = value
+
+    @celsius.deleter
+    def celsius(self):
+        print("deleting")
+        del self._celsius
+
+    @property
+    def fahrenheit(self):                 # computed, read-only
+        return self._celsius * 9 / 5 + 32
+
+t = Temperature(25)
+print(t.celsius, t.fahrenheit)
+t.celsius = 30
+print(t.fahrenheit)
+for bad in ("hot", -500):
+    try:
+        t.celsius = bad
+    except (TypeError, ValueError) as e:
+        print(type(e).__name__, e)
+try:
+    t.fahrenheit = 100
+except AttributeError as e:
+    print("AttributeError:", e)
+print(t.__dict__)
+del t.celsius
+print(type(Temperature.__dict__["celsius"]))
+```
+
+```text title="Output"
+25 77.0
+86.0
+TypeError celsius must be a number
+ValueError below absolute zero
+AttributeError: property 'fahrenheit' of 'Temperature' object has no setter
+{'_celsius': 30}
+deleting
+<class 'property'>
+```
+
+Assigning `self.celsius = celsius` inside `__init__` (rather than `self._celsius`) means validation also runs at construction time.
+
+### Traps
+
+- **Infinite recursion.** Returning `self.name` from the `name` property calls the property again:
+
+```python
+class Bad:
+    @property
+    def name(self):
+        return self.name     # calls the property again...
+
+try:
+    Bad().name
+except RecursionError as e:
+    print("RecursionError:", e)
+```
+
+```text title="Output"
+RecursionError: maximum recursion depth exceeded
+```
+
+- **Hidden cost.** Attribute syntax suggests "cheap". Don't hide a database query or an HTTP call behind a property; make it a method (`user.fetch_orders()`) so the cost is visible. For expensive-but-pure values, `functools.cached_property` computes once and stores the result in the instance dict.
+- A property is defined **per class**, not per instance. You cannot attach one to a single object.
+
+<Callout title="Coming from JS">
+  `@property` / `@x.setter` is the equivalent of JS `get celsius()` / `set celsius(v)` accessors, which also live on the prototype. Unlike JS, a Python property with no setter raises `AttributeError` on assignment instead of silently ignoring it (JS only throws in strict mode).
+</Callout>
+
+## `@classmethod` vs `@staticmethod`
+
+### What they are
+
+| Decorator | First argument | Typical use |
+|---|---|---|
+| none (instance method) | the instance, `self` | behaviour that needs object state |
+| `@classmethod` | the class, `cls` | alternative constructors, per-class factories |
+| `@staticmethod` | nothing | a helper that lives in the class namespace for organisation |
+
+### How they work underneath
+
+Both are descriptor wrappers around a function. `classmethod.__get__` binds the function to the **class** (even when accessed through an instance), so `cls` is whatever class you called it on, **including subclasses**. `staticmethod.__get__` returns the raw function with no binding at all.
+
+```python
+from datetime import date
+
+class User:
+    def __init__(self, name, born):
+        self.name = name
+        self.born = born
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["name"], date.fromisoformat(data["born"]))
+
+    @classmethod
+    def from_csv_row(cls, row):
+        name, born = row.split(",")
+        return cls(name.strip(), date.fromisoformat(born.strip()))
+
+    @staticmethod
+    def is_valid_name(name):
+        return name.isidentifier()
+
+    def __repr__(self):
+        return f"{type(self).__name__}({self.name!r}, {self.born})"
+
+class Admin(User):
+    pass
+
+print(User.from_dict({"name": "ana", "born": "1990-04-01"}))
+print(Admin.from_csv_row("root, 1970-01-01"))    # cls is Admin!
+print(User.is_valid_name("ana"), User("x", None).is_valid_name("not valid"))
+print(dict.fromkeys(["a", "b"], 0))              # built-in classmethod example
+print(type(User.__dict__["from_dict"]), type(User.__dict__["is_valid_name"]))
+print(User.from_dict)
+print(User.is_valid_name)
+```
+
+```text title="Output"
+User('ana', 1990-04-01)
+Admin('root', 1970-01-01)
+True False
+{'a': 0, 'b': 0}
+<class 'classmethod'> <class 'staticmethod'>
+<bound method User.from_dict of <class '__main__.User'>>
+<function User.is_valid_name at 0x0000020C07F3DFE0>
+```
+
+`Admin.from_csv_row` returned an `Admin`, not a `User`, because the method used `cls(...)` instead of hard-coding `User(...)`. That is the whole point of alternative constructors as classmethods: they are **inherited correctly**. The standard library is full of them: `dict.fromkeys`, `datetime.fromisoformat`, `int.from_bytes`, and Pydantic's `Model.model_validate`.
+
+<Callout title="Coming from JS">
+  Python has no function overloading and only one `__init__`, so where TS might overload a constructor, Python uses named classmethod constructors (`User.from_dict`, `User.from_row`). A JS `static` method is closest to `@classmethod`, because inside a JS static method `this` is the class it was called on (so `this` is the subclass in `Admin.create()`). `@staticmethod` is a JS static method that never touches `this`.
+</Callout>
+
+### When to use which
+
+- Need the instance? Regular method.
+- Need to construct or configure based on the class? `@classmethod`.
+- Need neither? Prefer a **module-level function**. Use `@staticmethod` only when the helper is so tightly tied to the class that callers should find it there, or when subclasses should be able to override it.
+
+## Name mangling, `_x`, and why nothing is really private
+
+### What it is
+
+Python has **no access modifiers**. Instead:
+
+- `_name` (one underscore) is a **convention** meaning "internal, not part of the public API". Nothing enforces it, although `from module import *` skips such names and linters warn when you touch them.
+- `__name` (two leading underscores, at most one trailing) inside a class body triggers **name mangling**: the compiler rewrites it to `_ClassName__name`.
+
+### How mangling works underneath
+
+Mangling is a **compile-time text rewrite** applied to identifiers written inside a `class` block. `self.__secret` in class `Account` is compiled as `self._Account__secret`. Outside the class, nothing is rewritten, so `a.__secret` looks for a literally named attribute that does not exist.
+
+```python
+class Account:
+    def __init__(self):
+        self._internal = "convention: please don't touch"
+        self.__secret = "mangled"
+
+    def reveal(self):
+        return self.__secret
+
+a = Account()
+print(a._internal)
+print(a.reveal())
+try:
+    a.__secret
+except AttributeError as e:
+    print("AttributeError:", e)
+print(a.__dict__)
+print(a._Account__secret)          # not private at all
+```
+
+```text title="Output"
+convention: please don't touch
+mangled
+AttributeError: 'Account' object has no attribute '__secret'
+{'_internal': "convention: please don't touch", '_Account__secret': 'mangled'}
+mangled
+```
+
+### What it is actually for
+
+Mangling is not a security feature. It exists to **avoid accidental name clashes in inheritance**, so a base class can keep an attribute that subclasses will not overwrite by accident:
+
+```python
+class Base:
+    def __init__(self):
+        self.__id = "base-id"      # becomes _Base__id
+    def base_id(self):
+        return self.__id
+
+class Child(Base):
+    def __init__(self):
+        super().__init__()
+        self.__id = "child-id"     # becomes _Child__id, no clash
+
+c = Child()
+print(c.base_id())
+print(c.__dict__)
+```
+
+```text title="Output"
+base-id
+{'_Base__id': 'base-id', '_Child__id': 'child-id'}
+```
+
+**Trap:** strings are never mangled, so `getattr(self, "__v")` does not find `self.__v`:
+
+```python
+class Box:
+    def __init__(self):
+        self.__v = 1
+    def get_dynamic(self):
+        return getattr(self, "__v", "not found")   # strings are NOT mangled
+
+print(Box().get_dynamic())
+```
+
+```text title="Output"
+not found
+```
+
+Names with two leading **and** two trailing underscores (`__init__`) are never mangled; those are reserved for the language's special methods.
+
+<Callout title="Coming from JS">
+  JS `#secret` fields are **truly private**: enforced by the engine, invisible to `Object.keys`, and a syntax error to access from outside. TS `private`/`protected` are **compile-time only** and vanish in the emitted JS. Python is closer to TS: `_x` is a gentlemen's agreement, and `__x` is a rename that anyone can undo with `obj._Class__x`. The Python culture is "we are all consenting adults": document the public API and trust callers.
+</Callout>
+
+**Guidance:** use `_x` for internals (this is what you will use 95% of the time). Use `__x` only in base classes designed for subclassing by others, where a clash would be a real risk.
+
+## `__repr__` vs `__str__`
+
+### What they are
+
+- `__repr__`: the **developer** representation, returned by `repr(obj)`. Shown in the REPL, in debuggers, in logs of containers, and with `!r` in f-strings. Aim for unambiguous, ideally something that looks like the code to recreate the object.
+- `__str__`: the **end-user** representation, returned by `str(obj)`, `print(obj)` and plain `{obj}` in f-strings.
+
+### How the fallback works
+
+`object.__str__` simply calls `repr()`, so if you define only `__repr__`, both work. The reverse is not true. Containers always use the `repr` of their elements.
+
+```python
+from datetime import date
+
+class Money:
+    def __init__(self, amount, currency):
+        self.amount = amount
+        self.currency = currency
+    def __repr__(self):
+        return f"Money({self.amount!r}, {self.currency!r})"
+    def __str__(self):
+        return f"{self.amount:.2f} {self.currency}"
+
+m = Money(9.5, "EUR")
+print(m)                 # str()
+print(repr(m))
+print(f"{m} / {m!r}")
+print([m])               # containers use repr of elements
+d = date(2026, 10, 13)
+print(str(d), repr(d))
+
+class NoRepr:
+    pass
+print(NoRepr())
+
+class OnlyRepr:
+    def __repr__(self):
+        return "OnlyRepr()"
+print(str(OnlyRepr()))   # __str__ falls back to __repr__
+```
+
+```text title="Output"
+9.50 EUR
+Money(9.5, 'EUR')
+9.50 EUR / Money(9.5, 'EUR')
+[Money(9.5, 'EUR')]
+2026-10-13 datetime.date(2026, 10, 13)
+<__main__.NoRepr object at 0x000002786AC98EC0>
+OnlyRepr()
+```
+
+**Rule of thumb:** always write a `__repr__` for classes you will debug or log (dataclasses generate one for you). Add `__str__` only when there is a distinct user-facing format. Use `!r` inside a `__repr__` so that strings get their quotes.
+
+<Callout title="Coming from JS">
+  `__str__` is like overriding `toString()`. There is no single JS equivalent of `__repr__`; the closest is Node's `[util.inspect.custom]`, which controls what `console.log` shows. In Python, `print([obj])` uses `__repr__`, which is why a missing `__repr__` gives you useless `<... object at 0x...>` output in logs.
+</Callout>
+
+## Dynamic attributes: `getattr`, `setattr`, `hasattr`, `delattr`
+
+### What they are
+
+These built-ins do attribute access with the name as a **runtime string**: `getattr(obj, "x")` is `obj.x`, `setattr(obj, "x", v)` is `obj.x = v`, `delattr(obj, "x")` is `del obj.x`, and `hasattr(obj, "x")` tries `getattr` and reports whether it raised `AttributeError`. They go through the full lookup machinery, so properties, descriptors and `__getattr__` all apply. `vars(obj)` returns the instance `__dict__`.
+
+```python
+class Settings:
+    pass
+
+s = Settings()
+setattr(s, "db_url", "postgres://localhost")
+print(s.db_url, getattr(s, "db_url"))
+print(getattr(s, "timeout", 30))       # default instead of AttributeError
+print(hasattr(s, "db_url"), hasattr(s, "timeout"))
+delattr(s, "db_url")
+print(vars(s))
+
+env = {"DEBUG": "1", "PORT": "8000"}
+for key, value in env.items():
+    setattr(s, key.lower(), value)
+print(vars(s))
+
+field = "port"
+print(getattr(s, field))
+try:
+    getattr(s, "missing")
+except AttributeError as e:
+    print("AttributeError:", e)
+```
+
+```text title="Output"
+postgres://localhost postgres://localhost
+30
+True False
+{}
+{'debug': '1', 'port': '8000'}
+8000
+AttributeError: 'Settings' object has no attribute 'missing'
+```
+
+A classic backend use is **dispatch by name**, e.g. routing webhook events to handler methods:
+
+```python
+class Handler:
+    def handle(self, event):
+        method = getattr(self, f"on_{event['type']}", self.on_unknown)
+        return method(event)
+    def on_created(self, event):
+        return f"created {event['id']}"
+    def on_deleted(self, event):
+        return f"deleted {event['id']}"
+    def on_unknown(self, event):
+        return f"ignored {event['type']}"
+
+h = Handler()
+for e in [{"type": "created", "id": 1}, {"type": "deleted", "id": 2}, {"type": "renamed", "id": 3}]:
+    print(h.handle(e))
+```
+
+```text title="Output"
+created 1
+deleted 2
+ignored renamed
+```
+
+### Traps
+
+**`hasattr` swallows `AttributeError` from inside a property**, which can hide a real bug:
+
+```python
+class Flaky:
+    @property
+    def value(self):
+        raise AttributeError("oops inside property")
+
+print(hasattr(Flaky(), "value"))
+```
+
+```text title="Output"
+False
+```
+
+**Methods added to the class bind; functions added to an instance do not.** Binding happens only for functions found on the class during lookup:
+
+```python
+class Greeter:
+    pass
+
+g = Greeter()
+def hello(self):
+    return f"hello from {type(self).__name__}"
+
+Greeter.hello = hello            # add method to class: all instances get it
+print(g.hello())
+g.bye = lambda: "bye"            # on instance: a plain function, NOT bound
+print(g.bye())
+print(type(Greeter.__dict__["hello"]), type(g.__dict__["bye"]))
+```
+
+```text title="Output"
+hello from Greeter
+bye
+<class 'function'> <class 'function'>
+```
+
+**Security:** never call `getattr(obj, user_input)` on untrusted input without a whitelist or a prefix like `on_`; otherwise a request could reach `__class__` or internal methods. Prefer an explicit dict of handlers when the set is fixed.
+
+<Callout title="Coming from JS">
+  `getattr(obj, name)` is `obj[name]`, `setattr` is `obj[name] = v`, `hasattr` is roughly `name in obj`, and `delattr` is `delete obj[name]`. The key difference is that Python separates **attributes** (`obj.x`) from **items** (`obj["x"]`). A plain object is not a dictionary: `s["port"]` raises `TypeError`. Use a `dict` when you want string-keyed data, and attributes when you want a fixed shape.
+</Callout>
+
+For how classes can intercept these operations (`__getattr__`, `__getattribute__`, `__setattr__`), see [the data model](/docs/python/data-model-dunder-methods). To restrict which attributes an instance may have, see `__slots__` in [dataclasses, slots and enums](/docs/python/dataclasses-slots-and-enums).
+
+## Interview questions
+
+1. **What is the difference between `__new__` and `__init__`?** **`__new__` is a static method that receives the class and creates and returns the instance; `__init__` receives that instance and initialises it, returning `None`. You override `__new__` mainly when subclassing immutable types like `int`, `str` or `tuple`, or for caching.**
+2. **Why does Python need an explicit `self`?** **Methods are ordinary functions stored on the class. `obj.method` uses the descriptor protocol (`function.__get__`) to produce a bound method that passes `obj` as the first argument. `self` is just the name of that parameter, which keeps the mechanism explicit and lets `Class.method(obj)` work.**
+3. **What does `c.inc is c.inc` evaluate to, and why?** **`False`. Each attribute access creates a new bound-method object wrapping the same function and instance. They compare equal with `==` but are different objects.**
+4. **Explain the shared mutable class attribute bug.** **A list or dict assigned in the class body is created once and stored on the class. `self.items.append(x)` reads through to that single object and mutates it, so every instance sees the change. Create mutable state in `__init__` instead.**
+5. **What is the attribute lookup order for `obj.x`?** **Data descriptors on the type's MRO (like properties) first, then the instance `__dict__`, then non-data descriptors (functions) and plain class attributes along the MRO, then `__getattr__` if defined, else `AttributeError`.**
+6. **When would you use `@classmethod` instead of `@staticmethod`?** **When the method needs the class, typically alternative constructors like `from_dict`. Using `cls(...)` makes subclasses return instances of themselves. `@staticmethod` gets no implicit argument and is just a namespaced function.**
+7. **Does `__x` make an attribute private?** **No. It triggers compile-time name mangling to `_ClassName__x` to avoid clashes in subclasses. It can still be reached as `obj._ClassName__x`. Python has no enforced privacy; `_x` is the convention for internals.**
+8. **What is the difference between `__repr__` and `__str__`?** **`__repr__` is the unambiguous developer view used by the REPL, containers and `!r`; `__str__` is the readable user view used by `print` and `str`. `__str__` falls back to `__repr__`, so define `__repr__` first.**
+
+## Recap
+
+- A `class` statement **executes** its body into a namespace dict and calls `type(name, bases, ns)`; the class is an ordinary object.
+- Instance creation is `__new__` (allocate) then `__init__` (initialise). You rarely need `__new__`.
+- `self` is an ordinary first parameter. Functions on a class are descriptors; `obj.method` returns a **bound method** that already carries `obj`, so there is no lost-`this` problem.
+- Reads fall back from instance to class; writes go to the instance. Never put mutable per-object state in the class body.
+- Lookup order: data descriptors, instance `__dict__`, then class attributes and methods along the MRO, then `__getattr__`.
+- `@property` gives attribute syntax with validation; start with plain attributes and upgrade later.
+- `@classmethod` is for alternative constructors (use `cls`); `@staticmethod` is a namespaced function.
+- `_x` is a convention; `__x` is mangling for clash avoidance, not privacy.
+- Always write a `__repr__`; add `__str__` for user-facing text.
+- `getattr`/`setattr`/`hasattr` do dynamic attribute access through the full lookup machinery.

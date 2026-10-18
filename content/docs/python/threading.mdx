@@ -1,0 +1,682 @@
+---
+title: "Threading"
+description: "OS threads in Python: Thread and ThreadPoolExecutor, race conditions and locks, Condition, Semaphore, Event, Queue-based producer/consumer, thread-local data, daemon threads, deadlocks, and when threads are the right tool."
+---
+
+Python's `threading` module gives you **real OS threads** that share one heap. With the GIL, only one runs Python bytecode at a time, but they overlap beautifully whenever a thread waits on IO. This page covers the API and, more importantly, the bugs that come with shared memory. Read [Concurrency Models and the GIL](/docs/python/concurrency-models-and-the-gil) first if the GIL is new to you.
+
+Every snippet was run on **CPython 3.14.6** (GIL build). Thread scheduling is up to the OS, so **output order and timings can change between runs**. Where order matters, the examples are designed to be deterministic, and the ones that aren't say so.
+
+<Callout title="Coming from JS">
+Node gives you no shared-memory threads for JavaScript. `worker_threads` are isolated (separate V8 isolates, message passing, optional `SharedArrayBuffer` plus `Atomics`). Python threads are the opposite: **every thread sees every object**. A dict you mutate in one thread is the same dict in all of them. That is convenient, and it is exactly why you need locks. Also, Python threads are **preemptive**: the interpreter can switch threads between almost any two bytecodes, not only at `await` points like JS async code.
+</Callout>
+
+## `threading.Thread`
+
+A `Thread` wraps a callable. `start()` asks the OS to create a thread, which then calls your `target`. `join()` blocks until it finishes.
+
+```python
+import threading, time
+
+def worker(name, delay):
+    print(f"{name} start on {threading.current_thread().name}")
+    time.sleep(delay)
+    print(f"{name} done")
+
+t = threading.Thread(target=worker, args=("job", 0.1), name="worker-1")
+print("alive before start:", t.is_alive())
+t.start()
+print("alive after start:", t.is_alive())
+t.join()
+print("alive after join:", t.is_alive())
+print("main thread:", threading.main_thread().name, "active:", threading.active_count())
+```
+
+```text title="Output (the first two prints after start can swap)"
+alive before start: False
+job start on worker-1
+alive after start: True
+job done
+alive after join: False
+main thread: MainThread active: 1
+```
+
+What happens underneath:
+
+1. `start()` calls the C function `_thread.start_new_thread`, which creates a native thread (`pthread_create` or `_beginthreadex` on Windows) with its own C stack.
+2. The new thread creates a `PyThreadState` (its own Python call stack, current exception and so on), acquires the GIL, and runs `Thread.run()`, which calls your target.
+3. When the target returns, the thread state is destroyed and the OS thread exits.
+
+Traps:
+
+- **The return value is lost.** `Thread` has no way to give you the target's result. Use `ThreadPoolExecutor` (below), or write into a shared structure.
+- **Exceptions don't reach the caller.** An uncaught exception in a thread is printed by `threading.excepthook` and the thread dies. The main thread continues as if nothing happened:
+
+```python
+import threading
+def boom():
+    raise RuntimeError("worker failed")
+t = threading.Thread(target=boom, name="worker-7")
+t.start(); t.join()
+print("main thread keeps running")
+```
+
+```text title="Output (traceback trimmed)"
+Exception in thread worker-7:
+Traceback (most recent call last):
+  ...
+RuntimeError: worker failed
+main thread keeps running
+```
+
+You can install your own hook to send these to your logger or error tracker:
+
+```python
+import threading
+
+def boom():
+    raise RuntimeError("worker failed")
+
+def hook(args):
+    print(f"caught in {args.thread.name}: {args.exc_type.__name__}: {args.exc_value}")
+
+threading.excepthook = hook
+t = threading.Thread(target=boom, name="worker-7")
+t.start(); t.join()
+print("main thread keeps running")
+```
+
+```text title="Output"
+caught in worker-7: RuntimeError: worker failed
+main thread keeps running
+```
+
+- **You cannot kill a thread.** There is no `thread.kill()`. Threads must cooperate (check an `Event`, see below). This is deliberate: killing a thread that holds a lock would leave the lock held forever.
+
+## `ThreadPoolExecutor` and futures
+
+In real code you rarely create threads by hand. `concurrent.futures.ThreadPoolExecutor` keeps a pool of worker threads fed from an internal queue, and hands you a **`Future`** for each submitted call. A `Future` is a box that will eventually hold a result or an exception.
+
+```python
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def fetch(url):
+    time.sleep({"a": 0.3, "b": 0.1, "c": 0.2}[url])  # pretend network call
+    if url == "c":
+        raise ValueError(f"bad response from {url}")
+    return f"{url}: 200"
+
+with ThreadPoolExecutor(max_workers=3) as pool:
+    futures = {pool.submit(fetch, u): u for u in ["a", "b", "c"]}
+    for fut in as_completed(futures):
+        url = futures[fut]
+        try:
+            print("ok   ", fut.result())
+        except ValueError as exc:
+            print("error", url, "->", exc)
+```
+
+```text title="Output"
+ok    b: 200
+error c -> bad response from c
+ok    a: 200
+```
+
+- `submit(fn, *args)` returns a `Future` immediately.
+- `as_completed(futures)` yields futures in **completion order**.
+- `fut.result()` returns the value or **re-raises the exception in the calling thread**. This is how exceptions cross back from the worker.
+- Leaving the `with` block calls `shutdown(wait=True)`, so it waits for all work to finish.
+
+`pool.map` is the simpler form. It yields results in **input order**, even if later items finish first:
+
+```python
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+def square(x):
+    time.sleep(0.1 * (3 - x))   # later items finish first
+    return x * x
+
+with ThreadPoolExecutor(max_workers=3) as pool:
+    print(list(pool.map(square, [0, 1, 2])))   # results in INPUT order
+```
+
+```text title="Output"
+[0, 1, 4]
+```
+
+A trap: if nobody calls `result()` or `exception()`, a failure is silently stored on the future and never printed.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+def boom():
+    raise RuntimeError("lost?")
+with ThreadPoolExecutor() as pool:
+    print("default max_workers:", pool._max_workers)
+    fut = pool.submit(boom)          # nobody calls fut.result()
+print("no traceback printed; exception stored on the future:", repr(fut.exception()))
+```
+
+```text title="Output (max_workers depends on your CPU count)"
+default max_workers: 20
+no traceback printed; exception stored on the future: RuntimeError('lost?')
+```
+
+The default `max_workers` is `min(32, os.cpu_count() + 4)` (20 on this 16-core machine). For IO-bound work you can go higher. The right number is "how many concurrent requests can the downstream system take".
+
+<Callout title="Coming from JS">
+A `concurrent.futures.Future` is close to a Promise you can block on: `fut.result()` is like a synchronous `await`. `as_completed` resembles iterating promises as they settle, and `pool.map` resembles `Promise.all` (ordered results). One difference: a rejected Promise with no handler triggers `unhandledRejection`, while an unread failed `Future` makes no noise at all. Note this is **not** the same class as `asyncio.Future`, which is covered in the [asyncio](/docs/python/asyncio) page.
+</Callout>
+
+## Race conditions, demonstrated
+
+A race condition happens when the result depends on how threads interleave. The classic case is a read-modify-write on shared state:
+
+```python
+import threading
+
+def validate(amount):
+    return amount if amount > 0 else 0
+
+class Account:
+    def __init__(self):
+        self.balance = 0
+        self._lock = threading.Lock()
+
+    def deposit_unsafe(self, amount):
+        current = self.balance                 # read
+        self.balance = current + validate(amount)  # compute + write
+
+    def deposit_safe(self, amount):
+        with self._lock:
+            current = self.balance
+            self.balance = current + validate(amount)
+
+def run(method_name):
+    acct = Account()
+    def work():
+        method = getattr(acct, method_name)
+        for _ in range(500_000):
+            method(1)
+    threads = [threading.Thread(target=work) for _ in range(4)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    return acct.balance
+
+print("expected:", 4 * 500_000)
+print("unsafe:  ", run("deposit_unsafe"))
+print("safe:    ", run("deposit_safe"))
+```
+
+```text title="Output (the unsafe number changes on every run)"
+expected: 2000000
+unsafe:   1672376
+safe:     2000000
+```
+
+Why it loses money: the `validate()` call is a point where CPython checks whether another thread asked for the GIL. So this interleaving happens hundreds of thousands of times:
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Thread A
+  participant M as balance
+  participant B as Thread B
+  A->>M: read 100
+  Note over A: GIL handed over during validate
+  B->>M: read 100
+  B->>M: write 101
+  Note over B: GIL handed back
+  A->>M: write 101
+  Note over M: one deposit lost`} />
+
+## `Lock`
+
+`threading.Lock` is a mutual-exclusion lock. Only one thread can hold it at a time. Others block in `acquire()` until it is released.
+
+- Always use `with lock:`. It calls `acquire()` and guarantees `release()` in a `finally`, even if the body raises.
+- Keep the critical section **small**: read, compute, write. Never do network IO while holding a lock unless you must.
+- `acquire(timeout=...)` returns `False` instead of blocking forever, and `acquire(blocking=False)` tries once.
+- A `Lock` is not owned by a thread. Any thread may release it. Releasing an unlocked lock raises `RuntimeError`.
+
+Underneath, `Lock` is a thin wrapper around an OS primitive (in 3.13+ it is CPython's own lightweight `PyMutex`). Waiting in `acquire()` releases the GIL, so a blocked thread costs no CPU.
+
+## `RLock`: re-entrant lock
+
+A plain `Lock` deadlocks if the **same thread** tries to acquire it twice. That happens easily when one locked method calls another locked method. `RLock` remembers its owner thread and a recursion count, so the owner can re-acquire it.
+
+```python
+import threading
+
+lock = threading.Lock()
+rlock = threading.RLock()
+
+def outer(l):
+    with l:
+        return inner(l)
+
+def inner(l):
+    # A plain Lock is not re-entrant: the same thread blocks on itself.
+    got = l.acquire(timeout=0.5)
+    if got:
+        l.release()
+    return got
+
+print("Lock re-acquired? ", outer(lock))
+print("RLock re-acquired?", outer(rlock))
+```
+
+```text title="Output"
+Lock re-acquired?  False
+RLock re-acquired? True
+```
+
+Use `RLock` when a class's public methods lock and also call each other. Prefer `Lock` otherwise. It is cheaper, and needing re-entrancy is sometimes a sign the locking design is muddled.
+
+## `Condition`: wait until something is true
+
+A `Condition` combines a lock with a wait/notify mechanism. A thread holding the lock can `wait()`, which **atomically releases the lock and sleeps** until another thread calls `notify()`. Then it re-acquires the lock before returning.
+
+```python
+import threading, time
+
+class Inbox:
+    def __init__(self):
+        self._items = []
+        self._cond = threading.Condition()     # wraps an RLock by default
+
+    def put(self, item):
+        with self._cond:
+            self._items.append(item)
+            self._cond.notify()                # wake one waiter
+
+    def get(self, timeout=None):
+        with self._cond:
+            # wait_for re-checks the predicate after every wake-up
+            ok = self._cond.wait_for(lambda: self._items, timeout=timeout)
+            return self._items.pop(0) if ok else None
+
+inbox = Inbox()
+def consumer():
+    print("consumer waiting")
+    print("consumer got", inbox.get())
+
+t = threading.Thread(target=consumer)
+t.start()
+time.sleep(0.1)
+print("producer putting")
+inbox.put("hello")
+t.join()
+print("timed out ->", inbox.get(timeout=0.2))
+```
+
+```text title="Output"
+consumer waiting
+producer putting
+consumer got hello
+timed out -> None
+```
+
+The trap: **always wait in a loop or with `wait_for`**. Spurious wake-ups can happen, and with `notify_all()` several waiters wake, but only one of them gets the item. `wait_for(predicate)` does the loop for you. You will rarely write a `Condition` yourself, because `queue.Queue` is built on exactly this pattern.
+
+## `Semaphore`: bounded concurrency
+
+A semaphore holds a counter. `acquire()` decrements it and blocks at zero. `release()` increments it. Use it to cap how many threads do something at once, such as calls to a rate-limited API:
+
+```python
+import threading, time
+from concurrent.futures import ThreadPoolExecutor
+
+limit = threading.BoundedSemaphore(3)   # at most 3 calls in flight
+in_flight = 0
+peak = 0
+counter_lock = threading.Lock()
+
+def call_api(i):
+    global in_flight, peak
+    with limit:
+        with counter_lock:
+            in_flight += 1
+            peak = max(peak, in_flight)
+        time.sleep(0.05)                 # the "request"
+        with counter_lock:
+            in_flight -= 1
+    return i
+
+with ThreadPoolExecutor(max_workers=10) as pool:
+    results = list(pool.map(call_api, range(20)))
+print("results:", len(results), "peak concurrency:", peak)
+```
+
+```text title="Output"
+results: 20 peak concurrency: 3
+```
+
+`BoundedSemaphore` raises `ValueError` if you release more times than you acquired. That catches bugs, so prefer it over a plain `Semaphore`.
+
+## `Event`: a one-way signal
+
+An `Event` is a boolean flag that threads can wait on. The most common use is a graceful stop signal, which is how you "cancel" a thread:
+
+```python
+import threading, time
+
+stop = threading.Event()
+
+def heartbeat():
+    beats = 0
+    while not stop.is_set():
+        beats += 1
+        stop.wait(0.1)          # sleep, but wake immediately if stop is set
+    print(f"heartbeat stopped after {beats} beats")
+
+t = threading.Thread(target=heartbeat)
+t.start()
+time.sleep(0.35)
+stop.set()
+t.join()
+```
+
+```text title="Output (usually 4)"
+heartbeat stopped after 4 beats
+```
+
+Using `stop.wait(0.1)` instead of `time.sleep(0.1)` means the thread reacts to `set()` immediately instead of finishing its sleep first.
+
+<Callout title="Coming from JS">
+`threading.Event` used as a stop flag plays the role of an `AbortController`: the owner calls `set()` (like `abort()`), and workers check `is_set()` (like `signal.aborted`) or block on `wait()`. The big difference is that nothing is interrupted for you. A thread stuck in a blocking call that doesn't check the event will not stop. Design long-running loops to check it.
+</Callout>
+
+## `queue.Queue`: producer/consumer
+
+`queue.Queue` is a thread-safe FIFO built on a `Lock` and two `Condition`s (not-empty and not-full). It is the **preferred way to share work between threads**: instead of sharing mutable state, you pass messages, and the queue does all the locking.
+
+<Mermaid chart={`sequenceDiagram
+  participant P as Producer
+  participant Q as Queue maxsize 2
+  participant C as Consumer
+  P->>Q: put 0
+  C->>Q: get 0
+  P->>Q: put 1
+  P->>Q: put 2
+  Note over P,Q: queue full - put 3 blocks
+  C->>Q: task_done, get 1
+  P->>Q: put 3 unblocks
+  C->>Q: task_done for each item
+  Note over C: main thread q.join returns`} />
+
+```python
+import threading, queue, time
+
+q = queue.Queue(maxsize=2)      # bounded: put() blocks when full (backpressure)
+SENTINEL = object()
+
+def producer():
+    for i in range(5):
+        q.put(i)
+        print(f"produced {i}")
+    q.put(SENTINEL)
+
+def consumer():
+    while True:
+        item = q.get()
+        if item is SENTINEL:
+            q.task_done()
+            break
+        time.sleep(0.05)         # slow consumer
+        print(f"  consumed {item}")
+        q.task_done()
+
+c = threading.Thread(target=consumer)
+p = threading.Thread(target=producer)
+c.start(); p.start()
+q.join()                         # waits until every item had task_done()
+print("all items processed")
+```
+
+```text title="Output (interleaving can vary slightly)"
+produced 0
+produced 1
+produced 2
+  consumed 0
+produced 3
+  consumed 1
+produced 4
+  consumed 2
+  consumed 3
+  consumed 4
+all items processed
+```
+
+Key points:
+
+- **`maxsize` gives backpressure.** A fast producer blocks instead of filling memory. An unbounded queue (`maxsize=0`, the default) is a common memory leak in pipelines.
+- **`task_done()` and `join()`** let the main thread wait until every item has been *processed*, not just taken.
+- **Stopping consumers.** The classic trick is a sentinel object per consumer. Since Python 3.13 there is also `Queue.shutdown()`: after it, `put()` raises `queue.ShutDown`, and `get()` raises it once the queue is empty.
+
+```python
+import threading, queue
+
+q = queue.Queue()
+
+def worker(n):
+    while True:
+        try:
+            item = q.get()
+        except queue.ShutDown:         # 3.13+
+            print(f"worker {n} exiting")
+            return
+        print(f"worker {n} handled {item}")
+        q.task_done()
+
+for i in range(3):
+    q.put(i)
+q.shutdown()                            # no new puts; get() raises once empty
+threads = [threading.Thread(target=worker, args=(n,)) for n in range(2)]
+for t in threads: t.start()
+for t in threads: t.join()
+```
+
+```text title="Output (which worker handles which item varies)"
+worker 0 handled 0
+worker 0 handled 1
+worker 0 handled 2
+worker 0 exiting
+worker 1 exiting
+```
+
+## Thread-local data
+
+`threading.local()` creates an object whose attributes are **separate per thread**. It is how frameworks keep "current request" or "current DB connection" without passing it through every call:
+
+```python
+import threading, time
+
+ctx = threading.local()
+
+def handle(request_id):
+    ctx.request_id = request_id          # each thread sees its own attribute
+    time.sleep(0.05)
+    log("finished")
+
+def log(msg):
+    print(f"[req {ctx.request_id}] {msg}")
+
+threads = [threading.Thread(target=handle, args=(i,)) for i in range(3)]
+for t in threads: t.start()
+for t in threads: t.join()
+print("main thread has request_id?", hasattr(ctx, "request_id"))
+```
+
+```text title="Output (order of the first three lines can vary)"
+[req 0] finished
+[req 1] finished
+[req 2] finished
+main thread has request_id? False
+```
+
+Traps:
+
+- **Thread pools reuse threads.** A value set during one task is still there when the same thread picks up the next task. Always set it at the start of each task, or clear it in a `finally`.
+- **It does not work with asyncio.** Many coroutines share one thread, so they would share one thread-local. Use `contextvars.ContextVar`, which works for both threads and tasks. It is the Python counterpart of Node's `AsyncLocalStorage`.
+
+## Daemon threads and shutdown
+
+When the main thread finishes, the interpreter **waits for all non-daemon threads** to finish (it joins them in `threading._shutdown`). A **daemon** thread doesn't block exit. It is simply stopped at interpreter shutdown, without running its `finally` blocks.
+
+```python
+import threading, time
+
+def forever():
+    while True:
+        time.sleep(0.1)
+
+def flush_logs():
+    try:
+        time.sleep(0.3)
+    finally:
+        print("daemon cleanup ran")     # will NOT print: daemons are killed abruptly
+
+threading.Thread(target=forever, daemon=True).start()
+threading.Thread(target=flush_logs, daemon=True).start()
+time.sleep(0.1)
+print("main exits now")
+```
+
+```text title="Output"
+main exits now
+```
+
+Use daemon threads only for work that can be lost safely (a metrics ticker, a cache warmer). For anything that writes data, use a normal thread plus an `Event` for stopping, and `join()` it on shutdown. If a non-daemon thread never ends, your program hangs on exit. That is a common "why won't Ctrl+C stop my script" bug, because only the main thread receives `KeyboardInterrupt`.
+
+## Deadlocks and lock ordering
+
+A deadlock happens when threads wait on each other in a cycle. The textbook case is two locks taken in opposite orders:
+
+```python
+import threading, time
+
+a = threading.Lock()
+b = threading.Lock()
+
+def transfer_1():
+    with a:
+        time.sleep(0.05)
+        if b.acquire(timeout=1):            # without a timeout this hangs forever
+            b.release(); print("t1 ok")
+        else:
+            print("t1 gave up: deadlock (holds a, wants b)")
+
+def transfer_2():
+    with b:
+        time.sleep(0.05)
+        if a.acquire(timeout=1):
+            a.release(); print("t2 ok")
+        else:
+            print("t2 gave up: deadlock (holds b, wants a)")
+
+t1 = threading.Thread(target=transfer_1); t2 = threading.Thread(target=transfer_2)
+t1.start(); t2.start(); t1.join(); t2.join()
+```
+
+```text title="Output"
+t1 gave up: deadlock (holds a, wants b)
+t2 gave up: deadlock (holds b, wants a)
+```
+
+<Mermaid chart={`flowchart LR
+  T1["Thread 1"] -- holds --> A["Lock a"]
+  T1 -. wants .-> B["Lock b"]
+  T2["Thread 2"] -- holds --> B
+  T2 -. wants .-> A`} />
+
+The fix is a **global lock order**. If every thread always takes locks in the same order, a cycle is impossible:
+
+```python
+import threading, time
+
+def ordered(*locks):
+    # Always acquire locks in one global order (here: by id) to prevent deadlock
+    return sorted(locks, key=id)
+
+a = threading.Lock(); b = threading.Lock()
+def move(x, y, name):
+    first, second = ordered(x, y)
+    with first:
+        time.sleep(0.05)
+        with second:
+            print(f"{name} done")
+
+t1 = threading.Thread(target=move, args=(a, b, "t1"))
+t2 = threading.Thread(target=move, args=(b, a, "t2"))
+t1.start(); t2.start(); t1.join(); t2.join()
+```
+
+```text title="Output (t1 and t2 can swap)"
+t1 done
+t2 done
+```
+
+Other defences:
+
+- Hold as few locks as possible, for as short a time as possible.
+- **Never call unknown code (callbacks, logging handlers, user hooks) while holding a lock.** It may try to take a lock you hold.
+- Use timeouts on `acquire` in long-running services, and log loudly when they fire.
+- Prefer queues and message passing over shared state with many locks.
+- To debug a hung process, `faulthandler.dump_traceback_later(...)` or `py-spy dump --pid PID` prints the stack of every thread.
+
+## When threads are the right choice
+
+Threads are the right tool when:
+
+- **You call blocking libraries** that have no async version: `requests`, `boto3`, many vendor SDKs, `psycopg2`, file system work, older DB drivers.
+- **The concurrency level is modest**, from a few to a few hundred simultaneous operations.
+- **The heavy work happens in C code that releases the GIL** (hashing, compression, NumPy, some image processing).
+- **You need to keep one thing responsive** while blocking on another, such as a GUI, a CLI spinner, or a background flusher.
+- **You are inside asyncio and must call blocking code.** `asyncio.to_thread` runs it on a thread pool.
+
+Threads are the wrong tool when:
+
+- The work is **pure-Python CPU**. Use processes, or the free-threaded build.
+- You need **thousands of concurrent connections**. Each thread costs a stack and scheduling overhead, so use asyncio.
+- The code has a lot of shared mutable state. The lock design will become the hardest part of the system.
+
+<Callout type="info">
+On the free-threaded build (`python3.14t`), the same `threading` code runs in parallel on multiple cores. Nothing in the API changes, but every race on this page becomes more likely to show up. Code that is correctly locked now is ready for that future.
+</Callout>
+
+## Interview questions
+
+1. **How do you get a return value or exception back from a thread?**
+   **Use `ThreadPoolExecutor.submit`, which returns a `Future`. `future.result()` returns the value or re-raises the worker's exception in the caller.**
+
+2. **Why does `balance = balance + x` lose updates across threads even with a GIL?**
+   **It is a separate read, compute and write. The GIL can be handed to another thread between the read and the write, so two threads write values based on the same old balance.**
+
+3. **`Lock` vs `RLock`?**
+   **A `Lock` can't be re-acquired by the thread holding it (it would deadlock). An `RLock` tracks its owner and a recursion count, so the same thread can acquire it repeatedly.**
+
+4. **Why should `Condition.wait` be called in a loop?**
+   **Wake-ups can be spurious or stolen by another waiter, so the predicate must be re-checked. `wait_for(predicate)` does this for you.**
+
+5. **How do you stop a running thread?**
+   **You can't kill it. Signal it cooperatively, for example with an `Event` that the thread checks or waits on, then `join()` it.**
+
+6. **What is a daemon thread, and what is the risk?**
+   **A thread that doesn't keep the process alive. At shutdown it is stopped abruptly, without running `finally` blocks, so it must not own important writes.**
+
+7. **How do you prevent deadlocks with multiple locks?**
+   **Acquire locks in one consistent global order, keep critical sections short, avoid calling unknown code while holding a lock, and use timeouts to detect problems.**
+
+8. **Why is `threading.local` wrong in asyncio code, and what replaces it?**
+   **All coroutines on the loop share one thread and therefore one thread-local. Use `contextvars.ContextVar`, which is per-task (like Node's `AsyncLocalStorage`).**
+
+## Recap
+
+- `threading.Thread` creates real OS threads that share all Python objects. With the GIL, they overlap waits but not Python bytecode.
+- Prefer `ThreadPoolExecutor`. Its futures carry results and exceptions back to you, and unread futures hide failures.
+- Any read-modify-write on shared state is a race. Protect it with a `Lock`, using `with`, and keep the critical section small.
+- `RLock` allows re-entry, `Condition` waits for a predicate, `Semaphore` bounds concurrency, and `Event` signals stop.
+- `queue.Queue` with a `maxsize` is the safest way to connect producers and consumers. Use sentinels or `Queue.shutdown()` (3.13+) to stop them.
+- `threading.local` is per thread. Clear it in pools, and use `contextvars` for async code.
+- Daemon threads die without cleanup. Non-daemon threads keep the process alive.
+- Avoid deadlocks with a consistent lock order. Use threads for blocking IO and GIL-releasing C code, not for pure-Python CPU work.

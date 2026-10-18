@@ -1,0 +1,740 @@
+---
+title: "Iteration, Errors and Modules: Interview Questions"
+description: Twenty interview questions on iterators, generators, yield from, context managers, itertools, exceptions and exception groups, the import system, circular imports and packaging, with verified outputs.
+---
+
+Iteration, error handling and imports are where Python's protocols show most clearly: `for` is built on two methods, `with` on two more, and `import` is a cache lookup plus a module execution. All outputs come from CPython 3.14.
+
+## Iterators and generators
+
+### 1. What is the difference between an iterable and an iterator? **Easy**
+
+**Short answer:** An iterable is anything you can loop over: it has `__iter__` that returns a fresh iterator (lists, dicts, strings, files). An iterator is the object that produces values one at a time with `__next__` and raises `StopIteration` at the end. Iterators are also iterables (their `__iter__` returns `self`), but they can only be consumed once.
+
+A `for` loop calls `iter(obj)` once, then `next()` repeatedly until `StopIteration`, which it catches silently.
+
+```python
+nums = [1, 2, 3]
+it = iter(nums)
+print(next(it), next(it), next(it))
+try:
+    next(it)
+except StopIteration:
+    print("StopIteration")
+
+print(iter(nums) is iter(nums))   # a list hands out new iterators
+print(iter(it) is it)             # an iterator returns itself
+
+gen = (n * 10 for n in nums)
+print(list(gen), list(gen))
+```
+
+```text title="Output"
+1 2 3
+StopIteration
+False
+True
+[10, 20, 30] []
+```
+
+**Likely follow-up:** "Why did the second `list(gen)` return an empty list?" A generator is an iterator, so once exhausted it stays exhausted. If a function needs to iterate twice over its input, accept an iterable and call `list()` on it, or document that it requires a re-iterable collection.
+
+<Callout type="info" title="Coming from JS">
+  Same split as the JS iteration protocol: `[Symbol.iterator]()` is `__iter__`, and `next()` returning `done: true` corresponds to raising `StopIteration`.
+</Callout>
+
+See [iterators and iterables](/docs/python/iterators-and-iterables).
+
+### 2. How do you write your own iterable class? **Medium**
+
+**Short answer:** Implement `__iter__`. The easiest way is to make `__iter__` a generator function (use `yield` inside it): each call returns a new independent generator, so the object can be iterated many times. Writing a separate iterator class with `__next__` is only needed in special cases.
+
+```python
+class Countdown:
+    def __init__(self, start):
+        self.start = start
+    def __iter__(self):
+        n = self.start
+        while n > 0:
+            yield n
+            n -= 1
+
+c = Countdown(3)
+print(list(c), list(c))
+print(sum(c), max(c), 2 in c)
+```
+
+```text title="Output"
+[3, 2, 1] [3, 2, 1]
+6 3 True
+```
+
+**Likely follow-up:** "What goes wrong if `__iter__` returns `self` and the class keeps the position on the instance?" Then the object is a one-shot iterator: a second loop yields nothing, and two nested loops over the same object interfere with each other.
+
+### 3. How does a generator work under the hood? **Medium**
+
+**Short answer:** Calling a function that contains `yield` doesn't run its body; it returns a generator object that wraps a suspended frame. Each `next()` resumes the frame until the next `yield`, which hands a value out and freezes the local variables and instruction pointer. When the function returns, the generator raises `StopIteration`.
+
+The frame (locals, evaluation stack, position) lives on the heap with the generator object instead of on the C stack, which is why it can be paused and resumed. This is the same machinery `async def` coroutines are built on.
+
+```python
+def numbers():
+    print("start")
+    yield 1
+    print("between")
+    yield 2
+    print("end")
+
+g = numbers()
+print("created")
+print(next(g))
+print(next(g))
+try:
+    next(g)
+except StopIteration:
+    print("done")
+```
+
+```text title="Output"
+created
+start
+1
+between
+2
+end
+done
+```
+
+**Likely follow-up:** "Why use generators in a backend?" To stream data with constant memory: reading a large file or a database cursor line by line, streaming a response (`StreamingResponse` in FastAPI accepts a generator), or producing LLM tokens as they arrive.
+
+<Callout type="info" title="Coming from JS">
+  Same as JS `function*` generators. The difference is that Python marks a generator by the presence of `yield` in the body, not by a `*` in the signature.
+</Callout>
+
+See [generators and yield](/docs/python/generators-and-yield).
+
+### 4. What do `send()` and a generator's `return` value do? **Hard**
+
+**Short answer:** `gen.send(value)` resumes the generator and makes the paused `yield` expression evaluate to `value`, so data can flow in as well as out. A `return value` inside a generator ends it and stores `value` on the `StopIteration` exception, where `yield from` (or manual code) can read it.
+
+You must "prime" a fresh generator with `next(gen)` (or `send(None)`) to advance it to the first `yield` before sending real values. `gen.close()` raises `GeneratorExit` inside it so `finally` blocks run.
+
+```python
+def running_average():
+    total = count = 0
+    average = None
+    while True:
+        value = yield average
+        if value is None:
+            return {"count": count, "average": average}
+        total += value
+        count += 1
+        average = total / count
+
+avg = running_average()
+next(avg)                 # prime
+print(avg.send(10))
+print(avg.send(20))
+try:
+    avg.send(None)
+except StopIteration as stop:
+    print("returned", stop.value)
+```
+
+```text title="Output"
+10.0
+15.0
+returned {'count': 2, 'average': 15.0}
+```
+
+**Likely follow-up:** "Is this used anywhere today?" Before `async`/`await` (3.5), asyncio coroutines were generators driven by `send`. Today `send` is rare in application code, but understanding it explains how the event loop resumes a coroutine with the result of an awaited operation.
+
+### 5. What does `yield from` do beyond a `for` loop with `yield`? **Medium**
+
+**Short answer:** `yield from sub` delegates to a sub-generator: it yields every value from it, forwards `send()`, `throw()` and `close()` to it, and evaluates to the sub-generator's `return` value. A plain `for x in sub: yield x` only gets the first part.
+
+```python
+def read_chunk(name):
+    yield f"{name}-1"
+    yield f"{name}-2"
+    return 2                       # number of items produced
+
+def read_all(names):
+    total = 0
+    for name in names:
+        total += yield from read_chunk(name)
+    yield f"total={total}"
+
+print(list(read_all(["a", "b"])))
+
+def flatten(items):
+    for item in items:
+        if isinstance(item, list):
+            yield from flatten(item)
+        else:
+            yield item
+
+print(list(flatten([1, [2, [3, 4]], 5])))
+```
+
+```text title="Output"
+['a-1', 'a-2', 'b-1', 'b-2', 'total=4']
+[1, 2, 3, 4, 5]
+```
+
+**Likely follow-up:** "How does this relate to `await`?" `await` is essentially `yield from` for awaitables: it delegates to the awaited coroutine until it finishes and evaluates to its return value.
+
+<Callout type="info" title="Coming from JS">
+  `yield from` is JS `yield*`, including passing through the delegated generator's return value.
+</Callout>
+
+### 6. In a generator expression, what is evaluated immediately and what is lazy? **Hard**
+
+**Short answer:** Only the iterable of the *first* `for` clause is evaluated immediately, when the generator expression is created. Everything else (conditions, the output expression, later `for` clauses) runs lazily when values are requested, and reads variables as they are at that moment.
+
+This rule makes errors in the first iterable appear early, but it also produces surprising results when the variables used by the rest of the expression change before consumption.
+
+```python
+items = [1, 2, 3]
+allowed = [1, 2, 3]
+gen = (x for x in items if x in allowed)
+items = [10, 20]          # too late: the first iterable was already captured
+allowed = [3]             # still read lazily
+print(list(gen))
+
+try:
+    gen = (x for x in undefined_name)
+except NameError as e:
+    print("NameError raised at creation:", e)
+```
+
+```text title="Output"
+[3]
+NameError raised at creation: name 'undefined_name' is not defined
+```
+
+**Likely follow-up:** "Why was the first iterable chosen to be eager?" So that obvious mistakes such as iterating over a non-iterable surface where the expression is written, not much later where it happens to be consumed.
+
+## Context managers and itertools
+
+### 7. How does the `with` statement work, and how can `__exit__` suppress an exception? **Medium**
+
+**Short answer:** `with cm as x:` calls `cm.__enter__()` and binds its result to `x`, runs the block, then always calls `cm.__exit__(exc_type, exc, tb)`, passing the exception details if the block raised. If `__exit__` returns a truthy value, the exception is swallowed; otherwise it propagates.
+
+It is a structured `try`/`finally` you can package and reuse: files, locks, database transactions, temporary settings, timers.
+
+```python
+class Transaction:
+    def __enter__(self):
+        print("BEGIN")
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            print("COMMIT")
+        else:
+            print(f"ROLLBACK ({exc_type.__name__}: {exc})")
+        return exc_type is KeyError        # swallow only KeyError
+
+with Transaction():
+    print("insert row")
+
+with Transaction():
+    raise KeyError("missing")
+print("KeyError was suppressed")
+
+try:
+    with Transaction():
+        raise ValueError("bad data")
+except ValueError:
+    print("ValueError propagated")
+```
+
+```text title="Output"
+BEGIN
+insert row
+COMMIT
+BEGIN
+ROLLBACK (KeyError: 'missing')
+KeyError was suppressed
+BEGIN
+ROLLBACK (ValueError: bad data)
+ValueError propagated
+```
+
+**Likely follow-up:** "What about async resources?" `async with` uses `__aenter__` and `__aexit__`, which are coroutines; that is how `httpx.AsyncClient`, database sessions and `asyncio.TaskGroup` work.
+
+<Callout type="info" title="Coming from JS">
+  The closest JS feature is `using` / `await using` with `Symbol.dispose` (explicit resource management), which Node supports in recent versions. Python's `with` has existed since 2.5, and its exit hook can see and suppress the exception.
+</Callout>
+
+See [context managers](/docs/python/context-managers).
+
+### 8. How do `contextlib.contextmanager` and `ExitStack` help? **Medium**
+
+**Short answer:** `@contextmanager` turns a generator into a context manager: code before `yield` is the setup, the yielded value is bound by `as`, and code after it (put it in `finally`) is the teardown. `ExitStack` lets you enter a variable number of context managers and guarantees they all exit in reverse order.
+
+If the block raises, the exception is re-raised at the `yield` inside your generator, so a `try`/`finally` around `yield` is required for cleanup to run on errors.
+
+```python
+from contextlib import contextmanager, ExitStack
+
+@contextmanager
+def resource(name):
+    print(f"open {name}")
+    try:
+        yield name.upper()
+    finally:
+        print(f"close {name}")
+
+with resource("db") as handle:
+    print("using", handle)
+
+with ExitStack() as stack:
+    handles = [stack.enter_context(resource(n)) for n in ["a", "b", "c"]]
+    print("all open:", handles)
+```
+
+```text title="Output"
+open db
+using DB
+close db
+open a
+open b
+open c
+all open: ['A', 'B', 'C']
+close c
+close b
+close a
+```
+
+**Likely follow-up:** "Where have you seen this pattern in FastAPI?" Dependencies with `yield` (for example, a database session that is closed after the response) and the `lifespan` handler are both generator-based context managers.
+
+### 9. Why does `itertools.groupby` give "wrong" groups on unsorted data? **Medium**
+
+**Short answer:** `groupby` groups only *consecutive* items with the same key, like the Unix `uniq` command. On unsorted data the same key appears in several groups. Sort by the same key first, or use a `defaultdict(list)` if you don't need streaming.
+
+`groupby` is lazy and single-pass, which is why it can only look at neighbours. Each group is itself an iterator that is invalidated as soon as you advance to the next group.
+
+```python
+from itertools import groupby
+from collections import defaultdict
+
+orders = [("ana", 10), ("bo", 5), ("ana", 7)]
+print([(k, [a for _, a in g]) for k, g in groupby(orders, key=lambda o: o[0])])
+
+sorted_orders = sorted(orders, key=lambda o: o[0])
+print([(k, sum(a for _, a in g)) for k, g in groupby(sorted_orders, key=lambda o: o[0])])
+
+totals = defaultdict(int)
+for name, amount in orders:
+    totals[name] += amount
+print(dict(totals))
+```
+
+```text title="Output"
+[('ana', [10]), ('bo', [5]), ('ana', [7])]
+[('ana', 17), ('bo', 5)]
+{'ana': 17, 'bo': 5}
+```
+
+**Likely follow-up:** "What happens if you store the group iterators and read them later?" They are empty, because `groupby` already moved past their items. Convert each group to a list inside the loop if you need it later.
+
+See [itertools](/docs/python/itertools).
+
+### 10. Which `itertools` functions do you actually use in backend code? **Easy**
+
+**Short answer:** `chain` (concatenate iterables without copying), `islice` (take the first N items or a page of a lazy stream), `batched` (fixed-size chunks for bulk inserts or API calls, 3.12+), `pairwise` (consecutive pairs), `product` and `combinations` (test matrices), and `count`/`cycle` for infinite streams. All are lazy.
+
+```python
+from itertools import chain, islice, batched, pairwise, count
+
+print(list(chain([1, 2], (3,), range(4, 6))))
+print(list(islice(count(100), 3)))
+ids = range(1, 8)
+for batch in batched(ids, 3):
+    print("INSERT batch", batch)
+print(list(pairwise([10, 15, 12])))
+```
+
+```text title="Output"
+[1, 2, 3, 4, 5]
+[100, 101, 102]
+INSERT batch (1, 2, 3)
+INSERT batch (4, 5, 6)
+INSERT batch (7,)
+[(10, 15), (15, 12)]
+```
+
+**Likely follow-up:** "Can `batched` reject an incomplete last batch?" Yes, since 3.13 you can pass `strict=True`, which raises `ValueError` if the last batch is short.
+
+<Callout type="info" title="Coming from JS">
+  These are like the iterator helpers (`.take()`, `.drop()`, `.flatMap()`) that recently landed in JS, or the functions in lodash, but lazy and in the standard library.
+</Callout>
+
+## Exceptions
+
+### 11. Why is a bare `except:` (or `except BaseException`) dangerous? **Easy**
+
+**Short answer:** It catches everything, including `KeyboardInterrupt`, `SystemExit` and `GeneratorExit`, which inherit from `BaseException` and not from `Exception`. That can make a process impossible to stop with Ctrl+C and hides real bugs. Catch the narrowest exception you can handle, or `Exception` at a top-level boundary, and log it.
+
+```python
+print(issubclass(KeyboardInterrupt, Exception), issubclass(KeyboardInterrupt, BaseException))
+print(issubclass(ValueError, Exception))
+print(issubclass(SystemExit, Exception))
+
+import asyncio
+print(issubclass(asyncio.CancelledError, Exception))
+```
+
+```text title="Output"
+False True
+True
+False
+False
+```
+
+**Likely follow-up:** "Why is `asyncio.CancelledError` not an `Exception`?" Since 3.8 it inherits from `BaseException`, so a generic `except Exception` in a coroutine doesn't accidentally swallow cancellation and leave a task that refuses to stop.
+
+<Callout type="info" title="Coming from JS">
+  JS `catch` catches everything, and anything can be thrown. In Python only `BaseException` subclasses can be raised, and `except` clauses filter by type, so there is no need for `if (e instanceof ...)` chains.
+</Callout>
+
+See [exceptions](/docs/python/exceptions).
+
+### 12. In what order do `try`, `except`, `else` and `finally` run? **Easy**
+
+**Short answer:** `try` runs first. If it raises, the first matching `except` runs. If it doesn't raise, `else` runs. `finally` always runs last, whether or not there was an exception, and even if a block returned. Put only the code that can raise the expected error in `try`, and the follow-up work in `else`.
+
+```python
+def parse(text):
+    try:
+        value = int(text)
+    except ValueError:
+        print("except")
+        return None
+    else:
+        print("else")
+        return value
+    finally:
+        print("finally")
+
+print(parse("42"))
+print(parse("x"))
+```
+
+```text title="Output"
+else
+finally
+42
+except
+finally
+None
+```
+
+**Likely follow-up:** "Why use `else` at all?" So that an exception raised by the follow-up code is not accidentally caught by the `except` meant for the risky line.
+
+### 13. What does a function return if both `try` and `finally` contain `return`? **Medium**
+
+**Short answer:** The `finally` return wins: it overrides the value from `try` and even silently discards an exception that was propagating. Because this hides errors, Python 3.14 emits a `SyntaxWarning` for `return`, `break` or `continue` that leaves a `finally` block (PEP 765).
+
+`finally` runs on the way out of the function. A `return` there starts a new exit, replacing the pending return value or the in-flight exception.
+
+```python
+def which():
+    try:
+        return "try"
+    finally:
+        return "finally"
+
+def swallow():
+    try:
+        raise ValueError("lost")
+    finally:
+        return "no error?"
+
+print(which())
+print(swallow())
+```
+
+```text title="Output"
+demo.py:5: SyntaxWarning: 'return' in a 'finally' block
+  return "finally"
+demo.py:11: SyntaxWarning: 'return' in a 'finally' block
+  return "no error?"
+finally
+no error?
+```
+
+The warnings are printed by the compiler before the program runs; on Python 3.13 and older you get the same two results with no warning.
+
+**Likely follow-up:** "Does mutating the return value in `finally` change it?" If `try` returns a mutable object and `finally` mutates it (without `return`), the caller sees the mutation, because the return value is a reference that was already evaluated. Rebinding the variable in `finally` changes nothing.
+
+### 14. What is exception chaining, and what do `raise ... from` and `from None` do? **Medium**
+
+**Short answer:** When you raise inside an `except` block, Python stores the original exception on the new one as `__context__` and the traceback says "During handling of the above exception, another exception occurred". `raise New(...) from err` sets `__cause__` and marks the link as deliberate ("The above exception was the direct cause"). `from None` hides the original.
+
+Chaining preserves the root cause when you translate low-level errors into domain errors, which is exactly what a service layer should do.
+
+```python
+class UserNotFound(Exception):
+    pass
+
+def get_user(users, user_id):
+    try:
+        return users[user_id]
+    except KeyError as err:
+        raise UserNotFound(f"user {user_id} not found") from err
+
+try:
+    get_user({}, 7)
+except UserNotFound as e:
+    print(repr(e))
+    print("cause:", repr(e.__cause__))
+    print("suppress context:", e.__suppress_context__)
+
+try:
+    try:
+        {}["k"]
+    except KeyError:
+        raise ValueError("clean message") from None
+except ValueError as e:
+    print(e.__cause__, e.__suppress_context__, repr(e.__context__))
+```
+
+```text title="Output"
+UserNotFound('user 7 not found')
+cause: KeyError(7)
+suppress context: True
+None True KeyError('k')
+```
+
+**Likely follow-up:** "Is the original lost with `from None`?" No, it is still stored in `__context__`; only the traceback display is suppressed. Use `from None` when the low-level detail is just noise for the caller.
+
+<Callout type="info" title="Coming from JS">
+  `raise X from err` is the Python version of `new Error(msg, { cause: err })`, but Python also chains automatically, so you rarely lose the original error.
+</Callout>
+
+### 15. What are `ExceptionGroup` and `except*` for? **Hard**
+
+**Short answer:** An `ExceptionGroup` (3.11+) bundles several unrelated exceptions raised together, typically by concurrent tasks in an `asyncio.TaskGroup`. `except*` handles matching exceptions *inside* a group: each `except*` clause takes the subset it matches, and anything unmatched is re-raised in a new group.
+
+Unlike `except`, several `except*` clauses can run for one group. The handler receives a (sub)group, not a single exception, so you inspect `.exceptions`.
+
+```python
+def run_jobs():
+    raise ExceptionGroup("jobs failed", [
+        ValueError("bad input in job 1"),
+        TimeoutError("job 2 timed out"),
+        ValueError("bad input in job 3"),
+    ])
+
+try:
+    run_jobs()
+except* ValueError as group:
+    print("ValueErrors:", [str(e) for e in group.exceptions])
+except* TimeoutError as group:
+    print("Timeouts:", [str(e) for e in group.exceptions])
+
+eg = ExceptionGroup("x", [KeyError("a"), ValueError("b")])
+matched, rest = eg.split(KeyError)
+print(matched.exceptions, rest.exceptions)
+```
+
+```text title="Output"
+ValueErrors: ['bad input in job 1', 'bad input in job 3']
+Timeouts: ['job 2 timed out']
+(KeyError('a'),) (ValueError('b'),)
+```
+
+**Likely follow-up:** "Does a plain `except ValueError` catch a group containing a `ValueError`?" No. The group is an `ExceptionGroup`, not a `ValueError`, so a plain `except ValueError` misses it. That is a common surprise when moving from `asyncio.gather` to `TaskGroup`.
+
+<Callout type="info" title="Coming from JS">
+  Similar to `AggregateError` from `Promise.any`, but with dedicated syntax to handle each kind of inner error separately.
+</Callout>
+
+### 16. How would you design exceptions for a backend service? **Medium**
+
+**Short answer:** Define a small hierarchy rooted at one base class for your application (`AppError`), with subclasses for domain cases (`NotFound`, `Conflict`, `PermissionDenied`) carrying structured data. Raise them from the service layer, and map them to HTTP responses in one place (an exception handler or middleware). Prefer EAFP ("easier to ask forgiveness than permission"): try the operation and catch the specific failure rather than checking first.
+
+EAFP avoids race conditions between the check and the action (the file or row can disappear in between) and is idiomatic because Python exceptions are relatively cheap when not raised.
+
+```python
+class AppError(Exception):
+    status = 500
+    def __init__(self, message, **details):
+        super().__init__(message)
+        self.details = details
+
+class NotFound(AppError):
+    status = 404
+
+class Conflict(AppError):
+    status = 409
+
+def to_response(err: AppError):
+    return {"status": err.status, "error": str(err), **err.details}
+
+try:
+    raise NotFound("order not found", order_id=42)
+except AppError as err:
+    print(to_response(err))
+
+config = {"port": "8000"}
+try:                                   # EAFP
+    port = int(config["port"])
+except (KeyError, ValueError):
+    port = 8000
+print(port)
+```
+
+```text title="Output"
+{'status': 404, 'error': 'order not found', 'order_id': 42}
+8000
+```
+
+**Likely follow-up:** "How does this map to FastAPI?" Register `@app.exception_handler(AppError)` once and return a `JSONResponse` built from the error. Raising `HTTPException` deep inside services couples business logic to HTTP, so keep that at the edge.
+
+<Callout type="info" title="Coming from JS">
+  This mirrors NestJS exception filters: domain errors bubble up, and one filter turns them into HTTP responses.
+</Callout>
+
+## Modules, imports and packaging
+
+### 17. What happens when you run `import mymodule`? **Medium**
+
+**Short answer:** Python first checks the `sys.modules` cache; if the module is there, it just binds the name. Otherwise finders search `sys.path` for it, a loader creates a module object, *inserts it into `sys.modules`*, and then executes the module's code top to bottom in that module's namespace. A module's top-level code therefore runs only once per process.
+
+Because modules are executed once and cached, they work as singletons: module-level objects (a config, a database engine, a logger) are shared by every importer.
+
+```python
+import sys
+import json
+
+print("json" in sys.modules)
+print(sys.modules["json"] is json)
+
+import importlib
+again = importlib.import_module("json")
+print(again is json)
+print(type(json).__name__, json.__name__)
+```
+
+```text title="Output"
+True
+True
+True
+module json
+```
+
+**Likely follow-up:** "How do you force a reload?" `importlib.reload(module)` re-executes the code in the same module object, but objects already imported with `from module import x` keep pointing at the old versions. It is a debugging tool, not something for production. Python 3.15 also adds explicit `lazy import` statements (PEP 810), which defer loading until first use to cut startup time.
+
+<Callout type="info" title="Coming from JS">
+  Like CommonJS `require`, Python caches modules and runs each one once. Unlike ES modules, imports are ordinary statements executed at runtime, so an import inside a function is fine and common.
+</Callout>
+
+See [modules, packages and imports](/docs/python/modules-packages-and-imports).
+
+### 18. Why do circular imports fail, and how do you fix them? **Hard**
+
+**Short answer:** If `a` imports `b` while `b` imports `a`, the second import finds `a` already in `sys.modules` but only *partially executed*, so `from a import something` fails if `something` isn't defined yet. Fix it by moving shared code to a third module, importing the module rather than names (`import a` and using `a.thing` at call time), or moving the import inside the function that needs it.
+
+Given a package `app` with these two files:
+
+```python title="app/models.py"
+from app.services import notify
+
+class User:
+    pass
+```
+
+```python title="app/services.py"
+from app.models import User
+
+def notify(user: User):
+    print("notify", user)
+```
+
+Running `python -c "import app.models"` gives (paths shortened):
+
+```text title="Output"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import app.models
+  File "app/models.py", line 1, in <module>
+    from app.services import notify
+  File "app/services.py", line 1, in <module>
+    from app.models import User
+ImportError: cannot import name 'User' from partially initialized module 'app.models' (most likely due to a circular import) (app/models.py)
+```
+
+`app.models` starts executing, imports `app.services`, which tries to read `User` from `app.models` before line 3 of `models.py` has run. (If the two files sit next to the script you run instead of inside a package, Python 3.13+ words the error differently and suggests the module might shadow a library, but the cause is the same.) If the import is only needed for a type annotation, the cleanest fix is:
+
+```python title="app/services.py"
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.models import User
+
+def notify(user: User):
+    print("notify", user)
+```
+
+This works unquoted on Python 3.14+, because annotations are evaluated lazily (PEP 649): `User` is only looked up if someone inspects the annotations. On 3.13 and older, write `user: "User"` or add `from __future__ import annotations`.
+
+**Likely follow-up:** "Is a circular import always a design problem?" Usually it signals two modules that know too much about each other. Extracting the shared pieces (models, interfaces) into a lower-level module that both depend on removes the cycle for good.
+
+### 19. What does `if __name__ == "__main__":` do, and what does `python -m` change? **Easy**
+
+**Short answer:** Every module has a `__name__`. It is the module's import name when imported, but `"__main__"` when the file is run as the program. The guard lets a file be both importable and runnable without executing its script part on import. `python -m package.module` runs a module as `__main__` *with the package context*, so absolute and relative imports inside the package work.
+
+```python title="tools.py"
+def slugify(text):
+    return text.lower().replace(" ", "-")
+
+print("tools loaded as", __name__)
+
+if __name__ == "__main__":
+    print(slugify("Hello World"))
+```
+
+Running `python tools.py`, then `python -c "import tools"`:
+
+```text title="Output"
+tools loaded as __main__
+hello-world
+tools loaded as tools
+```
+
+**Likely follow-up:** "Why is `python -m` preferred for tools like `pip`, `pytest` or `uvicorn`?" It guarantees the tool runs with the same interpreter (and virtual environment) as `python`, and it puts the current directory on `sys.path` the way imports expect.
+
+<Callout type="info" title="Coming from JS">
+  The JS equivalent is checking `require.main === module` in CommonJS, or comparing `import.meta.url` with the entry file in ES modules.
+</Callout>
+
+### 20. How do you manage dependencies and environments in a modern Python project? **Medium**
+
+**Short answer:** Each project gets its own virtual environment (an isolated `site-packages` plus a link to an interpreter), dependencies are declared in `pyproject.toml`, and exact versions are pinned in a lock file. Today most teams use `uv` for this (fast installs, `uv add`, `uv lock`, `uv run`, and it can install Python versions); Poetry and plain `pip` with `venv` are the older options.
+
+A virtual environment works because `python` inside it sets `sys.prefix` to the environment directory, so `site-packages` there wins. Nothing is installed globally.
+
+```python
+import sys
+
+print(sys.prefix == sys.base_prefix)   # True when no virtual env is active
+print(sys.version_info[:2])
+```
+
+```text title="Output"
+True
+(3, 14)
+```
+
+This snippet was run on a base conda interpreter, hence `True`; inside an activated venv it prints `False`.
+
+**Likely follow-up:** "How does that map to Node?" `pyproject.toml` is `package.json`, `uv.lock` is `package-lock.json`, `.venv` is `node_modules` (but it also pins the interpreter), and `uv run` is `npx`. The big difference: Python installs one version of each package per environment, so conflicting transitive versions must be resolved rather than nested.
+
+<Callout type="info" title="Coming from JS">
+  There is no per-package nesting like `node_modules`. If two of your dependencies need incompatible versions of a third package, the resolver fails and you have to pick compatible versions.
+</Callout>
+
+See [packaging and environments](/docs/python/packaging-and-environments).

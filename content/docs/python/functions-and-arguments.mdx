@@ -1,0 +1,684 @@
+---
+title: "Functions and Arguments"
+description: Functions as objects, every parameter kind and how CPython binds arguments to them, defaults evaluated once, return values, signatures, and why Python has no tail-call optimisation.
+---
+
+A Python function looks like a JavaScript function with different punctuation, but the details underneath differ in ways that bite: defaults are evaluated **once**, there are **five** kinds of parameter, keyword arguments are a first-class part of the call protocol, and deep recursion hits a hard wall. This page goes through each piece, down to what CPython does.
+
+<Callout type="info">
+  All snippets on this page were run on **CPython 3.14.6**. Bytecode (`dis`) listings change between minor versions, so yours may look slightly different. The ideas don't.
+</Callout>
+
+## Functions are objects
+
+### What it is
+
+`def` is an **executable statement**. When Python runs it, it builds a function object and binds it to a name. That object is an ordinary value: you can pass it around, store it in a dict, give it attributes, or replace it.
+
+```python
+def greet(name):
+    """Return a friendly greeting."""
+    return f"Hello, {name}"
+
+say = greet                      # no call, just another name for the same object
+print(say("Ada"))
+print(type(greet))
+print(say is greet)
+print(greet.__name__, greet.__qualname__, greet.__module__)
+print(greet.__doc__)
+
+greet.calls = 0                  # functions carry a __dict__ like any object
+greet.calls += 1
+print(greet.__dict__)
+
+handlers = {"greet": greet, "shout": str.upper}
+print(handlers["shout"]("hi"))
+```
+
+```text title="Output"
+Hello, Ada
+<class 'function'>
+True
+greet greet __main__
+Return a friendly greeting.
+{'calls': 1}
+HI
+```
+
+### How it works underneath: code object vs function object
+
+A function is really two objects:
+
+- A **code object** (`fn.__code__`): the compiled bytecode plus static facts about it: parameter counts, local variable names, constants. It's created once, when the module is compiled, and is immutable.
+- A **function object**: a thin wrapper that pairs that code object with the *runtime* things it needs: its globals dict (`__globals__`), its default values (`__defaults__`, `__kwdefaults__`), its closure cells (`__closure__`), its name, docstring and annotations.
+
+```python
+def area(width, height=1, *, unit="m"):
+    total = width * height
+    return f"{total}{unit}"
+
+c = area.__code__
+print(c.co_name, c.co_argcount, c.co_kwonlyargcount, c.co_posonlyargcount)
+print(c.co_varnames)
+print(c.co_consts)
+print(area.__defaults__)
+print(area.__kwdefaults__)
+
+# You can even swap the code object (don't do this in real code)
+def double(width, height=1, *, unit="m"):
+    return f"{width * height * 2}{unit}"
+area.__code__ = double.__code__
+print(area(3, 2))
+```
+
+```text title="Output"
+area 2 1 0
+('width', 'height', 'unit', 'total')
+(None,)
+(1,)
+{'unit': 'm'}
+12m
+```
+
+Notice: `co_varnames` lists parameters first, then other locals (`total`). The compiler already knows every local name before the function ever runs. That fact drives the scoping rules on the [scope page](/docs/python/scope-legb-and-closures).
+
+Positional defaults live in a **tuple** on the function object (`__defaults__`), aligned to the *last* N positional parameters. Keyword-only defaults live in a **dict** (`__kwdefaults__`). Keep this in mind for the mutable-default trap below.
+
+<Callout title="Coming from JS">
+  Same idea as JS: functions are first-class values with properties (`fn.name`, `fn.length`). Two differences: Python has no `this` (methods get `self` explicitly), and there is **no hoisting**. A `def` runs top to bottom like any other statement, so calling a function above its `def` at module level raises `NameError`. More on that in the scope page.
+</Callout>
+
+## The five parameter kinds
+
+### What they are
+
+A full Python signature can contain all of these, in this order:
+
+```python
+def f(a, b, /, c, d=4, *args, e, g=6, **kwargs): ...
+```
+
+| Kind | In the example | How callers can pass it |
+|---|---|---|
+| Positional-only | `a`, `b` (before `/`) | position only |
+| Positional-or-keyword | `c`, `d` | position or `name=value` |
+| Var-positional | `*args` | collects extra positional args into a tuple |
+| Keyword-only | `e`, `g` (after `*` or `*args`) | `name=value` only |
+| Var-keyword | `**kwargs` | collects extra keyword args into a dict |
+
+A bare `*` (no name) marks "keyword-only from here" without collecting anything: `def connect(host, *, timeout)`. Positional-only `/` was added in Python 3.8 (PEP 570).
+
+```python
+def f(a, b, /, c, d=4, *args, e, g=6, **kwargs):
+    print(f"a={a} b={b} c={c} d={d} args={args} e={e} g={g} kwargs={kwargs}")
+
+f(1, 2, 3, e=5)
+f(1, 2, c=3, d=40, e=5, extra=7)
+f(1, 2, 3, 4, 99, 100, e=5, g=60)
+```
+
+```text title="Output"
+a=1 b=2 c=3 d=4 args=() e=5 g=6 kwargs={}
+a=1 b=2 c=3 d=40 args=() e=5 g=6 kwargs={'extra': 7}
+a=1 b=2 c=3 d=4 args=(99, 100) e=5 g=60 kwargs={}
+```
+
+### How binding works
+
+When you call a function, CPython fills a fresh array of local slots (one per parameter) using roughly this algorithm:
+
+1. **Positional arguments** fill positional-only and positional-or-keyword slots left to right.
+2. If there are **more positional arguments** than slots: they go into `*args` as a tuple, or it's a `TypeError` if there is no `*args`.
+3. **Keyword arguments** are matched by name against positional-or-keyword and keyword-only slots. A keyword that names a slot **already filled** is a "multiple values" error. A keyword naming a **positional-only** parameter, or an unknown name, goes into `**kwargs`, or it's a `TypeError` if there is no `**kwargs`.
+4. **Empty slots** get their default from `__defaults__` / `__kwdefaults__`.
+5. Any slot still empty is a "missing argument" `TypeError`.
+
+The error messages map directly onto these steps:
+
+```python
+def f(a, b, /, c, d=4, *args, e, g=6, **kwargs):
+    pass
+
+for call in (
+    lambda: f(a=1, b=2, c=3, e=5),
+    lambda: f(1, 2, 3),
+    lambda: f(1, 2, 3, c=3, e=5),
+    lambda: f(1),
+):
+    try:
+        call()
+    except TypeError as err:
+        print("TypeError:", err)
+```
+
+```text title="Output"
+TypeError: f() missing 2 required positional arguments: 'a' and 'b'
+TypeError: f() missing 1 required keyword-only argument: 'e'
+TypeError: f() got multiple values for argument 'c'
+TypeError: f() missing 2 required positional arguments: 'b' and 'c'
+```
+
+The first one is interesting: `a=1` and `b=2` didn't fail as "unexpected". Because `f` has `**kwargs`, they were swept into `kwargs` (step 3), so `a` and `b` stayed empty (step 5).
+
+You can run this algorithm yourself with `inspect.signature(...).bind(...)`, which is what frameworks use to validate calls without making them:
+
+```python
+import inspect
+
+def f(a, b, /, c, d=4, *args, e, g=6, **kwargs):
+    pass
+
+sig = inspect.signature(f)
+bound = sig.bind(1, 2, 3, 4, 5, 6, e=7, z=8)
+print(bound.arguments)
+bound.apply_defaults()
+print(bound.arguments)
+```
+
+```text title="Output"
+{'a': 1, 'b': 2, 'c': 3, 'd': 4, 'args': (5, 6), 'e': 7, 'kwargs': {'z': 8}}
+{'a': 1, 'b': 2, 'c': 3, 'd': 4, 'args': (5, 6), 'e': 7, 'g': 6, 'kwargs': {'z': 8}}
+```
+
+<Mermaid chart={`flowchart TD
+  A["Call f(...)"] --> B["Fill positional slots left to right"]
+  B --> C{"Extra positional args?"}
+  C -->|"yes, has *args"| D["Pack into args tuple"]
+  C -->|"yes, no *args"| X["TypeError: too many"]
+  C -->|no| E["Match keywords by name"]
+  D --> E
+  E --> F{"Slot already filled?"}
+  F -->|yes| Y["TypeError: multiple values"]
+  F -->|"no match or pos-only name"| G["Into **kwargs or TypeError"]
+  F -->|"matched"| H["Fill slot"]
+  G --> I["Apply __defaults__ and __kwdefaults__"]
+  H --> I
+  I --> J{"Any slot empty?"}
+  J -->|yes| Z["TypeError: missing"]
+  J -->|no| K["Run the body"]`} />
+
+### Why positional-only exists
+
+Three real reasons:
+
+1. **Freedom to rename.** If callers can't pass `template=...`, you can rename the parameter later without breaking anyone.
+2. **No clash with `**kwargs`.** A positional-only name can also appear as a key in `**kwargs`:
+3. **Matching C builtins.** Many builtins never accepted keywords (`len(obj=...)` fails). `/` lets pure-Python code express the same contract, and you'll see it in `help()` output.
+
+```python
+def render(template, /, **fields):
+    return template.format(**fields)
+
+# 'template' is positional-only, so it can also appear as a key in **fields
+print(render("{template} by {author}", template="Report", author="Ada"))
+
+def render_bad(template, **fields):
+    return template.format(**fields)
+try:
+    render_bad("{template}", template="Report")
+except TypeError as err:
+    print("TypeError:", err)
+
+try:
+    len(obj=[1, 2])
+except TypeError as err:
+    print("TypeError:", err)
+```
+
+```text title="Output"
+Report by Ada
+TypeError: render_bad() got multiple values for argument 'template'
+TypeError: len() takes no keyword arguments
+```
+
+### Why keyword-only is your friend
+
+Keyword-only parameters make call sites self-describing and stop the "boolean trap": `send(msg, True, False)` tells a reader nothing, while `send(msg, retry=True, urgent=False)` does. In backend code, a good default is: the one or two obvious inputs are positional, every option is keyword-only.
+
+```python
+def create_user(email, *, is_admin=False, send_welcome=True): ...
+```
+
+<Callout title="Coming from JS">
+  JS has no keyword arguments. The usual substitute is an options object: `createUser(email, { isAdmin: false })` with destructuring. Python's keyword-only parameters give you the same readability, plus the runtime rejects typos (`TypeError: unexpected keyword argument 'is_admn'`), where a JS options object silently ignores unknown keys. `*args` is Python's rest parameter (`...args`), but it's a **tuple**, not an array.
+</Callout>
+
+## Unpacking at the call site
+
+`*` and `**` also work in the other direction: at a call site they **spread** an iterable into positional arguments and a mapping into keyword arguments. Since Python 3.5 (PEP 448) you can use several of each in one call.
+
+```python
+def connect(host, port, *, timeout=5):
+    return f"{host}:{port} timeout={timeout}"
+
+args = ("db.local", 5432)
+opts = {"timeout": 10}
+print(connect(*args, **opts))
+
+cfg = {"host": "cache.local", "port": 6379, "timeout": 1}
+print(connect(**cfg))
+
+# several * and ** at one call site are fine (PEP 448)
+print(connect(*["a"], *[1], **{}, timeout=2))
+
+try:
+    connect(*args, **{"timeout": 1}, timeout=2)
+except TypeError as err:
+    print("TypeError:", err)
+
+try:
+    connect(**{"host": "x", "port": 1, "retries": 3})
+except TypeError as err:
+    print("TypeError:", err)
+```
+
+```text title="Output"
+db.local:5432 timeout=10
+cache.local:6379 timeout=1
+a:1 timeout=2
+TypeError: __main__.connect() got multiple values for keyword argument 'timeout'
+TypeError: connect() got an unexpected keyword argument 'retries'
+```
+
+Traps:
+
+- **Duplicate keys are an error at call time**, unlike dict merging (`{**a, **b}`) where the last one wins. To "override" a config dict, merge first: `connect(**{**defaults, **overrides})`.
+- `**` requires **string keys**. `f(**{1: "x"})` raises `TypeError: keywords must be strings`.
+- Spreading a generator with `*` consumes it fully before the call starts.
+
+The classic use is **forwarding**: `def wrapper(*args, **kwargs): return fn(*args, **kwargs)`. You'll write that in every decorator.
+
+## Default values are evaluated once
+
+### What happens
+
+The default expression runs **when the `def` statement runs**, not when the function is called. The result is stored in `__defaults__` and reused on every call that needs it.
+
+```python
+def make_default():
+    print("  evaluating the default")
+    return 42
+
+print("before def")
+def f(x=make_default()):
+    return x
+print("after def")
+print(f())
+print(f())
+```
+
+```text title="Output"
+before def
+  evaluating the default
+after def
+42
+42
+```
+
+### Underneath: the bytecode
+
+Disassemble a `def` and you can see it. The default list is built **in the code that defines the function**, packed into a tuple, and attached as an attribute of the new function object. The function's own body never mentions it:
+
+```python
+import dis
+dis.dis(compile("def f(bucket=[]): pass", "<demo>", "exec"))
+```
+
+```text title="Output"
+  0           RESUME                   0
+
+  1           BUILD_LIST               0
+              BUILD_TUPLE              1
+              LOAD_CONST               0 (<code object f at 0x000001551D2E2330, file "<demo>", line 1>)
+              MAKE_FUNCTION
+              SET_FUNCTION_ATTRIBUTE   1 (defaults)
+              STORE_NAME               0 (f)
+              LOAD_CONST               1 (None)
+              RETURN_VALUE
+
+Disassembly of <code object f at 0x000001551D2E2330, file "<demo>", line 1>:
+  1           RESUME                   0
+              LOAD_CONST               0 (None)
+              RETURN_VALUE
+```
+
+`BUILD_LIST 0` runs exactly once. `SET_FUNCTION_ATTRIBUTE 1 (defaults)` stores that one list in `f.__defaults__`.
+
+### The mutable default trap
+
+So if the default is mutable and you mutate it, every later call sees the change:
+
+```python
+def add_item(item, bucket=[]):
+    bucket.append(item)
+    return bucket
+
+print(add_item.__defaults__)
+print(add_item("a"))
+print(add_item("b"))
+print(add_item.__defaults__)
+print(add_item("c", []))          # explicit list: fine
+print(add_item("d"))              # back to the shared default
+print(add_item.__defaults__[0] is add_item("e"))
+```
+
+```text title="Output"
+([],)
+['a']
+['a', 'b']
+(['a', 'b'],)
+['c']
+['a', 'b', 'd']
+True
+```
+
+The last line proves it: the list returned by the call *is* the object sitting in `__defaults__`. In a web server this is a real bug: a module is imported once per process, so a mutable default is effectively **process-wide shared state** that leaks data between requests.
+
+The same applies to `{}`, `set()`, a `datetime.now()` (frozen at import time), or any object you mutate.
+
+### The fix: the `None` sentinel
+
+```python
+def add_item(item, bucket=None):
+    if bucket is None:
+        bucket = []
+    bucket.append(item)
+    return bucket
+
+print(add_item("a"))
+print(add_item("b"))
+print(add_item.__defaults__)
+```
+
+```text title="Output"
+['a']
+['b']
+(None,)
+```
+
+Now `__defaults__` holds the immutable `None`, and a fresh list is made **inside the body**, which runs per call.
+
+When `None` is a legitimate value the caller might pass, use a private sentinel object instead. `object()` creates a unique value nobody else can produce:
+
+```python
+_MISSING = object()
+
+def get_setting(settings, key, default=_MISSING):
+    if key in settings:
+        return settings[key]
+    if default is _MISSING:
+        raise KeyError(key)
+    return default          # None is a perfectly valid default here
+
+print(get_setting({"debug": True}, "debug"))
+print(get_setting({}, "timeout", None))
+try:
+    get_setting({}, "timeout")
+except KeyError as err:
+    print("KeyError:", err)
+```
+
+```text title="Output"
+True
+None
+KeyError: 'timeout'
+```
+
+<Callout title="Coming from JS" type="warn">
+  This is the opposite of JavaScript. In JS, `function add(item, bucket = [])` evaluates `[]` **on every call** where the argument is `undefined`, so there's no shared-state trap. In Python the default is evaluated **once, at definition time**. Also, JS uses the default only for `undefined` (not `null`), while Python uses it only when the argument is **absent**. Passing `None` explicitly does not trigger the default.
+</Callout>
+
+Linters catch this: Ruff rule `B006` flags mutable defaults. Pydantic and `dataclasses` have the same issue and solve it with `default_factory`.
+
+## Return values
+
+A function without a `return`, or with a bare `return`, returns `None`. "Multiple return values" are really **one tuple**, built by the commas, which the caller usually unpacks:
+
+```python
+def stats(nums):
+    return min(nums), max(nums), sum(nums) / len(nums)
+
+result = stats([3, 1, 4, 1, 5])
+print(result, type(result).__name__)
+
+lo, hi, avg = stats([3, 1, 4, 1, 5])
+print(lo, hi, avg)
+
+head, *tail = stats([3, 1, 4, 1, 5])
+print(head, tail)
+
+def no_return():
+    x = 1
+
+def bare_return():
+    return
+
+print(no_return(), bare_return())
+```
+
+```text title="Output"
+(1, 5, 2.8) tuple
+1 5 2.8
+1 [5, 2.8]
+None None
+```
+
+When the tuple has more than two or three fields, or leaves your module, give the fields names. A `NamedTuple` still unpacks like a tuple, so callers don't break:
+
+```python
+from typing import NamedTuple
+
+class Stats(NamedTuple):
+    lo: int
+    hi: int
+    avg: float
+
+def stats(nums) -> Stats:
+    return Stats(min(nums), max(nums), sum(nums) / len(nums))
+
+s = stats([3, 1, 4, 1, 5])
+print(s)
+print(s.avg)
+lo, hi, avg = s          # still unpacks like a tuple
+print(lo, hi)
+```
+
+```text title="Output"
+Stats(lo=1, hi=5, avg=2.8)
+2.8
+1 5
+```
+
+<Callout title="Coming from JS">
+  JS has no tuples, so you return an array (`return [a, b]`) or an object (`return { a, b }`) and destructure it. Python's `return a, b` with `x, y = f()` is the array version. A `NamedTuple` or a dataclass is the object version.
+</Callout>
+
+## Docstrings and `inspect.signature`
+
+A **docstring** is a string literal as the first statement of a function, class or module. The compiler stores it in `__doc__`. `help()`, IDEs, Sphinx and FastAPI (for OpenAPI descriptions) all read it. Convention (PEP 257): triple double quotes, a one-line summary, a blank line, then details.
+
+`inspect.signature` gives a structured view of the parameters. It's the backbone of tools that read your functions: FastAPI uses it to decide which arguments come from the path, query or body, and pytest uses it to inject fixtures by name.
+
+```python
+import inspect
+
+def fetch(url: str, /, retries: int = 3, *, timeout: float = 5.0, **headers: str) -> bytes:
+    """Fetch a URL and return the body.
+
+    Retries on connection errors with exponential backoff.
+    """
+    ...
+
+print(fetch.__doc__.splitlines()[0])
+print(inspect.getdoc(fetch).splitlines()[-1])
+sig = inspect.signature(fetch)
+print(sig)
+for name, p in sig.parameters.items():
+    default = "-" if p.default is p.empty else repr(p.default)
+    print(f"{name:8} {p.kind.name:22} default={default:6} annotation={p.annotation}")
+print(sig.return_annotation)
+```
+
+```text title="Output"
+Fetch a URL and return the body.
+Retries on connection errors with exponential backoff.
+(url: str, /, retries: int = 3, *, timeout: float = 5.0, **headers: str) -> bytes
+url      POSITIONAL_ONLY        default=-      annotation=<class 'str'>
+retries  POSITIONAL_OR_KEYWORD  default=3      annotation=<class 'int'>
+timeout  KEYWORD_ONLY           default=5.0    annotation=<class 'float'>
+headers  VAR_KEYWORD            default=-      annotation=<class 'str'>
+<class 'bytes'>
+```
+
+Notes:
+
+- `inspect.getdoc` strips the indentation that triple-quoted strings pick up. Prefer it over raw `__doc__`.
+- `p.empty` (the same as `inspect.Parameter.empty`) means "no default". It's a sentinel, for the reason shown above: `None` could be a real default.
+- `inspect.signature` follows `__wrapped__`, which is why decorators should use `functools.wraps` (see [Decorators](/docs/python/decorators)).
+- Annotations are **not enforced** at runtime. They're metadata that tools read. From Python 3.14, annotations are evaluated lazily (PEP 649), so forward references no longer need quotes.
+
+## Recursion: limits and no tail calls
+
+### The recursion limit
+
+Every Python-level call pushes a frame, and CPython caps the depth (default `1000`) to fail with a clean `RecursionError` instead of crashing the process.
+
+```python
+import sys
+print(sys.getrecursionlimit())
+
+def depth(n):
+    try:
+        return depth(n + 1)
+    except RecursionError:
+        return n
+
+print(depth(0))
+
+def fact(n, acc=1):          # tail-recursive in shape
+    if n <= 1:
+        return acc
+    return fact(n - 1, acc * n)
+
+try:
+    fact(5000)
+except RecursionError as err:
+    print("RecursionError:", err)
+
+def fact_loop(n):
+    acc = 1
+    for i in range(2, n + 1):
+        acc *= i
+    return acc
+print(fact_loop(5000).bit_length(), "bits")
+```
+
+```text title="Output"
+1000
+998
+RecursionError: maximum recursion depth exceeded
+54233 bits
+```
+
+(998, not 1000, because the module and the first frames already use part of the budget.)
+
+You can raise the limit with `sys.setrecursionlimit`, but a much higher value can still crash the interpreter if the real stack runs out, and on threads the stack is smaller. Since 3.11, Python-to-Python calls no longer consume C stack inside the interpreter loop, and since 3.12 the limit applies only to Python frames (C code has its own protection), which made deep recursion safer, but not unlimited.
+
+### Why there's no tail-call optimisation
+
+`fact` above is tail-recursive: the recursive call is the last thing it does. Some languages reuse the frame for such calls. CPython doesn't. The bytecode shows an ordinary `CALL` followed by `RETURN_VALUE`. There is no special tail-call instruction:
+
+```python
+import dis
+def fact(n, acc=1):
+    if n <= 1:
+        return acc
+    return fact(n - 1, acc * n)
+dis.dis(fact)
+```
+
+```text title="Output"
+  3           RESUME                   0
+
+  4           LOAD_FAST_BORROW         0 (n)
+              LOAD_SMALL_INT           1
+              COMPARE_OP              58 (bool(<=))
+              POP_JUMP_IF_FALSE        3 (to L1)
+              NOT_TAKEN
+
+  5           LOAD_FAST_BORROW         1 (acc)
+              RETURN_VALUE
+
+  6   L1:     LOAD_GLOBAL              1 (fact + NULL)
+              LOAD_FAST_BORROW         0 (n)
+              LOAD_SMALL_INT           1
+              BINARY_OP               10 (-)
+              LOAD_FAST_BORROW_LOAD_FAST_BORROW 16 (acc, n)
+              BINARY_OP                5 (*)
+              CALL                     2
+              RETURN_VALUE
+```
+
+The reasons are design decisions, not oversights:
+
+1. **Tracebacks.** TCO throws frames away, so an error deep in a recursion would show a stack missing the calls that led to it. Guido van Rossum has said readable tracebacks matter more.
+2. **Dynamic names.** `fact` is looked up as a **global at call time** (`LOAD_GLOBAL`). The compiler can't know the tail call is a self-call, since someone could rebind `fact`.
+3. **Python style prefers iteration.** Loops, generators and explicit stacks are the idiomatic answer.
+
+So for anything that can get deep (tree walks over user data, linked structures, recursive JSON), use a loop with an explicit stack:
+
+```python
+def walk(tree):
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        yield node["name"]
+        stack.extend(reversed(node.get("children", [])))
+
+tree = {"name": "a", "children": [{"name": "b", "children": [{"name": "c"}]}, {"name": "d"}]}
+print(list(walk(tree)))
+```
+
+```text title="Output"
+['a', 'b', 'c', 'd']
+```
+
+<Callout title="Coming from JS">
+  Same situation in practice. ES2015 specified proper tail calls, but V8 (so Node) never shipped them, and deep recursion gives `RangeError: Maximum call stack size exceeded`. The difference is the scale: V8's limit depends on stack size and frame size and is typically around ten thousand simple frames, while Python's default is a flat 1000.
+</Callout>
+
+## Interview questions
+
+1. **What does `def` actually do at runtime?**
+   **It executes: it evaluates the defaults, creates a function object that pairs the precompiled code object with globals, defaults and closure cells, and binds it to the name.**
+
+2. **Explain the mutable default argument bug and how to fix it.**
+   **Defaults are evaluated once at definition time and stored in `__defaults__`, so a mutated list or dict default is shared by every call. Use `None` (or a private sentinel) as the default and create the object inside the body.**
+
+3. **What are the five parameter kinds, in order?**
+   **Positional-only (before `/`), positional-or-keyword, `*args`, keyword-only (after `*` or `*args`), and `**kwargs`.**
+
+4. **Why would you use positional-only parameters?**
+   **So you can rename them without breaking callers, so their names can also appear as keys in `**kwargs`, and to match builtins that don't accept keywords.**
+
+5. **What does `return a, b` return?**
+   **A single tuple `(a, b)`. The caller unpacks it. Use a `NamedTuple` or dataclass when the fields need names.**
+
+6. **What happens with `f(**{"x": 1}, x=2)`?**
+   **`TypeError: got multiple values for keyword argument 'x'`. Duplicate keywords are an error at call time, unlike `{**a, **b}`, where the last key wins.**
+
+7. **Does Python optimise tail calls? Why not?**
+   **No. It would lose traceback frames, and the callee is looked up dynamically, so the compiler can't prove a self-call. Rewrite deep recursion as a loop.**
+
+8. **How does FastAPI know which parameter is a path parameter and which is the body?**
+   **It calls `inspect.signature` on your function and reads each parameter's name, default and annotation.**
+
+## Recap
+
+- Functions are objects: a shared immutable **code object** plus a **function object** carrying globals, `__defaults__`, `__kwdefaults__` and `__closure__`.
+- Five parameter kinds; binding fills positional slots, then `*args`, then keywords by name, then defaults, and every error message maps to one of those steps.
+- `*` and `**` pack in a signature and spread at a call site. Duplicate keywords at a call are errors.
+- Defaults are evaluated **once** when the `def` runs. Never use a mutable default; use `None` or a sentinel.
+- Multiple returns are one tuple. Name the fields with `NamedTuple` once there are more than a couple.
+- `inspect.signature` is how frameworks read your functions. Docstrings live in `__doc__`.
+- The recursion limit is 1000 by default and there is no TCO, so use loops for deep traversals.

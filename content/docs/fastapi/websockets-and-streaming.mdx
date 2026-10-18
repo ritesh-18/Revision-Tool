@@ -1,0 +1,717 @@
+---
+title: "WebSockets and Streaming"
+description: "Long-lived connections in FastAPI: the WebSocket lifecycle, disconnect handling, a broadcast room manager, auth on WebSockets, why multiple workers need Redis pub/sub, StreamingResponse with sync and async generators, native Server-Sent Events, JSON Lines, detecting client disconnects, and choosing between SSE, WebSockets and long polling."
+---
+
+A normal endpoint is a function call: request in, response out, connection free. This chapter is about the cases where the response is **not one thing at the end**: a chat message pushed to twenty browsers, a progress bar for a job, an LLM answer arriving token by token, a 2 GB CSV export. They all rely on the same idea: keep the connection open and send data over time.
+
+ASGI was designed for exactly this (see [ASGI and the request lifecycle](/docs/fastapi/asgi-and-the-request-lifecycle)). A WSGI app had to return the whole response at once. An ASGI app calls `send()` as many times as it likes, and a WebSocket is just another `scope["type"]` with its own message types. For the protocol-level background (HTTP upgrade, frames, heartbeats, fan-out) see [Real-time backends](/docs/backend-first-principles/26-real-time-backends).
+
+All outputs below were produced with CPython 3.14.6, FastAPI 0.143.0, Starlette 1.8.0 and uvicorn 0.54.0. The streaming timings come from a real uvicorn server on localhost, because `TestClient` buffers streamed responses (more on that below).
+
+## WebSockets: the lifecycle
+
+A WebSocket starts as an HTTP `GET` with `Upgrade: websocket`. If the server agrees, it answers `101 Switching Protocols`, and from then on the TCP connection carries WebSocket **frames** in both directions, with no request/response pairing. In ASGI terms, the endpoint receives a `scope` with `type: "websocket"` and talks through messages:
+
+| Direction | ASGI message | FastAPI method |
+|---|---|---|
+| server receives | `websocket.connect` | (consumed by `accept()`) |
+| server sends | `websocket.accept` | `await ws.accept()` |
+| server receives | `websocket.receive` | `receive_text()`, `receive_bytes()`, `receive_json()`, `iter_text()` |
+| server sends | `websocket.send` | `send_text()`, `send_bytes()`, `send_json()` |
+| server receives | `websocket.disconnect` | raised as `WebSocketDisconnect` |
+| server sends | `websocket.close` | `await ws.close(code=...)` |
+
+```python
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    print("server: state before accept:", websocket.client_state.name)
+    await websocket.accept()
+    print("server: state after accept:", websocket.client_state.name)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            await websocket.send_json({"you_sent": data, "n": len(data)})
+    except WebSocketDisconnect as exc:
+        print("server: client left with code", exc.code)
+
+
+client = TestClient(app)
+with client.websocket_connect("/ws") as ws:
+    ws.send_json({"a": 1, "b": 2})
+    print("client got:", ws.receive_json())
+    ws.close(code=1000)
+```
+
+```text title="Output"
+server: state before accept: CONNECTING
+server: state after accept: CONNECTED
+client got: {'you_sent': {'a': 1, 'b': 2}, 'n': 2}
+server: client left with code 1000
+```
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant U as Uvicorn
+  participant E as FastAPI endpoint
+  B->>U: GET /ws with Upgrade websocket
+  U->>E: scope type websocket, message websocket.connect
+  E->>U: websocket.accept
+  U->>B: 101 Switching Protocols
+  B->>U: text frame
+  U->>E: websocket.receive
+  E->>U: websocket.send
+  U->>B: text frame
+  B->>U: close frame 1000
+  U->>E: websocket.disconnect, raised as WebSocketDisconnect`} />
+
+The pieces worth understanding:
+
+- **`accept()` is a decision.** Until you call it, the handshake hasn't finished. That is the moment to authenticate: you can still refuse with `close()` and no data has been exchanged.
+- **The endpoint is a long-running coroutine.** It lives as long as the connection. `while True: await receive...` is normal, because every `await` yields to the event loop, so thousands of idle sockets cost almost nothing but memory.
+- **Disconnect arrives as an exception.** When the client goes away, the next `receive_*()` raises `WebSocketDisconnect` with the close code (1000 normal, 1001 going away, 1006 abnormal, i.e. the TCP connection dropped without a close frame). Catch it and clean up. If you don't, the exception ends the endpoint, which is also fine, but your cleanup code won't run.
+- **Sending to a closed socket raises too.** That matters when *other* code sends to this socket (a broadcast). Wrap those sends.
+- **Path, query, header and cookie parameters and `Depends` work** on WebSocket routes, just like HTTP routes. There is no request body; data arrives as messages.
+
+<Callout title="Heartbeats are already handled">
+Uvicorn sends WebSocket **ping** frames every 20 seconds by default (`--ws-ping-interval`) and closes the connection if no pong arrives within `--ws-ping-timeout`. That detects dead peers and keeps idle connections alive through proxies. You don't have to build ping/pong at the application level unless your clients need app-level "are you still there" semantics.
+</Callout>
+
+## A connection manager for rooms
+
+A single WebSocket is a conversation. A chat room is a **fan-out**: one incoming message has to be sent to every connected member. FastAPI doesn't have rooms built in. You keep track of open sockets yourself, in memory:
+
+```python title="chat.py"
+import asyncio
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Query, WebSocket, WebSocketDisconnect, WebSocketException, status
+
+app = FastAPI()
+
+TOKENS = {"tok-alice": "alice", "tok-bob": "bob"}
+
+
+class RoomManager:
+    def __init__(self) -> None:
+        self.rooms: dict[str, set[WebSocket]] = {}
+
+    async def connect(self, room: str, ws: WebSocket) -> None:
+        await ws.accept()
+        self.rooms.setdefault(room, set()).add(ws)
+
+    def disconnect(self, room: str, ws: WebSocket) -> None:
+        members = self.rooms.get(room, set())
+        members.discard(ws)
+        if not members:
+            self.rooms.pop(room, None)
+
+    async def broadcast(self, room: str, message: dict) -> None:
+        members = list(self.rooms.get(room, ()))
+        results = await asyncio.gather(
+            *(ws.send_json(message) for ws in members), return_exceptions=True
+        )
+        for ws, result in zip(members, results):
+            if isinstance(result, Exception):      # dead socket: drop it
+                self.disconnect(room, ws)
+
+
+manager = RoomManager()
+
+
+async def ws_user(token: Annotated[str | None, Query()] = None) -> str:
+    user = TOKENS.get(token or "")
+    if user is None:
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="bad token")
+    return user
+
+
+@app.websocket("/rooms/{room}")
+async def room_ws(websocket: WebSocket, room: str, user: Annotated[str, Depends(ws_user)]):
+    await manager.connect(room, websocket)
+    await manager.broadcast(room, {"system": f"{user} joined", "online": len(manager.rooms[room])})
+    try:
+        while True:
+            text = await websocket.receive_text()
+            await manager.broadcast(room, {"from": user, "text": text})
+    except WebSocketDisconnect:
+        manager.disconnect(room, websocket)
+        await manager.broadcast(room, {"system": f"{user} left"})
+```
+
+Design decisions in `RoomManager`:
+
+- **`list(...)` before iterating.** Other coroutines can join or leave while `broadcast` is awaiting sends. Iterating a snapshot avoids "set changed size during iteration".
+- **Concurrent sends with `gather`.** Sending one by one means one slow client (a phone on a bad network, with a full TCP buffer) delays everyone after it. `gather` starts all sends together.
+- **`return_exceptions=True`** stops one dead socket from aborting the whole broadcast, and the loop afterwards evicts sockets whose send failed.
+- **Cleanup on disconnect** removes the socket and deletes empty rooms, so the dict doesn't grow forever.
+
+Running it under a real uvicorn server, with two clients using the `websockets` library:
+
+```bash
+uvicorn chat:app --port 8765
+```
+
+```python title="chat_client.py"
+import asyncio, json
+import websockets
+
+
+async def main():
+    url = "ws://127.0.0.1:8765/rooms/general"
+    async with websockets.connect(f"{url}?token=tok-alice") as alice:
+        print("alice:", json.loads(await alice.recv()))
+        async with websockets.connect(f"{url}?token=tok-bob") as bob:
+            print("alice:", json.loads(await alice.recv()))
+            print("bob:  ", json.loads(await bob.recv()))
+            await bob.send("hi all")
+            print("alice:", json.loads(await alice.recv()))
+            print("bob:  ", json.loads(await bob.recv()))
+        print("alice:", json.loads(await alice.recv()))
+
+    try:
+        async with websockets.connect(f"{url}?token=forged") as ws:
+            await ws.recv()
+    except websockets.exceptions.InvalidStatus as e:
+        print("rejected during handshake:", e.response.status_code)
+
+
+asyncio.run(main())
+```
+
+```text title="Output"
+alice: {'system': 'alice joined', 'online': 1}
+alice: {'system': 'bob joined', 'online': 2}
+bob:   {'system': 'bob joined', 'online': 2}
+alice: {'from': 'bob', 'text': 'hi all'}
+bob:   {'from': 'bob', 'text': 'hi all'}
+alice: {'system': 'bob left'}
+rejected during handshake: 403
+```
+
+```text title="Server log"
+INFO:     127.0.0.1:51746 - "WebSocket /rooms/general?token=tok-alice" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:51747 - "WebSocket /rooms/general?token=tok-bob" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:51748 - "WebSocket /rooms/general?token=forged" 403
+INFO:     connection rejected (403 Forbidden)
+```
+
+## Auth on WebSockets
+
+WebSocket auth has a constraint that HTTP auth doesn't: **the browser's `WebSocket` API can't set custom headers.** `new WebSocket(url)` sends cookies and the URL, nothing else. So `Authorization: Bearer ...` (the usual choice for HTTP APIs) is not available from browser JavaScript. Your options:
+
+| Where the credential travels | How | Watch out for |
+|---|---|---|
+| Cookie | session or JWT cookie, sent automatically on the upgrade request | check the `Origin` header, since browsers send cookies cross-site (cross-site WebSocket hijacking) |
+| Query parameter | `wss://.../ws?token=...` | URLs end up in access logs and proxy logs. Use a **short-lived, single-use ticket** fetched from an authenticated HTTP endpoint, not your long-lived JWT |
+| First message | accept, then require `{"type": "auth", "token": ...}` within a few seconds | the socket is already accepted, so enforce a timeout and close on failure |
+| `Sec-WebSocket-Protocol` | smuggle the token as a subprotocol | a hack; you must echo a subprotocol back in `accept(subprotocol=...)` |
+| `Authorization` header | non-browser clients (mobile apps, services) can set it | not available from browser JS |
+
+In the room example, auth is a normal dependency. `ws_user` reads the `token` query parameter and raises `WebSocketException(code=1008)` (policy violation) when it is invalid. Because this happens **before** `accept()`, the handshake is refused. Notice what the client actually saw against the real server: **HTTP 403**, not close code 1008. Closing a WebSocket before accepting it means the server answers the upgrade request with a plain HTTP error. Under `TestClient`, the same rejection appears as a `WebSocketDisconnect`:
+
+```python
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+from chat import app
+
+try:
+    with TestClient(app).websocket_connect("/rooms/general?token=forged"):
+        pass
+except WebSocketDisconnect as e:
+    print("rejected:", e.code, e.reason)
+```
+
+```text title="Output"
+rejected: 1008 bad token
+```
+
+A few more rules for WebSocket auth:
+
+- **Authenticate once, then re-check for long sessions.** A socket can stay open for hours, longer than the token's lifetime. Either close sockets when the token would expire, or re-validate periodically.
+- **Authorize every message, not just the connection.** "Alice may connect" doesn't mean "Alice may post to room `admins`". Check permissions for each action that arrives over the socket.
+- **Validate the `Origin` header** when you use cookies. Browsers don't apply CORS to WebSockets, so a malicious site can open a socket to your server with the user's cookies.
+- **Limit message size and rate.** Uvicorn caps frames at 16 MiB by default (`--ws-max-size`), which is far more than a chat message needs.
+
+## Multiple workers: why you need Redis pub/sub
+
+`RoomManager.rooms` is a dict **in one process's memory**. In production you run several worker processes, often on several machines (see [deployment and performance](/docs/fastapi/deployment-and-performance)). Alice's socket may live in worker 1 and Bob's in worker 2. When Bob posts, worker 2 broadcasts to the sockets **it** knows about, and Alice never sees the message.
+
+<Mermaid chart={`flowchart LR
+  subgraph W1["Worker 1"]
+    A["Alice socket"]
+    M1["RoomManager"]
+  end
+  subgraph W2["Worker 2"]
+    B["Bob socket"]
+    M2["RoomManager"]
+  end
+  R[("Redis pub/sub<br/>channel room:general")]
+  B -->|"hi all"| M2
+  M2 -->|PUBLISH| R
+  R -->|message| M1
+  R -->|message| M2
+  M1 --> A
+  M2 --> B`} />
+
+The fix is to send messages through a shared **message bus**. Each worker publishes incoming messages to a channel, every worker subscribes to the channels of the rooms it has local members in, and each worker delivers what it receives to its **local** sockets. Redis pub/sub is the common choice (NATS, Postgres `LISTEN/NOTIFY` and Kafka are alternatives). A sketch with `redis.asyncio` (not run here, it needs a Redis server):
+
+```python
+import asyncio, json
+import redis.asyncio as redis
+
+r = redis.Redis.from_url("redis://localhost:6379")
+
+
+async def publish(room: str, message: dict) -> None:
+    await r.publish(f"room:{room}", json.dumps(message))
+
+
+async def relay(manager: "RoomManager") -> None:
+    """One task per worker, started in the lifespan."""
+    pubsub = r.pubsub()
+    await pubsub.psubscribe("room:*")
+    async for msg in pubsub.listen():
+        if msg["type"] != "pmessage":
+            continue
+        room = msg["channel"].decode().removeprefix("room:")
+        await manager.broadcast(room, json.loads(msg["data"]))   # local sockets only
+```
+
+The endpoint calls `publish(...)` instead of `manager.broadcast(...)`, and the relay task does the local delivery. Two properties to know:
+
+- **Redis pub/sub is fire-and-forget.** A worker that is restarting misses messages, and nothing is stored. If clients must never miss messages (chat history, notifications), persist them (database or Redis Streams) and let clients fetch what they missed on reconnect.
+- **Sticky sessions are not a fix.** Routing a client to the same worker helps reconnects but doesn't help two users on different workers talk to each other.
+
+## Streaming HTTP responses
+
+Not every live update needs a two-way socket. Often the server just has a lot to say, or says it slowly. `StreamingResponse` takes an **iterator** and sends each item as a chunk as soon as it's produced, using `Transfer-Encoding: chunked` (no `Content-Length`, because the total size isn't known up front).
+
+```python
+import asyncio, threading, time
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+
+
+def csv_rows():                                  # sync generator
+    yield "id,name\n"
+    for i in range(1, 4):
+        time.sleep(0.1)                          # blocking is OK here: runs in a thread
+        yield f"{i},row-{i} ({threading.current_thread().name})\n"
+
+
+async def ticks():                               # async generator
+    for i in range(3):
+        await asyncio.sleep(0.1)
+        yield f"tick {i} ({threading.current_thread().name})\n".encode()
+
+
+@app.get("/export.csv")
+def export():
+    return StreamingResponse(csv_rows(), media_type="text/csv")
+
+
+@app.get("/ticks")
+async def get_ticks():
+    return StreamingResponse(ticks(), media_type="text/plain")
+
+
+client = TestClient(app)
+with client.stream("GET", "/export.csv") as r:
+    print(r.headers["content-type"], r.headers.get("content-length"), r.headers.get("transfer-encoding"))
+    for line in r.iter_lines():
+        print(repr(line))
+
+start = time.perf_counter()
+with client.stream("GET", "/ticks") as r:
+    for chunk in r.iter_text():
+        print(f"{time.perf_counter() - start:.2f}s", repr(chunk))
+```
+
+```text title="Output"
+text/csv; charset=utf-8 None None
+'id,name'
+'1,row-1 (AnyIO worker thread)'
+'2,row-2 (AnyIO worker thread)'
+'3,row-3 (AnyIO worker thread)'
+0.32s 'tick 0 (asyncio-portal-3416c8c1a50)\ntick 1 (asyncio-portal-3416c8c1a50)\ntick 2 (asyncio-portal-3416c8c1a50)\n'
+```
+
+Two mechanisms show up here:
+
+- **Sync generators run in the threadpool.** Starlette iterates a sync iterator with `iterate_in_threadpool`: each `next()` call runs in an AnyIO worker thread, so `time.sleep` or a blocking file read inside it doesn't freeze the event loop. Async generators run on the event loop itself, so they must only `await` non-blocking things.
+- **`TestClient` buffers streamed bodies.** All three ticks arrived together after 0.32 s. The test transport collects the whole body before returning, so `TestClient` can check *what* is streamed but not *when*. To see real chunk timing you need a real server.
+
+The same `/ticks` endpoint (with 0.3 s sleeps) behind uvicorn, read with `httpx` streaming:
+
+```python
+import time
+import httpx
+
+with httpx.Client(base_url="http://127.0.0.1:8766") as c:
+    start = time.perf_counter()
+    with c.stream("GET", "/ticks") as r:
+        print(r.headers["content-type"], "| transfer-encoding:", r.headers.get("transfer-encoding"))
+        for chunk in r.iter_text():
+            print(f"  {time.perf_counter() - start:.2f}s {chunk!r}")
+```
+
+```text title="Output"
+text/plain; charset=utf-8 | transfer-encoding: chunked
+  0.33s 'tick 0\n'
+  0.63s 'tick 1\n'
+  0.94s 'tick 2\n'
+```
+
+Now each chunk arrives when it is produced. The client could render "tick 0" after a third of a second instead of waiting for the whole response. That's the entire value of streaming: **time to first byte** drops from "total time" to "time to first chunk", and memory stays flat because the server never holds the full body.
+
+Typical uses: large exports (CSV, NDJSON) built from a DB cursor page by page, proxying a file from object storage, and LLM output (see [streaming LLM responses](/docs/fastapi/streaming-llm-responses)).
+
+<Callout type="warn" title="Errors after the first byte">
+Once the first chunk is sent, the status code (200) and headers are already on the wire. If the generator raises halfway, the server can't turn it into a 500. The client just sees the connection end early, which may look like a complete response. Validate inputs and open resources **before** returning the `StreamingResponse`, and for structured streams send an explicit final "done" or "error" event so the client can tell a finished stream from a broken one.
+</Callout>
+
+### JSON Lines: yield models, FastAPI streams them
+
+FastAPI 0.143 can stream directly from a path operation that **is** a generator. Declare the return type as `AsyncIterable[Model]`, `yield` items, and FastAPI serializes each one with Pydantic and sends it as one line of JSON Lines:
+
+```python
+from collections.abc import AsyncIterable
+from pydantic import BaseModel
+
+
+class Progress(BaseModel):
+    step: int
+    of: int
+
+
+@app.get("/jobs/42/progress.jsonl")
+async def progress_jsonl() -> AsyncIterable[Progress]:
+    for i in range(1, 4):
+        await asyncio.sleep(0.1)
+        yield Progress(step=i, of=3)
+```
+
+```text title="Output (real server)"
+application/jsonl
+  {"step":1,"of":3}
+  {"step":2,"of":3}
+  {"step":3,"of":3}
+```
+
+JSON Lines (one JSON document per line) is the simplest structured stream: easy to produce, easy to parse with `for line in r.iter_lines(): json.loads(line)`, and well suited to service-to-service streaming. Browsers don't have a built-in parser for it, though. For browsers, SSE is the better fit.
+
+## Server-Sent Events
+
+**Server-Sent Events** (SSE) is a tiny text protocol on top of a streaming HTTP response with `Content-Type: text/event-stream`. Each event is a few `field: value` lines followed by a blank line:
+
+```text
+event: progress
+data: {"step": 1}
+id: 1
+
+```
+
+Browsers have a built-in client, `EventSource`, which parses events, dispatches them by `event` name, and **reconnects automatically**, sending the last seen `id` back as a `Last-Event-ID` header so the server can resume.
+
+### Native SSE in FastAPI
+
+FastAPI 0.143 ships SSE support in `fastapi.sse`. Set `response_class=EventSourceResponse` and `yield` from the path operation. Yield `ServerSentEvent` objects for full control, or plain objects/models that become JSON `data:` fields.
+
+```python
+import asyncio
+from collections.abc import AsyncIterable
+
+from fastapi import FastAPI, Header
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+
+app = FastAPI()
+
+
+@app.get("/jobs/42/events", response_class=EventSourceResponse)
+async def job_events(
+    last_event_id: str | None = Header(default=None),
+) -> AsyncIterable[ServerSentEvent]:
+    start = int(last_event_id) + 1 if last_event_id else 1
+    yield ServerSentEvent(comment="stream opened", retry=3000)
+    for i in range(start, 4):
+        await asyncio.sleep(0.1)
+        yield ServerSentEvent(data={"step": i, "of": 3}, event="progress", id=str(i))
+    yield ServerSentEvent(raw_data="done", event="end")
+
+
+@app.get("/models-stream", response_class=EventSourceResponse)
+async def plain_models() -> AsyncIterable[Progress]:
+    yield Progress(step=1, of=1)
+```
+
+Reading both from a real server, first from the beginning and then resuming as a reconnecting `EventSource` would:
+
+```python
+with httpx.Client(base_url="http://127.0.0.1:8766") as c:
+    with c.stream("GET", "/jobs/42/events") as r:
+        print(r.headers["content-type"], "| cache-control:", r.headers.get("cache-control"),
+              "| x-accel-buffering:", r.headers.get("x-accel-buffering"))
+        print(r.read().decode())
+
+    print("--- resume with Last-Event-ID: 2")
+    r = c.get("/jobs/42/events", headers={"Last-Event-ID": "2"})
+    print(r.text)
+
+    print("--- plain model yielded")
+    print(repr(c.get("/models-stream").text))
+```
+
+```text title="Output"
+text/event-stream; charset=utf-8 | cache-control: no-cache | x-accel-buffering: no
+: stream opened
+retry: 3000
+
+event: progress
+data: {"step": 1, "of": 3}
+id: 1
+
+event: progress
+data: {"step": 2, "of": 3}
+id: 2
+
+event: progress
+data: {"step": 3, "of": 3}
+id: 3
+
+event: end
+data: done
+
+
+--- resume with Last-Event-ID: 2
+: stream opened
+retry: 3000
+
+event: progress
+data: {"step": 3, "of": 3}
+id: 3
+
+event: end
+data: done
+
+
+--- plain model yielded
+'data: {"step":1,"of":1}\n\n'
+```
+
+What FastAPI did for you:
+
+- **Headers.** `text/event-stream`, `Cache-Control: no-cache` (so no cache stores a live stream), and `X-Accel-Buffering: no`, which tells nginx not to buffer the response. Without that header, nginx's default buffering would hold the events back and deliver them in one lump at the end.
+- **Encoding.** `data=` is always JSON-encoded (a string `"hello"` becomes `data: "hello"` with quotes). Use `raw_data=` for pre-formatted text, as with `done` above. Multi-line data is split into several `data:` lines as the spec requires, and `event` and `id` are validated to be single lines.
+- **Fields.** `comment` becomes a `:` line that clients ignore, `retry` tells `EventSource` how many milliseconds to wait before reconnecting, and `id` is what comes back as `Last-Event-ID`.
+- **Keep-alive.** When the generator is idle, FastAPI sends a `: ping` comment every 15 seconds, so proxies and load balancers with idle timeouts (often 60 s) don't cut the connection during a long gap.
+
+Resuming is your job: the endpoint reads `Last-Event-ID` and skips what the client already has. That only works if events have stable IDs and you can replay from an ID, which usually means the events are stored somewhere (a DB table, a Redis Stream) rather than generated on the fly.
+
+The browser side is a few lines:
+
+```js
+const es = new EventSource("/jobs/42/events");
+es.addEventListener("progress", (e) => render(JSON.parse(e.data)));
+es.addEventListener("end", () => es.close());   // otherwise it reconnects forever
+```
+
+<Callout title="sse-starlette">
+Before FastAPI had native SSE, the standard library was `sse-starlette` (installed here at 3.5.0). It works the other way around: you **return** `EventSourceResponse(generator)` and yield dicts or `sse_starlette.ServerSentEvent` objects, which are not JSON-encoded for you. It also has built-in pings and send timeouts. For new FastAPI code the native version is simpler and documents itself in OpenAPI. You'll still meet sse-starlette in existing code, and its wire output is the same protocol (with `\r\n` line endings):
+
+```python
+from sse_starlette import EventSourceResponse, ServerSentEvent
+
+@app.get("/events")
+async def events():
+    async def gen():
+        yield {"event": "progress", "data": json.dumps({"step": 1}), "id": "1"}
+        yield ServerSentEvent(data="done", event="end")
+    return EventSourceResponse(gen(), ping=15)
+```
+
+```text title="Output"
+text/event-stream; charset=utf-8
+'id: 1\r\nevent: progress\r\ndata: {"step": 1}\r\n\r\nevent: end\r\ndata: done\r\n\r\n'
+```
+</Callout>
+
+`EventSource` only supports `GET` with no body and no custom headers. LLM chat UIs usually need `POST` with a JSON body, so they use `fetch()` and parse the stream themselves (or a small library such as `@microsoft/fetch-event-source`). FastAPI's `EventSourceResponse` works with any method, including `POST`.
+
+## Detecting client disconnects
+
+A user closes the tab while you're streaming an LLM answer that costs money per token. You want to stop generating **now**. How does the server find out?
+
+TCP tells the server's socket that the peer closed. Uvicorn turns that into an ASGI `http.disconnect` message. What happens next depends on how your code is waiting.
+
+**Case 1: a streaming async generator.** Starlette's streaming response listens for `http.disconnect` while it sends, and cancels the streaming task when it arrives. Your generator gets `CancelledError` at its current `await`:
+
+```python
+@app.get("/feed", response_class=EventSourceResponse)
+async def feed(request: Request) -> AsyncIterable[ServerSentEvent]:
+    n = 0
+    try:
+        while True:
+            if await request.is_disconnected():
+                print("feed: is_disconnected() returned True after", n, "events", flush=True)
+                return
+            n += 1
+            yield ServerSentEvent(data={"n": n})
+            await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        print("feed: cancelled after", n, "events", flush=True)
+        raise
+    finally:
+        print("feed: cleanup ran", flush=True)
+```
+
+```python title="Client: read three events, then hang up"
+with httpx.Client(base_url="http://127.0.0.1:8766") as c:
+    with c.stream("GET", "/feed") as r:
+        for line in r.iter_lines():
+            if line:
+                print("client got:", line)
+            if line.startswith("data") and line.endswith("3}"):
+                break
+    print("client: closed the connection")
+```
+
+```text title="Output"
+client got: data: {"n": 1}
+client got: data: {"n": 2}
+client got: data: {"n": 3}
+client: closed the connection
+```
+
+```text title="Server log"
+INFO:     127.0.0.1:52437 - "GET /feed HTTP/1.1" 200 OK
+feed: cancelled after 3 events
+feed: cleanup ran
+```
+
+The `is_disconnected()` check never fired: cancellation got there first. That's the normal path for async generators, and it's why the cleanup belongs in `finally` (close the upstream LLM stream, release the DB cursor, record usage) and why you must re-raise `CancelledError` rather than swallow it (see [asyncio cancellation](/docs/python/asyncio)).
+
+**Case 2: a sync generator.** A thread can't be cancelled. The same feed written as a sync generator, which prints each time it produces a chunk:
+
+```python
+def sync_counter():
+    n = 0
+    try:
+        while True:
+            n += 1
+            print("sync_counter: producing", n, flush=True)
+            yield f"data: {n}\n\n"
+            time.sleep(0.2)
+    finally:
+        print("sync_counter: closed after", n, "chunks", flush=True)
+
+
+@app.get("/sync-feed")
+def sync_feed():
+    return StreamingResponse(sync_counter(), media_type="text/event-stream")
+```
+
+```text title="Server log (client read three chunks, then closed)"
+INFO:     127.0.0.1:49878 - "GET /sync-feed HTTP/1.1" 200 OK
+sync_counter: producing 1
+sync_counter: producing 2
+sync_counter: producing 3
+sync_counter: producing 4
+```
+
+Starlette stopped asking for chunks after the disconnect, so production stopped. But the generator's `finally` **never ran**, not even after the server had kept running for several more minutes: the generator was left suspended rather than closed, so its cleanup was at the mercy of garbage collection. Prefer async generators for anything that holds resources.
+
+**Case 3: a slow non-streaming endpoint.** A regular endpoint that thinks for 10 seconds and then returns JSON isn't cancelled when the client gives up. It runs to completion and its response is thrown away. Here `request.is_disconnected()` is the tool: poll it between steps of expensive work.
+
+```python
+async def expensive_work(request: Request):
+    n = 0
+    while n < 50:
+        await asyncio.sleep(0.2)                 # pretend: one LLM token / one DB page
+        n += 1
+        if await request.is_disconnected():
+            print("poll: client gone, stopping at", n, flush=True)
+            return
+    print("poll: finished all work", flush=True)
+
+
+@app.get("/poll-work")
+async def poll_work(request: Request):
+    await expensive_work(request)               # non-streaming: nobody cancels this
+    return {"ok": True}
+```
+
+```text title="Client gave up after 1 s. Server log:"
+poll: client gone, stopping at 5
+```
+
+Without the check, the loop would have run all 50 steps (10 seconds of work, or 50 LLM calls) for nobody.
+
+<Mermaid chart={`flowchart TD
+  A["Client closes the TCP connection"] --> B["Uvicorn delivers http.disconnect"]
+  B --> C{"How is the endpoint waiting?"}
+  C -->|"async generator streaming"| D["streaming task cancelled<br/>CancelledError at current await<br/>finally runs"]
+  C -->|"sync generator streaming"| E["no more next() calls<br/>generator left suspended<br/>finally not guaranteed"]
+  C -->|"regular endpoint"| F["keeps running to the end<br/>unless it polls request.is_disconnected()"]`} />
+
+## SSE vs WebSocket vs long polling
+
+| | Long polling | SSE | WebSocket |
+|---|---|---|---|
+| Direction | server to client (one message per request) | server to client | both ways |
+| Transport | plain HTTP requests | one long HTTP response | upgraded TCP connection, own framing |
+| Browser API | `fetch` in a loop | `EventSource` (GET only) or `fetch` streaming | `WebSocket` |
+| Reconnect and resume | natural: each poll is a new request | built in (`retry`, `Last-Event-ID`) | you build it |
+| Through proxies, CDNs, corporate firewalls | always works | works if buffering is off | usually works, sometimes blocked or needs special proxy config |
+| Data format | anything | UTF-8 text (JSON inside `data:`) | text or binary |
+| Auth | normal headers | cookies, or headers with `fetch` | cookies, query ticket or first message |
+| Server cost | a request per message plus idle waits | one open connection per client | one open connection per client |
+| HTTP/2 multiplexing | yes | yes, many streams on one connection | no, separate connection each |
+
+How to choose:
+
+- **Server pushes, client mostly listens** (notifications, job progress, dashboards, LLM tokens): **SSE**. It is plain HTTP, so auth middleware, logging, load balancers and proxies just work, and reconnection is built in. Client-to-server messages go over normal `POST` requests.
+- **Both sides talk often, with low latency** (chat with typing indicators, multiplayer games, collaborative editing, voice/audio streaming): **WebSocket**.
+- **Updates are rare, or the infrastructure can't hold connections open** (some serverless platforms, strict proxies): **long polling**, or simply periodic polling.
+- **Request in, long stream out, between services**: a streaming HTTP response (JSON Lines) is the simplest.
+
+Most AI products land on SSE for token streaming: the client sends a prompt with `POST`, the server streams tokens back, and the connection closes when the answer ends. WebSockets earn their complexity when the conversation is truly bidirectional, such as voice agents.
+
+## Traps
+
+- **Calling `receive_*` after a disconnect** or sending to a closed socket raises. Catch `WebSocketDisconnect` and wrap broadcast sends.
+- **Forgetting cleanup on disconnect** leaks sockets in the manager. Every send then fails, and memory grows.
+- **Sequential broadcast**: one slow client delays every client after it. Send concurrently.
+- **In-memory room managers with several workers**: messages only reach sockets in the same process. Use Redis pub/sub or another bus.
+- **Long-lived JWTs in WebSocket URLs** end up in logs. Use short-lived tickets, or cookies plus an `Origin` check.
+- **Expecting close code 1008 at the browser** when you reject before `accept()`: real servers answer the handshake with HTTP 403.
+- **Multi-client WebSocket tests without `with TestClient(app)`**: in our test, two sessions opened from a bare `TestClient` hung when one of them left and the server broadcast to the other. Inside `with TestClient(app) as client:` the same test passed.
+- **Blocking calls inside an async generator** freeze the event loop for every connection. Use a sync generator (it runs in a thread) or `await` async libraries.
+- **Expecting `TestClient` to show chunk timing**: it buffers the body. Use a real server to test latency.
+- **Proxy buffering** (nginx `proxy_buffering on`, some CDNs) turns a stream into one late response. FastAPI's SSE sends `X-Accel-Buffering: no`. For other proxies, disable buffering for the route.
+- **Idle timeouts** on load balancers cut quiet streams. Send keep-alive comments (native SSE does this every 15 s).
+- **Errors mid-stream** can't change the status code. Send an explicit error or end event.
+- **Swallowing `CancelledError`** in a streaming generator keeps it running after the client left. Clean up in `finally` and re-raise.
+- **Sync generators** aren't reliably closed on disconnect. Put resource cleanup in async generators.
+
+## Key points
+
+- A WebSocket endpoint is a long-running coroutine: `accept()`, loop on `receive_*`/`send_*`, and catch `WebSocketDisconnect` for cleanup.
+- Authenticate before `accept()`. Browsers can't set headers on WebSockets, so use cookies (with an `Origin` check), short-lived query tickets, or a first-message handshake.
+- A connection manager is a dict of sets of sockets. Broadcast concurrently, evict dead sockets, and remove empty rooms.
+- In-memory fan-out only works within one process. Several workers need a shared bus such as Redis pub/sub, and pub/sub doesn't store messages.
+- `StreamingResponse` sends chunks as an iterator produces them. Sync generators run in the threadpool, async generators on the loop.
+- FastAPI 0.143 streams JSON Lines from generator path operations and has native SSE (`fastapi.sse.EventSourceResponse`, `ServerSentEvent`) with correct headers, JSON encoding and keep-alive pings.
+- On disconnect, async streaming generators are cancelled (cleanup in `finally`), sync generators just stop being iterated, and regular endpoints keep running unless they poll `request.is_disconnected()`.
+- Pick SSE for server push, WebSockets for real two-way traffic, and long polling when connections can't stay open.

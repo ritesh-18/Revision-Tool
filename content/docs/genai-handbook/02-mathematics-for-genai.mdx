@@ -1,0 +1,729 @@
+---
+title: "2. Mathematics for GenAI"
+description: "You don't need to derive backpropagation to ship GenAI products. You do need enough mathematical intuition to reason about why models behave as they do —..."
+---
+
+<Callout type="info">
+  - 📘 **Handbook**: the original chapter text (unchanged).
+  - 🔧 **Going deeper**: code examples and extra depth on topics the chapter already covers.
+  - ➕ **Beyond the handbook**: topics the chapter does not cover, added because a GenAI engineer should know them.
+</Callout>
+
+## 2.1 Why Math Matters Here
+
+You don't need to derive backpropagation to ship GenAI products. You *do* need enough mathematical intuition to reason about why models behave as they do — why context length is quadratic in cost, why embeddings can be compared with cosine similarity, why temperature changes output diversity, why quantization works at all. This chapter builds operational intuition, not academic rigor.
+
+If you only remember three sentences from this chapter, remember these. Models are matrices applied to vectors. Training is gradient descent shaping those matrices. Inference is the same matrices being applied to new vectors. Every system-level decision you make in GenAI — context length, batch size, memory layout, quantization — is a consequence of these three facts.
+
+## 2.2 Linear Algebra — The Language of Models
+
+A model is, at its core, a giant collection of matrices being multiplied by vectors. Every internal state is a vector; every learned parameter is part of a matrix. Understanding linear algebra is understanding the *shape* of a model's computation.
+
+A **vector** is an ordered list of numbers. In GenAI, a token's embedding is a vector of typically 768, 1024, 4096, or higher dimensions. Each dimension is a learned feature — not human-interpretable, but mathematically meaningful. Two words with similar meanings end up with embeddings that point in similar directions. "Bank" the financial institution and "bank" the river edge end up in different regions of the space — contextual embeddings disambiguate them on the fly.
+
+A **matrix** is a 2D grid of numbers. When a model "applies a linear layer," it multiplies an input vector by a weight matrix. The matrix's rows and columns determine how input dimensions are mixed and how many output dimensions emerge.
+
+A **tensor** is the n-dimensional generalization. A batch of 32 sequences of 512 tokens with 4096-dim embeddings is a tensor of shape [32, 512, 4096]. Every bug in a deep learning pipeline can be traced — directly or indirectly — to a tensor shape mismatch.
+
+Intuition by analogy: a vector is a point in a high-dimensional space. A matrix is a transformation that stretches, rotates, or projects that space. A neural network is a stack of such transformations interleaved with nonlinearities so that the composition can express complex functions.
+
+## 2.3 Matrix Multiplication — The Hot Path
+
+Matrix multiplication is *the* operation that dominates LLM cost. When a transformer processes a sequence, it performs trillions of multiply-and-add operations across many matrix multiplications. GPUs exist in their current form because matrix multiplication parallelizes beautifully — every output element is independent of every other output element.
+
+Worked intuition: multiplying a 4096-dim vector by a 4096×4096 weight matrix produces a new 4096-dim vector. The cost is ~16.7 million multiply-add operations. For a 70-billion-parameter model, a single forward pass through one token involves doing this kind of operation dozens of times per layer across 80+ layers. Multiply by sequence length and batch size to see why we need hardware that can do thousands of multiplications in parallel per clock cycle.
+
+This is why GPU memory bandwidth matters more than GPU clock speed for LLM inference. The math itself is simple. Moving the matrix weights from HBM (high-bandwidth memory) into the compute cores is the bottleneck.
+
+## 2.3a Counting FLOPs and Bytes 🔧
+
+The claim above, that bandwidth matters more than clock speed, can be turned into two back-of-the-envelope formulas that predict an LLM's speed limit before you rent a GPU.
+
+### FLOPs per token
+
+**Problem.** You need to estimate how much compute one generated token costs.
+
+**Why it happens.** A weight matrix of shape `[d_in, d_out]` multiplied by one input vector costs `d_in × d_out` multiplications and as many additions, so 2 FLOPs per weight. Almost all of a dense LLM's parameters live in such matrices, and each is used once per token.
+
+**Mechanism.** Forward pass cost is about `2 × N` FLOPs per token, where `N` is the parameter count. An 8B model needs about 16 GFLOPs per token. Training adds the backward pass, about twice the forward cost, giving the `6 × N` per token used in Chapter 1's scaling-law maths.
+
+### Bytes per token, and why decode is memory-bound
+
+**Problem.** A GPU with about 1,000 TFLOPS could in theory run 16-GFLOP tokens at 60,000 per second, yet a single user sees perhaps 100 to 200 tokens per second.
+
+**Why it happens.** During decode the model processes one new token per sequence per step, and every step must read *all* weights from HBM. The useful work per byte read, the *arithmetic intensity*, is tiny: a BF16 matrix-vector product does 2 FLOPs per 2-byte weight, so 1 FLOP per byte. An H100 SXM offers about 989 TFLOPS of dense BF16 compute but about 3.35 TB/s of HBM bandwidth, a ratio of roughly 300 FLOPs per byte. Below that intensity the cores wait on memory.
+
+**Implementation.**
+
+```python
+def decode_ceiling(params_billion, bytes_per_param, hbm_tb_per_s, batch=1):
+    """Upper bound on decode speed from weight reads alone (ignores KV cache reads)."""
+    weight_bytes = params_billion * 1e9 * bytes_per_param
+    steps_per_s = hbm_tb_per_s * 1e12 / weight_bytes   # one full weight read per step
+    return steps_per_s, steps_per_s * batch            # per-user tok/s, total tok/s
+
+print(decode_ceiling(8, 2.0, 3.35))      # BF16 8B on H100: ~209 tok/s per user
+print(decode_ceiling(8, 0.5, 3.35))      # 4-bit weights: ~838 tok/s ceiling
+print(decode_ceiling(8, 2.0, 3.35, 64))  # batch 64: same per-user speed, 64x total
+
+# Arithmetic intensity of a batched matmul: B tokens share one weight read
+def intensity(batch, bytes_per_param=2.0):
+    return 2 * batch / bytes_per_param   # FLOPs per byte of weights
+print(intensity(1), intensity(300))      # 1.0 vs 300: compute-bound only near batch ~300
+```
+
+### What the formulas explain
+
+- **Batching is nearly free until compute saturates.** Each step reads the weights once whatever the batch size, so serving 64 users costs about the same weight traffic as serving one. This is why inference servers batch aggressively ([AI Inference Systems](/docs/genai-handbook/13-ai-inference-systems)).
+- **Quantization speeds up decode, not just memory.** Fewer bytes per weight means more steps per second from the same bandwidth.
+- **Prefill is compute-bound.** A 2,000-token prompt processes 2,000 tokens per weight read, so its intensity is high and FLOPs decide its speed.
+
+### Edge cases
+
+- **KV cache reads grow with context and batch.** At long contexts the cache can exceed the weights in bytes read per step, so the ceiling above becomes optimistic (KV maths is in [LLM Internals](/docs/genai-handbook/04-llm-internals)).
+- **Mixture-of-experts.** Per token only the active experts' weights matter for FLOPs, but a batch touches many experts, so bytes read per step sit between the active and total sizes.
+- **Real kernels sustain noticeably less than peak bandwidth**, and the server adds scheduling and sampling overhead. Treat the result as a ceiling, not a forecast.
+
+## 2.4 Tensors and Shapes — The Debugging Currency
+
+Engineers spend more time fighting tensor shapes than any other single thing. A familiar pattern: a model expects [batch, sequence, embedding] but the data loader produces [sequence, batch, embedding]. The error message mentions a matrix multiplication dimension mismatch ten layers deep, and the actual bug is in the data loader.
+
+Conventions vary. PyTorch often uses [batch, sequence, hidden]. JAX and TensorFlow sometimes use [batch, hidden, sequence]. Attention internals sometimes reshape to [batch, heads, sequence, head_dim]. Knowing which convention each library uses is half the battle in production debugging.
+
+## 2.4a Shape Bugs in Practice 🔧
+
+Building on the conventions above, here are the three shape mistakes that cause most real bugs, with PyTorch code that shows each one and its fix.
+
+### Splitting and merging attention heads
+
+**Problem.** Multi-head attention needs `[batch, seq, hidden]` reshaped to `[batch, heads, seq, head_dim]` and back. Doing it in the wrong order scrambles data without raising an error.
+
+**Why it happens.** `view` and `reshape` reinterpret the same flat memory in a new shape. Splitting the last dimension into `(heads, head_dim)` is safe because those numbers are adjacent in memory. Moving `heads` in front of `seq` needs a `transpose`, which changes strides but not memory, so the result is *non-contiguous*.
+
+**Implementation.**
+
+```python
+import torch
+
+B, T, D, H = 2, 5, 64, 8
+x = torch.randn(B, T, D)
+
+q = x.view(B, T, H, D // H).transpose(1, 2)   # [B, H, T, d_head]
+print(q.shape, q.is_contiguous())             # torch.Size([2, 8, 5, 8]) False
+
+merged = q.transpose(1, 2).reshape(B, T, D)   # undo in reverse order
+assert torch.equal(merged, x)
+# q.view(B, T, D) raises: q is non-contiguous after the transpose.
+# q.reshape(B, T, D) runs (it copies) but interleaves heads and tokens wrongly.
+# x.view(B, H, T, D // H) runs without error but mixes tokens across heads.
+```
+
+**Edge case.** The silent version (`x.view(B, H, T, D // H)` with no transpose) produces correct shapes and garbage values. Only a numerical test against a reference implementation catches it.
+
+### Silent broadcasting
+
+**Problem.** An operation between tensors of different shapes succeeds and computes the wrong thing.
+
+**Why it happens.** Broadcasting aligns shapes from the *right*. A vector of length `n` lines up with the last dimension, not the first. When the last dimension happens to equal the batch size, nothing fails.
+
+```python
+scores = torch.randn(4, 4)                 # [batch=4, n=4], equal by coincidence
+lengths = torch.tensor([4.0, 3.0, 2.0, 1.0])  # one length per ROW
+
+wrong = scores / lengths                   # divides each COLUMN j by lengths[j]
+right = scores / lengths[:, None]          # shape [4, 1] divides each ROW
+print(torch.allclose(wrong, right))        # False, and no error was raised
+```
+
+**Edge case.** Tests with batch size 1 or with non-square shapes hide this bug, and then production traffic with a matching size triggers it. Use distinct sizes in tests (batch 3, sequence 5, hidden 16) so accidental alignment cannot happen.
+
+### Making shapes explicit
+
+**Mechanism.** Name the axes in the operation itself. `torch.einsum` and the `einops` library both do this and fail loudly on mismatch:
+
+```python
+from einops import rearrange
+
+k = torch.randn(B, H, T, D // H)
+scores = torch.einsum("bhqd,bhkd->bhqk", q, k)   # [B, H, T, T], axes named
+heads = rearrange(x, "b t (h d) -> b h t d", h=H) # same as the view+transpose above
+assert scores.shape == (B, H, T, T)
+```
+
+**Failure mode.** Assertions cost almost nothing at runtime and turn a mystery ten layers deep into an error at the line that broke. Put `assert t.shape == (...)` at module boundaries, especially where data enters from a data loader or tokenizer.
+
+## 2.5 Vectors, Norms, and Distance Metrics
+
+For embeddings to be useful, we need a notion of "closeness." Two metrics dominate in practice:
+
+**Euclidean distance** measures the straight-line distance between two points. It is sensitive to vector magnitude. If one embedding has larger numbers overall, it will appear distant from smaller ones even if they point in the same direction.
+
+**Cosine similarity** measures the angle between two vectors, ignoring magnitude. It returns 1 for vectors pointing in identical directions, 0 for perpendicular, and −1 for opposite. This is why nearly every semantic search system uses cosine similarity: we care that "dog" and "puppy" point in similar conceptual directions, not that their embeddings happen to have the same length.
+
+A practical detail: many embedding models output already-normalized vectors (unit length). For those, cosine similarity reduces to a simple dot product, which is faster and cheaper.
+
+## 2.5a Distance Metrics in Code and in Postgres 🔧
+
+The normalization detail above has a precise form: for unit vectors, all three common metrics produce the same ranking, which tells you when the choice matters and when it does not.
+
+### The identity that links them
+
+**Problem.** Teams argue over cosine versus dot product versus Euclidean without knowing whether the choice changes results.
+
+**Why it happens.** For any two vectors, `‖a − b‖² = ‖a‖² + ‖b‖² − 2 a·b`. When both have length 1, this becomes `‖a − b‖² = 2 − 2 cos(a, b)`. Euclidean distance is then a strictly decreasing function of cosine similarity, and the dot product equals cosine.
+
+**Implementation.**
+
+```python
+import numpy as np
+
+def cos(x, y):
+    return x @ y / (np.linalg.norm(x) * np.linalg.norm(y))
+
+a, b, c = np.array([3.0, 4.0]), np.array([6.0, 8.0]), np.array([4.0, 3.0])
+print(np.linalg.norm(a - b), cos(a, b))   # 5.0 and 1.0: far apart, same direction
+
+unit = lambda v: v / np.linalg.norm(v)
+ua, uc = unit(a), unit(c)
+print(np.sum((ua - uc) ** 2), 2 - 2 * (ua @ uc))   # both 0.08
+```
+
+**Consequence.** With normalized embeddings, pick whichever metric your index computes fastest (usually inner product). With unnormalized embeddings, the metrics disagree and you must use the one the embedding model was trained for, which its model card states.
+
+### The same metrics in pgvector
+
+**Mechanism.** pgvector exposes three operators: `<->` for Euclidean distance, `<#>` for *negative* inner product, and `<=>` for cosine distance (`1 − cosine similarity`). All three are distances, so `ORDER BY ... ASC` returns the nearest first.
+
+```python
+import os
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+# e.g. postgresql+psycopg://user:pass@host/db
+engine = create_async_engine(os.environ["DATABASE_URL"])
+
+
+def to_vector(v: list[float]) -> str:
+    return "[" + ",".join(map(str, v)) + "]"
+
+
+# Index built with the cosine operator class:
+#   CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+NEAREST = text("""
+    SELECT id, content, 1 - (embedding <=> CAST(:q AS vector)) AS cosine_similarity
+      FROM chunks
+     ORDER BY embedding <=> CAST(:q AS vector)
+     LIMIT :k
+""")
+
+
+async def nearest(query_embedding: list[float], k: int = 5) -> list[dict]:
+    async with engine.connect() as conn:
+        result = await conn.execute(NEAREST, {"q": to_vector(query_embedding), "k": k})
+        return [dict(row) for row in result.mappings()]
+```
+
+### Failure modes
+
+- **Operator and index mismatch.** An HNSW index built with `vector_cosine_ops` is only used by queries that order by `<=>`. Ordering by `<->` silently falls back to a sequential scan, and latency jumps from milliseconds to seconds as the table grows. Check with `EXPLAIN`.
+- **Sign confusion with `<#>`.** It returns the negative dot product so that ascending order works. Reporting it as a similarity without flipping the sign inverts your thresholds.
+- **Zero vectors.** Cosine is undefined for a zero-length vector. An empty chunk embedded by a buggy pipeline can produce one, and similarity becomes NaN. Filter empty text before embedding.
+- **Thresholds are model-specific.** A cosine score of 0.8 means different things for different embedding models, so any "relevance cut-off" must be tuned per model. Index internals are covered in [Vector Databases](/docs/genai-handbook/09-vector-databases).
+
+## 2.6 Eigenvalues, Eigenvectors, and PCA — Why You Will Eventually Care
+
+You will not implement PCA by hand. But you will hit a wall when your vector index becomes too large to fit in RAM, and the standard fix is *dimensionality reduction*: projecting 1536-dim embeddings down to 256 dims while preserving most of the semantic structure. The math underneath that operation is eigendecomposition. The takeaway: high-dimensional embeddings often have a much lower *intrinsic* dimension, and you can exploit that for cost.
+
+## 2.6a Reducing Embedding Dimensions in Code 🔧
+
+To make the PCA idea above concrete, this section reduces embeddings with a few lines of NumPy and lists the rules that keep the reduced index correct.
+
+### PCA through SVD
+
+**Problem.** A 1536-dim index is too large for RAM, and you want to keep most of the semantic structure in fewer dimensions.
+
+**Why it works.** PCA finds the orthogonal directions along which the data varies most. Singular value decomposition of the centered data matrix `X − mean = U S Vᵀ` gives those directions as the rows of `Vᵀ`, ordered by the singular values `S`. The share of variance kept by the first `k` directions is `sum(S[:k]²) / sum(S²)`.
+
+**Implementation.**
+
+```python
+import numpy as np
+
+def fit_pca(sample: np.ndarray, k: int):
+    mean = sample.mean(axis=0)
+    _, S, Vt = np.linalg.svd(sample - mean, full_matrices=False)
+    kept = (S[:k] ** 2).sum() / (S ** 2).sum()
+    return mean, Vt[:k], kept
+
+def project(X: np.ndarray, mean: np.ndarray, components: np.ndarray) -> np.ndarray:
+    Z = (X - mean) @ components.T
+    return Z / np.linalg.norm(Z, axis=1, keepdims=True)   # re-normalize for cosine
+
+# Synthetic data with low intrinsic dimension: 32 latent factors spread over 1536 dims
+rng = np.random.default_rng(0)
+latent = rng.standard_normal((20_000, 32))
+mix = rng.standard_normal((32, 1536))
+X = latent @ mix + 0.1 * rng.standard_normal((20_000, 1536))
+
+mean, comps, kept = fit_pca(X[:5_000], k=64)   # fit on a sample, not the full corpus
+print(f"variance kept with 64 dims: {kept:.3f}")    # close to 1.0 for this data
+reduced = project(X, mean, comps)                    # shape [20000, 64]
+```
+
+### Rules that keep the index correct
+
+- **Fit once, apply everywhere.** Store `mean` and `components` with the index version. Every query embedding must go through the *same* projection, or query and documents live in different spaces.
+- **Fit on a representative sample.** SVD of millions of rows is expensive and unnecessary. Tens of thousands of rows drawn across all document types are usually enough, but a sample that misses a domain will compress that domain badly.
+- **Measure recall, not variance.** Variance kept is a proxy. The real test is retrieval quality: run your evaluation queries against the full and reduced index and compare recall@k.
+
+### The cheaper alternative: Matryoshka embeddings
+
+**Mechanism.** Some embedding models are trained so that the first `k` dimensions already form a good embedding (the matryoshka objective mentioned in 2.11). For those you can simply truncate and re-normalize, with no fitting step. OpenAI's text-embedding-3 models, for example, accept a `dimensions` parameter that does this server-side.
+
+**Edge case.** Truncating a model *not* trained this way throws away arbitrary information and can hurt recall far more than PCA. Check the model card before truncating.
+
+## 2.7 Probability — The Operating System of LLMs
+
+LLMs do not output text. They output a probability distribution over the entire vocabulary for each next token. A 100,000-token vocabulary means the model emits 100,000 numbers, each between 0 and 1, summing to 1. The text you see is the result of *sampling* from that distribution.
+
+This is why the same prompt produces different outputs. This is why temperature, top-k, and top-p exist — they control the shape of the distribution before sampling. Temperature 0 collapses the distribution to its single most likely token (deterministic, repetitive). High temperature flattens the distribution toward uniform (creative, unpredictable, more error-prone).
+
+Understanding this collapses a hundred mysteries: why your structured output sometimes drifts, why your evaluation scores are noisy run-to-run, why a function-calling agent occasionally invents a tool name. The model is sampling from a distribution; rare events do happen.
+
+## 2.7a Reading the Distribution: Logprobs in Practice 🔧
+
+Since the model emits a full distribution, many APIs let you see part of it as *log probabilities*, and that turns a text generator into a classifier with a confidence score.
+
+### Getting a confidence score from a one-token answer
+
+**Problem.** You use an LLM to classify (is this ticket urgent, does this answer cite the source) and need a probability, not just a label, so you can route uncertain cases to a human.
+
+**Why it works.** A logprob is `log(p)` for a token. `exp(logprob)` recovers the probability the model assigned. If the answer is a single token such as "yes" or "no", the first token's distribution *is* the model's belief.
+
+**Implementation (Python, OpenAI-compatible API).**
+
+```python
+import math
+import os
+
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()
+
+
+async def yes_no_confidence(question: str) -> float:
+    res = await client.chat.completions.create(
+        model=os.environ["CLASSIFIER_MODEL"],
+        messages=[
+            {"role": "system", "content": "Answer with exactly one word: yes or no."},
+            {"role": "user", "content": question},
+        ],
+        max_tokens=1,
+        temperature=0,
+        logprobs=True,
+        top_logprobs=5,
+    )
+
+    lp = res.choices[0].logprobs
+    top = lp.content[0].top_logprobs if lp and lp.content else []
+    # "Yes", " yes" and "yes" are different tokens: fold them together
+    p_yes = p_no = 0.0
+    for t in top:
+        word = t.token.strip().lower()
+        if word == "yes":
+            p_yes += math.exp(t.logprob)
+        elif word == "no":
+            p_no += math.exp(t.logprob)
+    if p_yes + p_no == 0:
+        raise ValueError("Model did not answer yes or no")
+    return p_yes / (p_yes + p_no)  # renormalized over the two valid answers
+```
+
+### Edge cases and failure modes
+
+- **Token variants.** The same word appears as several tokens (with or without a leading space, capitalized or not). Summing variants, as above, avoids under-counting.
+- **Missing mass.** The top few logprobs rarely sum to 1. Renormalizing over the valid labels answers "given that it picked a valid label, how sure was it", which is usually what you want.
+- **Calibration.** Instruction-tuned models are often over-confident: a 0.95 does not mean right 95 percent of the time. Before using the score as a threshold, plot accuracy against score on a labelled set and pick the cut-off from that plot.
+- **Availability.** Not every model or provider returns logprobs. Reasoning models often do not, because the visible answer follows hidden reasoning tokens. Design the fallback (ask for a verbal confidence, or sample several times and count votes) before you depend on it.
+
+## 2.8 Statistics — Evaluation in Disguise
+
+Every claim you make about a model — "it is 5% better than the baseline" — is a statistical claim that requires sample size, confidence intervals, and significance testing. The most common production mistake is comparing two prompts on 10 examples each, declaring a winner, and shipping the change. With LLM noise, 10 examples is not enough to distinguish real improvements from sampling variation.
+
+Practical rule of thumb: any A/B comparison on subjective output quality needs hundreds of examples, ideally graded by multiple independent judges, before you trust the verdict.
+
+## 2.8a How Many Examples Is Enough? 🔧
+
+The rule of thumb above comes from a short calculation; doing it yourself tells you how big an eval set must be for the size of improvement you care about.
+
+### Standard error of a pass rate
+
+**Problem.** Prompt B scores 82 percent and prompt A scores 78 percent on 100 examples. Is B better?
+
+**Why it happens.** A pass rate measured on `n` examples has standard error `sqrt(p × (1 − p) / n)`. At `p = 0.8` and `n = 100` that is 0.04, so the 95 percent confidence interval is roughly plus or minus 8 points. A 4-point gap sits well inside the noise.
+
+**Mechanism.** The sample size needed to detect a difference `δ` between two independent pass rates (95 percent confidence, 80 percent power) is roughly:
+
+```text
+n per variant ≈ (1.96 + 0.84)² × 2 × p × (1 − p) / δ²
+p = 0.8, δ = 0.03  ->  n ≈ 2,800 per variant
+p = 0.8, δ = 0.10  ->  n ≈ 250 per variant
+```
+
+### Paired comparison with a bootstrap
+
+**Problem.** Thousands of labelled examples are expensive.
+
+**Mechanism.** Run both variants on the *same* examples and analyze the per-example differences. Hard examples are hard for both prompts, so that shared difficulty cancels out and the comparison needs fewer examples. A bootstrap gives a confidence interval without distribution assumptions.
+
+**Implementation.**
+
+```python
+import numpy as np
+
+def paired_bootstrap(scores_a, scores_b, n_boot=10_000, seed=0):
+    """scores are per-example values (0/1 pass, or a judge score) on the SAME examples."""
+    diff = np.asarray(scores_b, float) - np.asarray(scores_a, float)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(diff), size=(n_boot, len(diff)))
+    boot_means = diff[idx].mean(axis=1)
+    lo, hi = np.percentile(boot_means, [2.5, 97.5])
+    return diff.mean(), (lo, hi)
+
+rng = np.random.default_rng(1)
+a = rng.random(300) < 0.78
+b = a | (rng.random(300) < 0.08)        # B fixes some of A's failures
+mean, (lo, hi) = paired_bootstrap(a, b)
+print(f"B - A = {mean:+.3f}, 95% CI [{lo:+.3f}, {hi:+.3f}]")
+# Ship only if the whole interval is above 0 (or above your minimum useful gain)
+```
+
+### Failure modes
+
+- **Correlated examples.** Ten questions about the same document are not ten independent samples. Resample by document (cluster bootstrap), or the interval will be too narrow.
+- **Generation noise.** Each example's score itself varies between runs (see 1.1a in [Introduction to GenAI](/docs/genai-handbook/01-introduction-to-genai)). Average several samples per example for noisy tasks.
+- **Many comparisons.** Testing twenty prompt variants and shipping the best guarantees a false winner now and then. Keep a held-out set to confirm the winner.
+- **Judge noise.** An LLM judge adds its own variance and biases. Check judge agreement with human labels on a subset ([Monitoring and Observability](/docs/genai-handbook/19-monitoring-observability) covers LLM-as-judge).
+
+## 2.9 Calculus and Gradient Descent — How Models Learn
+
+Training is, mechanically, a loop. The model makes a prediction, the loss function measures how wrong it was, and the *gradient* — the partial derivative of the loss with respect to every parameter — tells you which direction to nudge each parameter to reduce the loss. The update step takes a small step in that direction. Repeat billions of times across trillions of tokens, and the matrices stop being random and start encoding language.
+
+You will not write a backward pass. But you will reason about *learning rates* (step size), *gradient clipping* (preventing explosive updates), and *optimizer state* (Adam stores two moments per parameter, which is why training memory is roughly 3× model size).
+
+## 2.10 Softmax — The Function Every LLM Output Passes Through
+
+Softmax turns a vector of arbitrary real numbers into a probability distribution. Each output element is the exponential of the input divided by the sum of exponentials. This converts the model's raw "logits" (uncalibrated scores) into a proper probability distribution that sums to 1.
+
+Why exponentials? Because exponentials amplify differences. A logit that is twice as large does not become twice as probable — it becomes exponentially more probable. This is what makes LLMs decisive about confident predictions and uncertain about borderline ones.
+
+Temperature is implemented as *dividing the logits by a temperature value before softmax*. Temperature &lt; 1 sharpens the distribution (more decisive); temperature > 1 flattens it (more uniform). Temperature = 0 is a special case that becomes "argmax" — pick the single highest logit.
+
+## 2.10a Numerical Stability: Stable Softmax and Log-Sum-Exp ➕
+
+The exponentials that make softmax decisive also make it numerically dangerous, and every framework uses the same small trick to stay safe, which you need to know when you write your own sampling, scoring or loss code.
+
+### Overflow in the exponential
+
+**Problem.** A naive softmax returns `nan` for perfectly reasonable logits.
+
+**Why it happens.** Float32 can represent numbers up to about `3.4e38`, so `exp(x)` overflows to infinity for `x` above about 88.7. Float16 tops out at 65,504, so `exp(x)` overflows above about 11. Logits of 100 or more are normal in large models. Infinity divided by infinity is `nan`.
+
+**Mechanism.** Softmax does not change when you subtract the same constant from every logit, because the constant cancels between numerator and denominator. Subtracting the maximum makes the largest exponent `exp(0) = 1` and all others at most 1, so nothing can overflow.
+
+**Implementation.**
+
+```python
+import numpy as np
+
+def softmax_naive(z):
+    e = np.exp(z)
+    return e / e.sum()
+
+def softmax_stable(z):
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+z = np.array([1000.0, 999.0, 990.0])
+print(softmax_naive(z))    # [nan nan nan] plus an overflow warning
+print(softmax_stable(z))   # [0.731 0.269 0.0000333]
+```
+
+### Underflow and the log-sum-exp trick
+
+**Problem.** Loss functions and sequence scores need `log(p)`, and computing `log(softmax(z))` loses rare tokens.
+
+**Why it happens.** A probability like `1e-50` underflows to 0 in float32 (and far sooner in float16), and `log(0)` is negative infinity. One such token in a training batch turns the loss into infinity and the gradients into `nan`.
+
+**Mechanism.** Work in log space from the start. `log softmax(z)_i = z_i − log(sum_j exp(z_j))`, and the second term is computed stably as `m + log(sum_j exp(z_j − m))` with `m = max(z)`. That expression is called *log-sum-exp*.
+
+```python
+def logsumexp(z):
+    m = z.max()
+    return m + np.log(np.exp(z - m).sum())
+
+def log_softmax(z):
+    return z - logsumexp(z)
+
+z = np.array([0.0, -120.0])
+print(np.log(softmax_stable(z.astype(np.float32))))  # [0. -inf]: the rare token is lost
+print(log_softmax(z))                                # [0. -120.]: exact
+```
+
+### Where this shows up in your code
+
+- **Loss functions take logits, not probabilities.** PyTorch's `F.cross_entropy` applies log-softmax internally with this trick. Passing it probabilities you already softmaxed is a common bug: it double-applies softmax and learning stalls.
+- **Sequence scores add logprobs.** The probability of a 200-token answer is the product of 200 numbers below 1, which underflows. Sum the logprobs instead (this is what APIs return).
+- **Masked rows.** Attention masks set blocked positions to negative infinity. If *every* position in a row is masked (for example a fully padded sequence), the maximum is negative infinity, `z − max` is `nan`, and the `nan` spreads through the network. Production kernels special-case this; your own code must too.
+- **Low precision.** In float16 the safe range is tiny, which is one reason softmax and loss are usually computed in float32 even in mixed-precision training (see [Deep Learning Fundamentals](/docs/genai-handbook/03-deep-learning-fundamentals)).
+
+## 2.11 Embeddings Mathematics
+
+An embedding is a learned mapping from a discrete token (or sentence, or image) to a continuous vector. The training objective is constructed so that semantically similar inputs end up with similar vectors. Common objectives include masked language modeling (BERT-style), contrastive learning (pull similar pairs together, push dissimilar pairs apart), and matryoshka representations (the first N dimensions are themselves a useful embedding).
+
+Operational implications:
+- Embedding spaces are *not interchangeable*. Embeddings from one model cannot be compared meaningfully to embeddings from another.
+- The dimensionality is a design choice with cost implications. 1536-dim vectors store more nuance than 256-dim but cost 6× the storage and bandwidth.
+- Embeddings drift if the model is retrained. Your vector index becomes worthless until reindexed.
+
+## 2.12 Attention Mathematics — The Heart of the Transformer
+
+Attention computes, for each token, a weighted combination of all other tokens' representations. The weights come from three projections of each token's embedding: query (Q), key (K), and value (V). For each token, its query is compared against every other token's key to produce attention scores; those scores are passed through softmax to become weights; those weights are applied to the value vectors and summed.
+
+Conceptually: "for each word in my sentence, look at every other word, decide how much each matters to me right now, and mix their information into my own representation accordingly." Do this many times in parallel (multi-head attention) so different heads can capture different relationships (syntactic, semantic, coreference, positional).
+
+Cost: comparing every token against every other token is *O(n²)* in sequence length. This is the quadratic wall mentioned in Chapter 1. Every long-context optimization is an attack on this cost.
+
+## 2.12a Attention Step by Step, with Shapes 🔧
+
+The description above is easiest to trust once you have computed it yourself, so here is multi-head causal attention in about twenty lines of NumPy, with the shape of every tensor and a check against PyTorch.
+
+### The shapes
+
+For one sequence of `T` tokens, hidden size `D`, and `H` heads of size `d = D / H`:
+
+| Step | Operation | Shape |
+| --- | --- | --- |
+| Input | token representations `x` | `[T, D]` |
+| Project | `x @ Wq`, `x @ Wk`, `x @ Wv` | `[T, D]` each |
+| Split heads | reshape and transpose | `[H, T, d]` each |
+| Scores | `q @ kᵀ / sqrt(d)` | `[H, T, T]` |
+| Mask | set future positions to `-inf` | `[H, T, T]` |
+| Weights | softmax over the last axis | `[H, T, T]`, rows sum to 1 |
+| Mix | `weights @ v` | `[H, T, d]` |
+| Merge heads | transpose and reshape | `[T, D]` |
+| Output projection | `@ Wo` | `[T, D]` |
+
+The `[H, T, T]` score tensor is the quadratic term: at `T = 100,000` it has 10 billion entries per head.
+
+### Implementation
+
+```python
+import numpy as np
+
+def softmax(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)          # stable softmax, see 2.10a
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+
+def attention(q, k, v, causal=True):
+    """q, k, v: [H, T, d]"""
+    d = q.shape[-1]
+    scores = q @ k.transpose(0, 2, 1) / np.sqrt(d)   # [H, T, T]
+    if causal:
+        T = q.shape[1]
+        future = np.triu(np.ones((T, T), dtype=bool), k=1)   # True above the diagonal
+        scores = np.where(future, -np.inf, scores)
+    weights = softmax(scores)                         # [H, T, T]
+    return weights @ v, weights                       # [H, T, d]
+
+def multi_head_attention(x, Wq, Wk, Wv, Wo, n_heads):
+    T, D = x.shape
+    d = D // n_heads
+    split = lambda m: m.reshape(T, n_heads, d).transpose(1, 0, 2)   # [H, T, d]
+    out, weights = attention(split(x @ Wq), split(x @ Wk), split(x @ Wv))
+    out = out.transpose(1, 0, 2).reshape(T, D)        # concatenate heads
+    return out @ Wo, weights
+
+rng = np.random.default_rng(0)
+T, D, H = 6, 32, 4
+x = rng.standard_normal((T, D))
+Wq, Wk, Wv, Wo = (rng.standard_normal((D, D)) / np.sqrt(D) for _ in range(4))
+y, w = multi_head_attention(x, Wq, Wk, Wv, Wo, H)
+print(y.shape, w.shape)          # (6, 32) (4, 6, 6)
+print(np.round(w[0], 2))         # lower-triangular: no token sees the future
+```
+
+Checking the core against PyTorch's fused kernel confirms the maths:
+
+```python
+import torch
+import torch.nn.functional as F
+
+q, k, v = (rng.standard_normal((H, T, D // H)) for _ in range(3))
+ours, _ = attention(q, k, v, causal=True)
+ref = F.scaled_dot_product_attention(*(torch.tensor(t) for t in (q, k, v)), is_causal=True)
+print(np.allclose(ours, ref.numpy(), atol=1e-6))   # True
+```
+
+### Why divide by sqrt(d)
+
+**Problem.** Without scaling, attention becomes nearly one-hot early in training and gradients vanish.
+
+**Why it happens.** If the entries of `q` and `k` are roughly independent with variance 1, their dot product is a sum of `d` such products, so its variance is `d`. With `d = 128` the scores have a standard deviation of about 11, and softmax of numbers that far apart puts almost all weight on one position. Saturated softmax has near-zero gradient. Dividing by `sqrt(d)` brings the variance back to 1.
+
+```python
+d = 128
+qs, ks = rng.standard_normal((10_000, d)), rng.standard_normal((10_000, d))
+dots = (qs * ks).sum(axis=1)
+print(dots.std(), (dots / np.sqrt(d)).std())   # ~11.3 vs ~1.0
+```
+
+### Edge cases
+
+- **Memory.** The naive version stores the full `[H, T, T]` matrix. FlashAttention computes the same result in tiles without ever storing it, which is why long contexts fit at all (see 4.3a in [LLM Internals](/docs/genai-handbook/04-llm-internals)).
+- **Padding.** Batches of different-length sequences also need a padding mask. A row where every key is masked produces `nan` (see 2.10a).
+- **Decode time.** During generation `q` has length 1 while `k` and `v` come from the cache, so the score tensor is `[H, 1, T]`. That is why decode cost per token grows linearly with context, not quadratically.
+
+## 2.13 Token Probability and Sampling Math
+
+Beyond temperature, two more sampling controls dominate production:
+
+**Top-k sampling** restricts the distribution to the k highest-probability tokens, renormalizes, and samples. This bounds how exotic the output can be while preserving diversity within the top k.
+
+**Top-p (nucleus) sampling** restricts to the smallest set of tokens whose cumulative probability exceeds p (typically 0.9). When the model is confident, this set is tiny; when uncertain, it widens. This is adaptive in a way top-k is not.
+
+These controls matter more than people realize. Many "hallucination" complaints disappear when temperature is lowered and top-p tightened.
+
+## 2.13a A Sampler in Code, Including Min-p 🔧
+
+The controls above are easier to reason about once you see that each one is a few lines that zero out part of the distribution; this section writes the full sampler and adds min-p, a newer control that many open-source servers now support.
+
+### The sampler
+
+**Mechanism.** Every control runs after the model produces logits and before the random draw: scale by temperature, compute probabilities, build a "keep" mask from each truncation rule, zero out the rest, renormalize, sample.
+
+**Implementation.**
+
+```python
+import numpy as np
+
+def softmax(z):
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+def sample_next(logits, temperature=1.0, top_k=0, top_p=1.0, min_p=0.0, rng=None):
+    rng = rng or np.random.default_rng()
+    if temperature == 0:
+        return int(np.argmax(logits))                 # greedy: no division by zero
+    probs = softmax(logits / temperature)
+    keep = np.ones_like(probs, dtype=bool)
+
+    if top_k > 0:                                     # k most likely tokens
+        kth_largest = np.sort(probs)[-top_k]
+        keep &= probs >= kth_largest
+    if top_p < 1.0:                                   # smallest prefix with mass >= p
+        order = np.argsort(-probs)
+        cutoff = np.searchsorted(np.cumsum(probs[order]), top_p) + 1
+        nucleus = np.zeros_like(keep)
+        nucleus[order[:cutoff]] = True
+        keep &= nucleus
+    if min_p > 0.0:                                   # relative to the top token
+        keep &= probs >= min_p * probs.max()
+
+    p = np.where(keep, probs, 0.0)
+    return int(rng.choice(len(p), p=p / p.sum()))
+
+confident = np.array([8.0, 3.0, 2.5, 2.0, 1.0])
+uncertain = np.array([2.0, 1.9, 1.8, 1.7, 1.6])
+for name, z in [("confident", confident), ("uncertain", uncertain)]:
+    probs = softmax(z)
+    print(name, np.round(probs, 3), "min_p=0.1 keeps", int((probs >= 0.1 * probs.max()).sum()))
+# confident keeps 1 token, uncertain keeps all 5: the cut-off adapts to the model's confidence
+```
+
+### Why min-p exists
+
+**Problem.** At high temperature, top-p lets in junk. Temperature flattens the distribution, so the nucleus needed to reach 0.9 of the mass grows to include many low-quality tokens, and the text derails.
+
+**Why it happens.** Top-p sets an *absolute* mass target that ignores how dominant the top token is. Min-p (Nguyen et al., ICLR 2025) instead keeps tokens whose probability is at least a fraction of the top token's probability. When the model is confident, a top token at 0.9 with `min_p = 0.1` keeps only tokens above 0.09. When it is unsure, the threshold drops and more options survive. The authors report better quality at higher temperatures, and Hugging Face Transformers, vLLM and llama.cpp implement it. A 2025 follow-up paper disputes how large the gains are, so treat it as a tool to evaluate, not a guaranteed win.
+
+### Edge cases
+
+- **Order of operations differs between libraries.** Whether temperature is applied before or after truncation, and in which order top-k, top-p and min-p run, changes the result. Read your server's docs before porting settings between vLLM, llama.cpp and a hosted API.
+- **Temperature 0 is a special case**, not a tiny temperature. Dividing by a very small number is numerically fine with stable softmax, but servers treat 0 as greedy, which you should match.
+- **Truncation can remove everything except one token.** With aggressive settings sampling becomes greedy without you noticing, and repetition loops come back.
+- **Hosted APIs often expose only some controls.** Many closed APIs offer temperature and top-p but not top-k or min-p, and some reasoning models ignore sampling parameters entirely.
+
+## 2.14 Positional Encoding Math
+
+Attention is permutation-invariant by default — it has no idea which token came first. Positional encoding injects the order. Two families dominate:
+
+**Sinusoidal (absolute) encodings** add fixed sine and cosine signals at varying frequencies to the embeddings. Different positions get different patterns of waves, which the model learns to interpret.
+
+**Rotary Position Embeddings (RoPE)** rotate the query and key vectors in a position-dependent way before the attention dot product. This is the standard in modern LLMs (Llama, Qwen, Mistral) because it generalizes better to longer contexts than the model was trained on.
+
+The math matters operationally because *long-context inference depends on positional encoding choice*. Models with poorly chosen encodings degrade abruptly past training length; RoPE-based models degrade more gracefully and can be extended with techniques like NTK scaling and YaRN.
+
+## 2.15 Production Architecture Implications
+
+Every architectural decision in later chapters can be traced back to math in this chapter:
+- KV cache exists because the Q-K-V projections are expensive and reusable for previously seen tokens.
+- Quantization works because the matrices have enough redundancy that 4-bit precision preserves most of their information.
+- Speculative decoding works because most next-token predictions are easy and a small model agrees with a large model on them.
+- Embedding dimensionality reduction works because high-dim vectors have lower intrinsic dimension.
+
+## 2.16 Common Mistakes
+
+- Comparing embeddings from different models.
+- Trusting evaluation results from tiny sample sizes.
+- Treating temperature 0 as "deterministic" — it is, but the resulting outputs are often degenerate (repetitive loops).
+- Confusing token count with character count when budgeting context windows.
+- Assuming attention is linear in context length when planning latency budgets.
+
+## 2.17 Interview Questions
+
+- Why is attention quadratic, and how do production systems work around that?
+- Explain temperature in one sentence using softmax.
+- Why is cosine similarity preferred over Euclidean for embedding search?
+- What does the optimizer state add to memory requirements during training?
+- Why does RoPE generalize better to long contexts than sinusoidal encoding?
+
+**➕ More questions:**
+
+- *Why subtract the maximum logit before softmax?* — **Softmax is unchanged by a constant shift, and the shift keeps every exponent at or below 0, so nothing overflows.**
+- *Why is attention scaled by the square root of the head dimension?* — **A dot product of `d` unit-variance terms has variance `d`. Dividing by `sqrt(d)` restores variance 1 so softmax does not saturate and gradients keep flowing.**
+- *Estimate the maximum decode speed of an 8B BF16 model on a GPU with 3.35 TB/s of bandwidth.* — **Each step reads 16 GB of weights, so about 200 tokens per second per sequence at best. Batching raises total throughput, not per-user speed.**
+- *How does min-p differ from top-p?* — **Top-p keeps a fixed share of probability mass. Min-p keeps tokens above a fraction of the top token's probability, so its cut-off tightens when the model is confident and loosens when it is not.**
+- *Prompt B beats prompt A by 4 points on 100 examples. Ship it?* — **No. The 95 percent interval on each pass rate is about plus or minus 8 points. Run a paired comparison on more examples and check that the interval on the difference excludes zero.**
+
+## 2.18 Hands-on Exercises
+
+1. For a vocabulary of 100,000 tokens and a sequence of 2,048 tokens, estimate the size of the logits tensor for one forward pass.
+2. If a model produces 1536-dim embeddings and you store 10 million documents, calculate raw vector storage in GB (float32) and after 8-bit quantization.
+3. For a 70B model with FP16 weights, estimate model size on disk and required VRAM for inference at batch size 1.
+4. Explain in one paragraph, without equations, what changes when temperature goes from 0.2 to 1.5.
+
+## 2.19 Enterprise Best Practices
+
+Standardize the embedding model across the organization or pay the cost of re-embedding every time a team picks a different one. Document the embedding model and version inside the vector index metadata so future engineers can detect drift. Cache attention computations (KV cache) whenever the conversation has a stable prefix. When evaluating prompt changes, use enough samples that statistical significance — not anecdote — drives the decision.
+
+## Sources
+
+Sources for the 🔧 and ➕ additions:
+
+- NVIDIA H100 Tensor Core GPU datasheet (BF16 TFLOPS, HBM3 bandwidth): https://www.nvidia.com/en-us/data-center/h100/
+- Kaplan et al., "Scaling Laws for Neural Language Models" (2N forward FLOPs per token, 2020): https://arxiv.org/abs/2001.08361
+- PyTorch docs, `torch.nn.functional.scaled_dot_product_attention`: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+- PyTorch docs, `torch.nn.functional.cross_entropy`: https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html
+- einops documentation: https://einops.rocks/
+- Vaswani et al., "Attention Is All You Need" (scaled dot-product attention, 2017): https://arxiv.org/abs/1706.03762
+- pgvector README (distance operators, operator classes): https://github.com/pgvector/pgvector
+- Kusupati et al., "Matryoshka Representation Learning" (2022): https://arxiv.org/abs/2205.13147
+- OpenAI, "New embedding models and API updates" (`dimensions` parameter, 2024): https://openai.com/index/new-embedding-models-and-api-updates/
+- OpenAI API reference, Chat Completions `logprobs` and `top_logprobs`: https://platform.openai.com/docs/api-reference/chat
+- OpenAI Cookbook, "Using logprobs": https://cookbook.openai.com/examples/using_logprobs
+- Nguyen et al., "Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs" (ICLR 2025): https://arxiv.org/abs/2407.01082
+- "Min-p, Max Exaggeration: A Critical Analysis of Min-p Sampling in Language Models" (2025): https://arxiv.org/abs/2506.13681
+- Efron and Tibshirani, "An Introduction to the Bootstrap" (1993), for the bootstrap method.

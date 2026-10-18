@@ -1,0 +1,874 @@
+---
+title: "Generators and yield"
+description: "How generator functions suspend and resume, yield as a two-way expression with send, throw and close, yield from delegation, streaming pipelines, and the road from generators to asyncio coroutines."
+---
+
+A generator is a function that can pause in the middle, hand a value to its caller, and later continue exactly where it stopped, with all its local variables intact. That one ability gives you lazy iterators with almost no code, streaming pipelines that process gigabytes in kilobytes of memory, and historically it was the engine that Python's `async`/`await` was built on.
+
+This page assumes you know the iterator protocol from [Iterators and Iterables](/docs/python/iterators-and-iterables): a generator object **is** an iterator.
+
+<Callout type="info">
+All outputs on this page were produced with **CPython 3.14.6**. Version-specific behaviour is called out where it matters.
+</Callout>
+
+## Generator functions: calling one runs nothing
+
+Any `def` whose body contains `yield` (anywhere, even in unreachable code) is compiled as a **generator function**. Calling it does not execute the body. It builds a generator object and returns it immediately. The body runs only when someone calls `next()` on that object, and it runs only until the next `yield`.
+
+```python
+def countdown(n):
+    print("  starting")
+    while n > 0:
+        print(f"  about to yield {n}")
+        yield n
+        print(f"  resumed after {n}")
+        n -= 1
+    print("  finished")
+
+gen = countdown(2)
+print("created:", type(gen).__name__)
+print("next ->", next(gen))
+print("next ->", next(gen))
+try:
+    next(gen)
+except StopIteration:
+    print("StopIteration")
+```
+
+```text title="Output"
+created: generator
+  starting
+  about to yield 2
+next -> 2
+  resumed after 2
+  about to yield 1
+next -> 1
+  resumed after 1
+  finished
+StopIteration
+```
+
+Notice that `"starting"` was not printed when `countdown(2)` was called, only on the first `next`. When the body falls off the end (or hits `return`), the generator raises `StopIteration`, which is exactly what the iterator protocol requires.
+
+The "is it a generator" decision is made **at compile time**, by the presence of `yield`:
+
+```python
+import inspect
+def gen_fn():
+    yield 1
+def normal():
+    return 1
+print(inspect.isgeneratorfunction(gen_fn), inspect.isgeneratorfunction(normal))
+g = gen_fn()
+print(iter(g) is g, hasattr(g, "__next__"), hasattr(g, "send"))
+def never_yields():
+    return "hi"
+    yield         # unreachable, but its presence makes this a generator function
+print(type(never_yields()).__name__)
+```
+
+```text title="Output"
+True False
+True True True
+generator
+```
+
+That last case is a real trap: if you add a `yield` to debug something inside a normal function, every caller now gets a generator object instead of the return value, and nothing in the body runs.
+
+<Callout title="Coming from JS">
+JS marks generators syntactically with `function*`. Python has no marker; the presence of `yield` alone decides it. Otherwise the model is the same: calling the function returns a paused generator object, and `next()` runs it to the next `yield`. The difference is in the result shape: JS `gen.next()` returns `{ value, done }`, while Python `next(gen)` returns the value and raises `StopIteration` at the end.
+</Callout>
+
+## How suspension works: the frame stays alive
+
+A normal function call creates a **frame** (the record holding local variables, the evaluation stack, and the current instruction pointer). When the function returns, the frame is thrown away.
+
+A generator keeps its frame. In CPython 3.11+, the generator object physically embeds its frame data (`_PyInterpreterFrame`) inside itself. On `next()`, the interpreter links that frame into the current call stack and resumes execution at the saved instruction. On `yield`, it saves the instruction pointer, unlinks the frame from the stack, and returns the yielded value to the caller. Nothing is copied: locals simply stay where they were.
+
+You can see the machinery with `dis`:
+
+```python
+import dis
+def g():
+    x = yield 1
+dis.dis(g)
+```
+
+```text title="Output"
+   3           RETURN_GENERATOR
+               POP_TOP
+       L1:     RESUME                   0
+
+   4           LOAD_SMALL_INT           1
+               YIELD_VALUE              0
+               RESUME                   5
+               STORE_FAST               0 (x)
+               LOAD_CONST               1 (None)
+               RETURN_VALUE
+
+  --   L2:     CALL_INTRINSIC_1         3 (INTRINSIC_STOPITERATION_ERROR)
+               RERAISE                  1
+ExceptionTable:
+  L1 to L2 -> L2 [0] lasti
+```
+
+- `RETURN_GENERATOR` is the very first instruction: calling `g()` creates the generator object, copies the frame into it, and returns it without running anything else.
+- `YIELD_VALUE` suspends and hands `1` out. The following `RESUME` is where execution continues later, and the value pushed at that point (from `send`) is what gets stored into `x`.
+- `RETURN_VALUE` in a generator turns into `StopIteration(value)`.
+- The exception table entry catches a `StopIteration` that escapes the body and converts it to `RuntimeError` (PEP 479, covered below).
+
+### Generator states and `gi_*` attributes
+
+A generator is always in one of four states, which `inspect.getgeneratorstate` reports:
+
+<Mermaid chart={`stateDiagram-v2
+    [*] --> GEN_CREATED: "gen = f()"
+    GEN_CREATED --> GEN_RUNNING: "next(gen) or send(None)"
+    GEN_RUNNING --> GEN_SUSPENDED: "hits yield"
+    GEN_SUSPENDED --> GEN_RUNNING: "next / send / throw"
+    GEN_RUNNING --> GEN_CLOSED: "return, falls off end, or exception escapes"
+    GEN_SUSPENDED --> GEN_CLOSED: "close()"
+    GEN_CREATED --> GEN_CLOSED: "close()"
+    GEN_CLOSED --> [*]
+`} />
+
+```python
+import inspect
+def worker():
+    x = 10
+    yield x
+    x += 1
+    yield x
+
+g = worker()
+print(inspect.getgeneratorstate(g), g.gi_running, g.gi_suspended)
+next(g)
+print(inspect.getgeneratorstate(g), g.gi_frame.f_locals, g.gi_suspended)
+next(g)
+print(inspect.getgeneratorstate(g), g.gi_frame.f_locals)
+try:
+    next(g)
+except StopIteration:
+    pass
+print(inspect.getgeneratorstate(g), g.gi_frame)
+print(g.gi_code.co_name)
+```
+
+```text title="Output"
+GEN_CREATED False False
+GEN_SUSPENDED {'x': 10} True
+GEN_SUSPENDED {'x': 11}
+GEN_CLOSED None
+worker
+```
+
+- `gi_frame` is the live frame while the generator can still run, and becomes `None` once it is closed. Its `f_locals` shows the suspended locals, which is handy in a debugger.
+- `gi_running` is `True` only while the body is executing. `gi_suspended` (3.11+) is `True` while paused at a `yield`.
+- `gi_code` is the code object; `gi_yieldfrom` is the sub-iterator during a `yield from` (or `None`).
+
+A generator cannot be re-entered while it is running. Trying to advance a generator from inside its own body raises:
+
+```python
+def selfish():
+    yield next(g)     # tries to advance itself
+g = selfish()
+try:
+    next(g)
+except ValueError as e:
+    print("ValueError:", e)
+```
+
+```text title="Output"
+ValueError: generator already executing
+```
+
+The same error appears if two threads call `next()` on one generator at the same moment. Generators are not thread-safe; give each consumer its own, or guard with a lock.
+
+### `return` inside a generator
+
+A `return value` in a generator ends it and stores `value` on the `StopIteration` exception. `for` loops and `list()` throw that value away; only `yield from` (and manual handling) sees it.
+
+```python
+def gen():
+    yield 1
+    return "done!"
+
+g = gen()
+next(g)
+try:
+    next(g)
+except StopIteration as e:
+    print("return value:", e.value)
+print(list(gen()))   # for-loops and list() discard the return value
+```
+
+```text title="Output"
+return value: done!
+[1]
+```
+
+### PEP 479: `StopIteration` inside a generator becomes `RuntimeError`
+
+Before Python 3.7, a `StopIteration` that leaked out of a generator body (for example from a bare `next()` on an empty iterator) silently ended the generator. That hid real bugs: a missing row looked like the natural end of the data. Now it is converted to `RuntimeError`:
+
+```python
+def broken():
+    yield 1
+    raise StopIteration    # meant as "stop", but forbidden inside generators
+
+try:
+    list(broken())
+except RuntimeError as e:
+    print("RuntimeError:", e)
+```
+
+```text title="Output"
+RuntimeError: generator raised StopIteration
+```
+
+To end a generator, use `return`. When calling `next()` inside a generator, pass a default or catch `StopIteration` yourself.
+
+## Generator expressions
+
+A generator expression is the lazy cousin of a list comprehension: parentheses instead of brackets.
+
+```python
+squares = (x * x for x in range(5))
+print(type(squares).__name__)
+print(next(squares), list(squares))
+print(sum(x * x for x in range(5)))      # parens can be dropped when it is the only argument
+```
+
+```text title="Output"
+generator
+0 [1, 4, 9, 16]
+30
+```
+
+Under the hood a genexp compiles to a hidden generator function, called immediately with one argument: the iterator of the **first** `for` clause. That detail creates two traps.
+
+**The first iterable is evaluated immediately**, at creation time. Everything else (the conditions, nested `for` clauses, the output expression) is evaluated lazily:
+
+```python
+def source():
+    print("  source() called")
+    return [1, 2, 3]
+g = (x * 10 for x in source())           # first iterable evaluated immediately
+print("created")
+print(list(g))
+```
+
+```text title="Output"
+  source() called
+created
+[10, 20, 30]
+```
+
+This is deliberate: errors like "not iterable" show up where you wrote the expression, not later.
+
+**Free variables are read late**, when the item is produced:
+
+```python
+threshold = 2
+g = (x for x in range(5) if x > threshold)
+threshold = 3                            # condition reads the variable lazily
+print(list(g))
+```
+
+```text title="Output"
+[4]
+```
+
+Use a genexp when the result feeds straight into a consumer (`sum`, `any`, `max`, `"".join`, `dict`, a `for` loop) and you do not need the list afterwards. Use a list comprehension when you need to index, loop twice, or `len()` the result. Speed is roughly equal for in-memory data; on 3.14 `sum` of a million items took 0.30 s with a list and 0.31 s with a genexp. Choose by memory and by single versus multiple passes, not speed.
+
+## `yield` is an expression: `send`, `throw`, `close`
+
+So far, data has only flowed **out** of the generator. But `yield` is an expression, and its value is whatever the caller pushes **in** when resuming. Generators have three methods for this:
+
+| Method | What happens at the paused `yield` |
+|---|---|
+| `gen.send(value)` | The `yield` expression evaluates to `value`; runs to the next `yield` and returns what it yields |
+| `gen.throw(exc)` | The exception is raised at the `yield`, as if that line raised it |
+| `gen.close()` | `GeneratorExit` is raised at the `yield`; the generator must exit |
+
+`next(gen)` is exactly `gen.send(None)`.
+
+### `send`: two-way communication
+
+```python
+def running_average():
+    total = 0
+    count = 0
+    average = None
+    while True:
+        value = yield average     # hand out the average, receive the next value
+        total += value
+        count += 1
+        average = total / count
+
+avg = running_average()
+print(next(avg))        # prime: run to the first yield
+print(avg.send(10))
+print(avg.send(20))
+print(avg.send(60))
+```
+
+```text title="Output"
+None
+10.0
+15.0
+30.0
+```
+
+Read `value = yield average` in two halves: the right side runs first and suspends (sending `average` out); when resumed, the left side receives whatever was sent. Each `send` call therefore does three things: delivers a value to the paused `yield`, runs the body until the next `yield`, and returns the value that `yield` produces.
+
+The order is easier to see with prints:
+
+```python
+def echo():
+    print("  started")
+    received = yield "first"
+    print(f"  received {received!r}")
+    received = yield "second"
+    print(f"  received {received!r}")
+
+g = echo()
+print("next:", next(g))
+print("send:", g.send("A"))
+try:
+    g.send("B")
+except StopIteration:
+    print("done")
+```
+
+```text title="Output"
+  started
+next: first
+  received 'A'
+send: second
+  received 'B'
+done
+```
+
+**Priming.** A new generator is paused *before* its first line, not at a `yield`, so there is nowhere for a sent value to land. The first resume must be `next(gen)` or `gen.send(None)`:
+
+```python
+def g():
+    x = yield
+    print("got", x)
+gen = g()
+try:
+    gen.send(5)
+except TypeError as e:
+    print("TypeError:", e)
+print(gen.send(None) is None)   # same as next(gen)
+```
+
+```text title="Output"
+TypeError: can't send non-None value to a just-started generator
+True
+```
+
+People often wrap such "consumer" generators in a decorator that calls `next()` once right after creation.
+
+<Callout title="Coming from JS">
+`gen.send(v)` is JS's `gen.next(v)`, with the same priming rule: in JS, the argument to the first `next()` is silently discarded, while Python raises `TypeError` if it is not `None`. `gen.throw(e)` matches JS `gen.throw(e)`. `gen.close()` is roughly JS `gen.return()`, but Python delivers a `GeneratorExit` exception that the generator may observe, while JS performs a forced return that runs `finally` blocks.
+</Callout>
+
+### `throw`: inject an exception at the paused `yield`
+
+```python
+def resilient():
+    while True:
+        try:
+            yield "working"
+        except ValueError as e:
+            print(f"  handled inside: {e}")
+            yield "recovered"
+
+g = resilient()
+print(next(g))
+print(g.throw(ValueError("bad input")))   # raised AT the paused yield
+print(next(g))
+try:
+    g.throw(KeyError("unhandled"))
+except KeyError as e:
+    print("propagated out:", e)
+import inspect
+print(inspect.getgeneratorstate(g))
+```
+
+```text title="Output"
+working
+  handled inside: bad input
+recovered
+working
+propagated out: 'unhandled'
+GEN_CLOSED
+```
+
+If the generator catches the exception and yields again, `throw` returns that yielded value. If not, the exception propagates out of `throw` to the caller, and the generator is closed. This is precisely how asyncio delivers a cancellation (`CancelledError`) into a coroutine that is awaiting something. The three-argument form `throw(type, value, traceback)` is deprecated since 3.12; pass an exception instance.
+
+### `close` and `GeneratorExit`
+
+`close()` raises `GeneratorExit` at the paused `yield`. The generator is expected to run its cleanup (`finally` blocks, `with` exits) and finish.
+
+```python
+def with_cleanup():
+    try:
+        yield 1
+        yield 2
+    except GeneratorExit:
+        print("  GeneratorExit received")
+        raise
+    finally:
+        print("  cleanup ran")
+
+g = with_cleanup()
+print(next(g))
+g.close()
+print("closed; next gives:", next(g, "nothing"))
+```
+
+```text title="Output"
+1
+  GeneratorExit received
+  cleanup ran
+closed; next gives: nothing
+```
+
+`GeneratorExit` inherits from `BaseException`, not `Exception`, precisely so that a careless `except Exception:` inside the generator does not swallow it. A generator that catches it and **yields again** is broken:
+
+```python
+def stubborn():
+    try:
+        yield 1
+    except GeneratorExit:
+        yield "nope"    # not allowed
+
+g = stubborn()
+next(g)
+try:
+    g.close()
+except RuntimeError as e:
+    print("RuntimeError:", e)
+```
+
+```text title="Output"
+RuntimeError: generator ignored GeneratorExit
+```
+
+**New in 3.13:** if the generator handles `GeneratorExit` and returns a value, `close()` returns that value (it used to return `None` always). That makes "accumulate until closed" consumers clean:
+
+```python
+def summarizer():
+    total = 0
+    try:
+        while True:
+            total += yield
+    except GeneratorExit:
+        return total     # 3.13+: close() returns this value
+
+s = summarizer()
+next(s)
+for v in (5, 10, 15):
+    s.send(v)
+print(s.close())
+```
+
+```text title="Output"
+30
+```
+
+### Abandoned generators are closed by the garbage collector
+
+When a generator object is destroyed while suspended, CPython calls `close()` on it from its finalizer. In CPython that usually happens right away, because reference counting frees the object the moment the last reference disappears:
+
+```python
+def reader():
+    try:
+        yield "line 1"
+        yield "line 2"
+    finally:
+        print("  finally: file closed")
+
+for line in reader():
+    print(line)
+    break                   # abandon the generator
+print("after loop")
+```
+
+```text title="Output"
+line 1
+  finally: file closed
+after loop
+```
+
+Do not rely on this for important resources. If the generator is kept alive (stored in a variable, caught in a traceback, part of a reference cycle, or running on PyPy), its `finally` runs much later or at interpreter exit. If a generator holds a file, DB connection, or lock, either close it explicitly, or wrap it: `with contextlib.closing(gen()) as g:`. See [Context Managers](/docs/python/context-managers).
+
+## `yield from`: delegation
+
+`yield from sub` hands control to a sub-iterator until it is exhausted. In its simplest use it replaces `for x in sub: yield x`, but it does far more than that loop:
+
+1. Every `send()` from the outside goes straight to the sub-generator, not to the delegating one.
+2. Every `throw()` is forwarded to the sub-generator, and `close()` closes it.
+3. When the sub-generator returns, its return value becomes the value of the `yield from` expression.
+
+```python
+def inner():
+    yield 1
+    yield 2
+    return "inner done"
+
+def outer():
+    result = yield from inner()
+    print(f"  inner returned {result!r}")
+    yield 3
+
+print(list(outer()))
+```
+
+```text title="Output"
+  inner returned 'inner done'
+[1, 2, 3]
+```
+
+The send pass-through:
+
+```python
+def inner():
+    while True:
+        x = yield
+        if x is None:
+            return "stopped"
+        print(f"  inner got {x}")
+
+def outer():
+    r = yield from inner()
+    print(f"  outer saw {r!r}")
+
+g = outer()
+next(g)
+g.send("a")      # goes straight through to inner
+g.send("b")
+try:
+    g.send(None)
+except StopIteration:
+    print("done")
+```
+
+```text title="Output"
+  inner got a
+  inner got b
+  outer saw 'stopped'
+done
+```
+
+Writing this transparently by hand takes about 40 lines (PEP 380 shows the full expansion, handling `send`, `throw`, `close`, and return values). `yield from` exists because getting that right is hard. It is also fast: the interpreter forwards directly via the `SEND` instruction without bouncing through Python-level code.
+
+The most common everyday uses are recursion and composition:
+
+```python
+def flatten(items):
+    for item in items:
+        if isinstance(item, (list, tuple)):
+            yield from flatten(item)
+        else:
+            yield item
+
+print(list(flatten([1, [2, [3, 4], (5,)], 6])))
+```
+
+```text title="Output"
+[1, 2, 3, 4, 5, 6]
+```
+
+```python
+class Node:
+    def __init__(self, value, children=()):
+        self.value = value
+        self.children = list(children)
+    def __iter__(self):
+        yield self.value
+        for child in self.children:
+            yield from child
+
+tree = Node("root", [Node("a", [Node("a1"), Node("a2")]), Node("b")])
+print(list(tree))
+```
+
+```text title="Output"
+['root', 'a', 'a1', 'a2', 'b']
+```
+
+Trap: each level of recursive `yield from` is a separate generator, so a tree of depth 1,000 needs 1,000 nested generators and can hit the recursion limit. For very deep structures, use an explicit stack.
+
+<Callout title="Coming from JS">
+`yield from` is JS's `yield*`. Both delegate to an inner iterator and both make the inner generator's `return` value the result of the expression. Python's version also forwards `send`, `throw` and `close`, just as `yield*` forwards `next(v)`, `throw` and `return`.
+</Callout>
+
+## Generator pipelines: streaming large data
+
+Because each generator pulls one item at a time from the one before it, you can chain small generators into a pipeline, much like Unix pipes or Node streams. Memory use stays constant no matter how big the input is: only one item is "in flight" at a time.
+
+### Streaming a large log file
+
+```python
+import io
+
+LOG = io.StringIO(
+    "2026-10-01 INFO  GET /users 200 12ms\n"
+    "2026-10-01 ERROR GET /orders 500 340ms\n"
+    "2026-10-01 INFO  POST /users 201 25ms\n"
+    "2026-10-02 ERROR GET /orders 502 1200ms\n"
+    "2026-10-02 WARN  GET /health 200 900ms\n"
+)
+
+def read_lines(f):
+    for line in f:
+        yield line.rstrip("\n")
+
+def parse(lines):
+    for line in lines:
+        date, level, method, path, status, ms = line.split()
+        yield {"level": level, "path": path, "status": int(status), "ms": int(ms[:-2])}
+
+def only_errors(records):
+    return (r for r in records if r["status"] >= 500)
+
+pipeline = only_errors(parse(read_lines(LOG)))
+for rec in pipeline:
+    print(rec)
+```
+
+```text title="Output"
+{'level': 'ERROR', 'path': '/orders', 'status': 500, 'ms': 340}
+{'level': 'ERROR', 'path': '/orders', 'status': 502, 'ms': 1200}
+```
+
+In production replace `io.StringIO` with `open("access.log", encoding="utf-8")` inside a `with` block. File objects are already lazy line iterators, so a 20 GB file flows through this pipeline in a few kilobytes.
+
+The order of execution is "depth first": one item travels through every stage before the next item is read.
+
+```python
+def stage(name, items):
+    for x in items:
+        print(f"  {name} handles {x}")
+        yield x
+
+for x in stage("C", stage("B", stage("A", [1, 2]))):
+    print("consumer got", x)
+```
+
+```text title="Output"
+  A handles 1
+  B handles 1
+  C handles 1
+consumer got 1
+  A handles 2
+  B handles 2
+  C handles 2
+consumer got 2
+```
+
+That also means the slowest stage dictates throughput, and nothing runs in parallel. Generators give you laziness, not concurrency.
+
+### Paginating an API lazily
+
+Hiding cursor-based pagination behind a generator is one of the most useful backend patterns. Callers just loop over users; pages are fetched only when needed, and stopping early stops the fetching.
+
+```python
+import itertools
+
+FAKE_DB = [{"id": i} for i in range(1, 8)]
+
+def fetch_page(cursor, limit=3):
+    """Stand-in for an HTTP call such as GET /users?cursor=...&limit=3"""
+    print(f"  HTTP GET cursor={cursor}")
+    start = cursor or 0
+    items = FAKE_DB[start:start + limit]
+    next_cursor = start + limit if start + limit < len(FAKE_DB) else None
+    return {"items": items, "next_cursor": next_cursor}
+
+def iter_users():
+    cursor = None
+    while True:
+        page = fetch_page(cursor)
+        yield from page["items"]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return
+
+for user in itertools.islice(iter_users(), 4):   # only the pages we need are fetched
+    print(user)
+```
+
+```text title="Output"
+  HTTP GET cursor=None
+{'id': 1}
+{'id': 2}
+{'id': 3}
+  HTTP GET cursor=3
+{'id': 4}
+```
+
+The third page was never requested. With a real HTTP client (`httpx`, `requests`), this is the same code with `client.get(...)` inside `fetch_page`. For an async client, make it an **async generator** (`async def` with `yield`) and consume it with `async for`, shown below.
+
+The same shape works for DB result streaming: a server-side cursor with `fetchmany(1000)` inside a `while` loop, yielding rows one at a time.
+
+## Memory: generators versus lists
+
+`sys.getsizeof` shows the size of the container object itself (not the items it references), and `tracemalloc` shows peak allocations during a computation.
+
+```python
+import sys, tracemalloc
+
+N = 1_000_000
+as_list = [x * 2 for x in range(N)]
+as_gen = (x * 2 for x in range(N))
+print("list object:", sys.getsizeof(as_list), "bytes")
+print("generator object:", sys.getsizeof(as_gen), "bytes")
+del as_list, as_gen
+
+tracemalloc.start()
+total = sum([x * 2 for x in range(N)])
+_, peak_list = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+
+tracemalloc.start()
+total2 = sum(x * 2 for x in range(N))
+_, peak_gen = tracemalloc.get_traced_memory()
+tracemalloc.stop()
+
+print(f"peak with list:      {peak_list / 1e6:.1f} MB")
+print(f"peak with generator: {peak_gen / 1e3:.1f} KB")
+print(total == total2)
+```
+
+```text title="Output"
+list object: 8448728 bytes
+generator object: 208 bytes
+peak with list:      40.4 MB
+peak with generator: 0.4 KB
+True
+```
+
+The list object alone is about 8 MB (8 bytes per pointer, plus over-allocation), and the int objects it points to bring the peak to about 40 MB. The generator never holds more than one item, so its peak is a few hundred bytes regardless of `N`. (The 208 bytes is the generator plus its embedded frame; it does not grow.)
+
+Trap: `sys.getsizeof` on a list does **not** include the items. Use `tracemalloc` (or a profiler like `memray`) to measure what a computation really costs.
+
+## Generators, coroutines, and asyncio
+
+Generators are the ancestor of Python's async model, and the relationship explains a lot about how `async`/`await` works underneath.
+
+**Step 1: generators as coroutines (2005, PEP 342).** Once `yield` could receive values via `send`, a generator could pause to "ask" for something and be resumed with the answer. A scheduler could run many such generators, resuming each when its I/O was ready:
+
+```python
+def old_style():
+    value = yield "request"
+    return f"got {value}"
+
+g = old_style()
+print(g.send(None))
+try:
+    g.send("response")
+except StopIteration as e:
+    print(e.value)
+```
+
+```text title="Output"
+request
+got response
+```
+
+**Step 2: `yield from` (2012, PEP 380)** let these coroutines call each other and receive return values, so asyncio's first version (3.4) used `@asyncio.coroutine` and `yield from future`.
+
+**Step 3: native coroutines (2015, PEP 492).** `async def` and `await` gave coroutines their own type so they could not be confused with iterators. But the machinery is the same: a coroutine object has `send`, `throw` and `close`, keeps its frame alive while suspended, and finishes with `StopIteration(value)`. `await x` is essentially `yield from x.__await__()`.
+
+```python
+import asyncio, inspect
+
+async def fetch():
+    await asyncio.sleep(0)
+    return 42
+
+c = fetch()
+print(type(c).__name__, inspect.iscoroutine(c))
+print(hasattr(c, "send"), hasattr(c, "throw"), hasattr(c, "close"))
+print(c.send(None))     # drive it by hand, like the event loop does
+try:
+    c.send(None)
+except StopIteration as e:
+    print("StopIteration value:", e.value)
+```
+
+```text title="Output"
+coroutine True
+True True True
+None
+StopIteration value: 42
+```
+
+That is literally what the asyncio event loop does inside a `Task`: call `coro.send(None)`, see what it yields (a `Future` it is waiting on, or `None` for "just let others run" as `sleep(0)` does), and call `send` again when that future is done. Cancellation is `coro.throw(CancelledError())`. Read the [asyncio page](/docs/python/asyncio) for the event loop itself.
+
+**Async generators (PEP 525)** combine both: an `async def` that contains `yield`. You consume them with `async for`, and they are the natural fit for streaming from async sources (paginated async HTTP, DB cursors, websockets).
+
+```python
+import asyncio
+
+async def ticker(n):
+    for i in range(n):
+        await asyncio.sleep(0)
+        yield i
+
+async def main():
+    async for t in ticker(3):
+        print("tick", t)
+    print([t async for t in ticker(3)])
+
+asyncio.run(main())
+```
+
+```text title="Output"
+tick 0
+tick 1
+tick 2
+[0, 1, 2]
+```
+
+Async generators cannot use `yield from` and cannot `return` a value. Their cleanup is `await agen.aclose()`, and like sync generators, abandoned ones are finalised later, so wrap them with `contextlib.aclosing` when they hold resources.
+
+<Callout title="Coming from JS">
+In JS, async functions are built on promises and the microtask queue, and generators are a separate feature (although `co` and early `async` transpilers used generators exactly like Python's PEP 342 coroutines). In Python, a coroutine really is a generator-like object driven by `send`: nothing runs until an event loop (or you) calls `send`. That is why calling an `async def` without `await` does nothing and later warns `coroutine ... was never awaited`, while a JS async function starts running immediately when called. Async generators and `for await...of` map directly to Python's async generators and `async for`.
+</Callout>
+
+## When to use generators
+
+- **Large or unbounded data** you process once: files, DB rows, API pages, event streams.
+- **Pipelines** of small, testable stages (read, parse, filter, transform).
+- **Custom iterables**: make `__iter__` a generator instead of writing an iterator class.
+- **Producing values on demand** when the consumer may stop early (search, "first N matches").
+- Avoid them when callers need random access, `len()`, or several passes; return a list instead.
+- `send`/`throw` based coroutines are rarely written by hand today. Use `async def` for concurrency, and keep `send` for niche cases like stateful consumers or tests that drive a coroutine manually.
+
+## Interview questions
+
+1. **What happens when you call a generator function?** **Nothing in the body runs. Python creates a generator object holding a suspended frame and returns it; the body runs only when `next()` or `send()` is called, and only up to the next `yield`.**
+2. **How does a generator remember its local variables between `yield`s?** **The generator object owns its frame (in 3.11+ the frame data is embedded in the object). `yield` saves the instruction pointer and unlinks the frame from the call stack without destroying it; resuming re-links it.**
+3. **What is the difference between `next(gen)` and `gen.send(value)`?** **`next(gen)` is `gen.send(None)`. `send(value)` makes the paused `yield` expression evaluate to `value`. The first resume must send `None` because the generator has not reached a `yield` yet.**
+4. **What does `close()` do and why is `GeneratorExit` a `BaseException`?** **It raises `GeneratorExit` at the paused `yield` so `finally` blocks run. It inherits from `BaseException` so `except Exception` does not swallow it. Yielding again after catching it gives `RuntimeError`. Since 3.13 `close()` returns the generator's return value.**
+5. **What does `yield from` do that a `for` loop with `yield` does not?** **It forwards `send`, `throw` and `close` to the sub-generator and evaluates to the sub-generator's return value.**
+6. **Why does a `StopIteration` raised inside a generator become a `RuntimeError`?** **PEP 479 (3.7+). Otherwise an accidental `StopIteration` from a bare `next()` would silently end iteration and hide bugs. Use `return` to finish a generator.**
+7. **When is a generator expression's iterable evaluated?** **The first `for` clause's iterable is evaluated immediately; conditions, nested loops and free variables are evaluated lazily as items are produced.**
+8. **How do generators relate to `async`/`await`?** **Coroutines grew out of generators: `send` lets a paused function receive results, and `yield from` let coroutines chain. Native coroutines use the same `send`/`throw`/`close` and `StopIteration` machinery, and the event loop drives them by calling `send`.**
+
+## Recap
+
+- A function containing `yield` returns a generator object; the body runs lazily, one `yield` at a time.
+- The generator keeps its frame alive between resumes. States are created, running, suspended, closed; `gi_frame`, `gi_running`, `gi_suspended` expose them.
+- `return` in a generator ends it with `StopIteration(value)`; a leaked `StopIteration` becomes `RuntimeError`.
+- Generator expressions evaluate their first iterable eagerly and everything else lazily.
+- `yield` is an expression: `send` pushes values in, `throw` injects exceptions, `close` raises `GeneratorExit` for cleanup.
+- `yield from` delegates fully, including `send`, `throw`, `close` and the return value.
+- Pipelines of generators stream any amount of data in constant memory; wrap pagination in a generator so callers just loop.
+- Native coroutines and async generators are built on the same suspend-and-resume model; the asyncio event loop is the thing calling `send`.

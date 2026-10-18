@@ -1,0 +1,563 @@
+---
+title: "Serving Your Own Models"
+description: "Putting a local ML model behind FastAPI: load once in the lifespan, keep CPU-bound inference off the event loop (threads vs processes vs the GIL, measured), dynamic batching with asyncio futures, GPU memory and one worker per GPU, model versioning and warm-up, and when to hand inference to vLLM, TGI, Triton or Ray Serve with FastAPI as the gateway."
+---
+
+Calling a hosted LLM is network I/O: your process waits and does nothing. Serving **your own** model (an embedding model, a classifier, a reranker, a small LLM) is the opposite: your process does the heavy computation. That changes almost everything about how the FastAPI app must be built, because the [event loop](/docs/python/asyncio) can only stay responsive if nothing on it computes for long.
+
+This chapter uses fake models so the behaviour is measurable without downloading weights: one burns CPU in pure Python, one sleeps the way a C extension does with the GIL released, and one has the cost profile of a GPU forward pass. Everything was run on **CPython 3.14.6 (free-threaded build)** with FastAPI 0.143.0 and Uvicorn 0.54.0 on Windows. The free-threaded build can run with the GIL on (`-X gil=1`) or off (`-X gil=0`), which lets the benchmark show both worlds on the same machine. Timings vary between runs; the patterns don't.
+
+## Load once, in the lifespan
+
+Loading a model means reading hundreds of megabytes to gigabytes of weights, building the graph, and possibly moving it to a GPU. It takes seconds. Do it **once per process**, at startup, in the [lifespan](/docs/fastapi/middleware-lifespan-and-background-tasks), and store it on `app.state`:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.model = load_model()        # seconds, once
+    yield
+    del app.state.model                   # free memory on shutdown
+
+
+@app.post("/predict")
+async def predict(text: str, request: Request):
+    model = request.app.state.model       # shared by every request
+    ...
+```
+
+The tempting mistakes are loading inside the endpoint (seconds of latency and a memory spike on *every* request), or loading at import time at module level (it runs in every process that imports the module, including test collection and tools, and you can't control when). A lifespan load also means a process that can't load its model fails at startup, before it receives traffic, which is what you want.
+
+## CPU-bound inference blocks the event loop
+
+FastAPI runs `async def` endpoints directly on the event loop. If one of them calls `model.predict()` and that takes 140 ms of computation, **nothing else** in that process runs for 140 ms: not other predictions, not health checks, not the next chunk of a streaming response. (Plain `def` endpoints are different: FastAPI runs them in a thread pool automatically. See [ASGI and the request lifecycle](/docs/fastapi/asgi-and-the-request-lifecycle).)
+
+Here is a server with two fake models and four ways to call them:
+
+```python
+import asyncio
+import time
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
+
+
+class PurePythonModel:
+    """CPU-bound Python bytecode: holds the GIL the whole time."""
+
+    def predict(self, text: str) -> dict:
+        acc = 0
+        for i in range(3_000_000):                 # about 0.14 s on this machine
+            acc = (acc + i * len(text)) % 1_000_003
+        return {"label": "positive" if acc % 2 else "negative"}
+
+
+class NativeKernelModel:
+    """Stands in for numpy/torch/onnxruntime: the heavy part runs in C with the GIL released.
+    time.sleep also releases the GIL, so it is a fair (idealised) stand-in."""
+
+    def predict(self, text: str) -> dict:
+        time.sleep(0.14)
+        return {"label": "positive"}
+
+
+# ---- process pool: each worker process loads its own copy of the model once ----
+_worker_model: PurePythonModel | None = None
+
+
+def _init_worker() -> None:
+    global _worker_model
+    _worker_model = PurePythonModel()             # the expensive load happens per process
+
+
+def _predict_in_worker(text: str) -> dict:
+    return _worker_model.predict(text)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.py_model = PurePythonModel()         # load once, share across requests
+    app.state.native_model = NativeKernelModel()
+    app.state.procs = ProcessPoolExecutor(max_workers=4, initializer=_init_worker)
+    # Workers spawn lazily. Keep 4 busy at once so all 4 start (and load) now, not mid-traffic.
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*(loop.run_in_executor(app.state.procs, time.sleep, 0.5)
+                           for _ in range(4)))
+    yield
+    app.state.procs.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/py/blocking")
+async def py_blocking(text: str, request: Request):
+    return request.app.state.py_model.predict(text)               # runs ON the event loop
+
+
+@app.post("/py/threadpool")
+async def py_threadpool(text: str, request: Request):
+    return await run_in_threadpool(request.app.state.py_model.predict, text)
+
+
+@app.post("/py/processpool")
+async def py_processpool(text: str, request: Request):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(request.app.state.procs, _predict_in_worker, text)
+
+
+@app.post("/native/threadpool")
+async def native_threadpool(text: str, request: Request):
+    return await run_in_threadpool(request.app.state.native_model.predict, text)
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+```
+
+The benchmark starts this app with Uvicorn in a **separate process** (so the client doesn't compete with the server for the GIL), once with the GIL enabled and once disabled. For each endpoint, it fires four predictions concurrently, waits 50 ms so they're in flight, and then times a `GET /health`:
+
+```python
+def scenario(path: str) -> None:
+    with ThreadPoolExecutor(4) as pool:
+        t0 = time.perf_counter()
+        preds = [pool.submit(timed, "POST", f"{path}?text=hi") for _ in range(4)]
+        time.sleep(0.05)                       # the 4 predictions are now in flight
+        health = timed("GET", "/health")
+        for f in preds:
+            f.result()
+        total = time.perf_counter() - t0
+    print(f"  {path:22} 4 predictions in {total:.2f}s | /health took {health * 1000:4.0f} ms")
+
+
+for gil in ("1", "0"):
+    # start_server/stop_server launch and kill: python -X gil=N -m uvicorn serve_blocking:app
+    server = start_server(gil)
+    print(f"server GIL {'enabled' if gil == '1' else 'disabled'}:")
+    for path in ("/py/threadpool", "/py/processpool"):
+        [timed("POST", f"{path}?text=warm") for _ in range(2)]   # warm threads and processes
+    for path in ("/py/blocking", "/py/threadpool", "/py/processpool", "/native/threadpool"):
+        scenario(path)
+    stop_server(server)
+```
+
+```text title="Output (one run; absolute timings vary)"
+server GIL enabled:
+  /py/blocking           4 predictions in 1.05s | /health took  989 ms
+  /py/threadpool         4 predictions in 1.14s | /health took  370 ms
+  /py/processpool        4 predictions in 0.33s | /health took   24 ms
+  /native/threadpool     4 predictions in 0.18s | /health took   91 ms
+server GIL disabled:
+  /py/blocking           4 predictions in 0.84s | /health took  785 ms
+  /py/threadpool         4 predictions in 0.35s | /health took   20 ms
+  /py/processpool        4 predictions in 0.33s | /health took   21 ms
+  /native/threadpool     4 predictions in 0.18s | /health took   25 ms
+```
+
+Read the GIL-enabled block first, because that's what standard CPython does:
+
+- **`/py/blocking`**: the four predictions run one after another *on the event loop*, and the health check waits behind all of them, nearly a second for a request that does no work. This is the bug to avoid. In a real deployment, the load balancer's health check fails and the instance gets killed for being "down" while it's busy.
+- **`/py/threadpool`**: moving pure-Python work to a thread **doesn't help much**. The threads take turns holding the GIL, and the event loop thread has to win the GIL back many times to process even one small request (accept, parse, route, respond). Each time, it waits behind CPU-bound threads that only release it every few milliseconds (the switch interval). This is the "convoy effect" described in [Concurrency models and the GIL](/docs/python/concurrency-models-and-the-gil). Total time doesn't improve either: four threads still execute Python bytecode one at a time.
+- **`/py/processpool`**: each prediction runs in its own process with its own interpreter and its own GIL. The four run in parallel (0.33 s instead of about 0.6 s) and the event loop stays free (24 ms health check). See [multiprocessing](/docs/python/multiprocessing).
+- **`/native/threadpool`**: when the heavy work is in C code that **releases the GIL** (numpy, PyTorch, ONNX Runtime, tokenizers written in Rust, or `time.sleep` here), threads work well: the predictions overlap, and the loop stays responsive. This is the common case for real ML models, because their math runs in native kernels.
+
+With the GIL disabled, threads run Python bytecode in parallel, so `/py/threadpool` behaves like the process pool. That's the promise of free-threaded Python. Most deployments still run the standard GIL build, and many ML libraries don't support free-threading yet, so don't design around it.
+
+What this means in practice:
+
+| Your inference code | Offload with | Why |
+| --- | --- | --- |
+| Native kernels that release the GIL (torch, onnxruntime, numpy, most tokenizers) | `run_in_threadpool` / `anyio.to_thread.run_sync` | Cheap, shares one copy of the model, real overlap |
+| Heavy pure-Python pre- or post-processing | `ProcessPoolExecutor` | Only processes escape the GIL |
+| A GPU model | A single thread or queue that owns the GPU (see batching below) | The GPU is the bottleneck, not Python |
+| Anything slow, as a quick fix | Make the endpoint a plain `def` | FastAPI runs it in its thread pool; same GIL caveats |
+
+Mechanics worth knowing:
+
+- `fastapi.concurrency.run_in_threadpool(fn, *args)` is Starlette's wrapper around `anyio.to_thread.run_sync`. AnyIO's default thread limiter allows **40** concurrent threads, shared with FastAPI's `def` endpoints. If 40 slow predictions are running, the 41st call (and every sync endpoint) waits for a free slot. Pass your own `anyio.CapacityLimiter` to `anyio.to_thread.run_sync(..., limiter=...)` to give inference its own bounded pool.
+- A process pool pays for **pickling** arguments and results across process boundaries. Send text in and small results out; don't ship tensors back and forth.
+- Every process in the pool holds **its own copy of the model**. Four workers with a 2 GB model need 8 GB of RAM. That's the main cost of the process approach.
+- On Windows and macOS, pool workers are created with **spawn**: they re-import your module, so the initializer and the predict function must be top-level and importable, and module import must not have side effects.
+- The pool spawns workers lazily. The lifespan above keeps four busy at once so all four start (and load their model copy) before traffic arrives. In an earlier run without that warm-up, the first burst of requests paid the process start-up cost and the process pool looked no faster than the blocking endpoint.
+
+## Dynamic batching
+
+GPUs (and to a lesser degree vectorized CPU code) have a large **fixed cost per call**: launching kernels, moving weights through memory. Running 16 inputs in one forward pass costs little more than running 1. If 16 requests each run their own forward pass, you pay that fixed cost 16 times, one after another, because there's only one GPU.
+
+**Dynamic batching** collects requests that arrive close together into one batch. Each request puts its input and an `asyncio.Future` on a queue and awaits the future. A single background task takes the first item, waits up to a few milliseconds for more (or until the batch is full), runs the model once, and resolves each future with its result.
+
+<Mermaid chart={`sequenceDiagram
+  participant R1 as request 1
+  participant R2 as request 2
+  participant R3 as request 3
+  participant B as batch loop
+  participant M as model
+  R1->>B: put (input, future)
+  Note over B: first item arrives, start the max_wait timer
+  R2->>B: put (input, future)
+  R3->>B: put (input, future)
+  Note over B: timer fires or batch is full
+  B->>M: predict_batch([x1, x2, x3])
+  M-->>B: [y1, y2, y3]
+  B-->>R1: future.set_result(y1)
+  B-->>R2: future.set_result(y2)
+  B-->>R3: future.set_result(y3)`} />
+
+```python
+import asyncio
+import time
+from collections import Counter
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
+
+
+class FakeGPUModel:
+    """One forward pass costs a fixed 40 ms (kernel launch, weights through memory)
+    plus 1 ms per item. Batching amortises the fixed part, like a real GPU."""
+
+    def predict_batch(self, texts: list[str]) -> list[dict]:
+        time.sleep(0.040 + 0.001 * len(texts))
+        return [{"text": t, "label": "positive" if len(t) % 2 else "negative"} for t in texts]
+
+
+class DynamicBatcher:
+    def __init__(self, model: FakeGPUModel, max_batch: int = 16, max_wait_ms: float = 10):
+        self.model = model
+        self.max_batch = max_batch
+        self.max_wait = max_wait_ms / 1000
+        self.queue: asyncio.Queue[tuple[str, asyncio.Future]] = asyncio.Queue()
+        self.batch_sizes: Counter[int] = Counter()
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+
+    async def predict(self, text: str) -> dict:
+        fut = asyncio.get_running_loop().create_future()
+        await self.queue.put((text, fut))
+        return await fut                                  # resolved by the batch loop
+
+    async def _loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            batch = [await self.queue.get()]              # block until there is work
+            deadline = loop.time() + self.max_wait
+            while len(batch) < self.max_batch:
+                timeout = deadline - loop.time()
+                if timeout <= 0:
+                    break
+                try:
+                    batch.append(await asyncio.wait_for(self.queue.get(), timeout))
+                except TimeoutError:
+                    break
+            batch = [(t, f) for t, f in batch if not f.cancelled()]   # client gave up
+            if not batch:
+                continue
+            self.batch_sizes[len(batch)] += 1
+            try:
+                results = await run_in_threadpool(self.model.predict_batch,
+                                                  [t for t, _ in batch])
+            except Exception as exc:
+                for _, f in batch:
+                    if not f.done():
+                        f.set_exception(exc)
+                continue
+            for (_, f), result in zip(batch, results):
+                if not f.done():
+                    f.set_result(result)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    model = FakeGPUModel()
+    app.state.model = model
+    app.state.gpu_lock = asyncio.Lock()          # one GPU: one forward pass at a time
+    app.state.batcher = DynamicBatcher(model, max_batch=16, max_wait_ms=10)
+    app.state.batcher.start()
+    yield
+    await app.state.batcher.stop()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/predict/single")
+async def predict_single(text: str, request: Request):
+    async with request.app.state.gpu_lock:
+        [result] = await run_in_threadpool(request.app.state.model.predict_batch, [text])
+    return result
+
+
+@app.post("/predict/batched")
+async def predict_batched(text: str, request: Request):
+    return await request.app.state.batcher.predict(text)
+
+
+async def load_test(client: httpx.AsyncClient, path: str, n: int) -> None:
+    latencies = []
+
+    async def one(i: int):
+        t0 = time.perf_counter()
+        r = await client.post(path, params={"text": "x" * i})
+        r.raise_for_status()
+        latencies.append(time.perf_counter() - t0)
+
+    t0 = time.perf_counter()
+    await asyncio.gather(*(one(i) for i in range(n)))
+    wall = time.perf_counter() - t0
+    latencies.sort()
+    print(f"{path:17} {n} requests: wall {wall:.2f}s, {n / wall:5.0f} req/s, "
+          f"p50 {latencies[n // 2] * 1000:4.0f} ms, max {latencies[-1] * 1000:4.0f} ms")
+
+
+async def main():
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            await load_test(client, "/predict/single", 64)
+            await load_test(client, "/predict/batched", 64)
+            print("batch sizes seen:", dict(sorted(app.state.batcher.batch_sizes.items())))
+            for path in ("/predict/single", "/predict/batched"):    # idle server, 1 request
+                t0 = time.perf_counter()
+                r = await client.post(path, params={"text": "abc"})
+                print(f"{path:17} alone: {(time.perf_counter() - t0) * 1000:3.0f} ms {r.json()}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+```text title="Output"
+/predict/single   64 requests: wall 2.73s,    23 req/s, p50 1399 ms, max 2699 ms
+/predict/batched  64 requests: wall 0.28s,   233 req/s, p50  202 ms, max  259 ms
+batch sizes seen: {16: 4}
+/predict/single   alone:  42 ms {'text': 'abc', 'label': 'positive'}
+/predict/batched  alone:  61 ms {'text': 'abc', 'label': 'positive'}
+```
+
+Under load, batching gives about **10x the throughput** and much lower latency: 64 concurrent requests became four forward passes of 16 instead of 64 passes of one. The single-request endpoint serializes on the GPU lock, so the last request waits for 63 others (2.7 s).
+
+The cost shows on an idle server: a lone request waits out the batching window before it runs (61 ms against 42 ms). The window is 10 ms; Windows timer granularity adds a few more. That's the knob:
+
+- **`max_wait_ms`** trades idle latency for batch size. 2 to 10 ms is typical for GPU models. Measure your model's cost per batch size before choosing.
+- **`max_batch`** is bounded by GPU memory (activations grow with batch size and sequence length) and by where throughput stops improving.
+- **Pad-aware batching**: for text models, a batch is padded to its longest input. Mixing a 10-token and a 500-token input wastes compute; production batchers group by length.
+
+Details in the loop that matter:
+
+- **One loop owns the model.** Only the batch task calls `predict_batch`, so there's never more than one forward pass at a time and no lock is needed. The `run_in_threadpool` keeps the GPU call off the event loop, so new requests keep queueing while a batch runs.
+- **Cancelled futures are skipped.** If a client disconnects, its request task is cancelled and so is its future. The loop drops those instead of computing results nobody will read.
+- **Errors go to every waiter.** If the batch fails, every future gets the exception. Without that, a single bad input would leave 15 other requests hanging forever. A refinement is to retry the batch item by item to isolate the bad input.
+- **Bound the queue.** In production, use `asyncio.Queue(maxsize=...)` and reject with 503 when it's full, so overload shows up as fast errors instead of ever-growing latency.
+
+This is the "static window" version of the idea. LLM inference servers go further with **continuous batching**: since generation produces one token per step, new requests join the running batch at the next step and finished ones leave, so the GPU never waits for the slowest sequence in a batch.
+
+## GPUs: one worker per GPU
+
+The usual way to scale a CPU-bound Python web app is more Uvicorn worker processes (see [Deployment and performance](/docs/fastapi/deployment-and-performance)). With a GPU model, that backfires:
+
+- **Each process loads its own copy of the weights onto the GPU.** A 7B-parameter model in 16-bit precision is about 14 GB of weights alone. Four workers on a 24 GB card won't fit, and even small models multiply.
+- **Each process creates its own CUDA context**, which costs several hundred MB of GPU memory before any model is loaded.
+- **Processes can't share a batch.** Four workers each running batches of 4 is worse than one worker running batches of 16, because the fixed per-pass cost is paid four times and the passes contend for the same compute units.
+- **Inference memory is more than weights**: activations, and for LLMs the KV cache, which grows with batch size times sequence length. That's often the real limit on concurrency.
+
+So the standard layout is **one worker process per GPU**, with async request handling and a batcher inside it to keep the GPU busy, and a load balancer across GPUs or machines. Pin each process to its device with `CUDA_VISIBLE_DEVICES`. Don't fork a process after CUDA has been initialized; CUDA doesn't survive `fork`, so load models after workers start (the lifespan does this naturally).
+
+## Model versioning and warm-up
+
+Two operational habits prevent most model-serving incidents:
+
+1. **Always know which model answered.** Load models by explicit version and content hash, return the version in a response header, and log it with every prediction. When accuracy drops, the first question is "did the model change?".
+2. **Warm up before taking traffic.** The first inference is often much slower than the rest: lazy initialization, CUDA kernel selection and compilation, memory allocator growth, JIT tracing. Run a few dummy inputs in the lifespan so real users never pay that cost.
+
+```python
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
+from fastapi.testclient import TestClient
+
+
+class FakeModel:
+    """First call is slow (lazy init, kernel compilation, cache fill), later calls are fast."""
+
+    def __init__(self, version: str, sha: str):
+        self.version, self.sha = version, sha
+        self._warm = False
+
+    def predict(self, text: str) -> dict:
+        if not self._warm:
+            time.sleep(0.30)                 # what a cold first request would pay
+            self._warm = True
+        time.sleep(0.01)
+        score = 0.91 if self.version == "v2" else 0.74
+        return {"label": "positive", "score": score}
+
+
+def load_model(version: str) -> FakeModel:
+    time.sleep(0.05)                         # read weights from disk / object storage
+    return FakeModel(version, sha={"v1": "a1b2c3", "v2": "d4e5f6"}[version])
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.ready = False
+    app.state.models = {}
+    for version in ("v1", "v2"):
+        model = await run_in_threadpool(load_model, version)
+        t0 = time.perf_counter()
+        await run_in_threadpool(model.predict, "warm-up")      # pay the cold cost here
+        print(f"loaded {version} (sha {model.sha}), warm-up took "
+              f"{(time.perf_counter() - t0) * 1000:.0f} ms")
+        app.state.models[version] = model
+    app.state.default_version = "v2"
+    app.state.ready = True
+    yield
+    app.state.models.clear()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/ready")
+async def ready(request: Request, response: Response):
+    if not request.app.state.ready:
+        response.status_code = 503
+    return {"ready": request.app.state.ready,
+            "models": sorted(request.app.state.models),
+            "default": request.app.state.default_version}
+
+
+@app.post("/predict")
+async def predict(text: str, request: Request, response: Response,
+                  version: str | None = None):
+    state = request.app.state
+    version = version or state.default_version
+    model = state.models.get(version)
+    if model is None:
+        raise HTTPException(404, f"unknown model version {version!r}")
+    result = await run_in_threadpool(model.predict, text)
+    response.headers["X-Model-Version"] = f"{model.version}+{model.sha}"
+    return {**result, "model_version": model.version}
+
+
+if __name__ == "__main__":
+    with TestClient(app) as client:
+        print(client.get("/ready").json())
+        for v in (None, "v1", "v9"):
+            t0 = time.perf_counter()
+            r = client.post("/predict", params={"text": "great", **({"version": v} if v else {})})
+            print(r.status_code, r.headers.get("x-model-version"), r.json(),
+                  f"{(time.perf_counter() - t0) * 1000:.0f} ms")
+```
+
+```text title="Output"
+loaded v1 (sha a1b2c3), warm-up took 311 ms
+loaded v2 (sha d4e5f6), warm-up took 312 ms
+{'ready': True, 'models': ['v1', 'v2'], 'default': 'v2'}
+200 v2+d4e5f6 {'label': 'positive', 'score': 0.91, 'model_version': 'v2'} 12 ms
+200 v1+a1b2c3 {'label': 'positive', 'score': 0.74, 'model_version': 'v1'} 12 ms
+404 None {'detail': "unknown model version 'v9'"} 1 ms
+```
+
+The 300 ms cold-start cost was paid during startup, and the first real request took 12 ms. Serving two versions side by side makes these patterns cheap:
+
+- **Shadow traffic**: serve v1 to users, also run v2 on the same inputs in the background, and compare outputs offline.
+- **Canary**: route a small percentage of users (hashed by user id, so each user sees one version consistently) to v2 and watch metrics.
+- **Instant rollback**: switch `default_version` without reloading anything.
+
+A `/ready` endpoint separates **readiness** ("send me traffic") from **liveness** ("I'm not stuck"). Here the lifespan completes before Uvicorn accepts connections, so `/ready` is always true once reachable. If you load models in a background task instead (to keep startup fast), `/ready` returns 503 until loading finishes, and your orchestrator's readiness probe holds traffic back. Store model artifacts in object storage with immutable versioned paths, and record the version and hash in your model registry (MLflow, a database table, or a simple manifest file).
+
+## When to stop and use an inference server
+
+A FastAPI app with a batcher is the right tool for small models: embedding models, classifiers, rerankers, anything that fits comfortably on one device. For **LLMs** and for heavy multi-model GPU fleets, dedicated inference servers implement things you don't want to write yourself:
+
+| Server | What it's for |
+| --- | --- |
+| **vLLM** | High-throughput LLM serving. PagedAttention manages KV-cache memory in pages, continuous batching keeps the GPU full, plus prefix caching, quantization and tensor parallelism across GPUs. Exposes an OpenAI-compatible HTTP API. |
+| **TGI** (Hugging Face Text Generation Inference) | LLM serving with continuous batching, streaming and quantization; integrates with the Hugging Face hub. |
+| **Triton Inference Server** (NVIDIA) | Many model formats (TensorRT, ONNX, PyTorch, Python), built-in dynamic batching, model ensembles, concurrent model instances per GPU. Good for fleets of non-LLM models. |
+| **Ray Serve** | Python-native serving on a Ray cluster: autoscaling replicas, fractional GPUs, composing several models into one pipeline, and request batching through a decorator. |
+
+Signs you've reached that point: you're generating text token by token, the model needs more than one GPU, you're writing KV-cache or memory management code, or you need autoscaling GPU replicas.
+
+You don't throw FastAPI away. It becomes the **gateway** in front of the inference server: authentication, tenants, [rate limits and budgets](/docs/fastapi/production-ai-concerns), request validation, prompt templates, logging and metrics, and routing between your own models and hosted APIs. It talks to the inference server over HTTP like any upstream service, so the event loop is only waiting on I/O again (**not run**; needs a running vLLM server):
+
+```python
+# Not run: needs a vLLM server, e.g. `vllm serve <model> --port 8001`.
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import StreamingResponse
+
+VLLM = "http://vllm:8001"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # one shared client = connection pooling to the inference server
+    app.state.http = httpx.AsyncClient(base_url=VLLM, timeout=httpx.Timeout(60, connect=2))
+    yield
+    await app.state.http.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/v1/generate")
+async def generate(body: GenerateRequest, request: Request, user=Depends(current_user)):
+    payload = {
+        "model": body.model,
+        "messages": [{"role": "user", "content": body.prompt}],
+        "max_tokens": min(body.max_tokens, user.plan.max_tokens),   # gateway policy
+        "stream": True,
+    }
+
+    async def relay():
+        async with request.app.state.http.stream("POST", "/v1/chat/completions",
+                                                 json=payload) as upstream:
+            async for line in upstream.aiter_lines():
+                if await request.is_disconnected():
+                    break                    # closing the upstream stream frees the GPU slot
+                if line:
+                    yield line + "\n\n"
+
+    return StreamingResponse(relay(), media_type="text/event-stream")
+```
+
+Closing the upstream stream when your client disconnects matters more here than with a hosted API: an abandoned generation keeps occupying a slot in *your* GPU's batch until it hits `max_tokens`.
+
+## Traps
+
+- **Loading the model per request** or at import time. Load once, in the lifespan.
+- **Calling `predict()` inside `async def`.** Every other request in that process freezes, health checks included.
+- **Assuming threads fix CPU-bound Python.** With the GIL, pure-Python computation in threads barely overlaps and can still starve the event loop. Threads help when the heavy work is native code that releases the GIL; otherwise use processes.
+- **Unbounded concurrency.** The default thread limiter (40) is shared with sync endpoints, and an unbounded batch queue turns overload into minute-long latencies. Bound both and shed load with 503.
+- **Several Uvicorn workers on one GPU.** Duplicated weights and CUDA contexts, out-of-memory errors, and worse batching. One process per GPU.
+- **Forgetting the process pool's memory cost.** N processes means N copies of the model.
+- **Skipping warm-up.** The first users after every deploy get multi-second latencies, and autoscalers react to the spike.
+- **Not recording the model version** on each response and log line. You can't debug a quality regression you can't attribute.
+- **A batcher that loses futures.** An exception or a cancelled task that never resolves its waiters leaves requests hanging until their timeout.
+- **Building your own LLM server.** Continuous batching and KV-cache paging are hard; vLLM and TGI already do them.
+
+## Key points
+
+- Load models once per process in the lifespan and keep them on `app.state`.
+- Never run inference directly in an `async def` endpoint. Use threads for GIL-releasing native code, processes for pure-Python CPU work, and measure which you have.
+- Dynamic batching (a queue of input-and-future pairs, a short wait window, one batch call, resolve every future) multiplies GPU throughput at the cost of a few milliseconds of idle latency.
+- One worker process per GPU, with batching inside it. Scale with more GPUs, not more workers per GPU.
+- Version models explicitly, return the version with every response, and warm up before accepting traffic.
+- For LLMs and large GPU fleets, use vLLM, TGI, Triton or Ray Serve, and keep FastAPI as the gateway for auth, limits, validation and observability.
+
+Next: [Production AI concerns](/docs/fastapi/production-ai-concerns): rate limits, budgets, caching, fallbacks, guardrails, observability and evals.

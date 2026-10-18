@@ -1,0 +1,811 @@
+---
+title: "Validations and Transformations"
+description: Where input validation sits in a layered backend, the syntactic, semantic, type and cross-field checks it runs, how transformation fixes data before use, and why the server must never rely on frontend validation.
+---
+
+<Callout type="info">
+  Notes for [Validations and transformations for backend engineers](https://youtu.be/qedj_JjjL-U) by **Sriniously**. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+This lesson is less about theory and more about **a set of rules to keep in mind while designing APIs**, mostly for **data integrity and security**. The core idea fits in one sentence: **check and normalize every piece of client input at the entry point, before any real logic runs.**
+
+<Mermaid chart={`flowchart LR
+  A["Where it sits: controller / service / repository"] --> B["Why at the entry point"]
+  B --> C["Demo: syntactic errors"]
+  C --> D["Types: syntactic, semantic, type"]
+  D --> E["Transformation: query strings to numbers"]
+  E --> F["Demos: semantic, complex, transform, type"]
+  F --> G["Frontend vs backend validation"]`} />
+
+---
+
+## 1. Where validation lives: the three layers 🎓
+
+A typical backend splits a request's work into layers:
+
+| Layer | Responsibility |
+|---|---|
+| **Controller** | Everything HTTP: reading the request, **validating input**, choosing status codes (success or error), shaping the response format. Calls the service. |
+| **Service** | Business logic for the API: may call one or more repository methods, send notifications or emails, call webhooks … |
+| **Repository** | Talking to persistent storage: queries, inserts, deletes, in Postgres, Redis or any other store |
+
+**Why split controller and service?** So HTTP concerns (status codes, input format, validation) stay in one layer and the business logic doesn't care whether it was called from HTTP, a queue or a CLI.
+
+### The exact spot
+
+<Mermaid chart={`flowchart LR
+  C["Client<br/>JSON body, query, path params, headers"] --> R["Route matching"]
+  R --> V["Validation + transformation pipeline"]
+  V -->|"invalid"| E["400 Bad Request<br/>list of field errors"]
+  V -->|"valid, typed, normalized"| CT["Controller logic"]
+  CT --> S["Service"]
+  S --> RP["Repository"]
+  RP --> DB[(Database)]`} />
+
+After the router has matched the route and picked the controller method, and **before any significant logic runs** (before the service is called, before the database is touched), the request goes through the **validation and transformation pipeline**.
+
+What gets validated: **everything the client controls**. The JSON body, **query parameters**, **path parameters**, **headers**.
+
+---
+
+## 2. What validation does, and why at the entry point 🎓
+
+### The mechanism
+The pipeline is usually a **middleware or a reusable utility** that you give a **schema** for each API. Take a requirement: the body must contain a `name` that is a string of **5 to 100 characters**. The pipeline checks in layers and stops with a clear error at the first failure for that field:
+
+<Mermaid chart={`flowchart TD
+  A{"Is name present?"} -->|"no"| E1["400: name is required"]
+  A -->|"yes"| B{"Is it a string?"}
+  B -->|"no, e.g. an array or boolean"| E2["400: expected string, received boolean"]
+  B -->|"yes"| C{"Length 5 to 100?"}
+  C -->|"too short / too long"| E3["400: length must be 5 to 100"]
+  C -->|"yes"| OK["Pass to controller"]`} />
+
+You can make the schema as strict as you need; this is just the basic idea.
+
+### The problem it prevents (the lesson's example)
+Suppose there's **no validation** and a client sends `name: 0` (a number) to a "create book" API:
+
+1. The controller passes it to the service, the service to the repository.
+2. The repository runs an `INSERT` into the `books` table.
+3. The column was defined as `name TEXT NOT NULL`. Postgres checks data types and **rejects the insert**.
+4. The error bubbles up as an unexpected exception, and the client gets **500 Internal Server Error**: "something went wrong on our side".
+
+That's a terrible experience for a simple form, and it's **wrong**: the client made the mistake, not the server. With validation at the entry point, the same request gets **400 Bad Request** with a message saying what to fix, and nothing deeper ever runs.
+
+**First-principles reason:** every layer below the controller is written assuming its inputs have a known shape. Validating once at the boundary turns "any bytes from the internet" into "data that satisfies our invariants", so the system never enters an **unexpected state**.
+
+> 🔧 **Edge case: sometimes it's worse than a 500.** Whether `0` fails depends on the driver and column type. With psycopg, the integer is sent as a number and PostgreSQL's assignment cast to `text` quietly turns it into the string `"0"`, so the insert **succeeds silently**: bad data is now stored. (asyncpg is stricter and refuses to encode an `int` for a `text` parameter.) Going the other way (a string into an `INTEGER` column) fails with `invalid input syntax for type integer`. Silent coercion is the stronger argument for validating at the edge: the database can't catch what it can legally convert.
+
+---
+
+## 3. What the first demo shows 🎓
+
+The lesson uses **Insomnia** (an API client) against a local server, calling `POST /api/valid/syntactic`.
+
+1. **Empty JSON body** → an **array of errors**: `email`, `phone` and `date` are all **required**.
+2. Fill them with junk (a random string for email, a **number** for phone, a date like `2025-11-05`) → two errors: **invalid email format**, and phone **expected string, received number**.
+3. Fix the email (add `@…test.com`) and make the phone a **string** → **200 OK**.
+
+🔧 The error wording ("Expected string, received number") matches the default messages of the JavaScript **Zod** library, so the demo server is most likely using it. Pydantic's equivalent message is "Input should be a valid string".
+
+---
+
+## 4. The three types of validation 🎓
+
+These aren't strict categories, but they're the ones you'll meet most often.
+
+| Type | Question it asks | Examples from the lesson |
+|---|---|---|
+| **Syntactic** | Does the value have the right **structure**? | Email = local part + `@` + domain + TLD. Phone = country code + the right number of digits for that country. Date in `YYYY-MM-DD` |
+| **Semantic** | Does the value **make sense**? | Date of birth can't be in the **future**. Age `365` is impossible (at least for now) |
+| **Type** | Is it the right **data type**? | string, number, boolean, array, nested object (whose fields are again typed) |
+
+🔧 OWASP uses the same split: **syntactic** validation enforces the format of structured fields, **semantic** validation enforces correctness in the business context (e.g. a start date before an end date). It also recommends **allowlists** (define exactly what's allowed) over denylists (try to list what's bad).
+
+---
+
+## 5. Transformation 🎓
+
+### The problem
+A paginated API: `GET /bookmarks?page=2&limit=20`. The rules:
+- `page` is a **number**, greater than 0 and less than 500;
+- `limit` is a **number**, greater than 0 and less than 10,000 (never return more than that at once).
+
+But **every query-parameter value reaches the server as a string**. A query string is just text in the URL; it has no types. So the server receives `page: "2"` and `limit: "20"`, and the very first rule (*must be a number*) fails. The client did nothing wrong.
+
+### The mechanism
+It's the **server's** job to **cast** (force a value of one type into another) `"2"` → `2` **before** the validation rules run. That step is a **transformation**: changing data into the shape the server expects.
+
+Transformation can also run **after** validation, e.g. normalizing a valid email to lower case.
+
+<Mermaid chart={`flowchart LR
+  Q["?page=2#amp;limit=20<br/>page: string 2, limit: string 20"] --> T1["Transform: cast to number"]
+  T1 --> V["Validate: integer, range"]
+  V --> T2["Transform: defaults, normalize"]
+  T2 --> H["Controller gets page: 2, limit: 20 as numbers"]`} />
+
+**Why put validation and transformation in one pipeline:** all knowledge about **input data** lives in one place. You don't have to search the codebase for what an API requires or what was done to the data before the business logic saw it.
+
+---
+
+## 6. What the remaining demos show 🎓
+
+Each demo calls an endpoint first with an **empty body**. A nice side effect: **validation errors act as documentation**. Even without API docs, the error list tells a client which fields exist and what they must contain.
+
+### Semantic
+- Required: `dateOfBirth` and `age` (the empty body says age expected a number, received nothing).
+- `1995-06-12` and age `43` → success, and the server echoes the values.
+- Change the year to **2026** → "**date of birth cannot be in the future**".
+- Age **430** → "**number must be less than or equal to 120**". The accepted range is **1 to 120** (a one-year-old won't call the API, but the rule is about plausibility).
+
+### Complex (cross-field)
+- Fields: `password`, `passwordConfirmation`, `married`.
+- Two different passwords → "**passwords don't match**" on `passwordConfirmation`, and "**must contain at least 8 characters**" on `password`.
+- Fix both → success.
+- Set `married: true` → "**partner name is required when married is true**". Add `partner` → success.
+- Called "complex" because the rules **depend on other fields**: two fields must be equal; one field is **conditionally required** based on another.
+
+### Transformation
+- Send an email in **mixed case**, a phone **without the leading `+`**, and a date in some format.
+- The response shows the email **lower-cased**, the phone **with `+` prepended**, and the date **reformatted**. The server reshaped the data for the service layer's needs before using it.
+
+### Type
+- Fields: `stringField`, `numberField`, `arrayField`, `booleanField`.
+- Send strings everywhere → "expected number / array / boolean, received string".
+- Fix to `10`, an array `[1, 2]`, and `false` → a new error: **array element 0 expected string**. Element-level rules apply too.
+- Use `["1", "2"]` → success.
+
+---
+
+## 7. 🔧 Going deeper: implementing the pipeline in Python (FastAPI + Pydantic)
+
+### FastAPI's built-in pipeline, with a 400 error format
+
+In FastAPI the pipeline already exists: every parameter you declare with a type, `Query(...)`, `Path(...)`, `Header(...)` or a Pydantic model is parsed, cast and validated before your function runs, and the handler only ever receives the transformed data. What you may want to change is the error format: by default FastAPI answers **422** with a `detail` list. This handler turns every validation failure into **400** with an `issues` list:
+
+```python title="validation_errors.py"
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    issues = [
+        {
+            "location": err["loc"][0],                           # "path", "query", "body" or "header"
+            "path": ".".join(str(p) for p in err["loc"][1:]),
+            "message": err["msg"],
+        }
+        for err in exc.errors()                                  # ALL errors, from every location at once
+    ]
+    return JSONResponse({"error": "ValidationError", "issues": issues}, status_code=400)
+```
+
+### The lesson's schemas, written out
+
+```python title="schemas.py"
+import datetime as dt
+from typing import Annotated, Self
+
+from pydantic import (
+    AfterValidator, BaseModel, BeforeValidator, ConfigDict, EmailStr, Field,
+    StringConstraints, ValidationInfo, field_validator,
+)
+from pydantic.alias_generators import to_camel
+
+
+class Schema(BaseModel):
+    # JSON keys stay camelCase (dateOfBirth); Python attributes are snake_case
+    model_config = ConfigDict(alias_generator=to_camel, validate_by_name=True)
+
+
+# Syntactic
+class Syntactic(Schema):
+    email: EmailStr
+    phone: Annotated[str, Field(pattern=r"^\+?[1-9]\d{7,14}$")]    # E.164-style: up to 15 digits
+    date: dt.date                                                   # parsed, so 2025-02-30 is rejected
+
+
+# Semantic: evaluate "now" at request time, not when the module loads
+class Semantic(Schema):
+    date_of_birth: dt.date
+    age: Annotated[int, Field(ge=1, le=120)]
+
+    @field_validator("date_of_birth")
+    @classmethod
+    def not_in_future(cls, d: dt.date) -> dt.date:
+        if d > dt.date.today():
+            raise ValueError("Date of birth cannot be in the future")
+        return d
+
+
+# Complex / cross-field
+class Signup(Schema):
+    password: Annotated[str, Field(min_length=8)]
+    password_confirmation: str
+    married: bool
+    partner: Annotated[str | None, StringConstraints(strip_whitespace=True, min_length=1)] = Field(
+        default=None, validate_default=True,                        # run the check even when it's absent
+    )
+
+    @field_validator("password_confirmation")
+    @classmethod
+    def passwords_match(cls, v: str, info: ValidationInfo) -> str:
+        if "password" in info.data and v != info.data["password"]:   # info.data = fields already validated
+            raise ValueError("Passwords don't match")
+        return v
+
+    @field_validator("partner")
+    @classmethod
+    def partner_if_married(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if info.data.get("married") and not v:
+            raise ValueError("Partner name is required when married is true")
+        return v
+
+
+# Transformation
+def lower_strip(v: object) -> object:
+    return v.strip().lower() if isinstance(v, str) else v
+
+
+class Contact(Schema):
+    email: Annotated[EmailStr, BeforeValidator(lower_strip)]
+    phone: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True),
+        AfterValidator(lambda p: p if p.startswith("+") else f"+{p}"),
+    ]
+    date: dt.datetime                     # ISO 8601 string or Unix timestamp in, ISO 8601 out (model_dump_json)
+
+
+# Type: strict mode turns off coercion, so "10" is NOT accepted as a number
+class Types(Schema):
+    model_config = ConfigDict(strict=True)
+    string_field: str
+    number_field: float
+    array_field: list[str]
+    boolean_field: bool
+
+
+# Query params: cast first (strings → numbers, Pydantic's default lax mode), then range-check, with defaults
+class Pagination(BaseModel):
+    page: Annotated[int, Field(ge=1, le=500)] = 1
+    limit: Annotated[int, Field(ge=1, le=10_000)] = 20
+```
+
+```python title="routes.py"
+from typing import Annotated
+
+from fastapi import Query
+
+
+@app.get("/bookmarks")
+async def list_bookmarks(q: Annotated[Pagination, Query()]):
+    return await bookmark_service.list(page=q.page, limit=q.limit)    # ints now
+```
+
+### Rejecting unknown query parameters
+
+```python title="pagination_query.py"
+from typing import Annotated
+
+from fastapi import Query
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class PaginationQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")       # reject ?pgae=2 instead of silently ignoring it
+
+    page: Annotated[int, Field(ge=1, le=500)] = 1   # FastAPI hands Pydantic "2"; lax mode casts it to 2
+    limit: Annotated[int, Field(ge=1, le=10_000)] = 20
+
+
+@app.get("/bookmarks")
+async def list_bookmarks(q: Annotated[PaginationQuery, Query()]):
+    return await bookmark_service.list(page=q.page, limit=q.limit)
+```
+
+---
+
+## 8. 🔧 Going deeper: edge cases worth engineering for
+
+**Coercion traps**
+- Casting by hand is the trap: `bool("false")` is **`True`** in Python (any non-empty string is truthy). Let the schema do it: a Pydantic `bool` field in lax mode parses `"false"`, `"0"`, `"no"` and `"off"` as `False`, and rejects anything it can't interpret.
+- An `int` field rejects `""` and `"  "` (`int_parsing`) instead of turning them into `0`. It does accept `" 2 "` and `"2.0"` as `2` in lax mode; use `strict=True` on the field if you want only real numbers. Decide whether an empty param means "missing" (make it optional) or an error.
+- Repeated query keys (`?tag=a&tag=b`): a plain `str` parameter keeps only one value. Declare `tags: Annotated[list[str], Query(alias="tag")] = []` and FastAPI collects both `?tag=a` and `?tag=a&tag=b` into a list.
+
+**Unknown fields and mass assignment**
+- By default a Pydantic model **ignores** (drops) unknown keys (`extra="ignore"`). That matters: if a sign-up body includes `"role": "admin"` and your code does `User(**await request.json())`, unvalidated extra fields go straight into the DB. Only ever pass **parsed** data (`body.model_dump()`) to the service.
+- Use `model_config = ConfigDict(extra="forbid")` if you'd rather reject unknown fields than drop them silently.
+
+**Normalization choices**
+- Lower-casing emails: technically the local part can be case-sensitive, but in practice nearly every provider treats it case-insensitively, so normalizing (and a unique index on the normalized value) prevents duplicate accounts like `Asha@x.com` and `asha@x.com`.
+- **Trim** strings before length checks, or `"     "` passes a min-length rule.
+- Dates: agree on **ISO 8601** and store **UTC**. A date-of-birth is a calendar date with no time zone; don't turn it into a midnight timestamp that shifts by a day in another zone.
+- Phone numbers: store in **E.164** (`+` country code + number, at most 15 digits). A library like `phonenumbers` (the Python port of Google's libphonenumber) validates per-country lengths, which a regex can't.
+
+**Cross-field refinements**
+- In Pydantic, a field validator that reads `info.data` only sees fields that were declared earlier **and** already passed, and a `mode="after"` model validator only runs once every field is individually valid. So "passwords don't match" won't appear in the same response as "password too short". That's often acceptable; if not, run the cross-field checks on a looser model and merge the errors.
+
+**Status codes and limits**
+- `400 Bad Request` is the common choice for validation failures. Some APIs use `422 Unprocessable Content` for "well-formed JSON, invalid values" and keep 400 for malformed syntax. Pick one and be consistent.
+- Cap the **body size** (FastAPI has no built-in limit, so set it at the reverse proxy, for example nginx's `client_max_body_size`, or in a middleware), string lengths and array lengths. A schema without maximums still lets a client send a 50 MB string.
+
+**Defence in depth**
+- Validation at the edge doesn't replace **database constraints**. Keep `NOT NULL`, `CHECK (age BETWEEN 1 AND 120)`, `UNIQUE` and foreign keys: they protect you from bugs, scripts and other services that bypass your API.
+- Validation isn't **output encoding**. A perfectly valid string can still be dangerous in HTML or SQL; use parameterized queries and escape on output.
+
+### ReDoS: when the validator becomes the attack ➕
+
+The schemas above lean on regular expressions (phone, date, email). A badly written regex turns validation, the thing meant to protect the server, into a way to stop it.
+
+#### How one request can pin a CPU ➕
+
+**Problem.** A request with a 40-character string in one field makes the server stop responding for seconds or minutes.
+
+**Why it happens (first principles).** Python's `re` module is a **backtracking** engine. When a pattern has ambiguous ways to match the same text, typically **nested quantifiers** like `(a+)+` or overlapping alternatives like `(a|a)*`, and the input almost matches but fails at the end, the engine tries every way of splitting the input before giving up. The number of splits grows **exponentially** with input length. And `re` doesn't release the GIL while matching, so on a standard CPython build one backtracking regex stalls the event loop of an async server and every other thread in the process: every other request waits.
+
+```python title="redos_demo.py (don't ship this)"
+import re
+import time
+
+bad = re.compile(r"^(\w+\s?)*$")           # nested quantifier: \w+ inside (...)*
+payload = "a" * 24 + "!"                   # almost matches, fails on the last char
+
+start = time.perf_counter()
+bad.match(payload)                         # roughly doubles per extra 'a'
+print(f"regex: {time.perf_counter() - start:.3f}s")
+```
+
+```text title="Output (CPython 3.14, one run)"
+regex: 1.118s
+```
+
+**Edge cases.** This isn't only about hand-written patterns. Library validators have shipped vulnerable regexes too: the JavaScript library Zod, before 3.22.3, had a ReDoS in its email regex (CVE-2023-4316). Keep validation libraries updated like any other security dependency.
+
+#### Defences ➕
+
+**Mechanism.** Remove either the ambiguity or the attacker's control of input size:
+1. **Cap the length first, and stop there if it fails.** A 40-character limit makes even a poor pattern bounded. Pydantic checks a field's `max_length` before its `pattern` and stops at the first failure, so a 1 MB string never reaches the regex. For a regex you run yourself, put the `AfterValidator` after a length constraint so it only sees input that passed.
+2. **Write unambiguous patterns.** Anchor them, avoid quantified groups that contain quantifiers, and make alternatives mutually exclusive. `^\+?[1-9]\d{7,14}$` from section 7 is safe: each position can match only one way. Since Python 3.11, `re` also supports atomic groups `(?>...)` and possessive quantifiers like `*+`, which forbid backtracking into a group.
+3. **Lint for it.** Tools like `regexploit` or the `dlint` flake8 plugin flag super-linear patterns in CI.
+4. **Use a linear-time engine** for patterns you don't control (for example user-defined search filters). `google-re2` (Google's RE2 for Python, imported as `re2`) guarantees linear time by not supporting backreferences and lookarounds. Pydantic's own `pattern=` constraint uses the Rust `regex` crate by default, which is linear-time too.
+5. **Prefer parsers to regexes** for complex formats: a URL parser (`urllib.parse.urlsplit`), `phonenumbers` for phones, `datetime.date.fromisoformat` for dates.
+
+```python title="safe_order.py"
+import re
+from typing import Annotated
+
+import re2                                  # google-re2: linear-time matching
+from pydantic import AfterValidator, Field
+
+# max_length is checked before the pattern, and Pydantic's pattern uses a linear-time Rust engine
+Slug = Annotated[str, Field(max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]
+
+# A regex you run yourself with `re` only ever sees input that passed the length check before it
+TAG = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def check_tag(s: str) -> str:
+    if not TAG.fullmatch(s):
+        raise ValueError("Invalid tag")
+    return s
+
+
+Tag = Annotated[str, Field(max_length=40), AfterValidator(check_tag)]
+
+
+def compile_user_pattern(pattern: str):
+    return re2.compile(pattern)             # user-supplied pattern: linear time, no catastrophic backtracking
+```
+
+**Edge cases.** Body-size limits don't help here: the malicious input is tiny. Only per-field length limits and safe patterns do. If you can't fix a pattern quickly, run it with a timeout: the third-party `regex` module accepts a `timeout=` argument, or run the check in a separate process you can kill. A thread doesn't help, because `re` holds the GIL and a running match can't be interrupted.
+
+---
+
+## 9. Unicode: strings that look equal but aren't ➕
+
+Section 8's normalization advice (trim, lower-case) assumes one character is one character. With Unicode it often isn't, and that breaks length rules, uniqueness checks and what users see.
+
+### Normalization forms: same text, different bytes ➕
+
+**Problem.** A user signs up as `José` on a phone. Later, logging in from a laptop, they type `José` and it doesn't match. A unique index on `username` happily accepts both spellings as different users, even though they look identical on screen.
+
+**Why it happens (first principles).** Unicode can represent many characters in more than one way. `é` can be one code point (U+00E9, precomposed) or two (`e` + U+0301, a combining acute accent). They look identical and are **canonically equivalent**, but their bytes differ, so `==`, hashes and database indexes treat them as different strings. Which form arrives depends on the operating system, keyboard and app the text was typed in.
+
+**Mechanism.** **Normalize** to one form at the boundary, before validating length or checking uniqueness:
+- **NFC** (canonical composition) changes no visible meaning. Use it for names, free text and anything you display.
+- **NFKC** also folds **compatibility** variants: the ligature `ﬁ` becomes `fi`, fullwidth `Ａ` becomes `A`, superscript `⁵` becomes `5`. That's useful for identifiers, but it changes meaning in some text, and the Unicode standard warns against applying it blindly to arbitrary text.
+
+Normalization is **idempotent** (normalizing twice equals normalizing once), so it's safe to do it at every boundary.
+
+```python title="unicode_schemas.py"
+import unicodedata
+from typing import Annotated
+
+from pydantic import AfterValidator, StringConstraints
+
+
+def nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s).strip()
+
+
+def nfkc_key(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).casefold().strip()
+
+
+DisplayName = Annotated[
+    str,
+    AfterValidator(nfc),
+    StringConstraints(min_length=1, max_length=50),     # validated AFTER normalizing
+]
+
+Username = Annotated[
+    str,
+    AfterValidator(nfkc_key),
+    StringConstraints(pattern=r"^\w{3,30}$"),           # \w is Unicode-aware: letters, digits and _ only
+]
+```
+
+**Edge cases.** Normalize **stored** data the same way, or old rows never match new input; a one-off backfill plus a `CHECK` constraint keeps it consistent. Never normalize passwords differently at sign-up and at login.
+
+### Length: code units, code points or characters ➕
+
+**Problem.** A "max 10 characters" rule rejects a 6-emoji name, and a database column accepts a name the API rejected.
+
+**Why it happens.** "Length" has three meanings:
+- Python's `len()` counts **code points**: `len('😀')` is 1, which is what Postgres `varchar(n)` and `char_length()` count;
+- JavaScript's `.length` (and so a browser form's length check) counts **UTF-16 code units**: the same emoji counts as 2 there;
+- users count **graphemes** (what looks like one character): a family emoji or a flag is several code points joined together but displays as one (`len('👨‍👩‍👧')` is 5).
+
+**Mechanism.** Pick the unit that matches the purpose, and make the API and the database agree:
+- **storage limits:** count code points, matching `varchar(n)`;
+- **UI-facing limits** ("max 10 characters"): count graphemes, for example with the third-party `regex` module's `\X`;
+- **byte limits** (a header, a key in another system): count UTF-8 bytes with `len(s.encode("utf-8"))`.
+
+```python title="length.py"
+import unicodedata
+from typing import Annotated
+
+import regex                                   # third-party; \X matches one grapheme cluster
+from pydantic import AfterValidator
+
+
+def graphemes(s: str) -> int:
+    return len(regex.findall(r"\X", s))
+
+
+def check_bio(s: str) -> str:
+    s = unicodedata.normalize("NFC", s)
+    if len(s) > 500:                           # len() counts code points: matches bio varchar(500)
+        raise ValueError("Too long")
+    if graphemes(s) < 1:
+        raise ValueError("Required")
+    return s
+
+
+Bio = Annotated[str, AfterValidator(check_bio)]
+```
+
+**Edge cases.** Pydantic's `max_length` uses `len()`, so it counts code points, the same unit as `varchar(n)`: anything the API accepts fits the column. Users still see a family emoji as one character while it uses 5 of the limit, and a JavaScript frontend counting UTF-16 units disagrees with both; document the unit.
+
+### Usernames and lookalikes: case folding, confusables, mixed scripts ➕
+
+**Problem.** Someone registers `pаypal` with a Cyrillic `а` (U+0430) and impersonates the real `paypal` account. Another registers `ADMIN` when `admin` exists.
+
+**Why it happens.** Different code points can render the same (**confusables**), and case rules are language-specific: `'I'.lower()` is `i`, but the correct lower case in Turkish is dotless `ı`. Normalization doesn't fix either, because the strings really are different characters.
+
+**Mechanism.** For identifiers other people see (usernames, handles, workspace slugs):
+1. Use a defined profile for identifiers rather than ad-hoc rules. The IETF **PRECIS** framework (RFC 8264, with username profiles in RFC 8265) restricts identifiers to letters and digits and specifies case mapping and normalization.
+2. Compare a **case-folded, normalized** form for uniqueness, and store it in its own indexed column.
+3. Detect confusables with Unicode **UTS #39**: compute `skeleton(x)`, a form where lookalike characters map to one prototype; two strings are confusable if their skeletons are equal. Store the skeleton with a unique index to block lookalike registrations.
+4. Reject **mixed-script** identifiers (Latin mixed with Cyrillic) unless you have a reason to allow them, or restrict to a single script per identifier.
+
+```sql title="usernames.sql"
+CREATE TABLE users (
+  id            uuid PRIMARY KEY,
+  username      text NOT NULL,                 -- as the user typed it (display)
+  username_key  text NOT NULL UNIQUE,          -- NFKC + case-folded (login and uniqueness)
+  username_skel text NOT NULL UNIQUE           -- UTS #39 skeleton (blocks lookalikes)
+);
+```
+
+**Edge cases.** Use locale-independent case folding for keys (Python's `str.casefold()` never depends on the locale; avoid locale-aware lower-casing from other libraries), or the same name maps to different keys on different servers. Skeleton matching is deliberately over-inclusive, so expect some false positives and give users a clear message.
+
+### Invisible and control characters ➕
+
+**Problem.** Two usernames look identical but one contains a zero-width space. A product name contains a right-to-left override that makes `exe.pdf` display as something else. An insert fails with a database error.
+
+**Why it happens.** Unicode includes characters that render as nothing (zero-width space U+200B, zero-width joiner U+200D), **bidirectional controls** that reorder how text displays (U+202E right-to-left override, the trick behind the "Trojan Source" attacks), and C0 control characters including the NUL byte. Postgres `text` can't store NUL at all, and `jsonb` rejects `\u0000` for the same reason, so a NUL that reaches the database becomes a 500.
+
+**Mechanism.** For single-line fields, use an allowlist of character categories (the OWASP Input Validation Cheat Sheet recommends exactly this): letters, marks, numbers, punctuation, symbols and the plain space. Reject everything in the "Other" categories (`\p{C}`, which `unicodedata.category()` reports as `Cc`, `Cf`, `Cn` and so on: controls, format characters, unassigned) except where you have a reason to allow them.
+
+```python title="no_invisible.py"
+import unicodedata
+from typing import Annotated
+
+from pydantic import AfterValidator, Field
+
+VISIBLE = {"L", "M", "N", "P", "S"}            # letters, marks, numbers, punctuation, symbols
+
+
+def only_visible(s: str, extra: str = "") -> bool:
+    # no "C*" categories (controls, format chars, NUL, unassigned); Zs is the only allowed separator
+    return all(
+        unicodedata.category(c)[0] in VISIBLE or unicodedata.category(c) == "Zs" or c in extra
+        for c in s
+    )
+
+
+def single_line(s: str) -> str:
+    s = unicodedata.normalize("NFC", s).strip()
+    if not s:
+        raise ValueError("Required")
+    if not only_visible(s):
+        raise ValueError("Contains invisible or control characters")
+    return s
+
+
+def multi_line(s: str) -> str:
+    s = unicodedata.normalize("NFC", s)
+    if not only_visible(s, extra="\n\t"):
+        raise ValueError("Contains invisible or control characters")
+    return s
+
+
+ProductName = Annotated[str, Field(max_length=120), AfterValidator(single_line)]
+```
+
+**Edge cases.** Some format characters are legitimate: the zero-width joiner builds many emoji sequences, and some scripts need U+200C or U+200D to render correctly. For free text, allow ZWJ and ZWNJ but strip or reject bidi overrides; for identifiers, reject all of them.
+
+---
+
+## 10. Frontend validation vs backend validation 🎓
+
+**The mistake:** treating frontend form validation as a replacement for backend validation.
+
+| | Frontend validation | Backend validation |
+|---|---|---|
+| **Purpose** | **User experience**: immediate feedback in the form | **Security and data integrity** |
+| **Can it be bypassed?** | Yes, trivially | No, it's the gate |
+| **Required?** | Nice to have | **Mandatory, for every API** |
+
+**Why the backend can't rely on it:** your server has many clients. A polished web app may validate perfectly, but someone can call the API directly with **Postman or Insomnia** (as the demos did), a script, or a modified client. There's **no frontend at all** in that path. If the backend depended on frontend checks, it would break as soon as the client changed.
+
+So design server-side validation to be **as strict and specific as possible**, without thinking about what the client checks.
+
+<Mermaid chart={`sequenceDiagram
+  autonumber
+  participant U as User
+  participant F as Web form
+  participant P as Postman / script
+  participant API as API (server validation)
+  U->>F: type bad email
+  F-->>U: inline error, no request sent
+  U->>F: fix email, submit
+  F->>API: POST valid payload
+  API-->>F: 200
+  P->>API: POST anything at all
+  API-->>P: 400 with field errors`} />
+
+**What the final demo shows:** the same endpoints have a small frontend. With a bad email, pressing submit **sends no API request** at all; the browser's form validation flags the field. After fixing it (a proper `…@gmail.com`), submit sends the request, the network panel shows the payload, and the server answers **200**. The frontend gives instant feedback; the backend enforces the rules.
+
+🔧 **Share one schema** between frontend and backend (e.g. generate the form's validation from the OpenAPI document FastAPI builds from your Pydantic models, or from `Model.model_json_schema()`). The UX checks and the security checks then can't drift apart, but the backend still runs its own copy on every request.
+
+---
+
+## 11. Validating at every trust boundary, not only HTTP requests ➕
+
+The frontend isn't the only source of data your code shouldn't trust. The same rule ("parse at the boundary, then trust the typed result") applies wherever bytes enter the process from somewhere you don't control in that moment.
+
+<Mermaid chart={`flowchart LR
+  H["HTTP requests"] --> B{"Boundary:<br/>parse with a schema"}
+  Q["Queue messages and events"] --> B
+  T["Third-party API responses"] --> B
+  S["Your own stored JSON and cache"] --> B
+  B -->|"typed, trusted"| L["Business logic"]
+  L --> O{"Output boundary:<br/>response schema"}
+  O --> R["HTTP response"]`} />
+
+Three boundaries already have their own lessons, so only pointers here: **configuration** is validated at startup ([lesson 17](/docs/backend-first-principles/17-configuration-management)), **webhooks** are signature-checked over the raw body before parsing ([lesson 30](/docs/backend-first-principles/30-webhooks)), and **uploaded files** are checked by size and magic bytes, never by the client's `Content-Type` ([lesson 24](/docs/backend-first-principles/24-object-storage-part-1)).
+
+### Queue and event payloads ➕
+
+**Problem.** A producer deploys a change that renames `userId` to `user_id`. Every consumer job now throws `KeyError: 'userId'` deep in a handler, the queue retries each one several times, and the failures look like infrastructure problems.
+
+**Why it happens.** A message on a queue is **serialized input from another process**, written by a different deploy, possibly hours ago. Type hints on the consumer side are a promise checked only by your type checker, about data that was never checked at runtime.
+
+**Mechanism.** Parse every message against a schema at the start of the handler, and treat a schema failure differently from a transient failure: a malformed message (a **poison message**) will fail the same way on every retry, so send it straight to a **dead-letter queue** instead of retrying.
+
+```python title="worker.py (Celery)"
+from typing import Literal
+from uuid import UUID
+
+from celery import Celery
+from celery.exceptions import Reject
+from pydantic import BaseModel, ValidationError
+
+app = Celery("emails", broker=BROKER_URL)
+
+
+class SendWelcome(BaseModel):
+    v: Literal[1]
+    user_id: UUID
+    locale: Literal["en", "hi", "de"] = "en"
+
+
+@app.task(acks_late=True)
+def send_welcome(payload: dict) -> None:
+    try:
+        msg = SendWelcome.model_validate(payload)
+    except ValidationError as e:
+        # Retrying won't fix bad data: reject without requeueing so the broker dead-letters it
+        fields = ", ".join(".".join(map(str, err["loc"])) for err in e.errors())
+        raise Reject(f"invalid payload: {fields}", requeue=False) from e
+    send_welcome_email(msg)                    # typed and trusted from here on
+```
+
+**Edge cases.** Celery has no dead-letter queue of its own: `Reject(requeue=False)` hands the message back to the broker, and RabbitMQ routes it to a dead-letter exchange if the queue was declared with one (`x-dead-letter-exchange`); SQS has DLQs through a redrive policy, and with other brokers you store the payload yourself before failing. Put a version field in the payload and keep accepting the previous version during deploys ([lesson 7](/docs/backend-first-principles/07-serialization-deserialization) covers versioned payloads). Alert on dead-lettered messages: a sudden spike almost always means a producer and consumer disagree after a deploy. Background-job mechanics (retries, idempotency) are in [lesson 14](/docs/backend-first-principles/14-task-queues-background-jobs).
+
+### Responses from third-party APIs ➕
+
+**Problem.** A payment provider starts returning `amount` as a string instead of a number for one currency. Your code multiplies it by a quantity and stores `"100" * 2 = "100100"`.
+
+**Why it happens.** An external API is a boundary you don't control. Its documentation describes intent, not every response you'll get: fields go missing in error cases, types change between versions, and enums gain values.
+
+**Mechanism.** Validate the fields you **use** (not the entire response), be tolerant of additions, and convert failures into a clear, logged error at the integration edge instead of a confusing bug three layers later.
+
+```python title="payments_client.py"
+import logging
+from typing import Annotated, Literal
+from urllib.parse import quote
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+logger = logging.getLogger(__name__)
+
+
+class ChargeResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")                       # keep fields we don't model
+
+    id: str
+    status: Literal["succeeded", "pending", "failed"]
+    amount: Annotated[int, Field(ge=0, strict=True)]               # minor units; strict: "100" is rejected, not cast
+
+    @field_validator("status", mode="wrap")
+    @classmethod
+    def unknown_is_pending(cls, v, handler):
+        try:
+            return handler(v)
+        except ValidationError:
+            return "pending"                                       # unknown status: treat as pending, then reconcile
+
+
+async def get_charge(client: httpx.AsyncClient, charge_id: str) -> ChargeResponse:
+    res = await client.get(f"{BASE}/charges/{quote(charge_id, safe='')}", timeout=5.0)
+    if res.is_error:
+        raise UpstreamError("payments", res.status_code)
+    try:
+        return ChargeResponse.model_validate_json(res.content)
+    except ValidationError as e:
+        logger.error("payments response failed schema",
+                     extra={"issues": e.errors(), "charge_id": charge_id})
+        raise UpstreamError("payments", 502) from e
+```
+
+**Edge cases.** Decide per field whether to fail or degrade: a missing optional display field can default, but a malformed **amount** must stop the flow. Watch for silent fallbacks like the `unknown_is_pending` wrap validator hiding real changes; count them in metrics.
+
+### Data you read back from your own storage ➕
+
+**Problem.** A JSONB `settings` column has rows written by five past releases, some by a script and one by a hotfix that stored `"true"` instead of `true`. Code that assumes the current shape crashes for those users only.
+
+**Why it happens.** The database checks a `jsonb` column only for being valid JSON. Caches (Redis), files and JSONB are the same as a queue: serialized data written by some past version of some program.
+
+**Mechanism.** Parse semi-structured data with a schema **on read** (in the repository layer, so services get typed objects), with defaults for fields added later. Where possible, also constrain it in the database:
+
+```sql title="settings-check.sql"
+ALTER TABLE users ADD CONSTRAINT settings_shape CHECK (
+  jsonb_typeof(settings) = 'object'
+  AND (NOT settings ? 'darkMode' OR jsonb_typeof(settings -> 'darkMode') = 'boolean')
+);
+```
+
+**Edge cases.** For a cache, treat a parse failure as a **miss**: delete the key and reload from the source of truth instead of returning an error. A `CHECK` constraint added later fails if existing rows violate it; clean the data first, or add it as `NOT VALID` and run `VALIDATE CONSTRAINT` after a backfill.
+
+### Your own responses: output validation ➕
+
+**Problem.** A refactor adds `passwordHash` to the user object returned by the repository, and every endpoint that returns a user now leaks it. Or a field that the contract says is always a string is sometimes `null`, and the mobile app crashes.
+
+**Why it happens.** Input validation protects your server from clients. Nothing, by default, protects **clients** from your server: the response is whatever object the handler happened to build.
+
+**Mechanism.** Give each endpoint a **response schema** and pass every response through it. An allowlist schema drops fields you didn't declare (stopping leaks) and fails loudly when the shape is wrong (stopping contract breaks). FastAPI does this natively: a `response_model` (or a return type annotation) makes it validate what the handler returns against that model and serialize **only** the declared fields, using Pydantic's Rust core. (Fastify and NestJS have equivalents.)
+
+```python title="respond.py"
+from pydantic import BaseModel, ConfigDict, EmailStr
+
+
+class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)    # accept ORM objects as well as dicts
+
+    id: str
+    email: EmailStr
+    name: str                                          # anything not declared (password_hash) is dropped
+
+
+@app.get("/users/{user_id}", response_model=UserResponse)
+async def get_user(user_id: str):
+    # validated on the way out; a mismatch raises ResponseValidationError → 500 (our bug, not the client's)
+    return await users.find(user_id)
+```
+
+**Edge cases.** Parsing big responses costs CPU; if that matters, enforce the full check in development and tests and keep only field stripping in production. Generating these schemas from (or into) an OpenAPI document keeps docs and code in sync ([lesson 29](/docs/backend-first-principles/29-openapi)).
+
+---
+
+## 12. Recap 🎓
+
+- Validation and transformation run at the **entry point**: after route matching, **before** the controller's logic, the service or the database.
+- Validate **every input**: body, query, path params, headers.
+- Without it, bad input becomes a **500** deep in the stack (or silently bad data); with it, the client gets a clear **400**.
+- Types: **syntactic** (structure: email, phone, date), **semantic** (makes sense: no future birth dates, ages 1–120), **type** (string, number, boolean, array, object), plus **complex** cross-field rules.
+- **Transformation** reshapes data: casting query strings to numbers, lower-casing emails, adding `+` to phones, formatting dates. Keep it in the same pipeline as validation.
+- **Frontend validation is UX; backend validation is security and integrity.** Never skip the backend.
+- ➕ **ReDoS:** backtracking regexes can take exponential time on tiny inputs. Cap length before the regex (a `max_length` constraint ahead of the pattern in Pydantic), write unambiguous patterns, lint them, use RE2 for untrusted patterns.
+- ➕ **Unicode:** normalize (NFC for text, NFKC for identifiers) before length and uniqueness checks; know which length unit you count; block lookalikes, mixed scripts and invisible or control characters in identifiers.
+- ➕ **Every trust boundary** gets a schema: queue messages (poison messages fail permanently), third-party responses, stored JSONB and cache entries, and your **own responses** (output schemas stop leaks).
+
+---
+
+## Interview questions
+
+1. **Where should input validation happen, and why there?** At the controller entry point, right after routing and before business logic, so every layer below can trust its inputs and errors are returned as 400 rather than surfacing as 500s.
+2. **Syntactic vs semantic validation?** Syntactic checks structure (is this a valid email or date format). Semantic checks meaning in context (a birth date can't be in the future, start must precede end).
+3. **Why does `?page=2` fail a "must be a number" rule, and what's the fix?** Query values always arrive as strings. Transform (cast) them to numbers before validating.
+4. **What's a cross-field validation? Give two examples.** A rule involving several fields: password confirmation must equal password; partner is required when `married` is true.
+5. **Why isn't frontend validation enough?** Anyone can call the API directly (Postman, curl, scripts). Frontend checks are for UX; backend checks are for security and integrity.
+6. **What goes wrong with `bool(request.query_params["flag"])`?** It uses Python truthiness, so `"false"` becomes `True`. Let a `bool` field parse it, or compare the literal strings explicitly.
+7. **How does validation help prevent mass-assignment bugs?** Parsing against a schema strips or rejects unknown fields like `role`, and only the parsed object is passed on.
+8. **If you validate in the API, do you still need DB constraints?** Yes: defence in depth against bugs and other writers that bypass the API.
+9. **400 or 422 for validation errors?** Either is defensible; 400 is most common, 422 signals well-formed but semantically invalid content. Be consistent and return per-field errors.
+10. ➕ **How can a 40-character input take down a Python server?** A regex with nested quantifiers backtracks exponentially when the input almost matches, and `re` holds the GIL the whole time, blocking the event loop and every other thread. Cap length before matching, avoid ambiguous patterns, or use a linear-time engine.
+11. ➕ **Two usernames look identical but your unique index accepts both. Why?** They use different code point sequences (precomposed vs combining characters, or a Cyrillic lookalike). Normalize and case-fold into a key column, and compare UTS #39 skeletons to block confusables.
+12. ➕ **What does `len('😀')` return in Python, and why does it matter for validation?** 1, because Python counts code points, like Postgres `varchar(n)`. A JavaScript frontend counts 2 (UTF-16 code units) and users count graphemes (a family emoji is 5 code points), so pick the unit deliberately.
+13. ➕ **A queue job fails schema validation. Should it be retried?** No. Bad data fails the same way every time; fail it permanently (dead-letter or failed set), keep the payload, and alert.
+14. ➕ **Why validate your own API responses?** An allowlist response schema stops accidental leaks (like a new `passwordHash` field) and catches contract breaks before clients do.
+
+## Sources
+
+- [Lesson video: Validations and transformations (Sriniously)](https://youtu.be/qedj_JjjL-U)
+- [OWASP: Input Validation Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html)
+- [OWASP: Mass Assignment Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html)
+- [Pydantic: Conversion table (lax and strict mode)](https://docs.pydantic.dev/latest/concepts/conversion_table/)
+- [Pydantic: Validators](https://docs.pydantic.dev/latest/concepts/validators/)
+- [FastAPI: Handling errors (RequestValidationError)](https://fastapi.tiangolo.com/tutorial/handling-errors/)
+- [FastAPI: Query parameter models (extra="forbid")](https://fastapi.tiangolo.com/tutorial/query-param-models/)
+- [MDN: 400 Bad Request](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/400)
+- [MDN: 422 Unprocessable Content](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/422)
+- [Psycopg 3: adapting Python values to PostgreSQL](https://www.psycopg.org/psycopg3/docs/basic/adapt.html)
+- [ITU-T E.164 (international numbering plan)](https://www.itu.int/rec/T-REC-E.164/)
+- [Python: re module (atomic groups and possessive quantifiers)](https://docs.python.org/3/library/re.html)
+- [OWASP: Regular expression Denial of Service](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)
+- [Snyk: ReDoS in zod before 3.22.3 (CVE-2023-4316)](https://security.snyk.io/vuln/SNYK-JS-ZOD-5925617)
+- [google-re2 (Python bindings for RE2)](https://pypi.org/project/google-re2/)
+- [Unicode UAX #15: Normalization Forms](https://www.unicode.org/reports/tr15/)
+- [Unicode UTS #39: Security Mechanisms (confusables, skeleton, mixed script)](https://www.unicode.org/reports/tr39/)
+- [RFC 8264: PRECIS Framework](https://www.rfc-editor.org/rfc/rfc8264.html)
+- [RFC 8265: PRECIS profiles for usernames and passwords](https://www.rfc-editor.org/rfc/rfc8265.html)
+- [Python: unicodedata (normalize, category)](https://docs.python.org/3/library/unicodedata.html)
+- [regex module (\X grapheme clusters, timeouts)](https://pypi.org/project/regex/)
+- [PostgreSQL: Character types](https://www.postgresql.org/docs/current/datatype-character.html)
+- [PostgreSQL: JSON types (\u0000 rejected in jsonb)](https://www.postgresql.org/docs/current/datatype-json.html)
+- [Trojan Source: invisible vulnerabilities (bidi controls)](https://trojansource.codes/)
+- [Celery: Reject (tasks guide)](https://docs.celeryq.dev/en/stable/userguide/tasks.html#reject)
+- [FastAPI: Response model](https://fastapi.tiangolo.com/tutorial/response-model/)

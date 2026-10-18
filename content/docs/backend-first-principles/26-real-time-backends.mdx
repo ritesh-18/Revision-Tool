@@ -1,0 +1,2174 @@
+---
+title: "Real-Time Backends"
+description: Polling, long polling, SSE and WebSockets from first principles, how many connections one box can hold, and how pub/sub, sequence numbers and edge caches make real-time work across many servers.
+---
+
+<Callout type="info">
+  Notes for [Real-Time Backends](https://youtu.be/wUQryt697cs) by **Sriniously**, from the *Backend from First Principles* series. They follow the lesson's order and are written in my own words, not as a transcript.
+  - 🎓 **Lesson**: what the video teaches, explained with the engineering behind it.
+  - 🔧 **Going deeper**: extra detail I added on top (code, edge cases, docs). It isn't from the video.
+  - ➕ **Beyond the lesson**: a topic the video does not cover at all, added because a backend engineer should know it.
+</Callout>
+
+Every backend feature so far had one shape: **the client asks, the server answers.** This lesson is about the first requirement that breaks that shape: the server has news the client never asked for, and it needs to get there **now**.
+
+<Mermaid chart={`flowchart LR
+  A["The problem: server cannot speak first"] --> B["Polling"]
+  B --> C["Long polling"]
+  C --> D["Server-Sent Events"]
+  D --> E["WebSockets: handshake, frames, masking, ping/pong"]
+  E --> F["How many connections fit on one box"]
+  F --> G["Many instances: pub/sub"]
+  G --> H["Catch-up with sequence numbers"]
+  H --> I["Fan-out and reconnect storms"]`} />
+
+---
+
+## 1. The requirement and the constraint 🎓
+
+### The product requirement
+A task board (think Trello or Linear). Two people have **board 412** open. One drags a task from *To do* to *In progress*. The other person, anywhere in the world, should see the card move **live**: not after a refresh, not after navigating away and back.
+
+### Why this is hard (first principles)
+HTTP is a **request/response** protocol. The client opens the connection and sends a request; the server can only write a response **to a request it has already received**. There is no HTTP mechanism for the server to start a conversation. (This was the model from the HTTP lesson.)
+
+So when the server learns "task 88 moved", it has **no channel** to tell browser B. Everything in this lesson is a different trick for getting around that one constraint.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Browser A
+  participant S as Server
+  participant B as Browser B
+  A->>S: PATCH /tasks/88 (move to In progress)
+  S-->>A: 200 OK
+  Note over S,B: Server knows B should be told...
+  Note over S,B: ...but B has no open request, so there is nothing to reply to`} />
+
+---
+
+## 2. Polling: ask in a loop 🎓
+
+### The mechanism
+If the server can't announce changes, the client keeps asking. Every **3 seconds**, browser B sends "has board 412 changed since my last look?". Most answers are "no". When the answer is "yes", the server either sends the **change itself** (a delta) or says "something changed, refetch the board" and the client re-renders.
+
+### What the demo shows 🎓
+Two browsers side by side (Asha and Leo), both polling every 3 s, each with a **request counter** and an **unchanged counter**. Both counters climb together almost every tick, meaning the response said "nothing changed". Only when Asha moves a task does Leo's next poll come back with a change, so his unchanged counter skips one. Visually: **almost every request is wasted.**
+
+🔧 A minimal version that at least makes the "no" answer cheap. The loop runs in the browser page (JavaScript); the endpoint is FastAPI:
+
+```ts title="polling.client.ts (browser)"
+let since = 0; // last version we have seen
+
+setInterval(async () => {
+  const res = await fetch(`/boards/412/changes?since=${since}`);
+  if (res.status === 204) return;               // nothing changed: tiny response
+  const { version, changes } = await res.json();
+  applyChanges(changes);
+  since = version;
+}, 3000);
+```
+
+```python title="polling.py"
+from fastapi import FastAPI, Response
+
+app = FastAPI()
+
+
+@app.get("/boards/{board_id}/changes")
+async def changes(board_id: str, since: int = 0):
+    version = await boards.current_version(board_id)  # e.g. a counter bumped on every change
+    if version <= since:
+        return Response(status_code=204)
+    return {"version": version, "changes": await boards.changes_since(board_id, since)}
+```
+
+### When polling is fine 🎓
+For an **internal tool with a handful of users**, polling every few seconds is a perfectly reasonable decision. It's simple, stateless and works through every proxy. The lesson keeps pushing only because a user-facing product at scale exposes its costs.
+
+---
+
+## 3. Why polling breaks at scale 🎓
+
+### Problem 1: delay is half the interval
+A change happens at a random moment inside the polling interval, so on average it waits **half an interval** before anyone sees it. Pure arithmetic: a 3 s interval means about **1.5 s** average delay (worst case: the full 3 s).
+
+### The naive fix makes it worse: poll faster
+Drop to 1 s to make the UI snappier. Now do the maths for **10,000 open boards**:
+
+| Interval | Requests per second | Average delay |
+|---|---|---|
+| 3 s | about 3,333 | 1.5 s |
+| 1 s | 10,000 | 0.5 s |
+
+And each "request" is not just a packet. It is a full HTTP request that goes through the **load balancer**, the **auth middleware** (token validation), the **logging middleware** (a log line written somewhere), the **service layer** (a database query), and **serialisation** back to JSON. So 10,000 req/s means roughly **10,000 DB queries per second, almost all returning "nothing changed"**. You made the UX 3x better and the bill 3x worse.
+
+### Problem 2: cost scales with watchers, not with events
+This is the key insight. A board where **nothing happens all day** costs exactly as much as a board that changes every second, because you pay **per request**, and requests are generated by **people watching**, not by **things happening**.
+
+<Mermaid chart={`flowchart LR
+  subgraph Polling["Polling cost"]
+    P1["users x (1 / interval)"] --> P2["load independent of activity"]
+  end
+  subgraph Push["Push cost"]
+    Q1["events x subscribers"] --> Q2["zero load when nothing happens"]
+  end`} />
+
+The value is in the **events**; requests are just a medium, and here a very wasteful one.
+
+### Problem 3: mobile batteries and data
+On a phone, every poll wakes the **cellular radio**, one of the most power-hungry things a phone does. A polling loop drains battery and data even when the board is idle.
+
+🔧 Why the radio matters: after sending, a cellular radio stays in a high-power state for several seconds before dropping to idle. Polling every few seconds means it **never gets to idle**.
+
+### What we actually want
+1. **The server speaks first** when something happens.
+2. We **pay per event**, not per watcher per second.
+
+---
+
+## 4. Long polling: let the server take its time 🎓
+
+### The mechanism
+The constraint is "the server can only answer a question". So ask a question and let the server **delay the answer**:
+
+1. The browser sends a request.
+2. The server **doesn't respond**. It holds the request open, sometimes for up to a minute.
+3. The moment a change happens, the server writes the response and the request completes.
+4. The browser immediately sends the **next** request, starting a new cycle.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser
+  participant S as Server
+  B->>S: GET /boards/412/wait?since=41
+  Note over S: holds the request (no change yet)
+  Note over S: task moves (version 42)
+  S-->>B: 200 version 42 + change
+  Note over B,S: GAP: parse, render, open new request
+  Note over S: another change (43) happens here, nobody is connected
+  B->>S: GET /boards/412/wait?since=42
+  S-->>B: 200 version 43 (immediately, it was waiting)`} />
+
+### Why it is not enough 🎓
+**RFC 6202** documents long polling along with its problems. The core one is the **gap**: after the server answers, the browser has to process the response and open a fresh request, and during that window **the server has no connection to you**. The RFC puts average latency around **one network transit**, but the worst case is **more than three** transits because of that gap. Every cycle also pays the full cost of a new HTTP request (headers, auth, logging).
+
+It was the standard real-time trick for years, but the field moved on.
+
+### 🔧 Implementation: hold the request, handle the gap
+The gap is safe **only if the client says where it left off** (`since`). Then a change that lands during the gap is returned immediately on the next request instead of being lost.
+
+```python title="long_poll.py (FastAPI + asyncio)"
+import asyncio
+from collections import defaultdict
+
+from fastapi import FastAPI, Response
+
+app = FastAPI()
+waiters: defaultdict[str, set[asyncio.Event]] = defaultdict(set)  # board_id -> pending requests
+
+
+@app.get("/boards/{board_id}/wait")
+async def wait_for_changes(board_id: str, since: int = 0):
+    if await boards.current_version(board_id) > since:
+        return await boards.changes_since(board_id, since)  # missed during the gap
+
+    wake = asyncio.Event()
+    waiters[board_id].add(wake)
+    try:
+        async with asyncio.timeout(30):  # below the LB idle timeout
+            await wake.wait()
+    except TimeoutError:
+        return Response(status_code=204)
+    finally:
+        waiters[board_id].discard(wake)  # runs on wake-up, timeout or cancellation
+    return await boards.changes_since(board_id, since)
+
+
+def notify_board(board_id: str) -> None:
+    for wake in waiters.get(board_id, ()):
+        wake.set()
+```
+
+The coroutine simply **suspends** on `wake.wait()`, so thousands of held requests cost thousands of small `asyncio.Event` objects, not thousands of threads.
+
+Edge case: the 30 s timeout must be **shorter than every idle timeout on the path** (load balancer, reverse proxy, corporate proxy), or something in the middle will cut the request first and the client sees an error instead of a clean 204.
+
+---
+
+## 5. Server-Sent Events (SSE): a response that never ends 🎓
+
+### The mechanism
+Take long polling and remove the gap: **the server just never finishes the response.**
+
+1. The browser makes an ordinary `GET`.
+2. The server replies `200` with `Content-Type: text/event-stream`.
+3. It **doesn't close** the response. Whenever there's news, it writes a small chunk of text to the same open response.
+4. The connection lives as long as the tab does. If it drops, the browser reconnects on its own.
+
+It is **not a new protocol**. It is plain HTTP: headers, then a response body that keeps arriving.
+
+### What the demo shows 🎓
+`curl` is used as the client against a local server, declaring `Accept: text/event-stream` and hitting the events endpoint. Events stream in one after another, each with an **id**, an **event name** (`task.moved`, `task.deleted`, `task.created`) and **data** the front end can render directly (insert a card, move a card).
+
+🔧 What that looks like on the wire:
+
+```text
+id: 1041
+event: task.moved
+data: {"taskId":88,"from":"todo","to":"doing","boardId":412}
+
+id: 1042
+event: task.created
+data: {"taskId":91,"column":"todo","title":"Write tests"}
+
+retry: 5000
+: keep-alive comment, ignored by the browser
+```
+
+Each event ends with a **blank line**.
+
+### The four fields 🎓
+| Field | Purpose |
+|---|---|
+| `id` | Event ID. The browser remembers the last one it saw |
+| `event` | Event type, so the client can route it (`task.moved`) |
+| `data` | The payload. Several `data:` lines are joined with newlines |
+| `retry` | How many milliseconds the browser should wait before reconnecting |
+
+### Reconnection and resume, built into the browser 🎓
+Because SSE is a web standard, the browser's `EventSource` **implements reconnection for you**. When the connection drops, it waits (the `retry` value) and reconnects, and it sends a **`Last-Event-ID`** header with the ID of the last event it received. **Your code doesn't do any of that.** The server reads the header and replays everything after that ID, so the client catches up instantly instead of missing changes.
+
+<Mermaid chart={`sequenceDiagram
+  participant B as Browser (EventSource)
+  participant S as Server
+  B->>S: GET /boards/412/events (Accept: text/event-stream)
+  S-->>B: 200 Content-Type text/event-stream
+  S-->>B: id 1041 task.moved
+  S-->>B: id 1042 task.created
+  Note over B,S: network drops
+  Note over B: waits retry ms, reconnects automatically
+  B->>S: GET /boards/412/events + Last-Event-ID 1042
+  S-->>B: replay 1043, 1044 (missed while offline)
+  S-->>B: then live events continue`} />
+
+### SSE is not a toy 🎓
+People who know WebSockets often treat SSE as the inferior option. The lesson's counter-examples:
+- **Uber's push platform** (telling drivers about trips) was built on SSE.
+- **LinkedIn's instant messaging**, including typing indicators and read receipts, used SSE.
+- **Every major LLM API** streams tokens to your CLI or browser with SSE. When text appears one word at a time, you're watching `data:` fields arrive.
+
+The reason: it's plain HTTP, so it works on every device and through every network without compatibility worries.
+
+### 🔧 Implementation: an SSE endpoint with resume
+```python title="board_events.py (FastAPI StreamingResponse)"
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
+from fastapi import Depends, FastAPI, Header
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+
+def sse(e: BoardEvent) -> str:
+    return f"id: {e.seq}\nevent: {e.type}\ndata: {json.dumps(e.data)}\n\n"
+
+
+@app.get("/boards/{board_id}/events")
+async def stream(
+    board_id: str,
+    user: User = Depends(current_user),
+    last_event_id: int = Header(0),  # the browser sends Last-Event-ID automatically on reconnect
+):
+    await authz.assert_can_view(user, board_id)
+
+    async def body() -> AsyncIterator[str]:
+        queue = bus.subscribe(board_id)  # 1. subscribe FIRST (a bounded asyncio.Queue of live events)
+        try:
+            sent = last_event_id
+            for e in await events.since(board_id, last_event_id):  # 2. catch up from Last-Event-ID
+                yield sse(e)
+                sent = e.seq
+            while True:  # 3. then go live
+                try:
+                    async with asyncio.timeout(20):
+                        e = await queue.get()
+                except TimeoutError:
+                    yield ": ping\n\n"  # heartbeat comment keeps proxies from closing an idle stream
+                    continue
+                if e.seq > sent:  # drop anything the replay already covered
+                    yield sse(e)
+                    sent = e.seq
+        finally:
+            bus.unsubscribe(board_id, queue)  # client went away: the generator is closed
+
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},  # stop nginx buffering
+    )
+```
+
+🔧 `sse-starlette`'s `EventSourceResponse` does the formatting, pings and disconnect handling for you (yield `ServerSentEvent(id=..., event=..., data=...)` objects); the hand-written version above shows what goes over the wire.
+
+The consuming side is the browser's `EventSource` (page JavaScript):
+
+```ts title="client.ts (browser)"
+const es = new EventSource('/boards/412/events', { withCredentials: true });
+es.addEventListener('task.moved', (e) => moveCard(JSON.parse((e as MessageEvent).data)));
+```
+
+🔧 Edge cases:
+- **Subscribe before replaying, or de-duplicate.** If you replay first and subscribe second, an event published in between is lost. Either buffer live events during replay, or subscribe first and drop any event whose `seq` you already sent.
+- **HTTP/1.1 limit:** browsers allow only **6 connections per domain** over HTTP/1.1, shared by all tabs, so 7 tabs with SSE will stall. HTTP/2 multiplexes streams on one connection and removes this problem.
+- **`EventSource` can't set custom headers** (no `Authorization: Bearer`). Use cookies, or a short-lived token in the query string.
+
+### The limitation: one direction only 🎓
+The name says it: **server**-sent events. The server can talk all day, but the browser **can't send anything back on the same connection**. When the user drags a task, that's a separate `POST`. For many products that's fine. For the live board, we want **both directions on one connection**.
+
+---
+
+## 6. WebSockets: one connection, both directions 🎓
+
+### What the demo shows 🎓
+A WebSocket CLI tool connects to a server on port **7821** at the `/echo` path. The logs show a TCP connection, then "connected", with response headers `Upgrade: websocket`, `Connection: Upgrade` and `Sec-WebSocket-Accept`. After that, the client sends "task moved on board 412", the server echoes it back immediately and also sends its own messages. Both sides write whenever they want.
+
+### Step 1: it starts as plain HTTP (the handshake)
+A WebSocket connection **begins as an ordinary HTTP GET**. That's a deliberate design choice: it travels through everything that already understands HTTP, which is almost every device and network.
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: GET /echo HTTP/1.1<br/>Upgrade: websocket<br/>Connection: Upgrade<br/>Sec-WebSocket-Key: 16 random bytes, base64
+  Note over S: accept = base64(SHA1(key + fixed GUID))
+  S-->>C: 101 Switching Protocols<br/>Upgrade: websocket<br/>Sec-WebSocket-Accept: accept
+  Note over C,S: No more HTTP: no headers, methods or status codes
+  C->>S: frame (masked)
+  S-->>C: frame
+  S-->>C: frame (server can speak first)`} />
+
+1. The client sends `Upgrade: websocket` and `Sec-WebSocket-Key`: **16 random bytes, base64-encoded**.
+2. The server appends a **fixed string** from the spec to that key, takes the **SHA-1** hash, base64-encodes it, and returns it as `Sec-WebSocket-Accept` with status **101 Switching Protocols**.
+3. From then on the TCP connection stays open, but **it's no longer HTTP**. It's a bidirectional stream of **frames**.
+
+**Why the key exchange exists:** it looks like security, but it isn't. Anyone can compute it, since the GUID is public. Its only job is to prove that whatever answered **actually understood the WebSocket request**, and isn't, say, a cache replaying an old `200` response.
+
+🔧 The whole computation (the GUID is from RFC 6455):
+
+```python
+import base64
+import hashlib
+
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def accept_for(key: str) -> str:
+    return base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
+
+
+# RFC example: accept_for("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+```
+
+### Step 2: frames 🎓
+RFC 6455 defines a frame as a small bit-level header followed by the payload:
+
+| Bits | Field | Meaning |
+|---|---|---|
+| 1 | `FIN` | This is the last fragment of a message |
+| 3 | `RSV1-3` | Reserved (used by extensions such as compression) |
+| 4 | `opcode` | 0 continuation, 1 text, 2 binary, 8 close, 9 ping, 10 pong |
+| 1 | `MASK` | Payload is masked (always set for client to server) |
+| 7 | `payload len` | 0 to 125 = the length; 126 = next 2 bytes hold it; 127 = next 8 bytes hold it |
+| 0 or 32 | masking key | 4 bytes, present when `MASK` is set |
+
+**Why the length encoding is clever:** a message under 126 bytes has a header of just **2 bytes** (plus 4 bytes of mask from the client). Compare that with polling, where every request carries **hundreds of bytes of headers**, plus cookies and auth. For small, frequent messages like "task moved", the saving is enormous.
+
+🔧 Decoding the header, to make the table concrete:
+
+```python title="frame_header.py"
+def parse_header(buf: bytes) -> tuple[bool, int, bytes]:
+    fin = bool(buf[0] & 0b1000_0000)
+    opcode = buf[0] & 0b0000_1111
+    masked = bool(buf[1] & 0b1000_0000)
+    length = buf[1] & 0b0111_1111
+    offset = 2
+    if length == 126:
+        length = int.from_bytes(buf[2:4], "big")
+        offset = 4
+    elif length == 127:
+        length = int.from_bytes(buf[2:10], "big")
+        offset = 10
+    mask = buf[offset : offset + 4] if masked else None
+    if mask:
+        offset += 4
+    payload = buf[offset : offset + length]
+    if mask:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))  # unmask
+    return fin, opcode, payload
+
+
+# RFC 6455's masked "Hello" frame
+print(parse_header(bytes([0x81, 0x85, 0x37, 0xFA, 0x21, 0x3D, 0x7F, 0x9F, 0x4D, 0x51, 0x58])))
+```
+
+```text title="Output"
+(True, 1, b'Hello')
+```
+
+### Step 3: masking, and the attack it prevents 🎓
+**Every frame from the browser to the server is masked:** each payload byte is XORed with one byte of a 4-byte key, cycling through the key. The key is sent **in clear text** in front of the payload. So masking is **not encryption**; anyone on the network can undo it with one line of code.
+
+**So why does it exist?** While the protocol was being designed, researchers ran an experiment against real caching proxies deployed on the internet and **poisoned** them:
+
+1. A malicious page opens a connection to a server **the attacker controls**, and does something that looks like an HTTP upgrade.
+2. It then sends bytes crafted to look like a **fresh `GET` for a popular file**, such as a widely used analytics script that thousands of sites load.
+3. A proxy in the middle that **doesn't understand WebSockets** sees what looks like a normal request and response, and **caches the attacker's response** under that popular URL.
+4. Everyone behind that proxy now gets **the attacker's script** when they ask for the real one.
+
+**The fix:** the browser XORs everything with a **fresh random key per frame** that the page's JavaScript can't predict. The attacker chooses what they send, but **not the bytes that appear on the wire**, so they can't forge something that looks like an HTTP request. That's why the key **must** be random and fresh for each frame. Masking protects **the infrastructure between you and your users**, not your data. (For confidentiality, use `wss://`, which is TLS.)
+
+<Mermaid chart={`flowchart TD
+  A["Attacker page writes bytes that look like GET /analytics.js"] --> B{"Masked with a random key?"}
+  B -->|"No (hypothetical)"| C["Proxy sees a valid HTTP request<br/>caches attacker response"]
+  C --> D["Every user behind the proxy gets malicious JS"]
+  B -->|"Yes (RFC 6455)"| E["Bytes on the wire look random"]
+  E --> F["Proxy sees no HTTP request, nothing to poison"]`} />
+
+### Step 4: ping/pong heartbeats 🎓
+**Opcode 9 is ping, opcode 10 is pong.** Either side can send a ping, and the other **must** reply with a pong.
+
+**Why it's needed (TCP first principles):** when a connection dies silently (the user walks into a lift, the phone switches from Wi-Fi to mobile data), **nothing is sent**. No error, no close frame, no FIN. The server keeps holding a socket it believes is alive, possibly for a very long time. From the socket's point of view, **an idle connection and a dead connection look exactly the same**, because in both cases nothing is happening. The only way to tell them apart is to **send something and see whether anything comes back**.
+
+**The usual rule:** if a ping gets no pong within about **30 seconds**, consider the connection dead, close it and free its resources.
+
+🔧 With FastAPI. The ASGI server (uvicorn) owns the frames, so ping/pong is a **server setting**, not handler code:
+
+```python title="ws_server.py"
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+app = FastAPI()
+
+
+@app.websocket("/ws")
+async def board_socket(ws: WebSocket):
+    await ws.accept()
+    boards: set[str] = set()
+    try:
+        while True:
+            msg = await ws.receive_json()
+            if msg["type"] == "subscribe":
+                boards.add(msg["boardId"])
+            elif msg["type"] == "move":
+                await handle_move(ws, msg)  # same connection, client to server
+    except WebSocketDisconnect:
+        pass  # clean close, or uvicorn dropped a connection that missed its pong
+    finally:
+        await leave_all(boards, ws)  # free everything this socket held
+
+
+if __name__ == "__main__":
+    # every 30 s uvicorn pings each socket (browsers auto-reply with pong);
+    # no pong within 30 s means dead: the connection is closed and its handler exits
+    uvicorn.run(app, port=7821, ws_ping_interval=30, ws_ping_timeout=30)
+```
+
+What those two settings do, written out with the `websockets` library (which also has them built in as `ping_interval` and `ping_timeout`):
+
+```python title="heartbeat.py (websockets library)"
+import asyncio
+
+from websockets.asyncio.server import ServerConnection
+
+
+async def heartbeat(ws: ServerConnection) -> None:
+    while True:
+        await asyncio.sleep(30)
+        pong = await ws.ping()  # a future that resolves when the matching pong arrives
+        try:
+            async with asyncio.timeout(30):
+                await pong
+        except TimeoutError:
+            ws.transport.abort()  # no pong: dead, free the socket and its memory
+            return
+```
+
+🔧 Note: browser JavaScript **can't send ping frames** (the `WebSocket` API has no method for it), but browsers answer server pings automatically. If the client also needs to detect a dead connection, send an application-level `{"type":"ping"}` message on a timer.
+
+---
+
+## 7. Authenticating and authorising a WebSocket ➕
+
+The handshake in section 6 proves the other side speaks WebSocket, but says nothing about **who** it is or **what it may see**, and a connection that stays open for hours makes both questions harder than they are for a normal request.
+
+#### 7.1 Where the credential goes: cookie, query string or first message ➕
+
+**Problem.** Your HTTP API uses `Authorization: Bearer ...`. The browser's `new WebSocket(url, protocols)` takes **a URL and a list of subprotocols, nothing else**. There is no way to set an `Authorization` header from page JavaScript, so the usual credential has nowhere to go.
+
+**Why (first principles).** The handshake is an HTTP request the **browser** builds, not your code. The browser adds what it always adds (cookies for that host, `Origin`, `User-Agent`), and the page only controls the URL. So the credential can travel in one of three places:
+
+| Option | How it works | Main risk |
+|---|---|---|
+| **Cookie** | The session cookie rides on the handshake automatically | Cross-site WebSocket hijacking (7.2), so you must check `Origin` |
+| **Token in the query string** | `wss://app/ws?token=...` | URLs end up in access logs, proxy logs and traces, so a long-lived token leaks |
+| **Token in the first message** | Connect, then send `{"type":"auth","token":"..."}` | Unauthenticated sockets hold memory until you time them out |
+
+**Mechanism.** A clean compromise is a **short-lived, single-use ticket**. The client calls a normal authenticated HTTP endpoint and gets back a random ticket that lives for **30 seconds** and can be used **once**. It connects with `?ticket=...`. If the URL lands in a log, the ticket is already spent. And all checks happen **before the 101** is sent, so an unauthenticated client never gets a socket.
+
+**Implementation.** In FastAPI the WebSocket endpoint starts running **before** you call `accept()`, and nothing has been sent to the client yet, so that's where every check goes. `send_denial_response` answers the handshake with a real HTTP status instead of the 101 (closing before `accept()` also works, and becomes a plain 403):
+
+```python title="ws_auth.py"
+import json
+import secrets
+
+from fastapi import Depends, FastAPI, Response, WebSocket
+from redis.asyncio import Redis
+
+app = FastAPI()
+redis = Redis.from_url(REDIS_URL, decode_responses=True)
+ALLOWED_ORIGINS = {"https://app.example.com"}
+
+
+# 1. a normal authenticated HTTP endpoint hands out a 30 s, single-use ticket
+@app.post("/ws-ticket")
+async def ws_ticket(user: User = Depends(require_auth)):
+    ticket = secrets.token_urlsafe(32)
+    await redis.set(f"wsticket:{ticket}", json.dumps({"userId": user.id, "exp": user.token_exp}), ex=30)
+    return {"ticket": ticket}
+
+
+# 2. every check runs BEFORE accept(), i.e. before the 101 Switching Protocols
+@app.websocket("/ws")
+async def board_socket(ws: WebSocket, ticket: str | None = None):
+    if ws.headers.get("origin") not in ALLOWED_ORIGINS:
+        return await ws.send_denial_response(Response(status_code=403))  # 7.2
+    raw = await redis.getdel(f"wsticket:{ticket}") if ticket else None  # single use
+    if raw is None:
+        return await ws.send_denial_response(Response(status_code=401))
+    session = json.loads(raw)  # {"userId": ..., "exp": ...}
+    await ws.accept()
+    await serve_connection(ws, session)
+
+
+# run with a message size cap (see 7.5): uvicorn ws_auth:app --ws-max-size 65536
+```
+
+**Edge cases.**
+- The browser **doesn't expose the HTTP status** of a failed handshake to page code; the client just sees an error and a close. So the client's reconnect logic should **always fetch a fresh ticket** before reconnecting, instead of guessing why it failed.
+- If you choose the first-message option, start a timer on connect (say 5 s) and close with **1008 Policy Violation** if no valid auth message has arrived. Otherwise an attacker can hold thousands of idle unauthenticated sockets.
+- Redact `ticket` (or `token`) from access logs anyway; OWASP calls out query-string tokens appearing in logs.
+
+#### 7.2 Checking `Origin`: cross-site WebSocket hijacking ➕
+
+**Problem.** You use cookie auth. A user who is logged in visits `evil.example`. That page runs `new WebSocket('wss://app.example.com/ws')`. If the browser attaches the session cookie, the attacker's page now has a **fully authenticated, two-way connection** as that user: it can read every board event and send moves.
+
+**Why (first principles).** For `fetch`, the browser enforces CORS: a cross-origin page can't read the response unless the server opts in. **WebSockets have no CORS.** The spec leaves the decision to the server, and gives it one tool: the **`Origin` header**, which the browser sets on the handshake and page JavaScript can't change. If the server doesn't look at it, nothing else does.
+
+**Mechanism.** Compare `Origin` against an **exact allowlist** on every handshake and reject everything else with 403 (the code in 7.1 does this first). As a second layer, `SameSite=Lax` or `Strict` session cookies stop most cross-site handshakes from carrying the cookie at all. But "same-site" includes sibling subdomains, so a compromised `blog.example.com` still counts as same-site: the `Origin` check is the real control.
+
+**Implementation.** The check itself is one line, but it's easy to get subtly wrong:
+
+```python
+# ❌ matches https://evilexample.com and https://example.com.attacker.net
+if origin.endswith("example.com"):
+    await ws.accept()
+if "example.com" in origin:
+    await ws.accept()
+
+# ✅ exact match against known origins (scheme + host + port)
+ALLOWED = {"https://app.example.com", "https://admin.example.com"}
+if origin in ALLOWED:
+    await ws.accept()
+```
+
+**Edge cases.**
+- Non-browser clients (a CLI, a mobile app, an attacker's script) can send **any** `Origin` or none. The check protects **your users' browsers**, it doesn't authenticate anyone. Native clients should use the ticket or token path, not cookies.
+- Local development needs `http://localhost:5173` in the allowlist; load it from configuration per environment (lesson 17), never hard-code a wildcard "for now".
+
+#### 7.3 Authorising rooms and messages, not just the connection ➕
+
+**Problem.** The connection is authenticated as Leo. Leo's client sends `{"type":"subscribe","boardId":"999"}`, a board he isn't a member of. The `ws_server.py` code in section 6 just adds it to the set. Leo now receives a stranger's board in real time. This is the same broken-object-level-authorisation bug as an unchecked `GET /boards/999`, over a different transport.
+
+**Why (first principles).** Authentication answers "who" **once**, at the handshake. Authorisation is **per resource and per action**, and a single connection touches many resources over its lifetime. Permissions also **change while the socket is open**: someone removes Leo from board 412 at 14:05, and his socket subscribed at 09:00.
+
+**Mechanism.** Three rules:
+1. Check `canView` on **every subscribe** and `canEdit` on **every command**, using the same authorisation service as your HTTP routes (lesson 08).
+2. Validate every inbound message against a schema before acting on it (lesson 09); a WebSocket message is untrusted input exactly like a request body.
+3. When membership changes, **publish a revocation** so whichever instance holds the user's sockets removes them from the room.
+
+**Implementation.**
+
+```python title="ws_handlers.py"
+import json
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+
+
+class Subscribe(BaseModel):
+    type: Literal["subscribe"]
+    id: str
+    boardId: str
+
+
+class Move(BaseModel):
+    type: Literal["move"]
+    id: str
+    boardId: str
+    taskId: str
+    to: Literal["todo", "doing", "done"]
+
+
+InboundMessage = TypeAdapter(Annotated[Subscribe | Move, Field(discriminator="type")])
+
+
+async def on_message(conn: Connection, raw: str) -> None:
+    try:
+        m = InboundMessage.validate_json(raw)  # Pydantic schema, untrusted input
+    except ValidationError:
+        return await conn.ws.close(1008, "invalid message")
+    user_id = conn.session["userId"]
+
+    match m:
+        case Subscribe():
+            if not await authz.can_view(user_id, m.boardId):
+                return await conn.ws.send_json({"type": "error", "ref": m.id, "code": "forbidden"})
+            await join(m.boardId, conn)
+        case Move():
+            if not await authz.can_edit(user_id, m.boardId):
+                return await conn.ws.send_json({"type": "error", "ref": m.id, "code": "forbidden"})
+            await handle_move(conn, m)
+
+
+# any instance can revoke: the one holding the socket acts on it
+async def revocation_listener(pubsub) -> None:  # a redis.asyncio PubSub
+    await pubsub.subscribe("membership:revoked")
+    async for msg in pubsub.listen():
+        if msg["type"] != "message":
+            continue
+        event = json.loads(msg["data"])
+        for conn in list(rooms.get(event["boardId"], ())):
+            if conn.session["userId"] == event["userId"]:
+                await leave(event["boardId"], conn)
+                await conn.ws.send_json({"type": "board.access_revoked", "boardId": event["boardId"]})
+```
+
+**Edge cases.**
+- Checking at subscribe time is what lets the fan-out path in section 10 skip a permission check **per outgoing event**. If events inside one board have **different visibility** (private tasks, admin-only comments), you need per-event filtering at send time as well, which costs CPU on every fan-out.
+- If you cache authorisation decisions to keep subscribes cheap, the revocation event must also **invalidate the cache**, or the next resubscribe sails through.
+
+#### 7.4 Tokens that expire while the socket stays open ➕
+
+**Problem.** Access tokens live 15 minutes. A socket lives 8 hours. An HTTP request after minute 15 is rejected, but the socket was checked once at 09:00 and keeps streaming. An employee who was offboarded at noon still receives live data until they close the laptop.
+
+**Why (first principles).** Expiry is enforced **at the moment a credential is checked**. On HTTP that's every request; on a WebSocket it's only the handshake, unless you deliberately check again.
+
+**Mechanism.** Store the token's `exp` on the connection and do one of two things before it passes:
+- **Close and reconnect:** close with a private-use code (RFC 6455 reserves **4000 to 4999** for applications), for example `4001 token expired`. The client gets a fresh token, then a ticket, then reconnects. Thanks to sequence-number catch-up (section 12) the user misses nothing.
+- **Re-authenticate in-band:** the client sends `{"type":"reauth","token":"..."}` before expiry; the server verifies it with the same verifier as HTTP and extends the deadline.
+
+Either way, also listen for **session revoked** events (logout everywhere, account disabled) and close those sockets immediately. OWASP's cheat sheet recommends closing sockets when sessions expire and re-validating long-lived ones periodically.
+
+**Implementation.**
+
+```python title="ws_expiry.py"
+import asyncio
+import json
+import time
+
+
+def arm_expiry(conn: Connection) -> None:
+    if conn.expiry_task:
+        conn.expiry_task.cancel()
+    delay = max(0.0, conn.session["exp"] - time.time())
+
+    async def expire() -> None:
+        await asyncio.sleep(delay)
+        await conn.ws.close(4001, "token expired")
+
+    conn.expiry_task = asyncio.create_task(expire())
+
+
+# one more branch in the message match from 7.3 (Reauth joins the Pydantic union)
+async def on_message(conn: Connection, raw: str) -> None:
+    m = InboundMessage.validate_json(raw)
+    match m:
+        case Reauth():
+            claims = await verify_access_token(m.token)  # same code path as the HTTP dependency
+            if claims["sub"] != conn.session["userId"]:
+                return await conn.ws.close(1008, "identity changed")
+            conn.session["exp"] = claims["exp"]
+            arm_expiry(conn)
+            await conn.ws.send_json({"type": "reauth.ok", "exp": claims["exp"]})
+
+
+# revocation from anywhere in the system
+async def session_revocations(pubsub) -> None:
+    await pubsub.subscribe("session:revoked")
+    async for msg in pubsub.listen():
+        if msg["type"] == "message":
+            user_id = json.loads(msg["data"])["userId"]
+            for conn in list(sockets_by_user.get(user_id, ())):
+                await conn.ws.close(4003, "session revoked")
+```
+
+**Edge cases.**
+- Have the client re-auth at about **80%** of the token's lifetime, not at the last second, so a slow network doesn't race the server's timer.
+- Cancel the expiry task when the socket disconnects, or each closed socket keeps a pending task (and the connection object with its board sets) alive until the sleep ends.
+- Rate-limit `reauth` messages; each one costs a signature verification.
+
+#### 7.5 Message size and rate limits ➕
+
+**Problem.** An authenticated client sends a **100 MB** frame, or 5,000 small messages a second. Your HTTP rate limiter never sees any of it, because after the 101 there are no more HTTP requests.
+
+**Why (first principles).** HTTP middleware (body-size limits, rate limiters, request timeouts) runs **per request**. A WebSocket is one request followed by an unbounded stream of frames, so every limit you rely on in HTTP has to be re-implemented **per message**. uvicorn's default `ws_max_size` is **16 MiB**, far more than a board event needs.
+
+**Mechanism.**
+- Set `--ws-max-size` (uvicorn) or `max_size` (the `websockets` library) to what your largest real message needs (OWASP suggests **64 KB or less** as a typical cap). The connection is closed with **1009 Message Too Big** when a message exceeds it.
+- A **token bucket** per connection for message rate (OWASP mentions about **100 messages per minute** as a common starting point; tune to your product, a collaborative cursor sends far more).
+- A **per-user** limit in Redis on top, because one user can open 50 tabs.
+
+**Implementation.**
+
+```python title="ws_rate_limit.py"
+import time
+
+from fastapi import WebSocket, WebSocketDisconnect
+
+
+class TokenBucket:
+    def __init__(self, capacity: float, refill_per_sec: float) -> None:
+        self.capacity = capacity
+        self.refill_per_sec = refill_per_sec
+        self.tokens = capacity
+        self.last = time.monotonic()
+
+    def take(self) -> bool:
+        now = time.monotonic()
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.refill_per_sec)
+        self.last = now
+        if self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
+
+
+@app.websocket("/ws")
+async def board_socket(ws: WebSocket):
+    await ws.accept()  # after the checks from 7.1
+    bucket = TokenBucket(20, 2)  # bursts of 20, then 2 messages per second
+    strikes = 0
+    try:
+        while True:
+            raw = await ws.receive_text()
+            if not bucket.take():
+                strikes += 1
+                if strikes > 50:
+                    return await ws.close(1008, "rate limit")
+                await ws.send_json({"type": "error", "code": "rate_limited"})
+                continue
+            await dispatch(ws, raw)
+    except WebSocketDisconnect:
+        pass
+```
+
+**Edge cases.** Rate-limit **expensive** messages (subscribe, which hits the database) much harder than cheap ones (typing, section 16). And count **outbound** pressure too: a client that never reads makes its outbound queue grow on your side, which is why the fan-out code in section 10 gives each socket a **bounded** `asyncio.Queue` and skips slow consumers.
+
+---
+
+## 8. How many connections can one machine hold? 🎓
+
+Now we have persistent, two-way connections. Each one is held open for hours. How many fit on one box?
+
+**The experiment:** a plain Linux machine with **16 cores and 61 GB of free memory**, running a WebSocket server of a few lines of **Go** that only accepts connections and holds them. No application logic, because the goal is to measure the connection ceiling.
+
+<Mermaid chart={`flowchart TD
+  W1["Wall 1: file descriptors<br/>ulimit -n = 1024"] -->|"raise the limit"| W2["Wall 2: client ephemeral ports<br/>about 28,232 per source IP"]
+  W2 -->|"dial from 3 source IPs"| W3["Wall 3: memory<br/>about 9.7 KB heap per connection"]
+  W3 --> R["1M idle connections: about 10 GB heap, fits in 61 GB"]`} />
+
+### Wall 1: file descriptors 🎓
+**Why:** on Unix, everything is a file, including a network socket. Every connection is a **file descriptor** as far as the kernel is concerned, so the number of connections you can hold is capped by how many files a process may have open.
+
+- `ulimit -n` says **1,024**.
+- Opening 2,000 connections, it stops at **1,017**. That's correct: about **7 descriptors** are already taken by stdin, stdout, stderr, the listening socket, the **epoll** instance the runtime uses to watch sockets, and so on.
+- **What the client saw:** no "connection refused", no error. Just a **timeout**, waiting for a handshake that never came.
+- **What the server saw:** `too many open files`, logged repeatedly with exponential backoff. The server is **up and healthy**, it still answers health checks, but it **refuses new connections**. That's a nasty failure mode: health checks are green while users can't connect.
+
+**The language twist:** in the same shell, ask the Go program for its limit and it says **1,048,575**. Ask Python and it says **1,024**. Why? The **Go runtime raises its own soft limit at startup**. The comment in Go's standard library explains it: some systems set an artificially low soft limit for compatibility with code that uses `select`, which has a hard-coded maximum descriptor number because of the size of `fd_set`. Go doesn't use `select`, so it raises the limit for itself and leaves old software alone. It sets the limit to **the maximum minus one** on purpose, so it can detect if someone else changes the limit later. That's why it's 1,048,575 and not 1,048,576.
+
+**Takeaway:** the famous "you'll hit 1,000 file descriptors" problem is real but **language-dependent**. In **Node, Python or Java** you'll hit it unless you raise the limit; Go raises it for you.
+
+🔧 Raising it for a Python (uvicorn) service:
+
+```bash
+ulimit -n                 # soft limit for this shell
+ulimit -Hn                # hard limit (the soft limit can go up to this)
+cat /proc/$(pgrep -f uvicorn)/limits | grep "open files"   # what the running process actually has
+```
+
+A Python process can also raise its own soft limit up to the hard limit at startup, the way Go does: `resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))` after reading both values with `resource.getrlimit` (Unix only).
+
+```ini title="board-ws.service (systemd)"
+[Service]
+LimitNOFILE=1048576
+```
+
+```yaml title="docker-compose.yml"
+services:
+  ws:
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+```
+
+### Wall 2: ports, but on the client 🎓
+With a million descriptors available, try again. It stops at **28,190**, with a different error: **`cannot assign requested address`**.
+
+**Investigate:** ask the kernel which ports it may use for **outgoing** connections: **32,768 to 60,999**, which is **28,232** ports. Subtract the **42** already used by other services on that shared machine and you get exactly **28,190**. The limit was **computable in advance**.
+
+**The common myth:** "a server can only hold 65,000 connections because there are only 65,000 ports". **False.** A TCP connection is identified by a **4-tuple**: source IP, source port, destination IP, destination port. Each connection only has to be unique across all four.
+
+- The server has **one IP and one port**, and those never change.
+- The test client also had **one IP**.
+- So the only thing that can vary is the **client's source port**, and there are 28,232 of those. **The limit belonged to the client, not the server.**
+
+<Mermaid chart={`flowchart LR
+  subgraph Tuple["TCP connection = 4-tuple"]
+    SIP["source IP"] --- SP["source port"] --- DIP["dest IP"] --- DP["dest port"]
+  end
+  DIP -.-> F1["fixed: server IP"]
+  DP -.-> F2["fixed: 443"]
+  SIP -.-> V1["1 client IP"]
+  SP -.-> V2["about 28k ephemeral ports"]
+  V1 --> L["max about 28k connections per client IP"]
+  V2 --> L`} />
+
+**The fix isn't a bigger server.** Give the client **three source addresses** and ask for 25,000 connections on each: **75,000 connections, zero failures**. The server holds 75,009 descriptors (75,000 sockets plus the same overhead as before).
+
+**Practical consequence:** when you **load-test** a real-time service, one load-generator machine can't produce enough connections. You need **several machines** (or several source IPs).
+
+🔧 Commands:
+
+```bash
+sysctl net.ipv4.ip_local_port_range              # 32768 60999 by default
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"   # more ports per client IP
+```
+
+### Wall 3: memory 🎓
+Now the real limit. The server used about **7.5 MB** doing nothing, and **722 MB** with 75,000 connections open. Subtract and divide: about **9,750 bytes per connection**. Three runs gave **9,751, 9,752 and 9,881** bytes, which is consistent.
+
+- That's the **process's own heap** per connection, not the total cost to the machine. The **kernel keeps its own per-socket structures** (buffers and so on), which don't show up in the process's resident memory.
+- Multiply out: **1 million connections ≈ a bit under 10 GB of heap**, before the kernel's share. On a 61 GB box that's easily achievable.
+- Most of that ~9 KB **isn't the socket**. It's the **goroutine** spawned per connection to watch it, plus the **buffers** given to it. That's why people pushing to very large numbers **don't use one goroutine per connection**; they watch every socket from one place using **epoll**.
+
+**Conclusion:** a million **idle** connections mostly comes down to **RAM**.
+
+🔧 In Python with asyncio there's no thread per connection (the event loop already uses epoll through the `selectors` module, or libuv with uvloop), but each connection is still a **task** with its coroutine frame, a `WebSocket` object, buffers and whatever your handler keeps in local variables. Measure it the same way: resident memory (for example `psutil.Process().memory_info().rss`) or `tracemalloc`'s traced total at 0 and at N connections, divided by N. Also watch per-socket kernel buffer memory (`ss -tm`), and keep message handlers from retaining big objects per connection.
+
+---
+
+## 9. Testing and load-testing a real-time server ➕
+
+Section 8 measured one box with a purpose-built Go program; this section is how you check **your own** server's correctness in CI and its capacity before launch, since the usual HTTP test and load tools measure the wrong things.
+
+#### 9.1 Integration tests against a real server on a random port ➕
+
+**Problem.** A WebSocket handler is asynchronous on both sides: you send a `move`, and some time later a `task.moved` arrives on **another** socket. Mocking the `WebSocket` objects hides exactly what breaks in production: framing, close codes, the subscribe-then-publish race, two clients interacting.
+
+**Why (first principles).** Starting a real server on `127.0.0.1` stays inside the machine, so it's still a **medium** test in the testing lesson's terms, and it's fast because nothing leaves the host. The hard part is **waiting**: a `sleep(100)` before the assertion is the flaky-test pattern from that lesson. Wait for **the message you expect**, with a timeout.
+
+**Mechanism.** Start uvicorn on port `0` (the OS picks a free one, so parallel pytest-xdist workers don't collide), connect real `websockets` clients, and use a helper that returns when a matching message arrives, under `asyncio.timeout`. Make the server **acknowledge subscribes**, and wait for that ack before triggering the event; otherwise the test races the subscription.
+
+**Implementation.** With pytest and the `anyio` plugin that ships with Starlette:
+
+```python title="test_board_ws.py"
+import asyncio
+import json
+
+import pytest
+import uvicorn
+from websockets.asyncio.client import connect
+from websockets.exceptions import InvalidStatus
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture
+async def url():
+    app = create_realtime_app(bus=InProcessBus(), auth=fake_ticket_auth)  # DI from the testing lesson
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    task = asyncio.create_task(server.serve())
+    while not server.started:  # readiness, not a fixed sleep
+        await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield f"ws://127.0.0.1:{port}/ws"
+    server.should_exit = True
+    await task
+
+
+async def next_message(ws, match, timeout: float = 2.0) -> dict:
+    async with asyncio.timeout(timeout):  # fails the test instead of hanging
+        async for raw in ws:
+            m = json.loads(raw)
+            if match(m):
+                return m
+    raise AssertionError("connection closed before the expected message")
+
+
+def connect_as(url: str, user: str):
+    return connect(f"{url}?ticket={user}", origin="https://app.example.com")
+
+
+@pytest.mark.anyio
+async def test_move_by_asha_reaches_leo(url):
+    async with connect_as(url, "asha") as asha, connect_as(url, "leo") as leo:
+        for ws in (asha, leo):
+            await ws.send(json.dumps({"type": "subscribe", "id": "s1", "boardId": "412"}))
+            await next_message(ws, lambda m: m["type"] == "subscribed" and m["boardId"] == "412")  # no race
+        await asha.send(json.dumps({"type": "move", "id": "c1", "boardId": "412", "taskId": "88", "to": "doing"}))
+        m = await next_message(leo, lambda m: m["type"] == "task.moved")  # received frames are buffered
+        assert (m["taskId"], m["to"]) == ("88", "doing")
+
+
+@pytest.mark.anyio
+async def test_foreign_origin_is_refused_before_upgrade(url):
+    with pytest.raises(InvalidStatus) as exc:
+        async with connect(f"{url}?ticket=asha", origin="https://evil.example"):
+            pass
+    assert exc.value.response.status_code == 403
+```
+
+**Edge cases.**
+- uvicorn's shutdown waits for open connections, so **close every client** in the test (the `async with` blocks do it), or pytest hangs at the end.
+- Test the **multi-instance path** separately: two server instances, one Redis from Testcontainers (`testcontainers-python`), a client on each. That's the bug from section 10 ("nothing happens in B"), and an in-process bus can never catch it.
+- Test **resume**: abort a client mid-stream (`ws.transport.abort()`), publish two events, reconnect with the last ID and assert both arrive in order.
+
+#### 9.2 Load tests that measure connections and fan-out latency ➕
+
+**Problem.** HTTP load tools report requests per second. A real-time service has almost no requests; what matters is **how many concurrent connections** it holds, **how long an event takes** to reach every subscriber, and whether that stays flat as the room grows.
+
+**Why (first principles).** The work is `events × subscribers` (section 14), so a test that opens 10,000 idle sockets proves only the memory wall from section 8. You must also **publish** at a realistic rate and measure **publish-to-receive latency** on the receiving side. And, from section 8, one generator machine runs out of **source ports** at about 28k connections, so big tests need several generators.
+
+**Mechanism.** **k6** has a `k6/websockets` module (the older `k6/experimental/websockets` is deprecated) whose global event loop lets one virtual user hold several connections. Each watcher records `Date.now() - sentAt` for every event into a custom **Trend** metric, and a **threshold** fails the run if p95 is too high, so the same script can gate a release.
+
+**Implementation.** k6 scripts are always JavaScript, whatever language the server under test is written in (a Python-native alternative is **Locust** with a custom user class that drives the `websockets` client):
+
+```js title="load/fanout.k6.js"
+import { WebSocket } from 'k6/websockets';
+import { setTimeout } from 'k6/timers';
+import { Trend } from 'k6/metrics';
+import http from 'k6/http';
+
+const fanout = new Trend('fanout_latency_ms', true);
+
+export const options = {
+  scenarios: {
+    watchers:  { executor: 'ramping-vus', exec: 'watch', stages: [{ duration: '5m', target: 5000 }, { duration: '20m', target: 5000 }] },
+    publisher: { executor: 'constant-arrival-rate', exec: 'publish', rate: 5, timeUnit: '1s', duration: '25m', preAllocatedVUs: 5 },
+  },
+  thresholds: { fanout_latency_ms: ['p(95)<250'] },
+};
+
+export function watch() {
+  const ws = new WebSocket(`wss://staging.example.com/ws?ticket=${http.post(TICKET_URL).json('ticket')}`);
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'subscribe', id: 's', boardId: '412' }));
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'task.moved' && m.sentAt) fanout.add(Date.now() - m.sentAt);
+  };
+  setTimeout(() => ws.close(), 25 * 60 * 1000);
+}
+
+export function publish() {
+  http.post(`${API}/boards/412/test-move`, JSON.stringify({ sentAt: Date.now() }), { headers: { 'content-type': 'application/json' } });
+}
+```
+
+**Edge cases.**
+- Put the publisher **in the same k6 run** as the watchers so `sentAt` and `Date.now()` come from the same clocks. With a publisher on another machine, clock skew becomes part of your "latency".
+- Shard the test across machines (k6 can run distributed, or just start one process per generator with a slice of the users), and raise `ulimit -n` and the port range on the generators, not only the server.
+- Ramp **reconnects** too: kill an instance mid-test and watch the reconnect storm (section 14) instead of discovering it during a deploy.
+
+#### 9.3 Soak tests: leaks that only show after hours ➕
+
+**Problem.** The service passes a 20-minute test and falls over after two days. Real-time servers are long-lived by design, so slow leaks (a callback never removed, a `dict` entry never deleted when a room empties, a background task never cancelled) accumulate in a way request/response services rarely see.
+
+**Why (first principles).** In a request/response service, most per-request objects die with the request. Here, per-connection state lives as long as the connection, and anything that **references** a closed socket (a room set, an expiry task, a closure in a pub/sub handler) keeps it alive. Memory per connection should stay flat over time; if it climbs, something is holding closed sockets.
+
+**Mechanism.** Run the load test for **many hours** with constant churn (connect, subscribe, disconnect), and export the right gauges: open connections, memory used, **memory per connection**, event-loop lag, and the size of every internal map.
+
+**Implementation.**
+
+```python title="realtime_metrics.py"
+import asyncio
+import time
+
+import psutil
+from prometheus_client import Gauge
+
+process = psutil.Process()
+loop_lag = {"max_ms": 0.0}
+
+
+async def measure_loop_lag(interval: float = 0.02) -> None:
+    """Sleep 20 ms and record how late the event loop woke us up."""
+    while True:
+        start = time.perf_counter()
+        await asyncio.sleep(interval)
+        lag_ms = (time.perf_counter() - start - interval) * 1000
+        loop_lag["max_ms"] = max(loop_lag["max_ms"], lag_ms)
+
+
+def take_max_lag() -> float:
+    value, loop_lag["max_ms"] = loop_lag["max_ms"], 0.0
+    return value
+
+
+Gauge("ws_open_connections", "open sockets").set_function(lambda: len(connections))
+Gauge("ws_rooms", "rooms with at least one local socket").set_function(lambda: len(rooms))
+Gauge("ws_rss_bytes_per_connection", "resident memory / connections").set_function(
+    lambda: process.memory_info().rss / max(1, len(connections))
+)
+Gauge("event_loop_lag_max_ms", "worst event loop lag since last scrape").set_function(take_max_lag)
+# start measure_loop_lag() as a background task in the app's lifespan
+```
+
+**Edge cases.** A flat `ws_open_connections` with a rising `ws_rooms` means rooms aren't deleted when they empty (the `leave` logic in section 10). Rising event-loop lag with flat traffic usually means fan-out got more expensive (bigger rooms, or JSON serialised once per socket instead of once per event), or something blocking (sync I/O, heavy CPU) is running on the loop.
+
+---
+
+## 10. Many instances: persistent connections are state 🎓
+
+### The problem
+Production doesn't run one machine. It runs several instances behind a load balancer (autoscaling), and containers die and get replaced during deploys.
+
+**The demo:** two instances behind a load balancer. Browser A lands on instance 1, browser B on instance 2. Both are healthy with live WebSockets. A moves a task, and **nothing happens in B**.
+
+**Why (first principles):** where does a WebSocket live? Instance 1 holds a socket **in its own process memory**, a goroutine, and a note that "this socket watches board 412". Instance 2 has never heard of browser A, and **can't**: they're separate processes, possibly in different countries.
+
+The whole series has worked to make the backend **stateless** so any instance can serve any request. Now: **a persistent connection is state.** It lives in one specific process, it can't be moved and it can't be shared. Once an instance accepts a WebSocket, **it's the only instance in the world that can talk to that user.**
+
+### Wrong fix: sticky sessions 🎓
+A **sticky session** tells the load balancer to keep sending the same client to the same instance, including on reconnect. A keeps going to instance 1, but **B is still on instance 2**, and instance 2 still knows nothing about A's change. Stickiness solves a different problem (keeping one client's state on one server), not **two clients on different servers**.
+
+### Right fix: pub/sub between instances 🎓
+The instances have to talk to each other. When something happens on board 412, the instance that receives it **doesn't try to deliver it directly**. It **publishes to a topic**. A broker in the middle (**Redis, NATS, Kafka**, or similar) hands the event to **every instance subscribed to that topic**. Each instance checks **its own** connections, finds the ones watching that board, and writes the frame.
+
+**The instance that receives the change and the instance that delivers it can now be different machines.** In the repeated demo, Asha moves a task and Leo sees it instantly.
+
+<Mermaid chart={`sequenceDiagram
+  participant A as Browser A
+  participant I1 as Instance 1
+  participant R as Redis pub/sub
+  participant I2 as Instance 2
+  participant B as Browser B
+  A->>I1: ws: move task 88 (board 412)
+  I1->>I1: validate, write to Postgres
+  I1->>R: PUBLISH board:412 event
+  R-->>I1: event (subscribed to board:412)
+  R-->>I2: event (subscribed to board:412)
+  I1-->>A: frame: task.moved
+  I2-->>B: frame: task.moved`} />
+
+🔧 Implementation with `redis.asyncio` (one subscriber connection per instance, a local room map, and a **bounded queue per socket** for backpressure):
+
+```python title="board_bus.py"
+import asyncio
+import json
+import os
+
+from fastapi import WebSocket
+from redis.asyncio import Redis
+
+redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+pubsub = redis.pubsub()  # its own connection: a subscribed connection can't run other commands
+rooms: dict[str, set["Client"]] = {}  # board_id -> local sockets only
+listener: asyncio.Task | None = None
+
+
+class Client:
+    """One socket plus a bounded outbox; a writer task drains it at the socket's pace."""
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self.outbox: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self.writer = asyncio.create_task(self._drain())
+
+    async def _drain(self) -> None:
+        while True:
+            await self.ws.send_text(await self.outbox.get())
+
+    def offer(self, payload: str) -> None:
+        try:
+            self.outbox.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass  # slow consumer: skip, it catches up by sequence number (section 12)
+
+
+async def join(board_id: str, client: Client) -> None:
+    global listener
+    if board_id not in rooms:
+        rooms[board_id] = set()
+        await pubsub.subscribe(f"board:{board_id}")  # only subscribe to boards someone here watches
+    rooms[board_id].add(client)
+    if listener is None or listener.done():
+        listener = asyncio.create_task(fan_out())
+
+
+async def leave(board_id: str, client: Client) -> None:  # call from the handler's finally block
+    room = rooms.get(board_id)
+    if room is None:
+        return
+    room.discard(client)
+    if not room:
+        del rooms[board_id]
+        await pubsub.unsubscribe(f"board:{board_id}")
+
+
+async def fan_out() -> None:
+    async for msg in pubsub.listen():  # ends when no channel is subscribed any more
+        if msg["type"] != "message":
+            continue
+        board_id = msg["channel"].removeprefix("board:")
+        for client in rooms.get(board_id, ()):
+            client.offer(msg["data"])  # never awaits: one slow socket can't stall the others
+
+
+async def publish(board_id: str, event: dict) -> None:
+    await redis.publish(f"board:{board_id}", json.dumps(event))
+```
+
+🔧 Order matters in the handler: **commit to Postgres first, then publish.** If you publish first and the write fails, every browser shows a move that never happened. If you need publish-after-commit to survive crashes too, use the transactional outbox pattern (see the Webhooks lesson).
+
+### The catch: Redis pub/sub is fire-and-forget 🎓
+If an instance **isn't connected at the moment you publish**, that message is **gone forever**. No queue, no delay, no retry.
+
+**Scenario:** a deploy takes down a container. In the seconds before its replacement is up, every message published for the users it was serving is lost. Those boards only see the changes **on their next refresh**.
+
+That's an architectural decision you must make knowingly: **Redis pub/sub gives at-most-once delivery.** If you need **at-least-once**, use something that **stores messages and tracks acknowledgements**: **Redis Streams, Kafka**, or a queue.
+
+| | Redis pub/sub | Redis Streams / Kafka |
+|---|---|---|
+| Storage | None | Messages kept (log) |
+| Subscriber offline | Message lost | Reads it later from its offset |
+| Delivery | At most once | At least once (with acks) |
+| Replay by ID | No | Yes (`XRANGE` / offsets) |
+
+---
+
+## 11. Choosing the broker as fan-out grows ➕
+
+The table above compares brokers on **delivery guarantees**; once you have dozens of instances and millions of rooms, the broker's own **cost model** (where each message travels, and how cheap a topic is) matters just as much.
+
+#### 11.1 Why Redis pub/sub gets expensive, and sharded pub/sub ➕
+
+**Problem.** You started on one Redis node. Traffic grows, so you move to **Redis Cluster** with six shards, expecting six times the pub/sub capacity. It doesn't come: every shard is now as busy with pub/sub as the single node was.
+
+**Why (first principles).** Classic `PUBLISH` in a cluster is **global**: a subscriber may be connected to any node, so the message is propagated **to every node** over the cluster bus. Adding shards adds key-space capacity but **not** pub/sub capacity; each node still sees every message. A second, self-inflicted version of the same cost is subscribing every app instance to one global channel (`events`) and filtering locally: then each instance receives **every event in the system**, and traffic is `instances × events`. The per-board channels in section 10 avoid that second problem; the cluster still has the first.
+
+**Mechanism.** **Sharded pub/sub** (Redis **7.0+**, commands `SSUBSCRIBE`, `SPUBLISH`, `SUNSUBSCRIBE`) hashes a **shard channel** to a slot exactly as it hashes keys. A message is sent to the node that owns that slot and stays **inside that shard** (its primary and replicas). Adding shards now does add capacity, because each board's traffic lives on one shard.
+
+**Implementation.** With redis-py (5.x), `spublish`, `ssubscribe` and `get_sharded_message` live on the **sync** cluster client's `ClusterPubSub`, so one background thread owns the subscriber and hands messages to the event loop:
+
+```python title="board_bus_sharded.py"
+import asyncio
+import json
+import queue
+import threading
+import time
+
+from redis.cluster import ClusterNode, RedisCluster
+
+nodes = [ClusterNode("redis-1", 6379), ClusterNode("redis-2", 6379)]
+pub = RedisCluster(startup_nodes=nodes, decode_responses=True)
+sub = RedisCluster(startup_nodes=nodes, decode_responses=True).pubsub()  # one connection per shard
+to_subscribe: queue.SimpleQueue[str] = queue.SimpleQueue()
+
+
+def channel(board_id: str) -> str:
+    return f"board:{{{board_id}}}"  # hash tag: routed to the shard that owns this slot
+
+
+def subscriber_thread(loop: asyncio.AbstractEventLoop) -> None:
+    while True:
+        while not to_subscribe.empty():
+            sub.ssubscribe(to_subscribe.get())  # the pubsub object is used by this thread only
+        msg = sub.get_sharded_message()  # non-blocking poll across the shard connections
+        if msg is None:
+            time.sleep(0.005)
+        elif msg["type"] == "smessage":
+            loop.call_soon_threadsafe(deliver_local, msg["channel"], msg["data"])
+
+
+def start_subscriber() -> None:  # call once from the app's lifespan
+    threading.Thread(target=subscriber_thread, args=(asyncio.get_running_loop(),), daemon=True).start()
+
+
+def join_room(board_id: str) -> None:
+    to_subscribe.put(channel(board_id))
+
+
+async def publish(board_id: str, event: dict) -> None:
+    await asyncio.to_thread(pub.spublish, channel(board_id), json.dumps(event))
+```
+
+In the f-string, `{{` and `}}` are literal braces, so the channel for board 412 is `board:` followed by `412` wrapped in braces.
+
+The `{...}` **hash tag** makes the channel and the board's other keys (for example its `board:{412}:log` stream from section 12) land on the **same slot**, so related operations stay on one shard.
+
+**Edge cases.**
+- Sharding spreads **many rooms**, not **one huge room**: all of board 412's traffic still goes through one shard. A single 30,000-member room is a fan-out problem (section 14), not a broker problem.
+- It is still **at-most-once**. Sharding changes the cost model, not the delivery guarantee.
+- During slot migration or failover, the subscriber connection for that slot is moved; resubscribe on reconnect and rely on catch-up (section 12) for anything published during the gap.
+
+#### 11.2 Durable logs: Redis Streams, NATS JetStream or Kafka ➕
+
+**Problem.** You decided (section 10) that you need **at-least-once** and **replay**. Three popular options look interchangeable on a slide. They aren't, because a real-time gateway has an unusual access pattern: **each instance wants only the rooms its own users are watching**, and that set changes every second.
+
+**Why (first principles).** The deciding property is **how cheap a topic is**:
+- A **Redis Stream** is just a key; a million per-board streams are fine, and `XREAD` / `XRANGE` on the boards you hold is cheap. It lives in memory, so you trim it (`MAXLEN`), which is why section 12 needs a "resync" path.
+- **NATS** subjects are cheap and hierarchical (`board.412`, with wildcards such as `board.>`). **Core NATS is at-most-once**, delivering only to subscribers connected at publish time; **JetStream** adds persistence and acknowledgements for at-least-once delivery.
+- **Kafka** topics and partitions are **heavyweight**: you don't create one per board. You key events by `boardId` into a fixed number of partitions, which gives per-board order inside a partition, but a consumer reads **whole partitions**, not "only boards 412 and 977". Every gateway would read every event and drop most of them.
+
+**Mechanism.** A common shape at scale: **Kafka (or the database outbox) is the durable source of truth**, a small **router** service consumes it, and republishes each event to a **cheap per-room fan-out layer** (Redis sharded pub/sub or NATS subjects) that the gateways subscribe to. Durability lives in one place; per-room routing lives in another.
+
+| | Redis Streams | NATS JetStream | Kafka |
+|---|---|---|---|
+| Cost of one topic per room | Very low (a key) | Low (subjects) | High (not done) |
+| Storage | Memory, trimmed | Disk or memory, retention limits | Disk, long retention |
+| Typical role here | Per-board catch-up log | Fan-out plus replay | Durable backbone feeding a router |
+
+**Implementation.** The router, sketched with `aiokafka` in and `nats-py` out:
+
+```python title="router.py"
+import os
+
+import nats
+from aiokafka import AIOKafkaConsumer
+
+
+async def run_router() -> None:
+    nc = await nats.connect(os.environ["NATS_URL"])
+    consumer = AIOKafkaConsumer(
+        "board-events",  # keyed by board_id: per-board order
+        bootstrap_servers=os.environ["KAFKA"],
+        group_id="realtime-router",
+    )
+    await consumer.start()
+    try:
+        async for message in consumer:
+            board_id = message.key.decode()
+            await nc.publish(f"board.{board_id}", message.value)  # only interested gateways get it
+    finally:
+        await consumer.stop()
+
+
+# gateway side: subscribe only to rooms with local sockets
+async def watch_board(nc, board_id: str) -> None:
+    sub = await nc.subscribe(f"board.{board_id}")
+    async for m in sub.messages:
+        deliver_local(board_id, m.data.decode())
+```
+
+**Edge cases.**
+- A durable broker **does not** fix the client side. Your browser was offline, not the gateway; the client still needs the sequence-number catch-up of section 12.
+- Kafka consumer lag is **user-visible latency** here; alert on it like you'd alert on p95 response time.
+- If the router republishes to at-most-once core NATS, the end-to-end guarantee is at-most-once again from that hop on, and catch-up is what makes it acceptable.
+
+---
+
+## 12. Catching up after a disconnect: sequence numbers 🎓
+
+### The problem
+Disconnects are **normal**, not exceptional: the phone switches from Wi-Fi to mobile data, someone closes the laptop lid, the load balancer hits its **idle timeout**. A production real-time system needs a **catch-up strategy**, not just a delivery strategy.
+
+### The mechanism
+The same shape as SSE's `Last-Event-ID`: **number every message**, have the client report the **last number it received**, and send everything after it.
+
+**Uber does exactly this:** a client connects and says "I'm at sequence 0". The server sends messages with increasing sequence numbers. If the connection breaks, the client reconnects and says "I got up to 2", and the server resumes from **3**.
+
+<Mermaid chart={`sequenceDiagram
+  participant C as Client
+  participant S as Server
+  participant L as Event log (per board)
+  C->>S: connect, lastSeq 0
+  S-->>C: seq 1, seq 2
+  Note over C,S: connection drops (seq 3 published meanwhile)
+  C->>S: reconnect, lastSeq 2
+  S->>L: events after 2
+  L-->>S: seq 3
+  S-->>C: seq 3 (catch-up)
+  S-->>C: seq 4 (live)`} />
+
+🔧 Implementation with a per-board Redis Stream as the log (survives instance restarts, unlike pub/sub):
+
+```python title="board_log.py"
+import json
+
+from redis.asyncio import Redis
+
+redis = Redis.from_url(REDIS_URL, decode_responses=True)
+
+
+# write side, after the DB commit
+async def record_and_publish(board_id: str, event: dict) -> None:
+    stream_id = await redis.xadd(
+        f"board:{board_id}:log", {"e": json.dumps(event)}, maxlen=10_000, approximate=True
+    )
+    await redis.publish(f"board:{board_id}", json.dumps({**event, "streamId": stream_id}))
+
+
+# reconnect side: client sends the last streamId it applied
+async def catch_up(board_id: str, last_id: str) -> dict:
+    entries = await redis.xrange(f"board:{board_id}:log", min=f"({last_id}", max="+")  # exclusive start
+    if len(entries) == 10_000:
+        return {"resync": True}  # too far behind: refetch the whole board
+    return {"events": [{"streamId": sid, **json.loads(fields["e"])} for sid, fields in entries]}
+```
+
+🔧 Edge cases:
+- **Trimmed history:** if the client's last ID is older than what the log still holds, send "resync" and let it **refetch the full board**. Never silently skip.
+- **Duplicates:** catch-up and the live stream can overlap. The client ignores anything with an ID ≤ the last one it applied.
+- **Per-entity order:** a sequence per board is enough; you don't need a global order.
+
+🔧 And the client side of reconnecting (jittered backoff, resume from last ID), as it runs in the browser page:
+
+```ts title="reconnecting-socket.ts (browser)"
+let lastId = '0-0';
+let attempt = 0;
+
+function connect() {
+  const ws = new WebSocket(`wss://app.example.com/ws?board=412&after=${encodeURIComponent(lastId)}`);
+  ws.onopen = () => { attempt = 0; };
+  ws.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    if (e.resync) return reloadBoard();
+    if (e.streamId <= lastId) return;   // duplicate from catch-up overlap (compare properly in real code)
+    apply(e);
+    lastId = e.streamId;
+  };
+  ws.onclose = () => {
+    const base = Math.min(30_000, 500 * 2 ** attempt++);
+    setTimeout(connect, base / 2 + Math.random() * base / 2);  // jitter spreads a reconnect storm
+  };
+}
+connect();
+```
+
+---
+
+## 13. End-to-end guarantees: acks, idempotent commands and ordering ➕
+
+Section 12 made **server-to-client** delivery recoverable; the other direction (the client's own commands) and the **order** in which everyone sees events need the same care, or two browsers can still disagree about the board.
+
+#### 13.1 Client commands need an ID and an acknowledgement ➕
+
+**Problem.** Asha drags a card; the client sends `{"type":"move",...}` over the socket, and the connection drops a moment later. Did the server get it? `ws.send()` returning only means the bytes were **queued locally**. If the client resends on reconnect and the first one did arrive, the task moves twice; for "add comment" you get a duplicate comment.
+
+**Why (first principles).** It's the same problem as webhooks' at-least-once delivery: the **acknowledgement can be lost**, so the sender must retry, so the receiver must make the retry harmless. A WebSocket doesn't change the physics; it just hides the request/response pairing HTTP gave you for free.
+
+**Mechanism.**
+1. The client gives every command a **client-generated ID** (a UUID) and keeps it in a **pending** list until it gets `{"type":"ack","ref":id}`.
+2. On reconnect, it **resends everything still pending**.
+3. The server records each command ID with a **unique constraint in the same transaction** as the change, so a resend is recognised and answered with the **original result** instead of being applied again.
+
+**Implementation.**
+
+```sql title="schema"
+CREATE TABLE processed_commands (
+  client_msg_id uuid PRIMARY KEY,
+  user_id       bigint      NOT NULL,
+  result        jsonb       NOT NULL,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+-- a nightly job deletes rows older than 7 days: clients never resend that late
+```
+
+```python title="move_command.py (server, asyncpg)"
+import json
+
+
+async def handle_move(conn: Connection, m: Move) -> None:
+    async with pool.acquire() as db, db.transaction():
+        prior = await db.fetchval("SELECT result FROM processed_commands WHERE client_msg_id = $1", m.id)
+        if prior is not None:
+            result = json.loads(prior)  # duplicate: same answer as before
+        else:
+            event = await move_task(db, m.boardId, m.taskId, m.to)  # assigns seq (13.2)
+            result = {"ok": True, "seq": event.seq}
+            await db.execute(
+                "INSERT INTO processed_commands (client_msg_id, user_id, result) VALUES ($1, $2, $3)",
+                m.id, conn.session["userId"], json.dumps(result),
+            )  # a concurrent duplicate fails here and rolls back
+    await conn.ws.send_json({"type": "ack", "ref": m.id, **result})
+```
+
+The pending list lives in the browser page:
+
+```ts title="command-outbox.ts (browser)"
+const pending = new Map<string, object>();
+
+export function sendCommand(ws: WebSocket, cmd: object) {
+  const id = crypto.randomUUID();
+  const msg = { ...cmd, id };
+  pending.set(id, msg);
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  return id;
+}
+export function onAck(ref: string) { pending.delete(ref); }
+export function onReconnected(ws: WebSocket) {
+  for (const msg of pending.values()) ws.send(JSON.stringify(msg));   // safe: the server dedupes
+}
+```
+
+**Edge cases.**
+- An **ack means "committed"**, not "everyone has seen it". Delivery to other clients is the fan-out path's job.
+- Two copies arriving at the **same moment** on two instances both miss the `SELECT`; the primary key makes the second `INSERT` fail and its transaction roll back. Catch that error (`asyncpg.UniqueViolationError`) and re-read the stored result.
+- Persist `pending` in `IndexedDB` if commands must survive a page reload (offline-first apps), and give up with a visible error after some time instead of retrying forever.
+
+#### 13.2 One writer assigns the order ➕
+
+**Problem.** Asha (instance 1) and Leo (instance 2) move the **same task** within the same millisecond. Each instance publishes its event. Browser C receives Asha's then Leo's; browser D receives Leo's then Asha's. C and D now show the task in **different columns**, and both are "up to date".
+
+**Why (first principles).** An order only exists where there is **one serialisation point**. Two publishers racing through a broker have none, so each receiver's order is just **arrival order**, which differs by network path. Timestamps don't help: two machines' clocks disagree by milliseconds, and same-millisecond ties happen.
+
+**Mechanism.** Make the database the single writer for each board's order: bump a **per-board counter inside the same transaction** as the change. The row lock on that counter serialises concurrent writers, so every event gets a unique, gap-free `seq`. Clients apply events **in `seq` order only**: if `seq` 7 arrives before 6, hold 7 briefly; if 6 doesn't show up, run the catch-up from section 12.
+
+**Implementation.**
+
+```sql title="per-board sequence, inside the move transaction"
+UPDATE boards SET seq = seq + 1 WHERE id = $1 RETURNING seq;   -- row lock: concurrent moves queue here
+INSERT INTO board_events (board_id, seq, type, payload) VALUES ($1, $2, 'task.moved', $3);
+UPDATE tasks SET column_name = $4 WHERE id = $5;
+```
+
+```ts title="ordered-apply.ts (browser)"
+let applied = 0;                                   // last seq applied
+const held = new Map<number, BoardEvent>();
+let gapTimer: ReturnType<typeof setTimeout> | undefined;
+
+export function onEvent(e: BoardEvent) {
+  if (e.seq <= applied) return;                    // duplicate
+  held.set(e.seq, e);
+  while (held.has(applied + 1)) {                  // apply every contiguous event
+    apply(held.get(applied + 1)!);
+    held.delete(++applied);
+  }
+  clearTimeout(gapTimer);
+  if (held.size > 0) gapTimer = setTimeout(() => requestCatchUp(applied), 1000);   // a gap that didn't fill
+}
+```
+
+**Edge cases.**
+- **Commit order is not publish order.** Transaction A gets `seq` 5 and B gets 6, but B's instance publishes first. That's normal, and exactly why the client holds events and fills gaps instead of trusting arrival order.
+- The counter row is a **hot spot**: every write on board 412 waits on it. That's fine for a board (a few writes a second) and not fine for a global counter; keep the sequence **per entity**, as section 12 already advised.
+
+#### 13.3 Optimistic UI and server rejections ➕
+
+**Problem.** Waiting for the ack makes dragging feel laggy, so the client moves the card **immediately** (optimistic update). Then the server rejects the move (the "todo cannot jump to done" rule from the testing lesson), or Leo's conflicting move gets the earlier `seq`. The client's screen is now wrong.
+
+**Why (first principles).** With optimistic updates the client shows **two kinds of state at once**: what the server has confirmed, and what the user has asked for but the server hasn't ruled on yet. If you mix them in one structure you can't undo just the rejected part.
+
+**Mechanism.** Keep **confirmed state** (built only from server events in `seq` order) and a list of **pending local commands**. What you render = confirmed state with pending commands replayed on top. On `ack`, drop the command (its server event will update confirmed state). On rejection, drop it and **show the user why**. On any server event, recompute; a conflicting pending move simply re-applies on top of the newer truth, or fails and is shown as rejected.
+
+**Implementation.**
+
+```ts title="optimistic-board.ts (browser)"
+let confirmed: BoardState = initialState;
+let pendingOps: { id: string; op: MoveOp }[] = [];
+
+const view = () => pendingOps.reduce((s, p) => applyMove(s, p.op), confirmed);   // pure functions
+
+export function userMoves(op: MoveOp) {
+  const id = sendCommand(ws, { type: 'move', ...op });
+  pendingOps.push({ id, op });
+  render(view());
+}
+export function onServerEvent(e: BoardEvent) { confirmed = applyEvent(confirmed, e); render(view()); }
+export function onAck(ref: string) { pendingOps = pendingOps.filter((p) => p.id !== ref); render(view()); }
+export function onRejected(ref: string, reason: string) {
+  pendingOps = pendingOps.filter((p) => p.id !== ref);
+  toast(`Move undone: ${reason}`);
+  render(view());
+}
+```
+
+**Edge cases.** This is "last writer by `seq` wins" per field, which is right for moving cards. For **two people editing the same text**, replaying whole operations loses edits; that's the territory of CRDTs and operational transforms the lesson lists as out of scope.
+
+---
+
+## 14. Fan-out and reconnect storms 🎓
+
+### Fan-out
+Pub/sub solves "many instances". But if **30,000 people** watch the same board, one person moving one task means **30,000 writes**. The real work is:
+
+> `work = events × subscribers`
+
+**Discord** wrote about this: communities with **30,000 people online at once**, where publishing a single event to one of them took **900 ms to 2.1 s**. For a platform whose core is messaging, that's a serious problem. Their fix: **don't do the fan-out in one place**; spread it across the machines that **own the recipients**, so each machine writes only to its own share.
+
+<Mermaid chart={`flowchart TD
+  E["1 event on a huge guild/board"] --> P["Publisher"]
+  P --> N1["Node 1 owns 10k sessions"]
+  P --> N2["Node 2 owns 10k sessions"]
+  P --> N3["Node 3 owns 10k sessions"]
+  N1 --> W1["10k local writes in parallel"]
+  N2 --> W2["10k local writes in parallel"]
+  N3 --> W3["10k local writes in parallel"]`} />
+
+🔧 Other levers: **coalesce** bursts (send "5 tasks moved" once per 100 ms instead of 5 frames), **serialise once** and send the same buffer to every socket, and **drop or disconnect slow consumers** whose send buffer keeps growing so one bad phone connection can't eat your memory.
+
+### Reconnect storms
+An instance holding **50,000 connections** dies. All 50,000 clients reconnect **at the same moment**, and each one wants its **initial state**: boards, tasks, who's online. That's **50,000 expensive requests in one second**.
+
+**Slack** wrote about exactly this. Their fix: make **connecting cheap** by keeping a **cache at the edge of the network** that holds what a client needs to start, so a reconnect storm **never reaches the origin** (the core services).
+
+<Mermaid chart={`sequenceDiagram
+  participant C as 50k clients
+  participant E as Edge cache
+  participant O as Origin services
+  Note over C: instance dies, everyone reconnects at once
+  C->>E: reconnect + "give me initial state"
+  E-->>C: boot state from cache (cheap)
+  E->>O: only cache misses / refreshes
+  Note over O: origin stays calm`} />
+
+🔧 Plus the client-side half: **jittered** reconnect delays (the code in section 12), so 50,000 reconnects spread over several seconds instead of landing in one. And on deploys, **drain** instances gradually (stop accepting new connections, close existing ones in batches) instead of killing them all at once.
+
+---
+
+## 15. Load balancers, proxies and deploys for long-lived connections ➕
+
+The note above says "drain instances gradually"; this section covers everything between the browser and your process that decides **when a connection dies**, because each hop was configured for short HTTP requests by default.
+
+#### 15.1 Proxies must be told to pass the upgrade ➕
+
+**Problem.** It works locally. Behind nginx in staging, every handshake fails and the browser reports a generic error.
+
+**Why (first principles).** `Upgrade` and `Connection` are **hop-by-hop** headers: they describe one TCP hop, so a proxy is supposed to **consume** them and not forward them. Your backend therefore receives a plain `GET` with no upgrade request. nginx versions before **1.29.7** also speak **HTTP/1.0** to upstreams by default, and the upgrade mechanism only exists in HTTP/1.1.
+
+**Mechanism.** Tell the proxy explicitly to forward the upgrade on the WebSocket route.
+
+**Implementation.** The pattern from the nginx docs:
+
+```nginx title="nginx.conf"
+http {
+  map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+  }
+  server {
+    location /ws {
+      proxy_pass http://realtime_backend;
+      proxy_http_version 1.1;                       # needed before nginx 1.29.7
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
+      proxy_set_header Host $host;
+      proxy_read_timeout 3600s;                     # 15.2
+      proxy_buffering off;                          # also needed for SSE streams
+    }
+  }
+}
+```
+
+**Edge cases.** Every hop needs this: ingress controller, CDN, service mesh sidecar. Managed load balancers (AWS ALB, Google Cloud Load Balancing, Cloudflare) handle the upgrade natively, but still apply their own **idle timeouts** (15.2).
+
+#### 15.2 Idle timeouts on every hop ➕
+
+**Problem.** A quiet board stays connected for exactly **60 seconds**, then drops, reconnects, and drops again a minute later. Nothing is wrong with your code.
+
+**Why (first principles).** Each proxy holds memory per connection, so each one closes connections that **send no bytes** for a while. On AWS an **Application Load Balancer** defaults to a **60 s** idle timeout (configurable from 1 to 4,000 s), and nginx closes a proxied WebSocket if the upstream sends nothing for **60 s** (`proxy_read_timeout`). The shortest timeout on the path wins.
+
+**Mechanism.** Either send something more often than the **smallest** timeout on the path, or raise the timeouts, and usually both:
+- Server **ping frames** (section 6) are bytes on the connection, so they reset these timers. A **25 to 30 s** heartbeat stays under a 60 s timeout with margin.
+- Raise the timeouts on infrastructure you control, so a missed ping or two doesn't kill the connection.
+- AWS also recommends the **application's** idle timeout be **longer** than the load balancer's, so the LB, not your server, is the side that closes idle connections (otherwise it can forward to a socket you just closed and return a 502).
+
+**Implementation.**
+
+```bash
+aws elbv2 modify-load-balancer-attributes \
+  --load-balancer-arn "$ALB_ARN" \
+  --attributes Key=idle_timeout.timeout_seconds,Value=300
+```
+
+| Hop | Default to check | Fix |
+|---|---|---|
+| AWS ALB | 60 s idle | Raise it, plus heartbeat under it |
+| nginx | `proxy_read_timeout` 60 s | Raise it on the WebSocket route |
+| Corporate proxies, mobile carrier NAT | Unknown, can be short | Heartbeat is the only lever you have |
+| Your server | uvicorn pings every 20 s (`--ws-ping-interval`) | Ping every 25 to 30 s or less, close after a missed pong (`--ws-ping-timeout`) |
+
+**Edge cases.** Long-polling and SSE (sections 4 and 5) suffer the same timeouts, which is why the SSE code sends a comment every 20 s and the long-poll code returns 204 at 30 s.
+
+#### 15.3 When sticky sessions are actually needed ➕
+
+**Problem.** Section 10 showed that sticky sessions don't solve "two users on two servers". But turn them off with Socket.IO and clients fail to connect at all when there are two instances.
+
+**Why (first principles).** A pure WebSocket is **one** TCP connection, so it's automatically pinned to one instance for its life; stickiness adds nothing. Protocols with an **HTTP long-polling transport** are different: one logical session is **many HTTP requests**, and they all have to reach the process holding that session's state. Socket.IO documents exactly this: with several nodes, all requests for a session ID must reach the process that created it.
+
+**Mechanism.** Two options: enable stickiness (cookie-based at the load balancer, or IP hash), or **disable the polling transport** so every session is one WebSocket.
+
+**Implementation.** In Python, Socket.IO servers are built with **python-socketio**; its `AsyncRedisManager` also does the section 10 pub/sub between instances for you. Allow only the WebSocket transport on the server:
+
+```python title="socketio_server.py (python-socketio)"
+import socketio
+
+mgr = socketio.AsyncRedisManager("redis://redis:6379/0")  # cross-instance fan-out
+sio = socketio.AsyncServer(async_mode="asgi", client_manager=mgr, transports=["websocket"])
+app = socketio.ASGIApp(sio)  # run with uvicorn
+```
+
+and in the browser:
+
+```ts title="socket.io client (browser): WebSocket only, no stickiness needed"
+import { io } from 'socket.io-client';
+const socket = io('https://app.example.com', { transports: ['websocket'] });
+```
+
+```nginx title="nginx: stickiness if you keep polling"
+upstream realtime_backend {
+  ip_hash;                    # same client IP, same instance
+  server 10.0.1.10:3000;
+  server 10.0.1.11:3000;
+}
+```
+
+**Edge cases.**
+- Long-lived connections **never rebalance**. After a scale-out, the new instance gets only **new** connections while the old ones stay overloaded. Give connections a **maximum age** (for example 2 to 4 hours plus random jitter), then close them with 1012 so they reconnect and spread across all instances.
+- `ip_hash` piles all users behind one corporate NAT onto one instance.
+
+#### 15.4 Draining connections on deploy ➕
+
+**Problem.** A rolling deploy replaces a pod holding 50,000 sockets. If the process just exits, all 50,000 clients reconnect in the same second (section 14's storm), and events in flight on that instance are lost.
+
+**Why (first principles).** In Kubernetes, terminating a pod runs any `preStop` hook, sends **SIGTERM**, waits the grace period (**30 s** by default), then sends **SIGKILL**. In parallel the pod is removed from Service endpoints, but that removal propagates asynchronously, so new upgrades can still arrive for a few seconds. You get one window to close connections **on your terms**.
+
+**Mechanism.** On SIGTERM:
+1. Start failing **readiness** and rejecting new upgrades (a client that lands here retries elsewhere).
+2. Close existing sockets **in batches** spread over most of the grace period, with close code **1012 Service Restart** (IANA: "the server is restarting"), so clients reconnect promptly with jitter to another pod.
+3. Clients resume from their last sequence number (section 12), so nothing is lost.
+4. Then close the pub/sub subscriber and exit before SIGKILL.
+
+The general shutdown pattern is in the graceful shutdown lesson (19); this is its WebSocket-specific version.
+
+**Implementation.**
+
+```python title="drain.py"
+import asyncio
+import math
+import signal
+
+import uvicorn
+from fastapi import FastAPI, Response, WebSocket
+
+app = FastAPI()
+draining = False
+connections: set[WebSocket] = set()  # added after accept(), removed in the handler's finally
+background: set[asyncio.Task] = set()
+
+
+@app.get("/ready")
+async def ready():
+    return Response(status_code=503 if draining else 200)
+
+
+@app.websocket("/ws")
+async def board_socket(ws: WebSocket):
+    if draining:
+        return await ws.send_denial_response(Response(status_code=503))
+    ...  # auth, accept() and the message loop as in 7.1
+
+
+async def drain(server: uvicorn.Server) -> None:
+    global draining
+    draining = True
+    sockets = list(connections)
+    batches, window = 20, 40.0  # inside a 60 s grace period
+    size = math.ceil(len(sockets) / batches)
+    for i in range(batches):
+        for ws in sockets[i * size : (i + 1) * size]:
+            if ws in connections:  # skip sockets that already left
+                await ws.close(1012, "service restart")
+        await asyncio.sleep(window / batches)
+    await pubsub.aclose()
+    server.should_exit = True  # uvicorn closes stragglers (also with 1012) and exits
+
+
+class DrainingServer(uvicorn.Server):
+    def handle_exit(self, sig, frame) -> None:
+        if sig == signal.SIGTERM and not draining:
+            loop = asyncio.get_running_loop()  # signal handlers run on the loop's (main) thread
+            loop.call_soon_threadsafe(lambda: background.add(loop.create_task(drain(self))))
+        else:
+            super().handle_exit(sig, frame)  # Ctrl+C, or a second signal: default behaviour
+
+
+if __name__ == "__main__":
+    DrainingServer(uvicorn.Config(app, host="0.0.0.0", port=3000)).run()
+```
+
+```yaml title="deployment.yaml (excerpt)"
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: realtime
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }    # let endpoint removal propagate before SIGTERM
+          readinessProbe:
+            httpGet: { path: /ready, port: 3000 }
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+```
+
+**Edge cases.**
+- Even a perfect drain means **every user reconnects once per deploy**. Make reconnects cheap (section 14's edge cache) and keep surge capacity, because the remaining pods absorb the moved connections.
+- Clients should treat **1012** as "reconnect soon with jitter" (hundreds of milliseconds to a few seconds), not as an error that starts a long backoff.
+
+---
+
+## 16. Presence and typing indicators ➕
+
+The lesson names presence as out of scope, but it's built straight from pieces already on this page (heartbeats, pub/sub, per-room fan-out), and almost every real-time product needs "who's here" and "who's typing".
+
+#### 16.1 Who is online: presence from heartbeats and expiry ➕
+
+**Problem.** "Asha and Leo are viewing board 412." The obvious design (mark online on connect, offline on close) produces **ghosts**: when an instance crashes or a phone loses signal, the close handler never runs, and Asha shows as online forever.
+
+**Why (first principles).** Section 6 already established it: a dead connection sends nothing, so you **can't rely on a disconnect event**. The only signal that can't be lost is **absence**: if nothing refreshed the entry for long enough, it's gone. So presence must be **lease-based**: each connection keeps renewing a short lease, and expiry, not an event, makes people go offline.
+
+**Mechanism.** A Redis **sorted set per board**: member = `userId:connectionId`, score = last heartbeat time. Each instance refreshes its own connections' entries every 20 s. Readers count only members newer than 60 s, and anyone can trim older ones. When an instance dies, its entries simply stop being refreshed and age out within a minute, with no cleanup code needed.
+
+**Implementation.**
+
+```python title="presence.py"
+import asyncio
+import time
+
+from redis.asyncio import Redis
+
+redis = Redis.from_url(REDIS_URL, decode_responses=True)
+TTL = 60.0  # seconds
+
+
+def key(board_id: str) -> str:
+    return f"presence:{{{board_id}}}"  # hash tag, as in section 11.1
+
+
+async def heartbeat(board_id: str, user_id: str, conn_id: str) -> None:
+    await redis.zadd(key(board_id), {f"{user_id}:{conn_id}": time.time()})
+
+
+async def who_is_here(board_id: str) -> list[str]:
+    cutoff = time.time() - TTL
+    await redis.zremrangebyscore(key(board_id), "-inf", cutoff)  # drop expired leases
+    members = await redis.zrangebyscore(key(board_id), cutoff, "+inf")
+    return sorted({m.split(":")[0] for m in members})  # a user with 3 tabs counts once
+
+
+async def leave(board_id: str, user_id: str, conn_id: str) -> None:
+    await redis.zrem(key(board_id), f"{user_id}:{conn_id}")  # fast path on clean close
+
+
+# every 20 s, per instance: refresh all local leases in one round trip
+async def refresh_leases() -> None:
+    while True:
+        now = time.time()
+        async with redis.pipeline(transaction=False) as p:
+            for board_id, room in rooms.items():
+                for conn in room:
+                    p.zadd(key(board_id), {f"{conn.session['userId']}:{conn.id}": now})
+            await p.execute()
+        await asyncio.sleep(20)
+```
+
+**Edge cases.**
+- Members are **per connection**, so closing one of three tabs doesn't mark the user offline.
+- The score uses **each instance's clock**. A few seconds of skew is harmless against a 60 s lease; much larger skew is a misconfigured host, so keep NTP running.
+- For a 30,000-person room, don't send the list at all; send a **count**, plus details only for people the viewer can see.
+
+#### 16.2 Broadcasting presence changes without a storm ➕
+
+**Problem.** Every join and leave is an event that fans out to everyone in the room. In a big room, presence churn alone can outweigh real events, and during a reconnect storm (section 14) 50,000 sockets "leave" and "join" within seconds: 100,000 presence events times every viewer.
+
+**Why (first principles).** Presence work is `changes × viewers`, the same formula as fan-out, but presence changes are **caused by network flakiness**, not by user intent. Most of them cancel out: a phone that drops for 3 seconds and comes back hasn't really left.
+
+**Mechanism.**
+- **Debounce leaves:** wait a grace period (say 15 s) before announcing someone left; if they reconnect inside it, announce nothing.
+- **Batch diffs:** collect joins and leaves per room and send one `presence.diff` every 1 to 2 seconds instead of one event per change.
+- **Degrade for large rooms:** above a size threshold send counts only.
+
+**Implementation.**
+
+```python title="presence_diff.py"
+import asyncio
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Diff:
+    joined: set[str] = field(default_factory=set)
+    left: set[str] = field(default_factory=set)
+
+
+pending_leaves: dict[tuple[str, str], asyncio.TimerHandle] = {}  # (board_id, user_id) -> timer
+diffs: defaultdict[str, Diff] = defaultdict(Diff)
+
+
+def on_join(board_id: str, user_id: str) -> None:
+    if timer := pending_leaves.pop((board_id, user_id), None):
+        timer.cancel()  # came back inside the grace period: no event
+        return
+    diffs[board_id].joined.add(user_id)
+
+
+def on_last_connection_closed(board_id: str, user_id: str) -> None:
+    def announce() -> None:
+        pending_leaves.pop((board_id, user_id), None)
+        diffs[board_id].left.add(user_id)
+
+    pending_leaves[(board_id, user_id)] = asyncio.get_running_loop().call_later(15, announce)
+
+
+async def flush_diffs() -> None:  # one background task per instance
+    while True:
+        await asyncio.sleep(1)
+        batch = dict(diffs)
+        diffs.clear()
+        for board_id, d in batch.items():
+            if d.joined or d.left:
+                await publish(board_id, {"type": "presence.diff", "joined": sorted(d.joined), "left": sorted(d.left)})
+```
+
+**Edge cases.** This state is **per instance**; a user whose reconnect lands on a different instance produces a leave on one and a join on another. Either accept the occasional flicker, or make the debounce decision against the shared sorted set from 16.1 (only announce a leave if the user has **no** live lease anywhere).
+
+#### 16.3 Typing indicators: ephemeral by design ➕
+
+**Problem.** Typing events are the **highest-frequency** messages in a chat-like product and are **worthless after a few seconds**. If they go through the same path as real events (sequence numbers, the Redis Stream log, catch-up on reconnect), you store junk, and a client that reconnects gets "Asha is typing" replayed from an hour ago.
+
+**Why (first principles).** Different data deserves different guarantees. A task move must never be lost; a typing indicator **should** be lost if it can't arrive in time, because a late one is wrong. This is the one place where Redis pub/sub's **at-most-once** delivery is exactly what you want.
+
+**Mechanism.**
+- The **client throttles**: at most one `typing` message every 3 s while the user is typing.
+- The **server** checks room membership, then publishes on pub/sub only: no `seq`, no log, no catch-up, never echoed to the sender.
+- The **receiver expires** the indicator after about 5 s without a refresh; an explicit `typing.stop` is optional, because expiry is what you rely on (same reasoning as presence).
+
+**Implementation.**
+
+The server side is one more branch in the message match from 7.3, after the membership check:
+
+```python title="typing.py (server)"
+async def on_message(conn: Connection, raw: str) -> None:
+    m = InboundMessage.validate_json(raw)  # Typing joins the Pydantic union
+    match m:
+        case Typing():
+            # pub/sub only: no seq, no stream log, no catch-up
+            await redis.publish(
+                f"ephemeral:{m.boardId}",
+                json.dumps({"type": "typing", "userId": conn.session["userId"]}),
+            )
+```
+
+The throttling and the expiry run in the browser page:
+
+```ts title="typing.ts (browser)"
+// sending client
+let lastSent = 0;
+input.addEventListener('input', () => {
+  if (Date.now() - lastSent > 3000) { ws.send(JSON.stringify({ type: 'typing', boardId })); lastSent = Date.now(); }
+});
+
+// receiving client
+const typing = new Map<string, number>();                     // userId -> expires at
+function onTyping(userId: string) { typing.set(userId, Date.now() + 5000); render(); }
+setInterval(() => { for (const [u, t] of typing) if (t < Date.now()) typing.delete(u); render(); }, 1000);
+```
+
+**Edge cases.** Rate-limit `typing` per connection (section 7.5) so a stuck key can't flood a room, and skip it entirely for very large rooms, where "37 people are typing" helps nobody.
+
+---
+
+## 17. 🔧 Choosing a transport
+
+| Need | Pick | Why |
+|---|---|---|
+| Few users, internal tool, minute-level freshness | Polling | Simplest, stateless, works everywhere |
+| Server-to-client stream (notifications, feeds, LLM tokens, dashboards) | SSE | Plain HTTP, auto-reconnect + `Last-Event-ID` for free |
+| Frequent messages in both directions (chat, live board, games, cursors) | WebSocket | One connection, 2-byte frames, both sides speak |
+| Old proxies that break streaming | Long polling fallback | Survives where streams don't |
+
+Whatever you pick, the server-side architecture is the same: **an event log with sequence numbers, pub/sub between instances, catch-up on reconnect.**
+
+---
+
+## 18. When real-time means media or lossy data: WebRTC and WebTransport ➕
+
+The table above covers **reliable, ordered data between a browser and your server**; two common requirements fall outside it: live audio and video, and data where a late message is worse than a lost one.
+
+#### 18.1 Real-time media: WebRTC, STUN, TURN and SFUs ➕
+
+**Problem.** Product wants voice and video calls on the board. Sending media frames over a WebSocket "works" in a demo, then stutters on every real network.
+
+**Why (first principles).** A WebSocket runs on **TCP**, which retransmits a lost packet and holds back **everything behind it** until the retransmission arrives (head-of-line blocking). For a file that's correct. For a video call it's wrong: a frame that arrives 400 ms late is useless, and holding back newer frames to deliver it makes things worse. Media wants **loss over delay**, which means **UDP**, codecs that tolerate loss, and ideally a **direct path** between the participants. Direct paths are hard because most devices sit behind **NAT** and have no public address.
+
+**Mechanism.** **WebRTC** is the browser stack for this, and your backend plays three roles around it:
+1. **Signalling:** before media flows, the peers exchange session descriptions and network candidates. WebRTC doesn't define how; you usually relay them over the WebSocket you already have.
+2. **NAT traversal (ICE):** a **STUN** server tells each client its public address so peers can try to connect directly. When that's impossible (symmetric NAT, strict firewalls), a **TURN** server **relays** all the media. MDN notes that TURN has real overhead and is used only when nothing else works; it's also **your bandwidth bill**.
+3. **Topology beyond 3 or 4 people:** in a **mesh**, each participant uploads its stream to every other participant (N minus 1 uploads), which a home connection can't sustain. An **SFU** (selective forwarding unit) receives each participant's stream **once** and forwards it to the others **without decoding or mixing**. LiveKit, for example, describes itself as a scalable, distributed WebRTC SFU.
+
+<Mermaid chart={`flowchart LR
+  subgraph Mesh["Mesh: N-1 uploads each"]
+    A1["A"] <--> B1["B"]
+    A1 <--> C1["C"]
+    B1 <--> C1
+  end
+  subgraph SFU["SFU: 1 upload each"]
+    A2["A"] --> S["SFU forwards<br/>(no mixing)"]
+    B2["B"] --> S
+    C2["C"] --> S
+    S --> A2
+    S --> B2
+    S --> C2
+  end`} />
+
+**Implementation.** What **your** backend writes is mostly credentials. With coturn's shared-secret mode (the "TURN REST API" scheme), the username is `expiryTimestamp:userId` and the password is `base64(HMAC-SHA1(secret, username))`, so credentials expire on their own and the TURN server needs no database:
+
+```python title="turn_credentials.py"
+import base64
+import hashlib
+import hmac
+import os
+import time
+
+from fastapi import Depends, FastAPI
+
+app = FastAPI()
+
+
+@app.get("/rtc/ice-servers")
+async def ice_servers(user: User = Depends(require_auth)):
+    expiry = int(time.time()) + 3600  # valid for 1 hour
+    username = f"{expiry}:{user.id}"
+    digest = hmac.new(os.environ["TURN_SECRET"].encode(), username.encode(), hashlib.sha1).digest()
+    credential = base64.b64encode(digest).decode()
+    return {
+        "iceServers": [
+            {"urls": "stun:turn.example.com:3478"},
+            {
+                "urls": ["turn:turn.example.com:3478?transport=udp", "turns:turn.example.com:443?transport=tcp"],
+                "username": username,
+                "credential": credential,
+            },
+        ]
+    }
+```
+
+With a managed SFU, the backend instead mints a **room token** after checking authorisation (lesson 08), here with the `livekit-api` package:
+
+```python title="livekit_token.py"
+import os
+from datetime import timedelta
+
+from fastapi import Depends
+from livekit import api
+
+
+@app.post("/boards/{board_id}/call-token")
+async def call_token(board_id: str, user: User = Depends(require_auth)):
+    await authz.assert_can_view(user, board_id)
+    token = (
+        api.AccessToken(os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"])
+        .with_identity(str(user.id))
+        .with_ttl(timedelta(minutes=10))
+        .with_grants(api.VideoGrants(room_join=True, room=f"board-{board_id}"))
+    )
+    return {"token": token.to_jwt()}
+```
+
+**Edge cases.**
+- Offer **TURN over TLS on port 443**; some corporate networks block everything else, and those users get no call at all without it.
+- Budget TURN and SFU **egress bandwidth**: it scales with participants times bitrate, and it's typically the largest cost of a calling feature.
+- Recording, transcription and AI agents join as **server-side participants** of the SFU room, not as extra browser connections.
+
+#### 18.2 WebTransport: QUIC streams and datagrams ➕
+
+**Problem.** Live cursors or multiplayer game state over a WebSocket: one lost TCP packet on a bad mobile link freezes **every** cursor until it's retransmitted, even though the next update a few milliseconds later would have replaced it anyway.
+
+**Why (first principles).** Same head-of-line blocking as 18.1, but for data rather than media. A WebSocket is a single ordered byte stream, so **unrelated** messages wait on each other, and there's no way to say "this one may be dropped".
+
+**Mechanism.** **WebTransport** runs over **HTTP/3**, which runs over **QUIC** (on UDP). It gives one session **many independent streams** (a loss on one doesn't stall the others), plus **unreliable datagrams** for data where only the latest value matters. QUIC identifies connections by an ID rather than by IP and port, so a phone moving from Wi-Fi to mobile data can keep the session. MDN lists WebTransport as **Baseline 2026** (newly available across current browsers since March 2026), and it's only available in secure contexts.
+
+**Implementation.** Client side, in the browser (server side depends on your stack having an HTTP/3 server with WebTransport support, which is less mature than WebSocket support; in Python, `aioquic` implements HTTP/3 and WebTransport at a low level, while uvicorn doesn't speak HTTP/3 at all):
+
+```ts title="cursors.webtransport.ts (browser)"
+const wt = new WebTransport('https://rt.example.com:4433/cursors');
+await wt.ready;
+
+// cursors: unreliable datagrams, the newest position wins
+const dgw = wt.datagrams.writable.getWriter();
+onMouseMove((x, y) => dgw.write(encodeCursor(boardId, x, y)));
+
+// task moves: a reliable bidirectional stream, as before
+const stream = await wt.createBidirectionalStream();
+const w = stream.writable.getWriter();
+await w.write(new TextEncoder().encode(JSON.stringify({ type: 'move', taskId: '88', to: 'doing' })));
+```
+
+**Edge cases.**
+- UDP is **blocked or throttled** on some networks, so keep a WebSocket fallback; WebTransport is an optimisation, not a replacement, for now.
+- Load balancers and proxies must support **QUIC/HTTP/3** end to end; many setups terminate HTTP/3 at the edge and speak TCP behind it, which removes the benefit for the hop that matters.
+- Datagrams have **no delivery or order guarantee**: put a sequence number or timestamp in each, and drop anything older than what you already applied.
+
+---
+
+## 19. When the app is closed: mobile background limits and push notifications ➕
+
+Every technique on this page assumes the client is **running** and holding a connection; on a phone that's often false, so a real-time backend needs a second delivery path for users who aren't connected.
+
+#### 19.1 Why a mobile socket can't stay open in the background ➕
+
+**Problem.** Leo switches from the app to his messages. A minute later Asha assigns him a task. Leo's WebSocket is gone, nothing arrives, and he finds out the next time he opens the app.
+
+**Why (first principles).** Section 3 explained why the **cellular radio** dominates battery use. Mobile operating systems protect the battery by **suspending** apps shortly after they leave the foreground; suspended apps run no code, so they can't answer pings or read sockets, and the connection dies. Instead, the OS keeps **one** connection per device to its own push service (**APNs** on Apple platforms, **FCM** on Android), shared by every app, so the radio can stay idle most of the time.
+
+**Mechanism.** Route each event per recipient:
+- Recipient has a **live socket** (presence lease from 16.1 is fresh): deliver over the socket.
+- Otherwise, and the event is worth interrupting someone for: send a **push** through APNs or FCM.
+- When the app opens again, it does **not** trust the push for state. It reconnects and runs the normal **catch-up from its last sequence number** (section 12); the push was only a wake-up or an alert.
+
+<Mermaid chart={`flowchart TD
+  E["task.assigned for Leo"] --> P{"Live socket for Leo?<br/>(fresh presence lease)"}
+  P -->|"yes"| WS["Send over WebSocket"]
+  P -->|"no"| W{"Worth a notification?"}
+  W -->|"yes"| Q[["Push queue"]]
+  Q --> N["APNs / FCM"]
+  W -->|"no"| L["Nothing now: catch-up on next open"]
+  N --> O["User opens app"]
+  O --> C["Reconnect + catch-up from last seq"]`} />
+
+#### 19.2 Sending pushes from the backend: alerts, background pushes and token hygiene ➕
+
+**Problem.** The push path has its own rules: background pushes are **not guaranteed**, payloads are small, and device tokens go stale constantly.
+
+**Why (first principles).** Apple and Google run push for billions of devices and protect battery and their own infrastructure, so they **throttle** what doesn't need to wake a user. Apple's docs say background (silent) notifications are low priority, delivery isn't guaranteed, and you shouldn't send more than **two or three per hour**; they must be sent with `apns-push-type: background` and `apns-priority: 5`. On FCM, **high** priority tries to deliver immediately even to a sleeping device and is meant for time-sensitive, user-visible content, while **normal** may be delayed; a **collapse key** lets a newer message replace an older undelivered one. Both services cap payloads at about **4 KB**.
+
+**Mechanism.**
+- Use **alert** notifications for things a person should see ("Asha assigned you task 88"), and don't rely on background pushes to keep data fresh.
+- Put an **ID and a hint** in the payload, not the data itself; the app fetches the real state. That keeps you under the size cap and keeps private data out of Apple's and Google's systems.
+- Send through a **queue** (lesson 14), never inline in the request that caused the event, and **delete tokens** the service reports as unregistered.
+
+**Implementation.** With the Firebase Admin SDK (FCM can deliver to iOS too, through APNs):
+
+```python title="push_worker.py"
+import asyncio
+
+from firebase_admin import messaging
+
+
+async def send_assignment_push(user_id: int, task_id: str, board_id: str) -> None:
+    tokens = await db.fetch("SELECT token FROM device_tokens WHERE user_id = $1", user_id)
+    for row in tokens:
+        message = messaging.Message(
+            token=row["token"],
+            notification=messaging.Notification(
+                title="New task assigned", body="Asha assigned you a task on Board 412"
+            ),
+            data={"kind": "task.assigned", "taskId": task_id, "boardId": board_id},  # a hint: the app fetches details
+            android=messaging.AndroidConfig(priority="high", collapse_key=f"board-{board_id}"),
+            apns=messaging.APNSConfig(headers={"apns-collapse-id": f"board-{board_id}"}),
+        )
+        try:
+            await asyncio.to_thread(messaging.send, message)  # the Admin SDK is synchronous
+        except messaging.UnregisteredError:
+            # app uninstalled or token rotated; any other error propagates so the queue retries
+            await db.execute("DELETE FROM device_tokens WHERE token = $1", row["token"])
+```
+
+**Edge cases.**
+- A user can get **both** the socket message and the push (the lease was still fresh when the app was suspended). Use the same event ID on both so the client can dedupe, and let the app clear the notification once the event is seen.
+- Respect **user preferences and quiet hours** server-side before enqueueing; the OS won't do it for you.
+- Pushes can arrive **late and out of order**, so never derive state from them; the sequence-number catch-up stays the source of truth.
+
+---
+
+## 20. Recap 🎓
+
+- The server **couldn't speak first**; it could only answer requests the browser started.
+- **Polling** works, but its cost scales with **people watching**, not **things happening**, and its delay is half the interval.
+- **Long polling** holds the request open, but the **gap** between a response and the next request means latency of up to three transits and changes that land in the gap.
+- **SSE** never closes the response: plain HTTP, browser-handled reconnection, resume via `Last-Event-ID`. Its limit is that it's **one-way**.
+- **WebSockets** start as HTTP and **upgrade** to a two-way stream of frames with tiny headers. **Masking** protects proxies from cache poisoning; **ping/pong** tells idle connections from dead ones.
+- On one machine the walls were **file descriptors** (language-dependent; Go raises its limit to about 1M), then the **client's** port range (fixed by dialling from several IPs), then **memory** (about 9.7 KB of heap per connection).
+- With many instances, a connection is **state**. **Sticky sessions don't help**; **pub/sub** lets instances talk. Redis pub/sub is **at-most-once**; use a stored log for at-least-once.
+- **Sequence numbers** let clients catch up after disconnects; **fan-out** must be spread out; **edge caches** absorb reconnect storms.
+
+**Not covered** (each is a whole field): **presence** (who's online), **collaborative editing** where two people change the same thing and someone has to win (live cursors as in Notion or Google Docs, built on algorithms such as **CRDTs**). Everything in this lesson is the foundation they're built on.
+
+**Beyond the lesson** ➕
+- ➕ **Auth for sockets:** the browser can't set an `Authorization` header on a WebSocket, so use cookies with an exact **`Origin` allowlist** (WebSockets have no CORS), or a **30 s single-use ticket**; authorise **every subscribe and command**; close or re-auth when the token **expires**; cap message size and rate.
+- ➕ **Testing:** real server on port 0 and **wait for messages, not time**; load-test **connections and publish-to-receive latency** (k6 `k6/websockets`) from several generators; soak for hours to find leaks.
+- ➕ **Broker cost:** classic `PUBLISH` reaches **every node** in Redis Cluster; **sharded pub/sub** (Redis 7) keeps a channel in one shard. Kafka topics are too heavy for one-per-room, so route from a durable log into cheap per-room fan-out.
+- ➕ **End-to-end guarantees:** client commands carry an **ID**, wait for an **ack**, and are **deduped** in the same transaction; a **per-board `seq` assigned in the DB** is the only real order; optimistic UI = confirmed state plus pending commands.
+- ➕ **Infrastructure:** proxies must forward the **upgrade**; heartbeats must beat the **shortest idle timeout** (ALB and nginx default to 60 s); stickiness is only needed for **long-polling transports**; drain on SIGTERM in batches with **1012**.
+- ➕ **Presence** is **lease-based** (heartbeats plus expiry, never disconnect events), with debounced, batched diffs; **typing** is deliberately at-most-once and expires.
+- ➕ **Media** needs WebRTC (signalling, STUN, TURN relay, an **SFU** past a few people); **WebTransport** adds QUIC streams and datagrams; **mobile** apps are suspended in the background, so fall back to **APNs/FCM pushes** that carry a hint and trigger catch-up.
+
+---
+
+## Interview questions
+
+1. **Why can't plain HTTP push data to a browser?** **The server can only respond to a request the client has already sent; there's no way for it to start a conversation.**
+2. **What's wrong with polling every second at scale?** **Load scales with watchers times frequency (10,000 users = 10,000 req/s through auth, logging and the DB), almost all returning "no change", and the delay is still half the interval.**
+3. **What is the gap in long polling and how do you make it safe?** **Between one response and the next request the server has no connection to the client. Make the client send `since`/last version so anything that happened in the gap is returned immediately.**
+4. **How does SSE resume after a disconnect?** **The browser's `EventSource` reconnects after `retry` ms and sends `Last-Event-ID`; the server replays events after that ID.**
+5. **Why does the WebSocket handshake hash the key with a GUID?** **To prove the responder actually understood the WebSocket upgrade and isn't a cache replaying a response; it isn't security.**
+6. **Why are client-to-server frames masked?** **So a malicious page can't control the bytes on the wire and trick non-WebSocket-aware proxies into caching forged HTTP responses (cache poisoning).**
+7. **Why do you need ping/pong if TCP is reliable?** **A silently dead connection sends nothing, so it looks exactly like an idle one; only sending something and waiting for a reply tells them apart.**
+8. **Is a server limited to 65,535 connections?** **No. A connection is a 4-tuple; the port limit is per client IP. The real limits are file descriptors and memory.**
+9. **Why don't sticky sessions solve multi-instance real-time?** **They pin one client to one server, but the two users are still on different servers that can't see each other's sockets. You need pub/sub between instances.**
+10. **What delivery guarantee does Redis pub/sub give, and what do you use instead?** **At-most-once: if a subscriber isn't connected at publish time the message is lost. Use Redis Streams or Kafka for a stored, replayable log.**
+11. **What is a reconnect storm and how do you defuse it?** **When a server dies, all its clients reconnect and fetch initial state at once. Use jittered backoff and serve boot state from an edge cache so the origin isn't hit.**
+12. ➕ **How do you authenticate a browser WebSocket if you can't set an `Authorization` header?** **Use the session cookie plus an exact `Origin` allowlist (WebSockets bypass CORS, so this prevents cross-site hijacking), or have the client fetch a short-lived single-use ticket over authenticated HTTP and pass it in the URL. Check everything before sending the 101.**
+13. ➕ **A user's access token expires after 15 minutes but their socket is open for 8 hours. What do you do?** **Store `exp` on the connection and close it with an application close code (4000 to 4999) or accept an in-band re-auth before expiry; also close sockets on session revocation events.**
+14. ➕ **Why doesn't adding shards to Redis Cluster scale classic pub/sub, and what does?** **Classic `PUBLISH` is propagated to every node, so each node still sees every message. Sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE`, Redis 7.0+) keeps a channel's traffic inside the shard that owns its slot.**
+15. ➕ **How do you make a client's "move task" command safe to resend after a disconnect?** **Give it a client-generated ID, keep it pending until acked, resend on reconnect, and have the server record the ID with a unique constraint in the same transaction as the change, returning the stored result for duplicates.**
+16. ➕ **Two users move the same task on two instances at once. How do all clients agree on the order?** **Assign a per-board sequence number inside the database transaction (the row lock serialises writers); clients apply strictly in sequence order, holding early events and running catch-up to fill gaps.**
+17. ➕ **Why do idle WebSockets drop every 60 seconds behind a load balancer, and how do you fix it?** **ALB and nginx both default to 60 s idle timeouts. Send heartbeats (ping frames) more often than the shortest timeout on the path, and raise the timeouts you control.**
+18. ➕ **How should a WebSocket server shut down during a rolling deploy?** **On SIGTERM fail readiness, reject new upgrades, close existing sockets in batches with 1012 Service Restart within the grace period, and rely on clients' jittered reconnect plus sequence-number catch-up.**
+19. ➕ **Why is presence built on heartbeats and expiry instead of connect/disconnect events?** **A crashed instance or dead network never fires the disconnect handler, so you'd get ghost users. Leases that must be refreshed (for example a Redis sorted set scored by last heartbeat) expire on their own.**
+20. ➕ **When would you use WebRTC, TURN and an SFU instead of WebSockets?** **For live audio/video: media needs UDP and loss over delay. STUN finds public addresses, TURN relays when direct paths fail, and an SFU forwards each stream once instead of every peer uploading to every other peer.**
+21. ➕ **How do you deliver real-time events to a mobile app that's in the background?** **You can't keep a socket open; the OS suspends the app. Send an APNs/FCM alert carrying an ID or hint, and have the app reconnect and catch up from its last sequence number when opened. Don't rely on silent pushes; they're throttled and not guaranteed.**
+
+## Sources
+
+- [Lesson video: Real-Time Backends (Sriniously)](https://youtu.be/wUQryt697cs)
+- [RFC 6455: The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455)
+- [RFC 6202: Known Issues and Best Practices for Long Polling and Streaming](https://www.rfc-editor.org/rfc/rfc6202)
+- [MDN: Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)
+- [MDN: WebSocket API](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API)
+- [FastAPI: WebSockets](https://fastapi.tiangolo.com/advanced/websockets/)
+- [websockets (Python library): keepalive and ping/pong](https://websockets.readthedocs.io/en/stable/topics/keepalive.html)
+- [Redis: Pub/Sub delivery semantics](https://redis.io/docs/latest/develop/interact/pubsub/)
+- [Redis: Streams](https://redis.io/docs/latest/develop/data-types/streams/)
+- ➕ [OWASP: WebSocket Security Cheat Sheet (auth options, Origin checks, re-validation, limits)](https://cheatsheetseries.owasp.org/cheatsheets/WebSocket_Security_Cheat_Sheet.html)
+- ➕ [uvicorn: settings (ws-max-size, ws-ping-interval, ws-ping-timeout)](https://www.uvicorn.org/settings/)
+- ➕ [Starlette: WebSockets (accept, close, send_denial_response)](https://www.starlette.io/websockets/)
+- ➕ [IANA: WebSocket close code registry (1008, 1009, 1012, private 4000 to 4999)](https://www.iana.org/assignments/websocket/websocket.xhtml)
+- ➕ [Grafana k6: k6/websockets module](https://grafana.com/docs/k6/latest/javascript-api/k6-websockets/)
+- ➕ [Redis: Sharded Pub/Sub (Redis 7.0+)](https://redis.io/docs/latest/develop/pubsub/#sharded-pubsub)
+- ➕ [NATS: JetStream (core NATS at-most-once vs JetStream at-least-once)](https://docs.nats.io/nats-concepts/jetstream)
+- ➕ [nginx: WebSocket proxying](https://nginx.org/en/docs/http/websocket.html)
+- ➕ [AWS: Application Load Balancer connection idle timeout](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-load-balancer-attributes.html)
+- ➕ [Socket.IO: Using multiple nodes (sticky sessions)](https://socket.io/docs/v4/using-multiple-nodes/)
+- ➕ [Kubernetes: Pod lifecycle and termination](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/)
+- ➕ [MDN: WebRTC protocols (ICE, STUN, NAT, TURN)](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Protocols)
+- ➕ [coturn: TURN REST API shared-secret credentials](https://github.com/coturn/coturn/blob/master/README.turnserver)
+- ➕ [LiveKit: open-source WebRTC SFU](https://github.com/livekit/livekit)
+- ➕ [MDN: WebTransport API](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport_API)
+- ➕ [Apple: Pushing background updates to your app](https://developer.apple.com/documentation/usernotifications/pushing-background-updates-to-your-app)
+- ➕ [Firebase: About FCM messages (priority, collapsible messages)](https://firebase.google.com/docs/cloud-messaging/concept-options)

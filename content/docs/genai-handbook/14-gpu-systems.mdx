@@ -1,0 +1,831 @@
+---
+title: "14. GPU Systems"
+description: "GPUs (Graphics Processing Units) are the engine of modern AI. They are not faster than CPUs in absolute terms — a CPU core typically clocks higher than a..."
+---
+
+<Callout type="info">
+  How to read this chapter:
+  - 📘 **Handbook**: the original handbook text, left as it was (only the ASCII diagrams were redrawn as Mermaid).
+  - 🔧 **Going deeper**: code, config and extra depth on topics the handbook already covers.
+  - ➕ **Beyond the handbook**: topics the handbook does not cover at all, added because a GenAI engineer should know them.
+</Callout>
+
+## 14.1 Concept Explanation
+
+GPUs (Graphics Processing Units) are the engine of modern AI. They are not faster than CPUs in absolute terms — a CPU core typically clocks higher than a GPU core. They are *vastly more parallel*. A modern GPU has thousands of cores running thousands of threads in lockstep, optimized for the kind of parallel arithmetic that matrix multiplication requires.
+
+The economics of GenAI are GPU economics. The bill, the latency, the scaling ceiling — all are downstream of GPU choice and utilization. An engineer who understands GPU architecture and operations can save organizations millions; one who does not, often costs them millions.
+
+## 14.2 GPU Architecture Overview
+
+A GPU has, conceptually:
+- **Streaming Multiprocessors (SMs)** — the compute cores. NVIDIA H100 has 132. A100 has 108.
+- **CUDA cores** — within each SM, the basic arithmetic units. Thousands per GPU.
+- **Tensor cores** — specialized matrix-math units, much faster than CUDA cores for the operations LLMs care about. The reason LLMs run well on GPUs is tensor cores.
+- **HBM (High Bandwidth Memory)** — the GPU's main memory. Fast, expensive, the limit on model size.
+- **L2 cache and registers** — on-chip memory for staging data near the compute.
+
+The metric that matters most for LLM inference: **memory bandwidth**, measured in TB/s. The H100 has 3.35 TB/s; A100 has 2 TB/s; consumer cards like RTX 4090 have around 1 TB/s. This is what feeds the compute cores.
+
+## 14.2a Memory-bound vs compute-bound: arithmetic intensity and the roofline ➕
+
+The handbook says bandwidth matters most for inference. This section shows why with arithmetic, so you can predict how fast a model will run on a GPU before you rent one.
+
+### The problem
+
+Spec sheets quote two numbers: peak TFLOPS and memory bandwidth. Teams often pick GPUs by TFLOPS, then find that token generation is nowhere near what the FLOPS suggest. The reason is that a kernel can only run as fast as its slowest resource. If it needs more bytes than the memory system can deliver, the tensor cores sit idle waiting for data.
+
+### Arithmetic intensity from first principles
+
+Arithmetic intensity is the number of floating-point operations a kernel does per byte it moves to or from HBM:
+
+```text
+arithmetic intensity (AI) = FLOPs performed / bytes moved from HBM
+```
+
+A GPU has a **ridge point**, the intensity at which compute and bandwidth are balanced:
+
+```text
+ridge point = peak FLOP/s / peak bytes/s
+```
+
+- If a kernel's intensity is **below** the ridge point it is **memory-bound**: time ≈ bytes / bandwidth.
+- If it is **above**, it is **compute-bound**: time ≈ FLOPs / peak FLOP/s.
+
+This is the roofline model. Plotted on log axes, attainable throughput is a sloped line (bandwidth) that flattens into a roof (peak compute) at the ridge point.
+
+<Mermaid chart={`flowchart LR
+  K["Kernel with intensity AI"] --> Q{"AI below ridge point?"}
+  Q -- yes --> MB["Memory-bound<br/>time = bytes / bandwidth<br/>fix: move fewer bytes"]
+  Q -- no --> CB["Compute-bound<br/>time = FLOPs / peak FLOP/s<br/>fix: faster math, lower precision"]
+  MB --> E1["Examples: decode at small batch,<br/>attention over a long KV cache"]
+  CB --> E2["Examples: prefill of long prompts,<br/>training matmuls"]`} />
+
+### The ridge point of a real GPU
+
+For an H100 SXM, NVIDIA lists 1,979 BF16 TFLOPS **with sparsity**. Dense math is half that, about 989 TFLOPS, and the HBM3 bandwidth is 3.35 TB/s:
+
+```text
+ridge = 989e12 FLOP/s / 3.35e12 B/s ≈ 295 FLOPs per byte
+```
+
+A kernel has to do about 295 floating-point operations for every byte it reads before the H100's tensor cores become the bottleneck.
+
+### Why decode is memory-bound and prefill is compute-bound
+
+Take one linear layer with a `d × d` weight matrix in BF16 (2 bytes per value), applied to `B` tokens at once:
+
+```text
+FLOPs = 2 · B · d²          (one multiply and one add per weight per token)
+bytes ≈ 2 · d²              (read the weights once; activations are small)
+AI    ≈ B FLOPs per byte
+```
+
+The intensity is roughly the number of tokens that share one read of the weights.
+
+- **Decode** produces one new token per sequence per step. With 32 sequences in the batch, `B = 32`, far below 295. The GPU spends most of its time streaming weights. Doubling TFLOPS would barely help; doubling bandwidth nearly doubles speed.
+- **Prefill** processes the whole prompt in one pass. A 2,000-token prompt gives `B = 2000`, well above 295, so prefill is compute-bound. That is why time-to-first-token grows with prompt length while inter-token latency mostly does not (see [Inference Systems](/docs/genai-handbook/13-ai-inference-systems)).
+
+This is also why continuous batching works. Raising decode batch size raises intensity almost for free, until you hit the ridge point or run out of KV-cache memory.
+
+### A decode speed ceiling you can compute
+
+When decode is memory-bound, each step must read every weight once. That gives a hard upper bound for a single sequence:
+
+```text
+max tokens/s per sequence ≈ HBM bandwidth / bytes of weights read per token
+```
+
+- Llama 3.1 8B in BF16 (about 16.1 GB) on one H100: `3.35e12 / 16.1e9 ≈ 208 tokens/s`.
+- Llama 3.1 70B in BF16 (about 141 GB) does not fit on one H100. Spread across GPUs with tensor parallelism, aggregate bandwidth scales with the GPU count, so 4 × H100 gives a ceiling of about `4 · 3.35e12 / 141e9 ≈ 95 tokens/s`, minus communication overhead.
+
+Real systems reach perhaps 60-80% of this ceiling. If you measure 20% of it, something else is wrong (CPU overhead, no CUDA graphs, tiny kernels).
+
+### Implementation: a roofline calculator
+
+```python
+# roofline.py: estimate whether a matmul is memory- or compute-bound
+from dataclasses import dataclass
+
+@dataclass
+class Gpu:
+    name: str
+    dense_tflops: float   # dense, not the sparsity figure
+    hbm_tb_s: float
+
+    @property
+    def ridge(self) -> float:
+        return (self.dense_tflops * 1e12) / (self.hbm_tb_s * 1e12)
+
+def linear_layer_time(gpu: Gpu, d_in: int, d_out: int, tokens: int, bytes_per_w: float = 2):
+    flops = 2 * tokens * d_in * d_out
+    bytes_moved = d_in * d_out * bytes_per_w + tokens * (d_in + d_out) * 2
+    intensity = flops / bytes_moved
+    t_compute = flops / (gpu.dense_tflops * 1e12)
+    t_memory = bytes_moved / (gpu.hbm_tb_s * 1e12)
+    bound = "compute" if t_compute > t_memory else "memory"
+    return intensity, max(t_compute, t_memory) * 1e6, bound  # microseconds
+
+h100 = Gpu("H100 SXM", dense_tflops=989, hbm_tb_s=3.35)
+print(f"ridge point: {h100.ridge:.0f} FLOPs/byte")
+for batch in (1, 32, 256, 2048):
+    ai, us, bound = linear_layer_time(h100, 8192, 8192, batch)
+    print(f"tokens={batch:5d}  AI={ai:7.1f}  time={us:7.1f} us  {bound}-bound")
+```
+
+Running it shows the time per layer staying almost flat from 1 to 256 tokens (memory-bound: the weights dominate), then rising with batch size once compute takes over.
+
+### Edge cases and failure modes
+
+- **The KV cache adds bytes that batching does not amortise.** Attention reads each sequence's own KV cache, so its intensity stays low however large the batch. At long contexts, attention reads can exceed weight reads, and decode slows down as conversations grow.
+- **Quantization changes the byte count, not the FLOPs.** INT4 weights cut weight bytes by 4×, which nearly quadruples the memory-bound ceiling. That explains why weight-only quantization speeds up decode even when the math is done in FP16.
+- **Mixture-of-experts models** read only the active experts per token. Use active parameters, not total, in the bandwidth formula, but remember total parameters still have to fit in memory.
+- **Sparsity figures are marketing.** The doubled TFLOPS assume 2:4 structured sparsity, which almost no LLM checkpoint uses. Always halve them for the ridge-point calculation.
+
+## 14.3 CUDA Cores vs Tensor Cores
+
+CUDA cores do general arithmetic — adds, multiplies, comparisons — on individual numbers. Tensor cores do whole matrix multiplications in a single operation, at much higher throughput.
+
+For LLMs, almost all the FLOPs come from tensor cores. CUDA cores handle the surrounding logic. NVIDIA's marketing TFLOPs numbers usually quote tensor core performance; real-world inference performance depends on how well the inference server keeps the tensor cores fed.
+
+**🔧 Making sure your code actually uses the tensor cores.** Tensor cores only engage for supported dtypes (FP16, BF16, FP8, INT8, and TF32 for FP32 inputs) and well-shaped matrices. A model accidentally loaded in FP32 runs on the much slower FP32 path and uses twice the memory of BF16. Matrix dimensions that are multiples of 8 (16 for FP8) map cleanly onto tensor-core tiles. In PyTorch, check the dtype and opt FP32 matmuls into TF32:
+
+```python
+import torch
+
+model = model.to(dtype=torch.bfloat16, device="cuda")   # tensor-core friendly dtype
+assert next(model.parameters()).dtype == torch.bfloat16
+
+# For code that must stay in FP32, let matmuls use TF32 tensor cores.
+torch.set_float32_matmul_precision("high")
+```
+
+Failure mode: a custom op (for example a hand-written attention or a Python loop over heads) silently falls back to CUDA cores. Profile with `torch.profiler` and look for kernels whose names contain `gemm` or `mma`. If the hot kernels are elementwise, the tensor cores are idle.
+
+## 14.4 VRAM and HBM
+
+VRAM is the GPU's main memory. For LLMs, two questions dominate:
+- Does the model fit?
+- Does the model plus KV cache plus activations fit?
+
+A rough sizing guide for inference in FP16/BF16:
+- **7B model** — ~14 GB weights, plus ~4 GB KV cache for moderate concurrency. Fits on a single 24 GB consumer GPU.
+- **13B model** — ~26 GB. Needs 40 GB A100 or H100, or 2x consumer GPU with tensor parallelism.
+- **70B model** — ~140 GB. Needs multiple GPUs.
+- **405B+ model** — multiple H100/H200 nodes with high-speed interconnect.
+
+Quantization halves or quarters these numbers. INT8 70B fits in 80 GB; INT4 fits in around 40 GB.
+
+### 14.4.1 The full serving memory equation 🔧
+
+The rough guide above covers weights only. To size a deployment you need every term, because the KV cache, not the weights, decides how many users one replica can serve.
+
+```text
+GPU memory used = weights + KV cache + activations/workspace + runtime overhead
+weights         = parameters × bytes per parameter
+KV cache        = tokens in flight × KV bytes per token
+```
+
+#### Weights
+
+`parameters × bytes per parameter`, where bytes are 2 for BF16/FP16, 1 for FP8/INT8 and about 0.5 for INT4 (plus a few percent for scales and zero-points). Llama 3.1 70B has about 70.6 billion parameters, so BF16 weights take `70.6e9 × 2 ≈ 141 GB`.
+
+#### KV cache per token
+
+Every layer stores one key vector and one value vector per KV head for every token in context:
+
+```text
+KV bytes per token = 2 (K and V) × layers × KV heads × head_dim × bytes per value
+```
+
+Modern models use grouped-query attention (GQA), so the number of KV heads is much smaller than the number of query heads, and that shrinks the cache a lot.
+
+| Model | Layers | KV heads | head_dim | KV per token (BF16) |
+|---|---|---|---|---|
+| Llama 3.1 8B | 32 | 8 | 128 | 131,072 bytes (128 KiB) |
+| Llama 3.1 70B | 80 | 8 | 128 | 327,680 bytes (320 KiB) |
+
+At 320 KiB per token, one 8K-token conversation on the 70B model holds about 2.7 GB of KV cache. Sixty-four such conversations need about 172 GB, more than the weights.
+
+#### Activations, workspace and runtime overhead
+
+During inference, activations are transient: they live only for the current forward pass, and their peak scales with the number of tokens processed in one step (the prefill chunk size), not with total context. On top of that come the CUDA context (a few hundred MB per process), NCCL buffers for multi-GPU, and the memory captured by CUDA graphs. Budget roughly 2-4 GB per GPU and calibrate it from your server's startup log.
+
+#### How vLLM budgets the memory
+
+vLLM does not grow the KV cache on demand. At startup it:
+
+1. Loads the weights.
+2. Runs a profiling forward pass at the maximum batch size to measure peak activation memory.
+3. Takes `--gpu-memory-utilization` (the fraction of the GPU it is allowed to use; 0.92 by default in current docs, 0.9 in older releases), subtracts weights and peak activations, and pre-allocates **all** the rest as KV-cache blocks.
+4. Logs the result as the KV-cache size in tokens and the maximum concurrency at `--max-model-len`.
+
+This is why `nvidia-smi` shows a vLLM GPU as about 92% full the moment it starts, even with zero traffic. That is normal and does not mean the GPU is loaded.
+
+#### Worked example: Llama 3.1 70B on H100s
+
+Assume 80 GB per GPU, utilisation 0.92, 3 GB overhead per GPU, 8K-token conversations:
+
+| Setup | Weights | KV pool | Tokens in cache | 8K conversations |
+|---|---|---|---|---|
+| 2 × H100, BF16 weights | 141 GB | about 0 | none | does not fit in practice |
+| 4 × H100, BF16 weights | 141 GB | 141 GB | about 431k | about 52 |
+| 2 × H100, FP8 weights, BF16 KV | 71 GB | 71 GB | about 215k | about 26 |
+| 2 × H100, FP8 weights, FP8 KV | 71 GB | 71 GB | about 431k | about 52 |
+
+The weights alone almost fill two H100s, which is why "70B needs 140 GB" really means "70B needs four H100s, or FP8 on two".
+
+#### Implementation: a sizing calculator
+
+```python
+# kv_sizing.py: how many concurrent sequences fit on a GPU setup?
+from dataclasses import dataclass
+
+@dataclass
+class ModelShape:
+    params: float     # total parameters
+    layers: int
+    kv_heads: int
+    head_dim: int
+
+def kv_bytes_per_token(m: ModelShape, kv_bytes: float = 2.0) -> float:
+    return 2 * m.layers * m.kv_heads * m.head_dim * kv_bytes
+
+def max_sequences(m: ModelShape, gpus: int, gpu_gb: float, ctx_tokens: int,
+                  weight_bytes: float = 2.0, kv_bytes: float = 2.0,
+                  util: float = 0.92, overhead_gb_per_gpu: float = 3.0) -> dict:
+    budget = gpus * gpu_gb * 1e9 * util
+    weights = m.params * weight_bytes
+    overhead = gpus * overhead_gb_per_gpu * 1e9
+    kv_pool = budget - weights - overhead
+    if kv_pool <= 0:
+        return {"fits": False, "short_by_gb": round(-kv_pool / 1e9, 1)}
+    tokens = kv_pool / kv_bytes_per_token(m, kv_bytes)
+    return {"fits": True, "kv_pool_gb": round(kv_pool / 1e9, 1),
+            "tokens": int(tokens), "sequences": int(tokens // ctx_tokens)}
+
+llama70 = ModelShape(params=70.6e9, layers=80, kv_heads=8, head_dim=128)
+print(max_sequences(llama70, gpus=4, gpu_gb=80, ctx_tokens=8192))
+print(max_sequences(llama70, gpus=2, gpu_gb=80, ctx_tokens=8192, weight_bytes=1, kv_bytes=1))
+```
+
+Read the layer and head counts from the model's `config.json` (`num_hidden_layers`, `num_key_value_heads`, and `head_dim` or `hidden_size / num_attention_heads`).
+
+### 14.4.2 Training memory is a different equation 🔧
+
+Training needs far more memory per parameter, because it keeps gradients and optimizer state as well as weights. With mixed-precision Adam, the classic accounting from the ZeRO paper is 16 bytes per parameter before activations:
+
+```text
+BF16 weights            2 bytes
+BF16 gradients          2 bytes
+FP32 master weights     4 bytes
+FP32 Adam momentum      4 bytes
+FP32 Adam variance      4 bytes
+-------------------------------
+total                  16 bytes per parameter
+```
+
+A full fine-tune of an 8B model therefore needs about `8e9 × 16 = 128 GB` before a single activation, more than one H100. Activations come on top and scale with `batch × sequence length × hidden size × layers`, which is why activation checkpointing (recompute instead of store) is standard. Sharding (ZeRO-3 or FSDP) divides the 16 bytes across GPUs. LoRA removes most of it, because only the adapter parameters carry gradients and optimizer state. The techniques themselves are covered in [Fine-tuning and Training](/docs/genai-handbook/23-finetuning-training).
+
+Edge cases: optimizers like 8-bit Adam or Adafactor shrink the 12 optimizer bytes; gradient accumulation lowers activation memory but not the 16-byte term; and a checkpoint saved with optimizer state is about 8× the size of the BF16 weights, which matters for storage and resume time.
+
+## 14.4a Debugging CUDA out-of-memory errors ➕
+
+Section 14.4 tells you what should fit. This section covers what to do when the GPU disagrees. The symptom-level playbook is in [Production Failures](/docs/genai-handbook/24-production-failures). Here the focus is the GPU-level tooling.
+
+### The problem
+
+`torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB` often appears when `nvidia-smi` claims several GB are free. Engineers then lower the batch size at random until it works, leaving performance on the table.
+
+### Why it happens: allocated vs reserved vs what nvidia-smi sees
+
+PyTorch does not call `cudaMalloc` for every tensor, because that call is slow and synchronises the device. Its caching allocator requests large segments from the driver and carves tensors out of them. Three numbers matter:
+
+- **Allocated**: bytes held by live tensors (`torch.cuda.memory_allocated()`).
+- **Reserved**: bytes the caching allocator holds from the driver, including free cached blocks (`torch.cuda.memory_reserved()`).
+- **nvidia-smi used**: reserved memory plus the CUDA context plus memory from any other process on the GPU.
+
+An OOM happens when a request cannot be served from a free block in the cache **and** the driver cannot provide a new segment. If the cache holds 6 GB free, but split into many 200 MB holes, a 2 GB request still fails. That is fragmentation, and it is most common when tensor sizes keep changing (variable batch sizes and sequence lengths).
+
+### Mechanism: expandable segments
+
+Setting the allocator option `expandable_segments:True` lets PyTorch map extra physical memory onto the end of an existing segment instead of allocating a new fixed-size one, which greatly reduces fragmentation for variable-shape workloads. As of PyTorch 2.14 the preferred variable is `PYTORCH_ALLOC_CONF`, and `PYTORCH_CUDA_ALLOC_CONF` remains as a backward-compatible alias.
+
+```bash
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+```
+
+### Implementation: find the culprit with a memory snapshot
+
+```python
+import torch
+
+torch.cuda.memory._record_memory_history(max_entries=100_000)
+try:
+    run_one_training_step_or_inference_batch()
+except torch.OutOfMemoryError:
+    print(torch.cuda.memory_summary(abbreviated=True))
+    raise
+finally:
+    torch.cuda.memory._dump_snapshot("oom_snapshot.pickle")
+    torch.cuda.memory._record_memory_history(enabled=None)
+
+print(f"peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+print(f"reserved now:   {torch.cuda.memory_reserved() / 2**30:.1f} GiB")
+```
+
+Drag `oom_snapshot.pickle` into the PyTorch memory visualiser at `pytorch.org/memory_viz`. It shows every allocation over time with the Python stack that made it, so you can see whether the spike comes from activations, a tensor kept alive by a reference, or optimizer state created on the first step.
+
+### OOM in vLLM specifically
+
+vLLM pre-allocates its KV cache (14.4.1), so runtime OOMs are rare. Failures show up in two other places:
+
+- **At startup**: "No available memory for the cache blocks" or a raised OOM during profiling. The weights plus profiled activations exceed the `--gpu-memory-utilization` budget. Fixes: lower `--max-model-len`, lower `--max-num-seqs` or `--max-num-batched-tokens` (smaller profiling peak), quantize, or add GPUs with `--tensor-parallel-size`.
+- **At runtime, as preemption rather than a crash**: when the KV pool is full, the scheduler preempts sequences and recomputes them later. Latency spikes but nothing dies. Watch `vllm:kv_cache_usage_perc` and `vllm:num_requests_waiting`, and look for preemption warnings in the logs.
+
+### Edge cases and failure modes
+
+- **Another process owns memory.** A stale Jupyter kernel or a second container on the same GPU holds memory you cannot see from inside PyTorch. Check `nvidia-smi --query-compute-apps=pid,used_memory --format=csv`.
+- **Gradients in inference code.** Forgetting `torch.inference_mode()` keeps the autograd graph alive and multiplies activation memory.
+- **Leaked references.** Appending loss tensors (not `loss.item()`) to a list keeps every step's graph alive. Memory then grows steadily over time rather than spiking.
+- **`torch.cuda.empty_cache()` is not a fix.** It returns cached blocks to the driver (useful when another process needs the memory) but does not free live tensors and makes later allocations slower.
+- **MIG instances** have hard memory limits. A model that fits on the full GPU OOMs on a 3g.40gb slice, and the error message looks identical.
+
+## 14.5 NVLink, PCIe, and Interconnect
+
+When multiple GPUs serve one model, they must exchange data at every layer. The bandwidth and latency of this exchange dictates whether multi-GPU is worth it.
+
+- **PCIe Gen5 x16** — ~64 GB/s. Adequate for most workloads, bottlenecks heavy multi-GPU LLM inference.
+- **NVLink 4.0 (H100)** — ~900 GB/s per GPU pair. Designed for multi-GPU model parallelism.
+- **NVSwitch** — connects many NVLink endpoints into a fully connected fabric within a node.
+- **InfiniBand / RoCE** — cross-node, ~400-800 Gbps. Used for multi-node training and large inference clusters.
+
+The rule: if you are doing tensor parallelism, NVLink matters enormously. If you are doing per-replica scaling (independent GPUs serving the same model), PCIe is fine.
+
+**🔧 A note on units.** NVIDIA quotes 900 GB/s of total NVLink bandwidth per H100 SXM (both directions combined, across all its links), and 128 GB/s for PCIe Gen5 x16 counting both directions. The handbook's 64 GB/s is the one-direction PCIe figure. Compare like with like: about 450 GB/s vs 64 GB/s per direction, roughly a 7× gap.
+
+### 14.5.1 How much data tensor parallelism actually moves 🔧
+
+The rule above ("NVLink matters for tensor parallelism") follows from a small calculation you can run for any model.
+
+#### Why TP communicates every layer
+
+In Megatron-style tensor parallelism each transformer layer does two all-reduces in the forward pass: one after the attention output projection and one after the MLP. Each all-reduce combines a tensor of shape `tokens × hidden_size`. A ring all-reduce across `N` GPUs sends about `2(N-1)/N` times the tensor size from each GPU.
+
+```text
+bytes per all-reduce   = tokens_in_step × hidden_size × 2 (BF16)
+bytes sent per GPU     ≈ 2(N-1)/N × bytes per all-reduce
+all-reduces per step   = 2 × layers
+```
+
+#### Worked example: 70B, TP=4, a decode step with 64 sequences
+
+```text
+one all-reduce   = 64 × 8192 × 2         ≈ 1.05 MB
+per GPU per step ≈ 1.5 × 1.05 MB × 160   ≈ 252 MB
+NVLink (~450 GB/s per direction): ≈ 0.56 ms
+PCIe Gen5 (~64 GB/s per direction): ≈ 3.9 ms
+weight read per GPU: 141 GB / 4 / 3.35 TB/s ≈ 10.5 ms
+```
+
+On NVLink, communication adds about 5% to a 10.5 ms step. On PCIe it adds about 37%, before counting the fixed latency of 160 small collectives (each costs tens of microseconds regardless of size), which often dominates at small batch sizes. That is the arithmetic behind "TP over PCIe hurts".
+
+#### Implementation: check the topology before you trust it
+
+```bash
+# Matrix of how every GPU pair is connected.
+# NV# = NVLink with # links, PIX/PXB = PCIe switch, SYS = across CPU sockets (slowest)
+nvidia-smi topo -m
+
+# Per-link NVLink state
+nvidia-smi nvlink --status
+```
+
+To see which transport NCCL actually chose, set `NCCL_DEBUG=INFO` in the environment of a vLLM or PyTorch multi-GPU job and read the startup log. Channels reported as `via P2P/NVL` use NVLink. If it reports `SHM` or `NET` between GPUs in the same node, peer-to-peer is disabled and TP performance will collapse.
+
+#### Edge cases and failure modes
+
+- **PCIe-only cards.** L4, L40S and RTX 4090 have no NVLink. TP=2 on them works but scales poorly. Prefer one replica per GPU with a quantized model.
+- **Cloud VMs with P2P disabled.** Some virtualised instances block GPU peer-to-peer over PCIe, forcing traffic through host memory. `nvidia-smi topo -m` and NCCL logs reveal it.
+- **TP across nodes.** Even 400 Gb/s InfiniBand (50 GB/s) is far slower than NVLink. Keep TP inside a node and use pipeline parallelism across nodes (14.6.1).
+- **NUMA placement.** GPUs attached to different CPU sockets (`SYS` in the topology) are slower to pair. Group TP ranks on the same socket when the node is not fully NVSwitch-connected.
+
+## 14.6 Multi-GPU Systems
+
+A typical AI server node has 4 or 8 GPUs connected by NVLink/NVSwitch. NVIDIA's reference designs (HGX H100/H200) form the basis of most cloud GPU offerings.
+
+Multi-node clusters connect dozens to thousands of these nodes via InfiniBand or high-speed Ethernet. Training a frontier model requires thousands of GPUs running synchronized for weeks. Inference at scale uses smaller pools — typically tens to hundreds of GPUs per region.
+
+### 14.6.1 Laying a model out across the GPUs of a node 🔧
+
+[Inference Systems](/docs/genai-handbook/13-ai-inference-systems) explains what tensor and pipeline parallelism are. This section is about choosing a layout for an 8-GPU node, and the vLLM flags that express it.
+
+#### The decision rule
+
+1. **Find the smallest TP that fits** the weights plus a useful KV pool (use the calculator in 14.4.1). More TP than needed wastes bandwidth on all-reduces.
+2. **Fill the rest of the node with data parallelism**: independent replicas behind a load balancer. Replicas share nothing, so they scale linearly and one crashing does not take the others down.
+3. **Use pipeline parallelism only across nodes**, when one node cannot hold the model. PP sends activations once per stage boundary instead of all-reducing every layer, so it tolerates slower links.
+
+For Llama 3.1 70B on an 8 × H100 node: TP=4 in BF16 fits 52 conversations of 8K tokens (14.4.1), so run **two TP=4 replicas**. That doubles throughput compared with one TP=8 replica, which spends more time communicating for very little gain in KV space.
+
+#### Implementation
+
+```bash
+# Two TP=4 replicas on one 8-GPU node (one container per replica is simpler to operate)
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve meta-llama/Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 4 --max-model-len 8192 --port 8000 &
+CUDA_VISIBLE_DEVICES=4,5,6,7 vllm serve meta-llama/Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 4 --max-model-len 8192 --port 8001 &
+
+# A model too big for one node: TP inside each node, PP across 2 nodes (needs a Ray cluster)
+vllm serve some-org/very-large-model \
+  --tensor-parallel-size 8 --pipeline-parallel-size 2
+```
+
+vLLM also has `--data-parallel-size` to run several engine replicas from one command. That is mostly useful for mixture-of-experts models, where expert layers can be sharded across the data-parallel ranks.
+
+#### Edge cases and failure modes
+
+- **TP must divide the head counts.** The number of attention heads (and ideally KV heads) must be divisible by the TP size. Llama 3.1 70B has 64 query heads and 8 KV heads, so TP of 1, 2, 4 or 8 is valid but TP=3 or 6 is not.
+- **Shared memory.** TP workers exchange data through `/dev/shm`. Docker's default 64 MB is too small, so run with `--ipc=host` or a large `--shm-size` (on Kubernetes, mount an in-memory `emptyDir` at `/dev/shm`, see [AI Deployment](/docs/genai-handbook/15-ai-deployment)).
+- **Blast radius.** One failing GPU kills its whole TP group. Smaller TP groups mean smaller outages.
+- **PP adds latency per stage.** With few concurrent requests, pipeline stages sit idle waiting for each other (bubbles). PP is a capacity tool, not a latency tool.
+
+## 14.7 MIG — Multi-Instance GPU
+
+A100 and H100 GPUs support MIG, which partitions a single GPU into up to seven smaller "instances," each with isolated memory and compute. This lets you serve multiple small models or multiple small workloads on one physical GPU without interference.
+
+When to use: many small workloads (multiple embedding models, small fine-tunes), per-tenant isolation, dev environments. When not to use: large models that need the full GPU, latency-critical workloads (MIG instances are smaller than the parent GPU).
+
+### 14.7.1 MIG in practice 🔧
+
+MIG is worth knowing at the command level, because the profiles are fixed and partitioning has rules that surprise people.
+
+#### Profiles on an H100 80GB
+
+A profile name `Ng.Mgb` means N compute slices (out of 7) and M GB of memory. The H100 80GB supports these:
+
+| Profile | Compute slices | Memory | Max instances per GPU |
+|---|---|---|---|
+| 1g.10gb | 1/7 | about 10 GB | 7 |
+| 1g.20gb | 1/7 | about 20 GB | 4 |
+| 2g.20gb | 2/7 | about 20 GB | 3 |
+| 3g.40gb | 3/7 | about 40 GB | 2 |
+| 4g.40gb | 4/7 | about 40 GB | 1 |
+| 7g.80gb | 7/7 | about 80 GB | 1 |
+
+There is also `1g.10gb+me`, which includes the media engines (video decoders). Profiles can be mixed on one GPU (for example one 3g.40gb plus three 1g.10gb) as long as the placement rules allow it.
+
+#### Implementation
+
+```bash
+# Enable MIG mode on GPU 0 (no processes may be using the GPU; some systems need a reset)
+sudo nvidia-smi -i 0 -mig 1
+
+# List the profiles this GPU supports
+nvidia-smi mig -lgip
+
+# Create two 3g.40gb GPU instances, each with its default compute instance (-C)
+sudo nvidia-smi mig -i 0 -cgi 3g.40gb,3g.40gb -C
+
+# Show the result. Each instance gets its own MIG UUID.
+nvidia-smi -L
+```
+
+On Kubernetes, the GPU Operator's MIG manager applies a named layout from a node label, and with the `mixed` strategy the device plugin exposes each profile as its own resource:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/mig-3g.40gb: 1
+```
+
+#### Edge cases and failure modes
+
+- **Reconfiguration is disruptive.** Changing the layout needs every process on that GPU stopped. Plan layouts per node pool rather than changing them on the fly.
+- **No tensor parallelism across MIG instances.** Instances cannot talk peer-to-peer, so one model cannot span two slices. MIG is for models that fit in one slice.
+- **Bandwidth is sliced too.** A 1g instance gets roughly a seventh of the SMs and a matching share of memory bandwidth, so the decode ceiling from 14.2a shrinks with it.
+- **Monitoring changes.** DCGM reports per-instance metrics with a GPU instance ID label. Dashboards built for whole GPUs will show misleading numbers.
+
+## 14.8 GPU Sharing in Kubernetes
+
+Beyond MIG, several mechanisms share GPUs across pods:
+- **Time-slicing** — GPUs round-robin between pods at the driver level. Simple, but unpredictable performance.
+- **MIG** — hardware-isolated partitions, predictable performance.
+- **MPS (Multi-Process Service)** — NVIDIA's CUDA-level sharing, allows multiple processes to issue CUDA kernels simultaneously to one GPU.
+- **vGPU** — NVIDIA's virtualization, common in VDI; less common in AI.
+
+The NVIDIA Device Plugin and GPU Operator for Kubernetes expose these as schedulable resources. Chapter 15 covers cluster deployment.
+
+### 14.8.1 Configuring time-slicing, and why it surprises LLM servers 🔧
+
+Time-slicing is the easiest way to share a GPU, and the easiest to get wrong with LLM servers.
+
+#### Mechanism
+
+The device plugin advertises each physical GPU as several `nvidia.com/gpu` resources. Pods scheduled onto the "replicas" share the real GPU, and the driver switches contexts between them in time slices. There is **no memory isolation**: every pod sees, and can allocate, the full GPU memory.
+
+#### Implementation
+
+The device plugin reads a config like this (usually through a ConfigMap referenced by the GPU Operator's ClusterPolicy):
+
+```yaml
+version: v1
+sharing:
+  timeSlicing:
+    renameByDefault: false        # true advertises nvidia.com/gpu.shared instead
+    failRequestsGreaterThanOne: true
+    resources:
+      - name: nvidia.com/gpu
+        replicas: 4               # each physical GPU appears as 4 schedulable GPUs
+```
+
+`failRequestsGreaterThanOne: true` rejects pods asking for 2 or more shared GPUs, because 2 replicas of the same GPU is not 2 GPUs' worth of compute, and allowing it misleads users.
+
+#### Why it surprises LLM servers
+
+vLLM claims about 92% of GPU memory at startup (14.4.1). Put two vLLM pods on one time-sliced GPU and the second fails to allocate its KV cache. If you must share, give each server an explicit share with `--gpu-memory-utilization 0.45`, and accept that one runaway pod can still starve the other. For predictable sharing between LLM servers, use MIG.
+
+#### MPS in one paragraph
+
+MPS funnels kernels from several processes into one GPU context, so kernels from different pods can run **at the same time** instead of taking turns, which helps small models that cannot fill the GPU alone. The device plugin supports an MPS sharing mode and can cap each client's memory and compute share. The cost is weaker fault isolation: a fatal error in one client can affect the other clients on that GPU.
+
+## 14.8a GPU utilisation metrics that lie ➕
+
+Sharing and autoscaling decisions depend on knowing how busy a GPU is, and the most common metric for that is misleading.
+
+### The problem
+
+A dashboard shows a GPU at 100% utilisation, so the team adds GPUs. Yet profiling shows the tensor cores idle most of the time. Or autoscaling on GPU utilisation never scales down, because the metric sits at 100% under light load.
+
+### What nvidia-smi utilisation actually measures
+
+`utilization.gpu` in `nvidia-smi` (and `DCGM_FI_DEV_GPU_UTIL` in DCGM) is the **percentage of time in the sample window during which at least one kernel was running**. One tiny kernel that keeps a single SM busy counts as 100%, exactly like a matmul saturating all 132 SMs. It measures "the GPU was not idle", not "the GPU was working hard".
+
+LLM decode makes this worse. A decode loop issues kernels back to back, so the metric reads close to 100% at batch size 1, even though, as 14.2a showed, decode at small batch uses a tiny fraction of the compute.
+
+### Better signals from DCGM profiling metrics
+
+DCGM exposes hardware counters that measure how much of the chip was in use:
+
+| DCGM field | What it measures | How to read it for LLMs |
+|---|---|---|
+| `DCGM_FI_PROF_SM_ACTIVE` | Fraction of time an average SM had at least one warp resident | Low values mean kernels are too small to fill the GPU |
+| `DCGM_FI_PROF_SM_OCCUPANCY` | Resident warps relative to the SM maximum | Low with high SM_ACTIVE points to register or shared-memory pressure |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | Fraction of cycles the tensor pipes were busy | The real "are we doing matmul work" number |
+| `DCGM_FI_PROF_DRAM_ACTIVE` | Fraction of cycles HBM was sending or receiving data | High in decode, shows the memory-bound regime |
+| `DCGM_FI_DEV_FB_USED` | Framebuffer memory used | Always high under vLLM because of pre-allocation |
+
+In the dcgm-exporter default counter list (as of 2026), `GR_ENGINE_ACTIVE`, `PIPE_TENSOR_ACTIVE` and `DRAM_ACTIVE` are enabled, while `SM_ACTIVE` and `SM_OCCUPANCY` are commented out. Uncomment them in your custom counters CSV if you want them.
+
+### Implementation: parse nvidia-smi quickly, query DCGM properly
+
+For a quick look on a single box, `nvidia-smi` has a CSV query mode that is safe to parse:
+
+```python
+# gpu_snapshot.py: poll nvidia-smi and print per-GPU stats
+import csv
+import io
+import subprocess
+
+FIELDS = ["index", "name", "utilization.gpu", "memory.used", "memory.total", "power.draw"]
+
+def gpu_snapshot() -> list[dict]:
+    out = subprocess.run(
+        ["nvidia-smi", f"--query-gpu={','.join(FIELDS)}", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    rows = []
+    for rec in csv.reader(io.StringIO(out)):
+        vals = [v.strip() for v in rec]
+        row = dict(zip(FIELDS, vals))
+        row["mem_pct"] = round(100 * float(row["memory.used"]) / float(row["memory.total"]), 1)
+        rows.append(row)
+    return rows
+
+for gpu in gpu_snapshot():
+    print(gpu["index"], gpu["name"], f"util={gpu['utilization.gpu']}%", f"mem={gpu['mem_pct']}%")
+```
+
+In a cluster, scrape dcgm-exporter with Prometheus and chart the profiling fields next to the coarse one:
+
+```text
+# Coarse "busy" metric versus real tensor work, per GPU
+avg by (gpu, Hostname) (DCGM_FI_DEV_GPU_UTIL)
+avg by (gpu, Hostname) (DCGM_FI_PROF_PIPE_TENSOR_ACTIVE) * 100
+avg by (gpu, Hostname) (DCGM_FI_PROF_DRAM_ACTIVE) * 100
+```
+
+For autoscaling an LLM server, neither is the right signal. Use the server's own queue and KV-cache metrics (`vllm:num_requests_waiting`, `vllm:kv_cache_usage_perc`), covered in [AI Deployment](/docs/genai-handbook/15-ai-deployment).
+
+### Edge cases and failure modes
+
+- **Profiling counters are exclusive.** While Nsight Compute or Nsight Systems GPU metrics are profiling a GPU, DCGM profiling fields can go blank or the profiler fails to attach. Pause DCGM profiling (`dcgmi profile --pause`) during deep-dive sessions.
+- **Sampling windows hide bursts.** A 1-second average can show 40% while requests see queueing during 200 ms bursts. Pair GPU metrics with request latency percentiles.
+- **MIG and time-slicing.** With MIG, metrics are per instance. With time-slicing, per-pod attribution is not possible from GPU counters, because every pod shares the same device.
+- **Power draw as a sanity check.** A GPU reporting 100% utilisation at a third of its power limit is not doing heavy math.
+
+## 14.9 Inference Optimization Techniques
+
+Beyond the inference servers in Chapter 13, several techniques live at the GPU level:
+
+- **Mixed precision (FP16, BF16, FP8).** Modern GPUs run these much faster than FP32.
+- **Operator fusion.** Combining multiple operations into one kernel reduces memory roundtrips.
+- **CUDA graphs.** Pre-record a sequence of kernels and replay it with minimal CPU overhead.
+- **FlashAttention.** A highly optimized attention kernel that reduces memory traffic; standard in modern inference servers.
+- **TensorRT-LLM.** Compiles models into highly optimized engines for NVIDIA hardware.
+
+Most of these are invisible to application engineers because the inference server bakes them in. But knowing they exist explains where new versions of vLLM and TGI get their performance jumps.
+
+**🔧 Why CUDA graphs matter so much for decode, and what they cost.** A decode step for a small model can be under 10 ms, but it launches hundreds of small kernels, and each launch costs the CPU several microseconds. At small batch sizes the CPU, not the GPU, sets the pace. CUDA graphs record the whole launch sequence once per batch-size bucket and replay it with one call. The costs: startup takes longer (vLLM captures graphs for many batch sizes), the captured graphs use GPU memory that comes out of the KV pool, and shapes must match a captured bucket. vLLM's `--enforce-eager` turns graphs off. That is useful when debugging or when memory is extremely tight, but expect noticeably slower decode.
+
+## 14.10 Quantization
+
+Quantization reduces precision (Chapter 4 introduced this conceptually; here we cover hardware).
+
+- **FP16 / BF16** — native training precision; minor accuracy loss is rare.
+- **FP8** — supported on H100 and newer. Roughly 2× throughput vs FP16.
+- **INT8** — well-supported across most GPUs; small accuracy loss; common in production.
+- **INT4** — supported via AWQ, GPTQ, and other algorithms; 4× memory savings; noticeable but manageable accuracy loss.
+
+Choose the most aggressive quantization that passes your evaluation set. Don't trust generic "INT4 is fine" claims for your specific task — always benchmark.
+
+**🔧 Weights, KV cache and hardware support are three separate decisions.** Weight quantization shrinks the `weights` term of the memory equation and raises the memory-bound decode ceiling (14.2a). KV-cache quantization shrinks the `KV cache` term and so doubles concurrency at FP8 (see the table in 14.4.1). The two are independent:
+
+```bash
+# Pre-quantized checkpoint (AWQ, GPTQ or FP8): vLLM reads the method from the checkpoint config
+vllm serve some-org/Llama-3.1-70B-Instruct-AWQ --tensor-parallel-size 2
+
+# Quantize BF16 weights to FP8 at load time, and store the KV cache in FP8 too
+vllm serve meta-llama/Llama-3.1-70B-Instruct --tensor-parallel-size 2 \
+  --quantization fp8 --kv-cache-dtype fp8
+```
+
+Edge cases: native FP8 tensor-core math needs Ada (L4, L40S) or Hopper and newer. On A100, FP8 checkpoints can still run through weight-only kernels that save memory and bandwidth but do not gain FP8 compute speed. FP8 KV cache can hurt quality on long-context retrieval tasks more than on chat, so include long-context cases in the evaluation set.
+
+## 14.11 LoRA and QLoRA — Fine-Tuning on Modest GPUs
+
+LoRA (Low-Rank Adaptation) freezes the base model and inserts small trainable "adapter" matrices. Only the adapters are trained, dramatically reducing memory and compute needs. A 70B model fine-tune that would require multiple H100s becomes feasible on a few A100s.
+
+QLoRA combines LoRA with 4-bit quantization of the base model. This is what enables 70B fine-tunes on a single 24 GB consumer GPU (slowly, but at all).
+
+LoRA adapters are tiny (typically 1-100 MB). You can serve a base model and switch between many LoRA adapters per request, enabling personalization at scale.
+
+**🔧 Checking the QLoRA claim with the memory equation.** At 4 bits, 70 billion parameters take about `70e9 × 0.5 = 35 GB` for the weights alone, before adapters, optimizer state and activations. That does not fit in 24 GB of VRAM without offloading layers to CPU memory. The original QLoRA paper fine-tuned a 65B model on a single 48 GB GPU. On a 24 GB card, the realistic QLoRA ceiling is around 30B-class models, or 70B with CPU offload at a large speed cost.
+
+**🔧 Serving many LoRA adapters from one base model.** vLLM loads adapters next to the base weights and batches requests for different adapters together:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --enable-lora --max-loras 8 --max-lora-rank 32 \
+  --lora-modules support-bot=/adapters/support legal-bot=/adapters/legal
+```
+
+Clients pick an adapter by sending its name as the `model` field of an OpenAI-compatible request. `--max-loras` sets how many adapters can be active in the same batch, and each slot reserves GPU memory sized for `--max-lora-rank`, so setting the rank higher than your adapters need wastes KV-cache space. Requests for an adapter that is not resident wait while it loads from CPU memory or disk, which shows up as TTFT spikes for rarely used adapters.
+
+## 14.12 NVIDIA Stack — The De Facto Standard
+
+NVIDIA's lock on AI is software as much as hardware.
+- **CUDA** — the language and runtime.
+- **cuDNN** — primitives for deep learning operations.
+- **cuBLAS** — basic linear algebra.
+- **NCCL** — multi-GPU communication.
+- **TensorRT / TensorRT-LLM** — optimized inference engines.
+- **Triton Inference Server** — production model serving.
+- **Magnum IO** — data movement libraries.
+- **NIM** — pre-packaged inference microservices.
+
+Most AI frameworks compile to this stack. Replacing NVIDIA means replacing all of it.
+
+## 14.13 AMD Stack
+
+AMD's MI300X is a competitive GPU on paper (192 GB HBM3, strong throughput), and ROCm — AMD's CUDA equivalent — has improved dramatically. Many open-source inference servers now support AMD.
+
+Strengths: more memory per GPU than current NVIDIA at similar tiers, often more available in cloud markets, sometimes better price per FLOP. Weaknesses: smaller ecosystem, less battle-tested at scale, fewer pre-trained kernels and operators.
+
+The trajectory matters. AMD is the strongest credible challenger and many companies are evaluating it as a hedge against NVIDIA pricing.
+
+## 14.14 Other AI Accelerators
+
+- **Google TPUs** — Google's custom chips, available via GCP. Strong for training and Google's own inference.
+- **AWS Inferentia / Trainium** — AWS custom chips. Lower cost per inference for compatible models, narrower model support.
+- **Intel Gaudi** — Intel's AI accelerator line. Competitive on price; ecosystem is the gap.
+- **Cerebras, Groq, SambaNova, Etched** — startups with novel architectures. Groq's deterministic, ultra-low-latency inference is notable for chat applications.
+- **Apple Silicon** — Metal Performance Shaders, used by llama.cpp on Mac for surprisingly good local inference.
+
+Most production teams stay on NVIDIA. Diversification is happening but slowly.
+
+## 14.15 Cloud GPU Comparison
+
+| Provider | Strengths | Weaknesses |
+|---|---|---|
+| AWS | Most regions, broad services | GPU supply tight, premium pricing |
+| Azure | Tight OpenAI integration | Capacity constraints, complex pricing |
+| GCP | TPUs as alternative, strong networking | Smaller GPU footprint than AWS |
+| Oracle (OCI) | Aggressive GPU pricing, free egress | Smaller ecosystem |
+| RunPod | Cheap on-demand and spot | Fewer enterprise features |
+| Lambda Labs | Simple, AI-focused | Capacity volatility |
+| CoreWeave | Large-scale GPU specialist | More opaque than hyperscalers |
+| Crusoe, FluidStack, Together AI | Niche GPU offerings | Varied maturity |
+
+For self-hosted inference at scale, secondary providers (CoreWeave, Lambda, RunPod, Crusoe) often offer 30-50% cost savings versus hyperscalers, at the cost of less enterprise tooling and capacity uncertainty.
+
+## 14.16 Production Architecture
+
+<Mermaid chart={`flowchart TD
+  C["Inference cluster (per region)"]
+  C --> A["Pool A: H100 nodes<br/>large models, paid tier traffic"]
+  C --> B["Pool B: A10G nodes<br/>small models, free tier traffic"]
+  C --> PC["Pool C: L40S nodes<br/>embedding and reranking"]
+  C --> D["Pool D: spot capacity<br/>batch workloads"]
+  A --> AS["Autoscaler (per pool)"]
+  B --> AS
+  PC --> AS
+  D --> AS
+  AS --> OP["GPU operator + device plugin (Kubernetes)"]
+  OP --> OBS["Observability<br/>(DCGM exporter, Prometheus, Grafana)"]`} />
+
+Multiple pools let you match GPU class to workload economics.
+
+## 14.17 Tradeoffs
+
+| Choice | Win | Cost |
+|---|---|---|
+| H100 | Top performance | Highest price, scarcest |
+| A100 | Strong, mature | Older, less FP8 support |
+| L40S / A10G | Cheap per replica | Smaller memory |
+| Consumer (RTX 4090) | Cheapest | No NVLink, no datacenter support |
+| MI300X | More memory, competitive perf | Software maturity lag |
+| TPU | Strong on Google, Jax | Lock-in, niche tooling |
+
+## 14.18 Scaling Challenges
+
+- **GPU supply.** Top-end GPUs are rationed by cloud providers. Reserve capacity in advance.
+- **Cold starts.** Loading a 70B model into GPU memory takes minutes. Keep warm replicas.
+- **Multi-region.** GPU pricing varies; some regions have no high-end GPU availability.
+- **Power and cooling.** Datacenter constraints affect availability and cost. This is a real bottleneck in some regions.
+
+**🔧 Cold starts in depth.** Where the minutes go (node provisioning, image pull, weight download, load into HBM, CUDA graph capture) and how to cut each stage is worked through in [AI Deployment, section 15.8a](/docs/genai-handbook/15-ai-deployment). Reserving capacity is covered in [Cloud for GenAI, section 16.16b](/docs/genai-handbook/16-cloud-for-genai).
+
+## 14.19 Security Concerns
+
+- GPU memory can hold sensitive data; isolate tenants with separate processes or MIG.
+- Side-channel risks exist between MIG instances under specific configurations.
+- GPU firmware and driver versions must be kept current for security and stability.
+
+## 14.20 Cost Optimization
+
+- Use spot/preemptible GPUs for batch workloads (often 70% cheaper).
+- Right-size GPU class to workload (don't run a 7B model on H100).
+- Quantize aggressively and benchmark.
+- Use LoRA adapters to multiplex personalization on shared base models.
+- Negotiate reserved capacity at scale.
+- Evaluate secondary providers for cost.
+
+## 14.21 Interview Questions
+
+- Walk through the memory layout of a 70B model in GPU VRAM.
+- Compare H100, A100, and L40S for chat inference at scale.
+- Explain MIG vs MPS vs time-slicing.
+- When does tensor parallelism help and when does it hurt?
+- Estimate cost per million tokens for hosting Llama 70B on H100.
+- ➕ Why is LLM decode memory-bound while prefill is compute-bound? **Each decode step reads every weight to produce one token per sequence, so arithmetic intensity is roughly the batch size, far below the H100's ridge point of about 295 FLOPs per byte. Prefill processes thousands of prompt tokens per weight read, so it sits above the ridge.**
+- ➕ How much KV cache does one token of Llama 3.1 70B need? **`2 × 80 layers × 8 KV heads × 128 × 2 bytes = 320 KiB` in BF16, so an 8K-token conversation holds about 2.7 GB.**
+- ➕ `nvidia-smi` shows 100% utilisation. Is the GPU saturated? **Not necessarily. That metric only means a kernel was running at some point in each sample window. Check DCGM `PIPE_TENSOR_ACTIVE`, `DRAM_ACTIVE` and the server's own queue metrics.**
+- ➕ Why does a vLLM GPU look 92% full with no traffic? **vLLM pre-allocates all memory left after weights and profiled activations as KV-cache blocks, up to `--gpu-memory-utilization`.**
+- ➕ You have 8 H100s and a 70B model. One TP=8 replica or two TP=4 replicas? **Usually two TP=4 replicas. TP=4 already fits the weights plus a large KV pool, and two independent replicas double throughput, while TP=8 adds all-reduce overhead for little extra capacity.**
+
+## 14.22 Hands-on Exercises
+
+1. Plan a GPU pool for 1M chat sessions per day on a 13B model.
+2. Calculate cost per million tokens for self-hosted 70B at $4/H100/hour with measured throughput of 2,000 tokens/sec/GPU.
+3. Compare three providers on price per H100-hour and design a multi-cloud failover.
+
+## 14.23 Common Mistakes
+
+- Buying H100s when L40S or A10G suffice.
+- Ignoring memory bandwidth — TFLOPs alone do not predict LLM inference speed.
+- Skipping quantization "to be safe" without measuring.
+- Forgetting NVLink in multi-GPU planning.
+- No warm capacity; cold starts cause user-visible delays.
+
+## 14.24 Enterprise Best Practices
+
+Treat GPU capacity as a strategic resource, not an operational one. Reserve frontier-GPU capacity in advance. Diversify across two providers for resilience. Maintain an internal benchmark suite that exercises your specific workloads on candidate GPUs. Plan annual GPU refresh cycles around new model launches and hardware generations.
+
+## Sources
+
+- [NVIDIA H100 product page (specs: memory, bandwidth, NVLink, PCIe, MIG)](https://www.nvidia.com/en-us/data-center/h100/)
+- [NVIDIA MIG User Guide: supported MIG profiles](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/latest/supported-mig-profiles.html)
+- [NVIDIA k8s-device-plugin: time-slicing, MPS and MIG strategies](https://github.com/NVIDIA/k8s-device-plugin)
+- [NVIDIA dcgm-exporter default counters](https://github.com/NVIDIA/dcgm-exporter/blob/main/etc/default-counters.csv)
+- [NVIDIA DCGM documentation: profiling metrics](https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html)
+- [vLLM engine arguments](https://docs.vllm.ai/en/latest/configuration/engine_args/)
+- [vLLM metrics design](https://docs.vllm.ai/en/latest/design/metrics.html)
+- [PyTorch CUDA semantics: caching allocator and PYTORCH_ALLOC_CONF](https://docs.pytorch.org/docs/stable/notes/cuda.html)
+- [PyTorch: understanding CUDA memory usage (memory snapshots)](https://docs.pytorch.org/docs/stable/torch_cuda_memory.html)
+- [Williams, Waterman, Patterson: Roofline model (CACM 2009)](https://dl.acm.org/doi/10.1145/1498765.1498785)
+- [Rajbhandari et al.: ZeRO, memory optimizations toward training trillion-parameter models](https://arxiv.org/abs/1910.02054)
+- [Shoeybi et al.: Megatron-LM tensor parallelism](https://arxiv.org/abs/1909.08053)
+- [Dettmers et al.: QLoRA](https://arxiv.org/abs/2305.14314)
+- [Meta Llama 3.1 70B model config (layers, KV heads)](https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct/blob/main/config.json)

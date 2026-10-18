@@ -1,0 +1,599 @@
+---
+title: "Iterators and Iterables"
+description: "The iterator protocol from the ground up: what a for loop really does, why lists can be looped twice and iterators only once, and the exhausted-iterator bugs that follow."
+---
+
+Almost everything you loop over in Python goes through one small protocol: two dunder methods and one exception. `for` loops, comprehensions, `list()`, `sum()`, unpacking, `in`, `zip`, `dict(...)`, and `yield from` all speak it. Once you can see the protocol, a whole family of bugs (empty second loops, missing rows, values that vanish after a debug print) stops being mysterious.
+
+<Callout type="info">
+All outputs on this page were produced with **CPython 3.14.6**. Behaviour is the same on 3.13 unless noted; bytecode listings change between versions.
+</Callout>
+
+## The protocol: `__iter__`, `__next__`, `StopIteration`
+
+Two roles exist, and it is worth keeping them strictly apart:
+
+| Role | Must provide | Meaning |
+|---|---|---|
+| **Iterable** | `__iter__()` returning an iterator | "You can loop over me" |
+| **Iterator** | `__next__()` returning the next value or raising `StopIteration`, plus `__iter__()` returning `self` | "I am a cursor over some values" |
+
+The built-ins `iter(obj)` and `next(it)` are thin wrappers: `iter` calls `type(obj).__iter__(obj)` and `next` calls `type(it).__next__(it)`. Note the lookup is on the **type**, not the instance, like every other dunder; assigning `obj.__iter__ = ...` on an instance does nothing.
+
+```python
+nums = [10, 20, 30]
+it = iter(nums)          # calls nums.__iter__()
+print(type(it))
+print(next(it))          # calls it.__next__()
+print(next(it))
+print(next(it))
+try:
+    next(it)
+except StopIteration:
+    print("StopIteration: the iterator is exhausted")
+print(next(it, "default"))   # second argument swallows StopIteration
+```
+
+```text title="Output"
+<class 'list_iterator'>
+10
+20
+30
+StopIteration: the iterator is exhausted
+default
+```
+
+Underneath, a `list_iterator` is a tiny C struct holding two things: a reference to the list and an integer index. `__next__` checks `index < len(list)`, returns `list[index]`, and bumps the index. When the index runs off the end, it drops its reference to the list (so a finished iterator does not keep the list alive) and signals exhaustion.
+
+Why an exception rather than a sentinel value like JS's `done: true`? Because any value, including `None`, is a legal element. An exception is the only "out-of-band" signal that can never collide with data. And it is cheap: in C, built-in iterators signal the end by returning `NULL` without even creating a `StopIteration` object; the exception is only materialised when Python code is watching.
+
+<Callout title="Coming from JS">
+JS uses `obj[Symbol.iterator]()` to get an iterator, and `iterator.next()` returns a result object `{ value, done }`. Python uses `__iter__()` and `__next__()`, and `__next__` returns the **bare value**; the end is signalled by raising `StopIteration`. There is no wrapper object allocated per step. Python's `next(it, default)` has no direct JS equivalent; you would write `const r = it.next(); r.done ? fallback : r.value`.
+</Callout>
+
+## What a `for` loop actually does
+
+This loop:
+
+```python
+for item in iterable:
+    body(item)
+```
+
+is, semantically, this:
+
+```python
+def for_loop(iterable, body):
+    iterator = iter(iterable)
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        body(item)
+
+for_loop("abc", print)
+```
+
+```text title="Output"
+a
+b
+c
+```
+
+<Mermaid chart={`flowchart TD
+    A["for item in iterable"] --> B["iterator = iter(iterable)<br/>GET_ITER"]
+    B --> C["next(iterator)<br/>FOR_ITER"]
+    C -->|"returns a value"| D["bind item, run body"]
+    D --> C
+    C -->|"raises StopIteration"| E["leave loop, run else block if present"]
+    D -->|"break"| F["leave loop, skip else block"]
+`} />
+
+`iter()` is called **exactly once**, at the start. Every step after that only calls `next()`. Here is the real bytecode CPython 3.14 generates:
+
+```python
+import dis
+def loop(items):
+    for x in items:
+        print(x)
+dis.dis(loop)
+```
+
+```text title="Output"
+  3           RESUME                   0
+
+  4           LOAD_FAST_BORROW         0 (items)
+              GET_ITER
+      L1:     FOR_ITER                14 (to L2)
+              STORE_FAST               1 (x)
+
+  5           LOAD_GLOBAL              1 (print + NULL)
+              LOAD_FAST_BORROW         1 (x)
+              CALL                     1
+              POP_TOP
+              JUMP_BACKWARD           16 (to L1)
+
+  4   L2:     END_FOR
+              POP_ITER
+              LOAD_CONST               0 (None)
+              RETURN_VALUE
+```
+
+- `GET_ITER` calls `iter()` on the object and leaves the iterator on the value stack.
+- `FOR_ITER` calls `__next__`. If a value comes back, execution falls through to the body. If the iterator is exhausted, it jumps to `L2`.
+- `JUMP_BACKWARD` goes back to `FOR_ITER`.
+
+There is no `try/except` in the real bytecode. The C implementation of `FOR_ITER` checks the "iterator returned NULL" condition directly, and it has specialised fast paths for lists, tuples, ranges and generators (the adaptive interpreter rewrites `FOR_ITER` into `FOR_ITER_LIST`, `FOR_ITER_RANGE` and so on after a few runs). So a `for` loop over a list never pays for exceptions at all.
+
+Everything else that consumes values follows the same pattern: `list(x)`, `tuple(x)`, `sum(x)`, `max(x)`, `"".join(x)`, `a, b = x`, `x in y` (when `__contains__` is missing), `dict(pairs)`, `set(x)`, and `*x` in calls.
+
+```python
+it = iter(range(5))
+first, *rest = it
+print(first, rest)
+a, b = iter("xy")
+print(a, b)
+print(*map(str.upper, "abc"))
+```
+
+```text title="Output"
+0 [1, 2, 3, 4]
+x y
+A B C
+```
+
+## Iterables vs iterators: why a list loops twice and an iterator once
+
+A list is an **iterable**: each call to `iter(list)` builds a **new** `list_iterator` with its own index starting at 0. An iterator's `__iter__` returns **itself**, so a second loop picks up the same cursor, which is already at the end.
+
+```python
+nums = [1, 2, 3]
+print(list(nums), list(nums))      # a list hands out a NEW iterator each time
+
+it = iter(nums)
+print(list(it), list(it))          # an iterator is single-use
+
+print(iter(nums) is iter(nums))    # two different iterator objects
+print(iter(it) is it)              # an iterator's __iter__ returns itself
+```
+
+```text title="Output"
+[1, 2, 3] [1, 2, 3]
+[1, 2, 3] []
+False
+True
+```
+
+Why must iterators have an `__iter__` that returns `self`? So you can hand an iterator to anything that expects an iterable. `for x in it` calls `iter(it)` first; if iterators did not implement `__iter__`, you could not loop over one. The price is that the "fresh start" promise is broken: iterating an iterator a second time silently yields nothing. No error, just an empty loop.
+
+The abstract base classes in `collections.abc` encode the two roles. `Iterator` is a subclass of `Iterable`, and both check structurally (no inheritance needed):
+
+```python
+from collections.abc import Iterable, Iterator
+nums = [1, 2, 3]
+it = iter(nums)
+print(isinstance(nums, Iterable), isinstance(nums, Iterator))
+print(isinstance(it, Iterable), isinstance(it, Iterator))
+print(type(iter({})).__name__, type(iter("hi")).__name__, type(iter(range(3))).__name__)
+```
+
+```text title="Output"
+True False
+True True
+dict_keyiterator str_ascii_iterator range_iterator
+```
+
+A useful rule of thumb: **containers are iterables; streams are iterators.** Lists, tuples, dicts, sets, strings, `range`, and dict views are re-iterable. File objects, generators, `map`, `filter`, `zip`, `enumerate`, `reversed`, database cursors, and `csv.reader` are iterators: one pass, then empty.
+
+<Callout title="Coming from JS">
+JS has the same split, but it is easier to miss. `[1,2,3][Symbol.iterator]()` returns a fresh `ArrayIterator`, while a generator object's `[Symbol.iterator]()` returns itself, so spreading a generator twice gives an empty second array. The JS built-in iterator objects (`arr.values()`, `map.entries()`) are also single-use. The difference in practice: in Python, very common built-ins like `map`, `filter` and `zip` return single-use iterators, while JS's `Array.prototype.map` and `filter` return new arrays. That is the root of most "my second loop is empty" bugs for people coming from JS.
+</Callout>
+
+## Writing a custom iterable class
+
+The correct design uses **two classes**: the iterable holds the data and the iterator holds the cursor.
+
+```python
+class Countdown:
+    """Iterable: every for-loop gets a fresh iterator."""
+    def __init__(self, start):
+        self.start = start
+
+    def __iter__(self):
+        return CountdownIterator(self.start)
+
+class CountdownIterator:
+    """Iterator: holds the cursor, single-use."""
+    def __init__(self, current):
+        self.current = current
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current <= 0:
+            raise StopIteration
+        value = self.current
+        self.current -= 1
+        return value
+
+c = Countdown(3)
+print(list(c))
+print(list(c))          # works again: Countdown is an iterable, not an iterator
+print([(a, b) for a in c for b in c][:4])   # nested loops each get their own cursor
+```
+
+```text title="Output"
+[3, 2, 1]
+[3, 2, 1]
+[(3, 3), (3, 2), (3, 1), (2, 3)]
+```
+
+### Trap: making the container its own iterator
+
+A very common mistake is to put `__next__` on the container and return `self` from `__iter__`. It works for one loop, then breaks in two ways.
+
+```python
+class BadCountdown:
+    """Iterable AND iterator in one object: a common mistake."""
+    def __init__(self, start):
+        self.current = start
+    def __iter__(self):
+        return self
+    def __next__(self):
+        if self.current <= 0:
+            raise StopIteration
+        self.current -= 1
+        return self.current + 1
+
+b = BadCountdown(3)
+print(list(b))
+print(list(b))          # empty: the cursor lives on the object itself
+b = BadCountdown(2)
+print([(x, y) for x in b for y in b])   # inner loop drains the shared cursor
+```
+
+```text title="Output"
+[3, 2, 1]
+[]
+[(2, 1)]
+```
+
+Nested loops over the same object share one cursor, so the inner loop drains it and the outer loop ends early. Two threads looping over it would interfere in the same way.
+
+### The idiomatic shortcut: make `__iter__` a generator
+
+In real code you rarely write the iterator class by hand. If `__iter__` is a generator function (it contains `yield`), each call returns a brand new generator object, which is an iterator with its own state. You get the two-class design for free. Generators are covered on the [generators page](/docs/python/generators-and-yield).
+
+```python
+class Countdown:
+    def __init__(self, start):
+        self.start = start
+    def __iter__(self):            # a generator function returns a fresh iterator
+        n = self.start
+        while n > 0:
+            yield n
+            n -= 1
+
+c = Countdown(3)
+print(list(c), list(c))
+```
+
+```text title="Output"
+[3, 2, 1] [3, 2, 1]
+```
+
+## The old `__getitem__` fallback
+
+Before the iterator protocol existed (it arrived in Python 2.2), `for` loops worked by calling `obj[0]`, `obj[1]`, `obj[2]` until an `IndexError` came up. That fallback is still there: if a type has no `__iter__` but has `__getitem__`, `iter()` wraps it in a generic `iterator` object that does exactly that.
+
+```python
+class Legacy:
+    def __getitem__(self, index):
+        if index >= 3:
+            raise IndexError        # IndexError ends the old-style protocol
+        return index * 100
+
+for x in Legacy():
+    print(x)
+
+from collections.abc import Iterable
+print(isinstance(Legacy(), Iterable))  # False, but iter() still works
+print(type(iter(Legacy())).__name__)
+```
+
+```text title="Output"
+0
+100
+200
+False
+iterator
+```
+
+Two consequences matter:
+
+- `isinstance(x, Iterable)` only checks for `__iter__`, so it returns `False` for these "sequence-protocol" objects even though they are loopable. **The only reliable test for iterability is to call `iter(x)` and catch `TypeError`.**
+- If your `__getitem__` takes string keys (a dict-like class), Python will still try `obj[0]` when someone loops over it, giving a confusing `KeyError: 0`. Define `__iter__` explicitly on mapping-like classes.
+
+To declare that a type is **not** iterable even though it has `__getitem__`, set `__iter__ = None`:
+
+```python
+class NotIterable:
+    __iter__ = None      # explicitly opt out
+
+try:
+    iter(NotIterable())
+except TypeError as e:
+    print("TypeError:", e)
+try:
+    for x in 42: pass
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+TypeError: 'NotIterable' object is not iterable
+TypeError: 'int' object is not iterable
+```
+
+## `iter()` with a sentinel
+
+`iter` has a second form: `iter(callable, sentinel)`. It calls `callable()` with no arguments over and over, yielding each result, and stops as soon as a result equals `sentinel`. This turns "call until it returns X" loops into iterators.
+
+```python
+import io
+stream = io.BytesIO(b"abcdefghij")
+for chunk in iter(lambda: stream.read(4), b""):
+    print(chunk)
+
+import random
+random.seed(1)
+rolls = list(iter(lambda: random.randint(1, 6), 6))   # roll until a 6
+print(rolls)
+```
+
+```text title="Output"
+b'abcd'
+b'efgh'
+b'ij'
+[2, 5, 1, 3, 1, 4, 4, 4]
+```
+
+The classic backend use is reading a file or socket in fixed-size chunks: `for chunk in iter(lambda: f.read(65536), b""):`. Use `functools.partial(f.read, 65536)` instead of a lambda if you prefer. Other uses: `iter(queue.get, None)` to drain a work queue until a `None` "poison pill" arrives.
+
+Traps: the sentinel is compared with `==`, and the sentinel value itself is **not** yielded. For a text-mode file the sentinel must be `""`, not `b""`; using the wrong one gives an infinite loop because `"" == b""` is `False`.
+
+## Laziness
+
+An iterator computes values only when `next()` is called. Nothing is precomputed, and nothing is stored beyond the current position. That is the whole point: you can stream a 50 GB log file, or an infinite sequence, in constant memory.
+
+```python
+def noisy(x):
+    print(f"  computing {x}")
+    return x * 2
+
+m = map(noisy, [1, 2, 3])
+print("map created:", m)
+print("first:", next(m))
+print("rest:", list(m))
+print("again:", list(m))
+```
+
+```text title="Output"
+map created: <map object at 0x0000022841B3ADC0>
+  computing 1
+first: 2
+  computing 2
+  computing 3
+rest: [4, 6]
+again: []
+```
+
+(The memory address differs on every run.) Creating the `map` ran nothing. Each `next` ran exactly one call. The third consumer got nothing because the iterator was already used up.
+
+Laziness has a cost you should know about: **errors also show up late.** If `noisy` raises on the third element, the exception surfaces wherever the iterator is finally consumed, which may be far from where you built it. Stack traces then point at a `list(...)` call in an unrelated function.
+
+### `map`, `filter`, `zip`, `enumerate`, `reversed` return iterators
+
+In Python 2 these returned lists. In Python 3 they return lazy, single-use iterators. `range` and dict views, by contrast, are lazy but **re-iterable** objects: they compute values on demand, yet each `iter()` call gives a fresh cursor, and they support `len`, indexing (`range`) and fast `in`.
+
+```python
+nums = [1, 2, 3, 4]
+for obj in (map(str, nums), filter(None, nums), zip(nums, nums), enumerate(nums), reversed(nums)):
+    print(type(obj).__name__, iter(obj) is obj)
+r = range(4)
+print(type(r).__name__, iter(r) is r, len(r), r[2], 3 in r)
+d = {"a": 1}
+print(type(d.keys()).__name__, iter(d.keys()) is d.keys())
+```
+
+```text title="Output"
+map True
+filter True
+zip True
+enumerate True
+list_reverseiterator True
+range False 4 2 True
+dict_keys False
+```
+
+`iter(obj) is obj` being `True` is the quickest test for "this is a one-shot iterator". Iterators also have no `len()`. `operator.length_hint` gives a best-effort guess for those that know it:
+
+```python
+import operator
+it = iter([1, 2, 3])
+next(it)
+print(operator.length_hint(it))
+try:
+    len(it)
+except TypeError as e:
+    print("TypeError:", e)
+```
+
+```text title="Output"
+2
+TypeError: object of type 'list_iterator' has no len()
+```
+
+<Callout title="Coming from JS">
+`arr.map(f)` in JS is eager and returns an array. Python's `map(f, xs)` is lazy and returns an iterator, closer to the newer JS iterator helpers (`arr.values().map(f)`, ES2025). For the eager JS feel, use a list comprehension: `[f(x) for x in xs]`. That is also considered more idiomatic than `list(map(...))` when `f` would be a lambda.
+</Callout>
+
+## Exhausted-iterator bugs
+
+These are the bugs this page exists to prevent. All of them come from consuming a one-shot iterator twice, or partially, without realising it.
+
+**1. Two aggregations over one iterator.**
+
+```python
+rows = map(int, ["3", "1", "2"])
+total = sum(rows)
+print("total:", total)
+print("max:", max(rows, default="nothing left"))
+```
+
+```text title="Output"
+total: 6
+max: nothing left
+```
+
+Without `default=`, `max` would raise `ValueError: max() iterable argument is empty`, which is a confusing message when you can see three rows in the source. Fix: materialise once with `rows = list(...)` if you need several passes, or compute everything in a single loop.
+
+**2. A check that silently consumes items.** `any()`, `all()`, `in` and `next()` stop early, but they still eat everything up to the stopping point.
+
+```python
+users = filter(lambda u: u["active"], [
+    {"id": 1, "active": True},
+    {"id": 2, "active": False},
+    {"id": 3, "active": True},
+])
+if any(u["id"] == 1 for u in users):     # consumes items up to the first match
+    print("found user 1")
+print([u["id"] for u in users])          # user 1 is gone
+```
+
+```text title="Output"
+found user 1
+[3]
+```
+
+```python
+nums = iter([1, 2, 3, 4])
+print(2 in nums)      # consumes 1 and 2
+print(list(nums))     # only what was left
+```
+
+```text title="Output"
+True
+[3, 4]
+```
+
+**3. Debug printing.** Adding `print(list(results))` "just to look" consumes `results`, and the real code after it now sees nothing. The bug appears only when you add logging, and disappears when you remove it.
+
+**4. Returning an iterator from a function that callers loop twice.** If a repository method returns `map(Row.from_db, cursor)`, the first caller is fine and the second gets nothing. Either return a list, or return a re-iterable object (a class with a generator `__iter__`).
+
+**5. `zip` stops at the shortest input, silently.** If two lists that should match differ in length, the extra items vanish. Since 3.10, pass `strict=True` to make that an error:
+
+```python
+names = ["a", "b", "c"]
+ages = [1, 2]
+print(list(zip(names, ages)))
+try:
+    list(zip(names, ages, strict=True))
+except ValueError as e:
+    print("ValueError:", e)
+```
+
+```text title="Output"
+[('a', 1), ('b', 2)]
+ValueError: zip() argument 2 is shorter than argument 1
+```
+
+The flip side of "zip pulls from each iterator in turn" is a useful idiom: passing the **same** iterator twice groups items into pairs.
+
+```python
+it = iter([1, 2, 3, 4, 5])
+print(list(zip(it, it)))   # pairs: the same iterator feeds both slots
+```
+
+```text title="Output"
+[(1, 2), (3, 4)]
+```
+
+Note the 5 was dropped (pulled from `it`, then discarded because the second slot was empty). `itertools.batched` is the clearer modern tool, see the [itertools page](/docs/python/itertools).
+
+**6. `StopIteration` leaking out of `next()`.** A bare `next(...)` on an empty iterator raises `StopIteration`, which callers will not expect from a normal function. Inside a generator it is even worse: since Python 3.7 (PEP 479) it is converted into a `RuntimeError`. Always give `next` a default when "no match" is possible.
+
+```python
+def first_even(nums):
+    return next(n for n in nums if n % 2 == 0)
+
+try:
+    first_even([1, 3, 5])
+except StopIteration:
+    print("StopIteration escaped from first_even")
+print(next((n for n in [1, 3, 5] if n % 2 == 0), None))
+```
+
+```text title="Output"
+StopIteration escaped from first_even
+None
+```
+
+**7. Mutating a container while iterating it.** The `list_iterator` only stores an index, so removing items shifts later items under the cursor and some get skipped. Dicts and sets detect size changes and raise.
+
+```python
+nums = [1, 2, 3, 4]
+for n in nums:
+    if n % 2 == 0:
+        nums.remove(n)
+print(nums)   # looks right by accident
+nums = [2, 4, 6, 8]
+for n in nums:
+    nums.remove(n)
+print(nums)   # skipped elements
+d = {"a": 1, "b": 2}
+try:
+    for k in d:
+        d["c"] = 3
+except RuntimeError as e:
+    print("RuntimeError:", e)
+```
+
+```text title="Output"
+[1, 3]
+[4, 8]
+RuntimeError: dictionary changed size during iteration
+```
+
+Fix: iterate over a copy (`for n in nums[:]`, `for k in list(d)`) or, better, build a new collection with a comprehension.
+
+## When to use what
+
+- **Return a list** when results are small and callers may loop, index, or `len()` them. It is the least surprising choice.
+- **Return an iterator or generator** when data is large, unbounded, or expensive and is normally consumed once (file lines, DB rows, paginated API results). Name it so the one-shot nature is clear, for example `iter_users()`.
+- **Write an iterable class** (with a generator `__iter__`) when you want laziness *and* re-iteration, like `range` does.
+- **Accept `Iterable[T]`** in function signatures, and if you need two passes, call `list()` on it yourself at the top. Do not assume the caller gave you a list.
+
+## Interview questions
+
+1. **What is the difference between an iterable and an iterator?** **An iterable has `__iter__` that returns a new iterator. An iterator has `__next__` plus an `__iter__` that returns itself, so it is single-use. Every iterator is iterable; not every iterable is an iterator.**
+2. **Write out what `for x in xs: body` does.** **`it = iter(xs)` once, then loop: `x = next(it)`, run the body, and break when `StopIteration` is raised. In bytecode this is `GET_ITER` followed by `FOR_ITER`.**
+3. **Why does looping over a `map` object a second time produce nothing?** **`map` returns an iterator whose `__iter__` returns itself, so the second loop reuses the already-exhausted cursor.**
+4. **How can a class be iterable without defining `__iter__`?** **By defining `__getitem__` that accepts 0, 1, 2 and raises `IndexError` at the end. `iter()` falls back to the old sequence protocol. `isinstance(x, Iterable)` misses this, so `iter(x)` inside `try/except TypeError` is the reliable check.**
+5. **What does `iter(callable, sentinel)` do and where would you use it?** **It calls the callable repeatedly until it returns a value equal to the sentinel. Typical use: reading fixed-size chunks with `iter(lambda: f.read(8192), b"")`.**
+6. **Why does Python signal the end of iteration with an exception rather than a return value?** **Any object, including `None`, can be a legitimate item, so only an out-of-band signal is unambiguous. In C, built-in iterators avoid the cost by returning `NULL` without creating the exception.**
+7. **What happens if you remove items from a list while looping over it?** **The list iterator tracks a plain index, so elements shift under it and some get skipped. Dicts and sets raise `RuntimeError` on a size change. Iterate over a copy or build a new collection.**
+8. **What is wrong with a container class whose `__iter__` returns `self`?** **The cursor lives on the container, so a second loop is empty and nested loops share state. Return a new iterator (or make `__iter__` a generator) instead.**
+
+## Recap
+
+- The protocol is `__iter__` (give me a cursor), `__next__` (give me the next value), and `StopIteration` (no more). `iter()` and `next()` call them.
+- A `for` loop calls `iter()` once and `next()` repeatedly until `StopIteration`. The same applies to `list()`, `sum()`, unpacking, `in`, and friends.
+- Iterables hand out fresh iterators; iterators return themselves from `__iter__` and are single-use. Containers are iterables, streams are iterators.
+- Custom iterables should create a new iterator per `__iter__` call; a generator `__iter__` does that for you.
+- The `__getitem__` fallback still exists and `__iter__ = None` opts out.
+- `iter(callable, sentinel)` turns "call until X" loops into iterators.
+- `map`, `filter`, `zip`, `enumerate`, and `reversed` are lazy and one-shot; `range` and dict views are lazy but re-iterable.
+- Most iterator bugs are double consumption or partial consumption: materialise with `list()` when you need more than one pass, and use `zip(strict=True)` and `next(it, default)` defensively.
