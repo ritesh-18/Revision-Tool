@@ -1,5 +1,5 @@
 # fumadoc-learning
-
+# Python-notes-link : https://fumadoc-python-learning.vercel.app
 This is a Next.js application generated with
 [Create Fumadocs](https://github.com/fuma-nama/fumadocs).
 
